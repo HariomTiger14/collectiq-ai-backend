@@ -1,42 +1,23 @@
-"""In-memory portfolio service."""
+from uuid import uuid4
 
-from fastapi import HTTPException, status
-
-from app.schemas.portfolio import (
-    PortfolioItemCreate,
-    PortfolioItemResponse,
-    PortfolioResponse,
-)
+from app.schemas.portfolio import PortfolioCreateRequest, PortfolioItem
 
 
-class PortfolioService:
-    """Service that manages portfolio items in memory."""
-
+class InMemoryPortfolioService:
     def __init__(self) -> None:
-        """Initialize empty in-memory storage."""
-        self._items: dict[str, PortfolioItemResponse] = {}
+        self._items: dict[str, PortfolioItem] = {}
 
-    def get_portfolio(self) -> PortfolioResponse:
-        """Return all saved portfolio items with summary totals."""
-        items = list(self._items.values())
-        return PortfolioResponse(
-            items=items,
-            total_items=len(items),
-            total_value=sum(item.estimated_value for item in items),
-        )
+    def list_items(self) -> list[PortfolioItem]:
+        return list(self._items.values())
 
-    def save_item(self, item: PortfolioItemCreate) -> PortfolioItemResponse:
-        """Save a portfolio item in memory."""
-        saved_item = PortfolioItemResponse(**item.model_dump())
-        self._items[saved_item.id] = saved_item
-        return saved_item
+    def add_item(self, request: PortfolioCreateRequest) -> PortfolioItem:
+        item_id = request.id or str(uuid4())
+        item = PortfolioItem(id=item_id, data=request.data)
+        self._items[item_id] = item
+        return item
 
-    def delete_item(self, item_id: str) -> None:
-        """Delete a portfolio item by id."""
-        if item_id not in self._items:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Portfolio item not found.",
-            )
+    def delete_item(self, item_id: str) -> bool:
+        return self._items.pop(item_id, None) is not None
 
-        del self._items[item_id]
+
+portfolio_service = InMemoryPortfolioService()

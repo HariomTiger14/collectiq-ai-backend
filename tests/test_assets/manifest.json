@@ -1,0 +1,47 @@
+[
+  {
+    "filename": "pokemon_card_placeholder.jpg",
+    "imageFilename": "pokemon_card_placeholder.jpg",
+    "expectedCategory": "Pokemon Card",
+    "expectedItemKeywords": ["Charizard", "Pokemon", "Base Set"],
+    "expectedBrandOrFranchise": "Pokemon",
+    "pricingExpected": true,
+    "expectedItem": "1999 Pokemon Charizard Holo",
+    "expectedConfidenceRange": {
+      "min": 80,
+      "max": 100
+    },
+    "status": "placeholder",
+    "notes": "Replace with a licensed or user-owned test image before real AI validation."
+  },
+  {
+    "filename": "sports_card_placeholder.jpg",
+    "imageFilename": "sports_card_placeholder.jpg",
+    "expectedCategory": "Sports Card",
+    "expectedItemKeywords": ["Michael Jordan", "Fleer", "Rookie"],
+    "expectedBrandOrFranchise": "Fleer",
+    "pricingExpected": true,
+    "expectedItem": "1986 Fleer Michael Jordan Rookie",
+    "expectedConfidenceRange": {
+      "min": 70,
+      "max": 95
+    },
+    "status": "placeholder",
+    "notes": "Placeholder manifest row for future golden-image validation."
+  },
+  {
+    "filename": "coin_placeholder.jpg",
+    "imageFilename": "coin_placeholder.jpg",
+    "expectedCategory": "Coin",
+    "expectedItemKeywords": ["Morgan", "Silver Dollar", "1921"],
+    "expectedBrandOrFranchise": "United States Mint",
+    "pricingExpected": true,
+    "expectedItem": "1921 Morgan Silver Dollar",
+    "expectedConfidenceRange": {
+      "min": 70,
+      "max": 95
+    },
+    "status": "placeholder",
+    "notes": "Placeholder manifest row for future golden-image validation."
+  }
+]
