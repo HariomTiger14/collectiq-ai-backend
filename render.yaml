@@ -1,0 +1,52 @@
+﻿services:
+  - type: web
+    name: collectiq-ai-backend-sit
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ENVIRONMENT
+        value: sit
+      - key: APP_VERSION
+        value: 0.1.0
+      - key: COMMIT_SHA
+        sync: false
+      - key: BUILD_TIME
+        sync: false
+      - key: PUBLIC_API_URL
+        value: https://api-sit.packlox.com
+      - key: PUBLIC_FRONTEND_URL
+        value: https://sit.packlox.com
+      - key: CORS_ALLOWED_ORIGINS
+        value: https://sit.packlox.com,https://admin.packlox.com,http://localhost:3000,http://127.0.0.1:3000
+      - key: HEALTH_TIMEOUT_SECONDS
+        value: "3"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_HEALTH_REQUIRED
+        value: "true"
+      - key: AI_PROVIDER
+        value: mock
+      - key: PRICING_PROVIDER
+        value: mock
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4.1-mini
+      - key: OPENAI_TIMEOUT_SECONDS
+        value: "30"
+      - key: PRICING_CACHE_TTL_SECONDS
+        value: "900"
+      - key: PRICING_PROVIDER_MIN_INTERVAL_MS
+        value: "250"

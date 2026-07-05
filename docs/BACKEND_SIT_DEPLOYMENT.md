@@ -1,4 +1,4 @@
-# CollectIQ Backend SIT Deployment
+﻿# CollectIQ Backend SIT Deployment
 
 Audit date: 2026-07-01
 
@@ -297,10 +297,14 @@ Cons:
 
 ## Recommended SIT Deployment: Render
 
-Create a Render Web Service:
+Deploy the dedicated `HariomTiger14/collectiq-ai-backend` repository as a Render Web Service. This repository is already rooted at the backend service, so the Render root directory should stay blank / repository root.
 
-- Root directory: `backend`
-- Runtime: Python or Docker
+The repo includes `render.yaml` for Blueprint deployment.
+
+Manual Render settings:
+
+- Root directory: blank / repository root
+- Runtime: Python
 - Build command: `pip install -r requirements.txt`
 - Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 - Health check path: `/health`
@@ -309,10 +313,15 @@ Environment variables for mock SIT:
 
 ```text
 ENVIRONMENT=sit
-BACKEND_ENV=sit
+APP_VERSION=0.1.0
+COMMIT_SHA=<deployed git commit>
+BUILD_TIME=<ISO-8601 deployment timestamp>
+PUBLIC_API_URL=https://api-sit.packlox.com
+PUBLIC_FRONTEND_URL=https://sit.packlox.com
 AI_PROVIDER=mock
 PRICING_PROVIDER=mock
 CORS_ALLOWED_ORIGINS=https://sit.packlox.com,https://admin.packlox.com,http://localhost:3000,http://127.0.0.1:3000
+HEALTH_TIMEOUT_SECONDS=3
 SUPABASE_URL=https://YOUR-SIT-PROJECT.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=<server-side service role key>
 SUPABASE_ANON_KEY=YOUR_PUBLIC_ANON_KEY
@@ -322,11 +331,12 @@ SUPABASE_HEALTH_REQUIRED=true
 Environment variables for OpenAI SIT:
 
 ```text
-BACKEND_ENV=sit
+ENVIRONMENT=sit
 AI_PROVIDER=openai
 OPENAI_API_KEY=<server-side secret>
+OPENAI_MODEL=gpt-4.1-mini
+OPENAI_TIMEOUT_SECONDS=30
 PRICING_PROVIDER=mock
-CORS_ALLOWED_ORIGINS=
 ```
 
 After deploy, open:
