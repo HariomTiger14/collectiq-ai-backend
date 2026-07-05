@@ -427,3 +427,102 @@ Existing app-compatible fields such as `brand`, `estimatedValue`, and nested `pr
 - Never put `OPENAI_API_KEY` or pricing provider keys in Flutter dart-defines.
 - Never commit `.env` files with real secrets.
 - Production remains disabled by app configuration.
+
+## Final SIT Deployment Checklist
+
+### Render Setup
+
+Use the checked-in `render.yaml` blueprint, or configure the Render Web Service manually:
+
+- Repository: `HariomTiger14/collectiq-ai-backend`
+- Branch: `main`
+- Root directory: blank / repository root
+- Runtime: Python
+- Python version: `3.12.8`
+- Build command: `pip install -r requirements.txt`
+- Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- Health check path: `/health`
+- Auto deploy: enabled for SIT once the first deployment is verified
+
+### Environment Variables
+
+Required for SIT readiness:
+
+```text
+ENVIRONMENT=sit
+APP_VERSION=0.1.0
+COMMIT_SHA=<deployed git commit>
+BUILD_TIME=<ISO-8601 deployment timestamp>
+PUBLIC_API_URL=https://api-sit.packlox.com
+PUBLIC_FRONTEND_URL=https://sit.packlox.com
+CORS_ALLOWED_ORIGINS=https://sit.packlox.com,https://admin.packlox.com,http://localhost:3000,http://127.0.0.1:3000
+HEALTH_TIMEOUT_SECONDS=3
+SUPABASE_URL=https://YOUR-SIT-PROJECT.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=<server-side service role key>
+SUPABASE_ANON_KEY=YOUR_PUBLIC_ANON_KEY
+SUPABASE_HEALTH_REQUIRED=true
+AI_PROVIDER=mock
+PRICING_PROVIDER=mock
+```
+
+Optional provider variables, only when intentionally validating those providers:
+
+```text
+OPENAI_API_KEY=<server-side secret>
+OPENAI_MODEL=gpt-4.1-mini
+OPENAI_TIMEOUT_SECONDS=30
+EBAY_ACCESS_TOKEN=<server-side secret>
+EBAY_BROWSE_API_URL=https://api.ebay.com/buy/browse/v1/item_summary/search
+EBAY_MARKETPLACE_ID=EBAY_AU
+EBAY_TIMEOUT_SECONDS=10
+TCGPLAYER_CLIENT_ID=<server-side secret>
+TCGPLAYER_CLIENT_SECRET=<server-side secret>
+TCGPLAYER_API_BASE=https://api.tcgplayer.com
+TCGPLAYER_TIMEOUT_SECONDS=10
+PRICECHARTING_API_KEY=<server-side secret>
+PRICECHARTING_API_BASE=https://www.pricecharting.com
+PRICECHARTING_TIMEOUT_SECONDS=10
+PRICING_CACHE_TTL_SECONDS=900
+PRICING_PROVIDER_MIN_INTERVAL_MS=250
+```
+
+Never commit real values for `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_API_KEY`, `EBAY_ACCESS_TOKEN`, `TCGPLAYER_CLIENT_ID`, `TCGPLAYER_CLIENT_SECRET`, or `PRICECHARTING_API_KEY`.
+
+### Custom Domain Setup
+
+After the Render service is healthy on its default host:
+
+1. Add the SIT API custom domain in Render, for example `api-sit.packlox.com`.
+2. Add the DNS record exactly as Render provides it.
+3. Wait for Render certificate provisioning to complete.
+4. Set `PUBLIC_API_URL=https://api-sit.packlox.com`.
+5. Keep `PUBLIC_FRONTEND_URL=https://sit.packlox.com`.
+6. Confirm the frontend uses `API_BASE_URL=https://api-sit.packlox.com`.
+
+### Health Verification
+
+Verify these endpoints after every SIT deploy:
+
+```text
+GET https://api-sit.packlox.com/health
+GET https://api-sit.packlox.com/version
+POST https://api-sit.packlox.com/analyze
+```
+
+Expected health behavior:
+
+- HTTP `200` with `status: healthy` when required dependencies pass.
+- HTTP `503` with `status: unhealthy` when a required dependency fails.
+- The response includes `environment`, `version`, `timestamp`, `services`, `latency`, and `checks`.
+- The response must not include provider keys, Supabase keys, OAuth tokens, or service role secrets.
+
+### Rollback Procedure
+
+If SIT deployment fails:
+
+1. In Render, open the service deploy history.
+2. Select the last known healthy deploy and choose rollback / redeploy.
+3. Confirm `GET /health` returns HTTP `200`.
+4. Confirm `GET /version` reports the expected rollback commit.
+5. Keep the failed commit available for diagnosis; do not rotate secrets unless logs show a secret exposure.
+6. If rollback still fails, temporarily set `AI_PROVIDER=mock` and `PRICING_PROVIDER=mock`, then re-check `/health`.
