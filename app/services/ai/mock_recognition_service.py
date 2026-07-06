@@ -1,11 +1,17 @@
+import base64
+import binascii
 import hashlib
+import logging
 from pathlib import Path
+from uuid import uuid4
 
 from app.services.ai.base_recognition_service import (
     AIRecognitionProvider,
     AlternativeMatch,
     RecognitionResult,
 )
+
+logger = logging.getLogger("collectiq.mock_recognition")
 
 
 def _alternatives(*matches: tuple[str, str, int, str]) -> list[AlternativeMatch]:
@@ -749,8 +755,22 @@ MOCK_COLLECTIBLES = [
 
 
 class MockRecognitionProvider(AIRecognitionProvider):
+    def __init__(self) -> None:
+        self.last_selection_diagnostics: dict[str, object] = {}
+
     def recognize(self, image_path: Path) -> RecognitionResult:
-        return MOCK_COLLECTIBLES[_index_for_path(image_path)]
+        index = _index_for_path(image_path)
+        result = MOCK_COLLECTIBLES[index]
+        self._record_selection(
+            seed_source="path",
+            seed_hash_prefix=_seed_hash_prefix(str(image_path)),
+            byte_length=None,
+            selected_index=index,
+            selected_title=result.title,
+            file_name=Path(str(image_path)).name,
+            content_type=None,
+        )
+        return result
 
     def recognize_api_payload(
         self,
@@ -758,14 +778,9 @@ class MockRecognitionProvider(AIRecognitionProvider):
         request_metadata: dict,
         image_payload: dict,
     ) -> RecognitionResult:
-        seed = (
-            image_payload.get("base64Image")
-            or image_payload.get("base64Preview")
-            or image_payload.get("localFilePath")
-            or image_payload.get("fileName")
-            or request_metadata.get("imagePath")
-            or request_metadata.get("timestamp")
-            or "uploads/mock.jpg"
+        seed_context = _seed_context_for_payload(
+            request_metadata=request_metadata,
+            image_payload=image_payload,
         )
         requested_category = str(request_metadata.get("requestedCategory") or "").strip()
         if requested_category:
@@ -775,10 +790,70 @@ class MockRecognitionProvider(AIRecognitionProvider):
                 if _matches_requested_category(item.category, requested_category)
             ]
             if matches:
-                index = _hash_to_index(str(seed), len(matches))
-                return matches[index]
+                index = _hash_to_index(seed_context.seed, len(matches))
+                result = matches[index]
+                selected_index = MOCK_COLLECTIBLES.index(result)
+                self._record_selection(
+                    seed_source=seed_context.source,
+                    seed_hash_prefix=_seed_hash_prefix(seed_context.seed),
+                    byte_length=seed_context.byte_length,
+                    selected_index=selected_index,
+                    selected_title=result.title,
+                    file_name=seed_context.file_name,
+                    content_type=seed_context.content_type,
+                    requested_category=requested_category,
+                )
+                return result
 
-        return self.recognize(Path(str(seed)))
+        index = _hash_to_index(seed_context.seed, len(MOCK_COLLECTIBLES))
+        result = MOCK_COLLECTIBLES[index]
+        self._record_selection(
+            seed_source=seed_context.source,
+            seed_hash_prefix=_seed_hash_prefix(seed_context.seed),
+            byte_length=seed_context.byte_length,
+            selected_index=index,
+            selected_title=result.title,
+            file_name=seed_context.file_name,
+            content_type=seed_context.content_type,
+            requested_category=requested_category or None,
+        )
+        return result
+
+    def _record_selection(
+        self,
+        *,
+        seed_source: str,
+        seed_hash_prefix: str,
+        byte_length: int | None,
+        selected_index: int,
+        selected_title: str,
+        file_name: str | None,
+        content_type: str | None,
+        requested_category: str | None = None,
+    ) -> None:
+        self.last_selection_diagnostics = {
+            "seedSource": seed_source,
+            "seedHashPrefix": seed_hash_prefix,
+            "byteLength": byte_length,
+            "selectedMockIndex": selected_index,
+            "selectedMockTitle": selected_title,
+            "fileName": file_name,
+            "contentType": content_type,
+            "requestedCategory": requested_category,
+        }
+        logger.info(
+            "Mock recognition selected fileName=%s contentType=%s byteLength=%s "
+            "seedSource=%s seedHashPrefix=%s selectedMockIndex=%s "
+            "selectedMockTitle=%s requestedCategory=%s",
+            file_name or "",
+            content_type or "",
+            byte_length,
+            seed_source,
+            seed_hash_prefix,
+            selected_index,
+            selected_title,
+            requested_category or "",
+        )
 
 
 def _index_for_path(image_path: Path) -> int:
@@ -791,7 +866,101 @@ def _index_for_path(image_path: Path) -> int:
 
 def _hash_to_index(seed: str, pool_size: int) -> int:
     digest = hashlib.sha256(seed.encode("utf-8")).digest()
-    return int.from_bytes(digest[:4], "big") % pool_size
+    return int.from_bytes(digest, "big") % pool_size
+
+
+def _seed_hash_prefix(seed: str) -> str:
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:12]
+
+
+class _SeedContext:
+    def __init__(
+        self,
+        *,
+        seed: str,
+        source: str,
+        byte_length: int | None,
+        file_name: str | None,
+        content_type: str | None,
+    ) -> None:
+        self.seed = seed
+        self.source = source
+        self.byte_length = byte_length
+        self.file_name = file_name
+        self.content_type = content_type
+
+
+def _seed_context_for_payload(*, request_metadata: dict, image_payload: dict) -> _SeedContext:
+    file_name = _optional_text(image_payload.get("fileName"))
+    content_type = _optional_text(image_payload.get("mimeType"))
+    base64_image = _optional_text(image_payload.get("base64Image"))
+    base64_preview = _optional_text(image_payload.get("base64Preview"))
+
+    decoded = _decode_base64_optional(base64_image)
+    if decoded:
+        return _SeedContext(
+            seed=f"bytes:{hashlib.sha256(decoded).hexdigest()}",
+            source="base64Image",
+            byte_length=len(decoded),
+            file_name=file_name,
+            content_type=content_type,
+        )
+
+    preview_decoded = _decode_base64_optional(base64_preview)
+    if preview_decoded:
+        return _SeedContext(
+            seed=f"preview:{hashlib.sha256(preview_decoded).hexdigest()}",
+            source="base64Preview",
+            byte_length=len(preview_decoded),
+            file_name=file_name,
+            content_type=content_type,
+        )
+
+    metadata_parts = [
+        ("fileName", file_name),
+        ("mimeType", content_type),
+        ("sizeBytes", _optional_text(image_payload.get("sizeBytes"))),
+        ("imageSource", _optional_text(image_payload.get("imageSource"))),
+        ("localFilePath", _optional_text(image_payload.get("localFilePath"))),
+        ("requestImagePath", _optional_text(request_metadata.get("imagePath"))),
+        ("timestamp", _optional_text(request_metadata.get("timestamp"))),
+        ("appVersion", _optional_text(request_metadata.get("appVersion"))),
+    ]
+    usable_parts = [(key, value) for key, value in metadata_parts if value]
+    if usable_parts:
+        seed = "|".join(f"{key}={value}" for key, value in usable_parts)
+        return _SeedContext(
+            seed=f"metadata:{seed}",
+            source="metadata",
+            byte_length=None,
+            file_name=file_name,
+            content_type=content_type,
+        )
+
+    return _SeedContext(
+        seed=f"fallback:{uuid4()}",
+        source="fallback",
+        byte_length=None,
+        file_name=file_name,
+        content_type=content_type,
+    )
+
+
+def _decode_base64_optional(value: str | None) -> bytes | None:
+    if not value:
+        return None
+    encoded = value.split(",", 1)[1] if value.startswith("data:") else value
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _optional_text(value) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _matches_requested_category(category: str, requested_category: str) -> bool:

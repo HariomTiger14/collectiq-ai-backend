@@ -1,5 +1,7 @@
 import os
-from dataclasses import dataclass
+import subprocess
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -14,6 +16,54 @@ ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png"}
 CHUNK_SIZE = 1024 * 1024
 
 load_dotenv(BACKEND_ROOT / ".env")
+
+
+def _first_env_value(*names: str) -> str | None:
+    for name in names:
+        value = os.getenv(name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def resolve_app_version() -> str:
+    return _first_env_value("APP_VERSION", "BACKEND_VERSION") or "0.1.0"
+
+
+def resolve_environment() -> str:
+    return _first_env_value("ENVIRONMENT", "BACKEND_ENV", "APP_ENV") or "local"
+
+
+def resolve_commit_sha() -> str:
+    return (
+        _first_env_value("COMMIT_SHA", "GIT_COMMIT", "CF_PAGES_COMMIT_SHA")
+        or _first_env_value("RENDER_GIT_COMMIT", "RENDER_COMMIT_SHA")
+        or _git_commit_sha()
+        or "unknown"
+    )
+
+
+def resolve_build_time() -> str:
+    return _first_env_value("BUILD_TIME", "CF_PAGES_COMMIT_TIME") or datetime.now(
+        UTC
+    ).isoformat()
+
+
+def _git_commit_sha() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    commit = result.stdout.strip()
+    return commit or None
 
 
 def parse_cors_allowed_origins(raw_value: str | None = None) -> tuple[str, ...]:
@@ -32,17 +82,11 @@ def parse_cors_allowed_origins(raw_value: str | None = None) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class Settings:
-    environment: str = os.getenv(
-        "ENVIRONMENT",
-        os.getenv("BACKEND_ENV", os.getenv("APP_ENV", "local")),
-    )
+    environment: str = field(default_factory=resolve_environment)
     application_name: str = os.getenv("APPLICATION_NAME", "PackLox API")
-    version: str = os.getenv("APP_VERSION", os.getenv("BACKEND_VERSION", "0.1.0"))
-    commit: str = os.getenv(
-        "COMMIT_SHA",
-        os.getenv("GIT_COMMIT", os.getenv("CF_PAGES_COMMIT_SHA", "unknown")),
-    )
-    build_time: str = os.getenv("BUILD_TIME", os.getenv("CF_PAGES_COMMIT_TIME", "unknown"))
+    version: str = field(default_factory=resolve_app_version)
+    commit: str = field(default_factory=resolve_commit_sha)
+    build_time: str = field(default_factory=resolve_build_time)
     public_api_url: str = os.getenv("PUBLIC_API_URL", "https://api-sit.packlox.com")
     public_frontend_url: str = os.getenv("PUBLIC_FRONTEND_URL", "https://sit.packlox.com")
     port: int = int(os.getenv("PORT", "8000"))

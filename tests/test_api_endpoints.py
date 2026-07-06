@@ -1,13 +1,15 @@
 import json
 import base64
+import os
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 from fastapi.testclient import TestClient
 
-from app.core.config import parse_cors_allowed_origins
+from app.core.config import Settings, parse_cors_allowed_origins
 from app.main import app
 from app.services.ai.openai_recognition_provider import OpenAIRecognitionProvider
 
@@ -45,6 +47,10 @@ class ApiEndpointsTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
+        self.assertEqual(
+            set(payload.keys()),
+            {"application", "environment", "version", "commit", "buildTime"},
+        )
         self.assertEqual(payload["application"], "PackLox API")
         self.assertIn("version", payload)
         self.assertIn("environment", payload)
@@ -54,6 +60,55 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertNotIn("api_key", serialized.lower())
         self.assertNotIn("secret", serialized.lower())
         self.assertNotIn("token", serialized.lower())
+
+    def test_version_metadata_uses_explicit_env_values(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "ENVIRONMENT": "sit",
+                "APP_VERSION": "2.0.0",
+                "COMMIT_SHA": "explicit-commit",
+                "BUILD_TIME": "2026-07-06T00:00:00Z",
+            },
+            clear=True,
+        ):
+            settings = Settings()
+
+        self.assertEqual(settings.environment, "sit")
+        self.assertEqual(settings.version, "2.0.0")
+        self.assertEqual(settings.commit, "explicit-commit")
+        self.assertEqual(settings.build_time, "2026-07-06T00:00:00Z")
+
+    def test_version_metadata_uses_render_commit_before_git_fallback(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"RENDER_GIT_COMMIT": "render-commit"},
+            clear=True,
+        ), patch("app.core.config._git_commit_sha") as git_commit:
+            settings = Settings()
+
+        self.assertEqual(settings.commit, "render-commit")
+        git_commit.assert_not_called()
+
+    def test_version_metadata_uses_git_commit_or_unknown_fallback(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "app.core.config._git_commit_sha",
+            return_value="git-commit",
+        ):
+            self.assertEqual(Settings().commit, "git-commit")
+
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "app.core.config._git_commit_sha",
+            return_value=None,
+        ):
+            self.assertEqual(Settings().commit, "unknown")
+
+    def test_version_metadata_build_time_fallback_exists(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            build_time = Settings().build_time
+
+        self.assertNotEqual(build_time, "unknown")
+        datetime.fromisoformat(build_time)
 
     def test_scanner_analyze_happy_path(self) -> None:
         response = self.client.post(
@@ -74,8 +129,13 @@ class ApiEndpointsTest(unittest.TestCase):
                 "Sports Card",
                 "Trading Card",
                 "Coin",
-                "Comic",
                 "Toy/Figure",
+                "Action Figure",
+                "Comic",
+                "Comic Book",
+                "Stamp",
+                "Retro Game",
+                "Vintage Toy",
             ],
         )
         self.assertGreaterEqual(payload["confidence"], 0)
@@ -428,6 +488,38 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertEqual(payload["category"], "Coin")
         self.assertEqual(payload["rawProviderPayload"]["provider"], "mock")
         self.assertIn("validate_image", payload["rawProviderPayload"]["pipelineStages"])
+        selection = payload["rawProviderPayload"]["mockSelection"]
+        self.assertEqual(selection["seedSource"], "base64Image")
+        self.assertEqual(selection["byteLength"], len(_valid_png_bytes()))
+
+    def test_root_analyze_camera_style_uploads_do_not_always_return_charizard(self) -> None:
+        titles = set()
+        for index, image_bytes in enumerate(
+            [
+                b"\xff\xd8\xff\xe0\x01\x02\xff\xd9",
+                b"\xff\xd8\xff\xe0\x09\x08\xff\xd9",
+                b"\xff\xd8\xff\xe0abc123\xff\xd9",
+            ]
+        ):
+            response = self.client.post(
+                "/analyze",
+                data={
+                    "imageSource": "camera",
+                    "timestamp": f"2026-07-06T00:00:0{index}Z",
+                },
+                files={"image": ("camera_scan.jpg", image_bytes, "image/jpeg")},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            titles.add(payload["itemName"])
+            self.assertEqual(
+                payload["rawProviderPayload"]["mockSelection"]["seedSource"],
+                "base64Image",
+            )
+
+        self.assertGreater(len(titles), 1)
+        self.assertNotEqual(titles, {"1999 Pokemon Charizard Holo"})
 
     def test_root_analyze_provider_unavailable(self) -> None:
         with patch(

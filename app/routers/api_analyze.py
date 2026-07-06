@@ -231,6 +231,7 @@ async def _analyze_collectible(payload: ApiAnalyzeRequest) -> ApiAnalyzeResponse
         rawProviderPayload={
             "provider": diagnostics.aiProvider,
             "pipelineStages": pipeline_result.stages,
+            **_selection_diagnostics(provider),
         },
         lowEstimate=pricing.lowEstimate,
         highEstimate=pricing.highEstimate,
@@ -409,6 +410,13 @@ def _provider_neutral_attributes(recognition) -> dict[str, str]:
         for key, value in _key_attributes(recognition).items()
         if value.strip()
     }
+
+
+def _selection_diagnostics(provider) -> dict[str, object]:
+    diagnostics = getattr(provider, "selection_diagnostics", None)
+    if not diagnostics:
+        return {}
+    return {"mockSelection": diagnostics}
 
 
 def _field_confidence(recognition) -> dict[str, int]:

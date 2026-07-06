@@ -1,5 +1,3 @@
-from datetime import UTC, datetime
-
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
@@ -45,11 +43,5 @@ async def version() -> dict[str, str]:
         "environment": settings.environment,
         "version": settings.version,
         "commit": settings.commit,
-        "buildTime": _build_time(),
+        "buildTime": settings.build_time,
     }
-
-
-def _build_time() -> str:
-    if settings.build_time != "unknown":
-        return settings.build_time
-    return datetime.now(UTC).isoformat()
