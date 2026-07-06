@@ -61,7 +61,7 @@ Copy `.env.example` to `.env`.
 AI_PROVIDER=mock
 PRICING_PROVIDER=mock
 GEMINI_API_KEY=
-GEMINI_MODEL=gemini-1.5-flash
+GEMINI_MODEL=gemini-2.5-flash
 GEMINI_TIMEOUT_SECONDS=30
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-4.1-mini
@@ -177,7 +177,7 @@ development and tests.
 ```text
 AI_PROVIDER=auto
 GEMINI_API_KEY=<server-side-gemini-key>
-GEMINI_MODEL=gemini-1.5-flash
+GEMINI_MODEL=gemini-2.5-flash
 GEMINI_TIMEOUT_SECONDS=30
 OPENAI_API_KEY=<server-side-openai-key>
 OPENAI_MODEL=gpt-4.1-mini

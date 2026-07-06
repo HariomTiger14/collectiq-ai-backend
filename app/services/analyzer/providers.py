@@ -1,8 +1,10 @@
 from pathlib import Path
 import logging
+import re
 import time
 from typing import Protocol
 
+from app.core.config import settings
 from app.services.ai.base_recognition_service import RecognitionResult
 from app.services.ai.gemini_recognition_provider import (
     GeminiInvalidResponseError,
@@ -143,12 +145,12 @@ class FallbackAnalyzerProvider:
                 )
             except _FALLBACK_PROVIDER_ERRORS as exc:
                 provider_name = getattr(provider, "provider_name", "unknown")
-                errors.append(f"{provider_name}:{type(exc).__name__}")
+                errors.append(f"{provider_name}:{_safe_exception_summary(exc)}")
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         "Analyzer provider failed provider=%s fallbackReason=%s",
                         provider_name,
-                        type(exc).__name__,
+                        _safe_exception_summary(exc),
                     )
                 continue
 
@@ -232,6 +234,29 @@ _FALLBACK_PROVIDER_ERRORS = (
     OpenAIProviderError,
     OpenAITimeoutError,
 )
+
+
+def _safe_exception_summary(exc: Exception) -> str:
+    message = _sanitize_error_text(str(exc).strip())
+    error_type = type(exc).__name__
+    if not message:
+        return error_type
+    return f"{error_type}:{message}"
+
+
+def _sanitize_error_text(message: str) -> str:
+    sanitized = message
+    for secret in (settings.gemini_api_key, settings.openai_api_key):
+        if secret and len(secret) >= 8:
+            sanitized = sanitized.replace(secret, "<redacted>")
+
+    sanitized = re.sub(
+        r"(?i)(key|api_key|token|access_token)=([^&\s]+)",
+        r"\1=<redacted>",
+        sanitized,
+    )
+    sanitized = re.sub(r"[A-Za-z0-9+/]{160,}={0,2}", "<redacted>", sanitized)
+    return sanitized[:500]
 
 
 def recognize_with_legacy_provider(
