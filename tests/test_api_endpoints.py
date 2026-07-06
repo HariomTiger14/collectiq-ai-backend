@@ -4,6 +4,7 @@ import os
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -12,6 +13,8 @@ from fastapi.testclient import TestClient
 from app.core.config import Settings, parse_cors_allowed_origins
 from app.main import app
 from app.services.ai.openai_recognition_provider import OpenAIRecognitionProvider
+from app.services.analyzer.backend_analyzer_service import BackendAnalyzerService
+from app.services.analyzer.providers import AutoAnalyzerProvider, MockAnalyzerProvider
 
 
 class ApiEndpointsTest(unittest.TestCase):
@@ -341,6 +344,176 @@ class ApiEndpointsTest(unittest.TestCase):
         image_content = request_json["input"][0]["content"][1]
         self.assertTrue(image_content["image_url"].startswith("data:image/jpeg;base64,"))
 
+    def test_backend_analyzer_sit_mock_with_real_key_selects_auto_provider(self) -> None:
+        with patch(
+            "app.services.analyzer.backend_analyzer_service.settings",
+            SimpleNamespace(
+                ai_provider="mock",
+                environment="sit",
+                openai_api_key="test-key",
+            ),
+        ):
+            provider = BackendAnalyzerService()._resolve_provider()
+
+        self.assertIsInstance(provider, AutoAnalyzerProvider)
+
+    def test_backend_analyzer_sit_mock_without_real_key_keeps_mock_provider(self) -> None:
+        with patch(
+            "app.services.analyzer.backend_analyzer_service.settings",
+            SimpleNamespace(
+                ai_provider="mock",
+                environment="sit",
+                openai_api_key="",
+            ),
+        ):
+            provider = BackendAnalyzerService()._resolve_provider()
+
+        self.assertIsInstance(provider, MockAnalyzerProvider)
+
+    def test_api_analyze_auto_provider_uses_real_vision_before_samples(self) -> None:
+        provider = AutoAnalyzerProvider(
+            vision_provider=OpenAIRecognitionProvider(
+                api_key="test-key",
+                client=_FakeOpenAIClient(
+                    response=_FakeOpenAIResponse(
+                        body={"output_text": json.dumps(_openai_output())}
+                    )
+                ),
+            )
+        )
+
+        with patch(
+            "app.services.analyzer.backend_analyzer_service.BackendAnalyzerService._resolve_provider",
+            return_value=provider,
+        ):
+            response = self.client.post(
+                "/analyze",
+                json=_api_analyze_payload(base64_image=True),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["diagnostics"]["aiProvider"], "openai")
+        self.assertEqual(
+            payload["rawProviderPayload"]["providerSelection"]["selectedProvider"],
+            "openai",
+        )
+        self.assertNotIn("mockSelection", payload["rawProviderPayload"])
+        self.assertEqual(payload["itemName"], "1999 Pokemon Charizard Holo")
+
+    def test_api_analyze_auto_provider_handles_unknown_low_confidence(self) -> None:
+        provider = AutoAnalyzerProvider(
+            vision_provider=OpenAIRecognitionProvider(
+                api_key="test-key",
+                client=_FakeOpenAIClient(
+                    response=_FakeOpenAIResponse(
+                        body={
+                            "output_text": json.dumps(
+                                _openai_output(
+                                    title="Unknown collectible",
+                                    category="Other",
+                                    confidence=42,
+                                    estimated_value=0,
+                                    condition="Unknown",
+                                    image_quality_issues=["blurry image"],
+                                    low_confidence_reasons=[
+                                        "The image is too blurry to verify fine details."
+                                    ],
+                                )
+                            )
+                        }
+                    )
+                ),
+            )
+        )
+
+        with patch(
+            "app.services.analyzer.backend_analyzer_service.BackendAnalyzerService._resolve_provider",
+            return_value=provider,
+        ):
+            response = self.client.post(
+                "/analyze",
+                json=_api_analyze_payload(base64_image=True),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["itemName"], "Unknown collectible")
+        self.assertEqual(payload["confidenceLevel"], "Low")
+        self.assertEqual(payload["confidence"], 42)
+        self.assertIn("blurry image", payload["imageQualityIssues"])
+        self.assertEqual(payload["diagnostics"]["aiProvider"], "openai")
+
+    def test_api_analyze_auto_provider_falls_back_with_reason(self) -> None:
+        provider = AutoAnalyzerProvider(
+            vision_provider=OpenAIRecognitionProvider(api_key=""),
+        )
+
+        with patch(
+            "app.services.analyzer.backend_analyzer_service.BackendAnalyzerService._resolve_provider",
+            return_value=provider,
+        ):
+            response = self.client.post(
+                "/analyze",
+                json=_api_analyze_payload(base64_image=True),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["diagnostics"]["aiProvider"], "mock")
+        selection = payload["rawProviderPayload"]["providerSelection"]
+        self.assertEqual(selection["selectedProvider"], "mock")
+        self.assertEqual(
+            selection["fallbackReason"],
+            "AIProviderNotConfiguredError",
+        )
+        self.assertIn("mockSelection", selection)
+
+    def test_api_analyze_response_contract_keys_remain_unchanged(self) -> None:
+        response = self.client.post("/analyze", json=_api_analyze_payload())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            set(response.json().keys()),
+            {
+                "id",
+                "itemName",
+                "title",
+                "category",
+                "manufacturer",
+                "year",
+                "series",
+                "variant",
+                "estimatedValue",
+                "estimated_value",
+                "currency",
+                "tags",
+                "description",
+                "attributes",
+                "images",
+                "rawProviderPayload",
+                "lowEstimate",
+                "highEstimate",
+                "confidence",
+                "condition",
+                "marketTrend",
+                "keyAttributes",
+                "aiReview",
+                "alternatives",
+                "recommendation",
+                "marketSummary",
+                "comparableSales",
+                "imageUrl",
+                "timestamp",
+                "fieldConfidence",
+                "confidenceLevel",
+                "lowConfidenceReasons",
+                "imageQualityIssues",
+                "scanRecommendations",
+                "diagnostics",
+            },
+        )
+
     def test_api_analyze_openai_invalid_json_returns_safe_error(self) -> None:
         provider = OpenAIRecognitionProvider(
             api_key="test-key",
@@ -627,13 +800,22 @@ def _valid_jpeg_bytes() -> bytes:
     return b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
 
 
-def _openai_output() -> dict:
+def _openai_output(
+    *,
+    title: str = "1999 Pokemon Charizard Holo",
+    category: str = "Pokemon Card",
+    confidence: int = 94,
+    estimated_value: int = 1850,
+    condition: str = "Near Mint",
+    low_confidence_reasons: list[str] | None = None,
+    image_quality_issues: list[str] | None = None,
+) -> dict:
     return {
-        "title": "1999 Pokemon Charizard Holo",
-        "category": "Pokemon Card",
-        "confidence": 94,
-        "estimatedValue": 1850,
-        "condition": "Near Mint",
+        "title": title,
+        "category": category,
+        "confidence": confidence,
+        "estimatedValue": estimated_value,
+        "condition": condition,
         "recommendation": "Consider professional grading before selling.",
         "description": "Likely a Base Set Charizard holographic card.",
         "detectedObjects": ["Card", "Pokemon", "Charizard"],
@@ -646,14 +828,16 @@ def _openai_output() -> dict:
             "cardNumber": 78,
             "condition": 70,
         },
-        "confidenceLevel": "High",
-        "lowConfidenceReasons": [],
-        "imageQualityIssues": ["none"],
+        "confidenceLevel": (
+            "High" if confidence >= 90 else "Medium" if confidence >= 70 else "Low"
+        ),
+        "lowConfidenceReasons": low_confidence_reasons or [],
+        "imageQualityIssues": image_quality_issues or ["none"],
         "scanRecommendations": [
             "Use bright, even lighting.",
             "Keep the card fully inside the frame.",
         ],
-        "primaryMatch": "1999 Pokemon Charizard Holo",
+        "primaryMatch": title,
         "alternativeMatches": [
             {
                 "title": "2002 Pokemon Expedition Charizard",

@@ -1,4 +1,4 @@
-﻿services:
+services:
   - type: web
     name: collectiq-ai-backend-sit
     runtime: python
@@ -37,7 +37,7 @@
       - key: SUPABASE_HEALTH_REQUIRED
         value: "true"
       - key: AI_PROVIDER
-        value: mock
+        value: auto
       - key: PRICING_PROVIDER
         value: mock
       - key: OPENAI_API_KEY

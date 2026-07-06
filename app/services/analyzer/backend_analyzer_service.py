@@ -7,6 +7,7 @@ from app.services.ai.base_recognition_service import RecognitionResult
 from app.services.ai.provider_factory import get_ai_recognition_provider
 from app.services.analyzer.image_validation import AnalyzerImageValidator
 from app.services.analyzer.providers import (
+    AutoAnalyzerProvider,
     BackendAnalyzerProvider,
     GeminiAnalyzerProvider,
     MockAnalyzerProvider,
@@ -92,6 +93,14 @@ class BackendAnalyzerService:
             return self._provider_factory(None)
 
         selected_provider = settings.ai_provider.strip().lower()
+        if selected_provider in {"auto", "real", "vision"}:
+            return AutoAnalyzerProvider()
+        if (
+            selected_provider == "mock"
+            and settings.environment.strip().lower() == "sit"
+            and settings.openai_api_key.strip()
+        ):
+            return AutoAnalyzerProvider()
         if selected_provider == "mock":
             return MockAnalyzerProvider()
         if selected_provider == "openai":

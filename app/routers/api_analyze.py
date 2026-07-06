@@ -416,6 +416,8 @@ def _selection_diagnostics(provider) -> dict[str, object]:
     diagnostics = getattr(provider, "selection_diagnostics", None)
     if not diagnostics:
         return {}
+    if isinstance(diagnostics, dict) and "seedSource" not in diagnostics:
+        return {"providerSelection": diagnostics}
     return {"mockSelection": diagnostics}
 
 
