@@ -12,9 +12,14 @@ from fastapi.testclient import TestClient
 
 from app.core.config import Settings, parse_cors_allowed_origins
 from app.main import app
+from app.services.ai.gemini_recognition_provider import GeminiRecognitionProvider
 from app.services.ai.openai_recognition_provider import OpenAIRecognitionProvider
 from app.services.analyzer.backend_analyzer_service import BackendAnalyzerService
-from app.services.analyzer.providers import AutoAnalyzerProvider, MockAnalyzerProvider
+from app.services.analyzer.providers import (
+    AutoAnalyzerProvider,
+    FallbackAnalyzerProvider,
+    MockAnalyzerProvider,
+)
 
 
 class ApiEndpointsTest(unittest.TestCase):
@@ -350,6 +355,7 @@ class ApiEndpointsTest(unittest.TestCase):
             SimpleNamespace(
                 ai_provider="mock",
                 environment="sit",
+                gemini_api_key="",
                 openai_api_key="test-key",
             ),
         ):
@@ -363,6 +369,7 @@ class ApiEndpointsTest(unittest.TestCase):
             SimpleNamespace(
                 ai_provider="mock",
                 environment="sit",
+                gemini_api_key="",
                 openai_api_key="",
             ),
         ):
@@ -370,16 +377,79 @@ class ApiEndpointsTest(unittest.TestCase):
 
         self.assertIsInstance(provider, MockAnalyzerProvider)
 
-    def test_api_analyze_auto_provider_uses_real_vision_before_samples(self) -> None:
+    def test_backend_analyzer_gemini_provider_selects_fallback_chain(self) -> None:
+        with patch(
+            "app.services.analyzer.backend_analyzer_service.settings",
+            SimpleNamespace(
+                ai_provider="gemini",
+                environment="sit",
+                gemini_api_key="test-key",
+                openai_api_key="",
+            ),
+        ):
+            provider = BackendAnalyzerService()._resolve_provider()
+
+        self.assertIsInstance(provider, FallbackAnalyzerProvider)
+        self.assertEqual(provider.selection_diagnostics["requestedProvider"], "gemini")
+        self.assertEqual(
+            provider.selection_diagnostics["preferredOrder"],
+            ["gemini", "mock"],
+        )
+
+    def test_api_analyze_auto_provider_uses_gemini_before_openai(self) -> None:
         provider = AutoAnalyzerProvider(
-            vision_provider=OpenAIRecognitionProvider(
-                api_key="test-key",
-                client=_FakeOpenAIClient(
-                    response=_FakeOpenAIResponse(
-                        body={"output_text": json.dumps(_openai_output())}
-                    )
+            providers=[
+                GeminiRecognitionProvider(
+                    api_key="gemini-key",
+                    client=_FakeGeminiClient(
+                        response=_FakeOpenAIResponse(
+                            body=_gemini_response(_openai_output(title="Gemini Card"))
+                        )
+                    ),
                 ),
+                OpenAIRecognitionProvider(
+                    api_key="test-key",
+                    client=_FakeOpenAIClient(
+                        response=_FakeOpenAIResponse(
+                            body={"output_text": json.dumps(_openai_output())}
+                        )
+                    ),
+                ),
+            ]
+        )
+
+        with patch(
+            "app.services.analyzer.backend_analyzer_service.BackendAnalyzerService._resolve_provider",
+            return_value=provider,
+        ):
+            response = self.client.post(
+                "/analyze",
+                json=_api_analyze_payload(base64_image=True),
             )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["diagnostics"]["aiProvider"], "gemini")
+        self.assertEqual(
+            payload["rawProviderPayload"]["providerSelection"]["selectedProvider"],
+            "gemini",
+        )
+        self.assertNotIn("mockSelection", payload["rawProviderPayload"])
+        self.assertEqual(payload["itemName"], "Gemini Card")
+
+    def test_api_analyze_auto_provider_uses_openai_when_gemini_unavailable(self) -> None:
+        provider = AutoAnalyzerProvider(
+            providers=[
+                GeminiRecognitionProvider(api_key=""),
+                OpenAIRecognitionProvider(
+                    api_key="test-key",
+                    client=_FakeOpenAIClient(
+                        response=_FakeOpenAIResponse(
+                            body={"output_text": json.dumps(_openai_output())}
+                        )
+                    ),
+                ),
+            ]
         )
 
         with patch(
@@ -398,17 +468,15 @@ class ApiEndpointsTest(unittest.TestCase):
             payload["rawProviderPayload"]["providerSelection"]["selectedProvider"],
             "openai",
         )
-        self.assertNotIn("mockSelection", payload["rawProviderPayload"])
-        self.assertEqual(payload["itemName"], "1999 Pokemon Charizard Holo")
 
     def test_api_analyze_auto_provider_handles_unknown_low_confidence(self) -> None:
         provider = AutoAnalyzerProvider(
-            vision_provider=OpenAIRecognitionProvider(
-                api_key="test-key",
-                client=_FakeOpenAIClient(
-                    response=_FakeOpenAIResponse(
-                        body={
-                            "output_text": json.dumps(
+            providers=[
+                GeminiRecognitionProvider(
+                    api_key="gemini-key",
+                    client=_FakeGeminiClient(
+                        response=_FakeOpenAIResponse(
+                            body=_gemini_response(
                                 _openai_output(
                                     title="Unknown collectible",
                                     category="Other",
@@ -421,10 +489,10 @@ class ApiEndpointsTest(unittest.TestCase):
                                     ],
                                 )
                             )
-                        }
-                    )
+                        )
+                    ),
                 ),
-            )
+            ]
         )
 
         with patch(
@@ -442,11 +510,14 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertEqual(payload["confidenceLevel"], "Low")
         self.assertEqual(payload["confidence"], 42)
         self.assertIn("blurry image", payload["imageQualityIssues"])
-        self.assertEqual(payload["diagnostics"]["aiProvider"], "openai")
+        self.assertEqual(payload["diagnostics"]["aiProvider"], "gemini")
 
     def test_api_analyze_auto_provider_falls_back_with_reason(self) -> None:
         provider = AutoAnalyzerProvider(
-            vision_provider=OpenAIRecognitionProvider(api_key=""),
+            providers=[
+                GeminiRecognitionProvider(api_key=""),
+                OpenAIRecognitionProvider(api_key=""),
+            ]
         )
 
         with patch(
@@ -463,11 +534,47 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertEqual(payload["diagnostics"]["aiProvider"], "mock")
         selection = payload["rawProviderPayload"]["providerSelection"]
         self.assertEqual(selection["selectedProvider"], "mock")
-        self.assertEqual(
-            selection["fallbackReason"],
-            "AIProviderNotConfiguredError",
-        )
+        self.assertIn("gemini:AIProviderNotConfiguredError", selection["fallbackReason"])
+        self.assertIn("openai:AIProviderNotConfiguredError", selection["fallbackReason"])
         self.assertIn("mockSelection", selection)
+
+    def test_api_analyze_gemini_mapping_handles_missing_fields_safely(self) -> None:
+        provider = FallbackAnalyzerProvider(
+            requested_provider="gemini",
+            providers=[
+                GeminiRecognitionProvider(
+                    api_key="gemini-key",
+                    client=_FakeGeminiClient(
+                        response=_FakeOpenAIResponse(
+                            body=_gemini_response(
+                                {
+                                    "title": "Partially visible collectible",
+                                    "category": "Other",
+                                    "confidence": 38,
+                                }
+                            )
+                        )
+                    ),
+                )
+            ],
+        )
+
+        with patch(
+            "app.services.analyzer.backend_analyzer_service.BackendAnalyzerService._resolve_provider",
+            return_value=provider,
+        ):
+            response = self.client.post(
+                "/analyze",
+                json=_api_analyze_payload(base64_image=True),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["itemName"], "Partially visible collectible")
+        self.assertEqual(payload["category"], "Other")
+        self.assertEqual(payload["confidence"], 38)
+        self.assertEqual(payload["condition"], "Unknown")
+        self.assertEqual(payload["diagnostics"]["aiProvider"], "gemini")
 
     def test_api_analyze_response_contract_keys_remain_unchanged(self) -> None:
         response = self.client.post("/analyze", json=_api_analyze_payload())
@@ -878,6 +985,22 @@ def _openai_output(
     }
 
 
+def _gemini_response(output: dict) -> dict:
+    return {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "text": json.dumps(output),
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+
 class _FakeOpenAIResponse:
     def __init__(self, *, status_code: int = 200, body: dict | None = None) -> None:
         self.status_code = status_code
@@ -906,6 +1029,10 @@ class _FakeOpenAIClient:
         if self.response is None:
             raise AssertionError("Fake OpenAI client requires a response.")
         return self.response
+
+
+class _FakeGeminiClient(_FakeOpenAIClient):
+    pass
 
 
 if __name__ == "__main__":

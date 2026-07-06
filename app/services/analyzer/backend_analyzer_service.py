@@ -9,6 +9,7 @@ from app.services.analyzer.image_validation import AnalyzerImageValidator
 from app.services.analyzer.providers import (
     AutoAnalyzerProvider,
     BackendAnalyzerProvider,
+    FallbackAnalyzerProvider,
     GeminiAnalyzerProvider,
     MockAnalyzerProvider,
     OpenAIAnalyzerProvider,
@@ -95,18 +96,27 @@ class BackendAnalyzerService:
         selected_provider = settings.ai_provider.strip().lower()
         if selected_provider in {"auto", "real", "vision"}:
             return AutoAnalyzerProvider()
+        if selected_provider == "gemini":
+            return FallbackAnalyzerProvider(
+                requested_provider="gemini",
+                providers=[GeminiAnalyzerProvider()],
+            )
+        if selected_provider == "openai":
+            return FallbackAnalyzerProvider(
+                requested_provider="openai",
+                providers=[OpenAIAnalyzerProvider()],
+            )
         if (
             selected_provider == "mock"
             and settings.environment.strip().lower() == "sit"
-            and settings.openai_api_key.strip()
+            and (
+                settings.gemini_api_key.strip()
+                or settings.openai_api_key.strip()
+            )
         ):
             return AutoAnalyzerProvider()
         if selected_provider == "mock":
             return MockAnalyzerProvider()
-        if selected_provider == "openai":
-            return OpenAIAnalyzerProvider()
-        if selected_provider == "gemini":
-            return GeminiAnalyzerProvider()
 
         return get_ai_recognition_provider(selected_provider)
 

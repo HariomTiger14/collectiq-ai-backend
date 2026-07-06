@@ -1,10 +1,12 @@
 from app.core.config import settings
 from app.services.ai.base_recognition_service import AIRecognitionProvider
+from app.services.ai.gemini_recognition_provider import GeminiRecognitionProvider
 from app.services.ai.mock_recognition_service import MockRecognitionProvider
 from app.services.ai.openai_recognition_provider import OpenAIRecognitionProvider
 
 
 _mock_provider = MockRecognitionProvider()
+_gemini_provider = GeminiRecognitionProvider()
 _openai_provider = OpenAIRecognitionProvider()
 
 
@@ -16,12 +18,15 @@ def get_ai_recognition_provider(
     if selected_provider == "mock":
         return _mock_provider
 
+    if selected_provider == "gemini":
+        return _gemini_provider
+
     if selected_provider == "openai":
         return _openai_provider
 
     raise ValueError(
         f"Unsupported AI_PROVIDER '{selected_provider}'. "
-        "Supported providers: mock, openai."
+        "Supported providers: mock, gemini, openai."
     )
 
 

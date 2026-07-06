@@ -40,6 +40,12 @@ services:
         value: auto
       - key: PRICING_PROVIDER
         value: mock
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-1.5-flash
+      - key: GEMINI_TIMEOUT_SECONDS
+        value: "30"
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_MODEL

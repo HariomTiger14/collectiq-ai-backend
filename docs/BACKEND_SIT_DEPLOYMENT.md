@@ -526,3 +526,20 @@ If SIT deployment fails:
 4. Confirm `GET /version` reports the expected rollback commit.
 5. Keep the failed commit available for diagnosis; do not rotate secrets unless logs show a secret exposure.
 6. If rollback still fails, temporarily set `AI_PROVIDER=mock` and `PRICING_PROVIDER=mock`, then re-check `/health`.
+
+## SIT Gemini-First Analyzer
+
+For current SIT real analyzer validation, configure the Render service with:
+
+```text
+AI_PROVIDER=auto
+GEMINI_API_KEY=<server-side Gemini secret>
+GEMINI_MODEL=gemini-1.5-flash
+GEMINI_TIMEOUT_SECONDS=30
+OPENAI_API_KEY=<optional server-side OpenAI backup secret>
+OPENAI_MODEL=gpt-4.1-mini
+OPENAI_TIMEOUT_SECONDS=30
+PRICING_PROVIDER=mock
+```
+
+Provider order for `AI_PROVIDER=auto` is Gemini first, then OpenAI, then deterministic mock fallback. Keep `GEMINI_API_KEY` and `OPENAI_API_KEY` in the Render dashboard or secret store only. Never commit secret values or pass provider keys to Flutter.
