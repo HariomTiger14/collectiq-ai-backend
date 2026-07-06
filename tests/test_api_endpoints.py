@@ -1,6 +1,7 @@
 import json
 import base64
 import os
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,8 @@ from app.services.analyzer.providers import (
     FallbackAnalyzerProvider,
     MockAnalyzerProvider,
 )
+from app.services.health.health_check_service import HealthCheckService
+from app.services.health.providers import HealthCheckResult
 
 
 class ApiEndpointsTest(unittest.TestCase):
@@ -50,6 +53,26 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertNotIn("secret", serialized.lower())
         self.assertNotIn("token", serialized.lower())
 
+    def test_health_returns_quickly_without_gemini_credentials(self) -> None:
+        providers = [
+            _StaticHealthProvider("api", True, True),
+            _StaticHealthProvider("supabase", True, False),
+            _StaticHealthProvider("analyzer", True, True),
+        ]
+        started_at = time.perf_counter()
+
+        with patch(
+            "app.routers.health.HealthCheckService",
+            return_value=HealthCheckService(providers=providers),
+        ), patch("app.routers.health.settings") as health_settings:
+            health_settings.environment = "sit"
+            health_settings.version = "0.1.0"
+            response = self.client.get("/health")
+
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        self.assertEqual(response.status_code, 200)
+        self.assertLess(elapsed_ms, 250)
+
     def test_version(self) -> None:
         response = self.client.get("/version")
 
@@ -68,6 +91,21 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertNotIn("api_key", serialized.lower())
         self.assertNotIn("secret", serialized.lower())
         self.assertNotIn("token", serialized.lower())
+
+    def test_version_returns_quickly_without_gemini_credentials(self) -> None:
+        started_at = time.perf_counter()
+
+        with patch("app.routers.health.settings") as health_settings:
+            health_settings.application_name = "PackLox API"
+            health_settings.environment = "sit"
+            health_settings.version = "0.1.0"
+            health_settings.commit = "test-commit"
+            health_settings.build_time = "2026-07-06T00:00:00Z"
+            response = self.client.get("/version")
+
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        self.assertEqual(response.status_code, 200)
+        self.assertLess(elapsed_ms, 250)
 
     def test_version_metadata_uses_explicit_env_values(self) -> None:
         with patch.dict(
@@ -1033,6 +1071,21 @@ class _FakeOpenAIClient:
 
 class _FakeGeminiClient(_FakeOpenAIClient):
     pass
+
+
+class _StaticHealthProvider:
+    def __init__(self, name: str, healthy: bool, required: bool) -> None:
+        self.name = name
+        self.required = required
+        self._healthy = healthy
+
+    def check(self) -> HealthCheckResult:
+        return HealthCheckResult(
+            name=self.name,
+            healthy=self._healthy,
+            required=self.required,
+            latency_ms=1,
+        )
 
 
 if __name__ == "__main__":

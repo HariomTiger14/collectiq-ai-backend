@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 
@@ -83,6 +85,37 @@ class HealthServiceTest(unittest.TestCase):
 
         self.assertEqual(result.name, "analyzer")
         self.assertIn(result.healthy, {True, False})
+
+    def test_analyzer_auto_is_lightweight_and_uses_config_only(self) -> None:
+        with patch(
+            "app.services.health.providers.settings",
+            SimpleNamespace(
+                ai_provider="auto",
+                gemini_api_key="gemini-key",
+                openai_api_key="",
+            ),
+        ):
+            result = AnalyzerHealthProvider().check()
+
+        self.assertTrue(result.healthy)
+        self.assertEqual(result.details["provider"], "auto")
+        self.assertEqual(result.details["geminiConfigured"], "true")
+        self.assertLess(result.latency_ms, 50)
+
+    def test_analyzer_gemini_reports_missing_key_without_network(self) -> None:
+        with patch(
+            "app.services.health.providers.settings",
+            SimpleNamespace(
+                ai_provider="gemini",
+                gemini_api_key="",
+                openai_api_key="",
+            ),
+        ):
+            result = AnalyzerHealthProvider().check()
+
+        self.assertFalse(result.healthy)
+        self.assertIn("GEMINI_API_KEY", result.message)
+        self.assertLess(result.latency_ms, 50)
 
     def test_service_reports_unhealthy_required_dependency(self) -> None:
         service = HealthCheckService(
