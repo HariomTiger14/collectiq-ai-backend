@@ -14,6 +14,7 @@ class NormalizedImageMetadata:
     size_bytes: int
     image_source: str
     local_file_path: str
+    image_role: str = "other"
     base64_image: str | None = None
     base64_preview: str | None = None
 
@@ -24,6 +25,7 @@ class NormalizedImageMetadata:
             "sizeBytes": self.size_bytes,
             "imageSource": self.image_source,
             "localFilePath": self.local_file_path,
+            "imageRole": self.image_role,
             **({"base64Image": self.base64_image} if self.base64_image else {}),
             **({"base64Preview": self.base64_preview} if self.base64_preview else {}),
         }
@@ -36,6 +38,7 @@ class AnalyzerImageValidator:
         size_bytes = _parse_int(image_payload.get("sizeBytes"))
         image_source = str(image_payload.get("imageSource") or "unknown").strip() or "unknown"
         local_file_path = str(image_payload.get("localFilePath") or "").strip()
+        image_role = _normalize_image_role(image_payload.get("imageRole"))
         base64_image = _optional_string(image_payload.get("base64Image"))
         base64_preview = _optional_string(image_payload.get("base64Preview"))
 
@@ -57,6 +60,7 @@ class AnalyzerImageValidator:
             size_bytes=size_bytes,
             image_source=image_source,
             local_file_path=local_file_path,
+            image_role=image_role,
             base64_image=base64_image,
             base64_preview=base64_preview,
         )
@@ -157,3 +161,25 @@ def _optional_string(value) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
     return value.strip()
+
+
+def _normalize_image_role(value) -> str:
+    if not isinstance(value, str):
+        return "other"
+    normalized = value.strip().lower()
+    aliases = {
+        "obverse": "front",
+        "front": "front",
+        "reverse": "back",
+        "back": "back",
+        "close-up": "closeup",
+        "closeup": "closeup",
+        "detail": "closeup",
+        "serial": "closeup",
+        "signature": "closeup",
+        "damage": "closeup",
+        "packaging": "packaging",
+        "package": "packaging",
+        "other": "other",
+    }
+    return aliases.get(normalized, "other")

@@ -97,7 +97,8 @@ class GeminiRecognitionProviderTest(unittest.TestCase):
         self.assertNotIn("gemini-key", json.dumps(client.last_request["json"]))
         parts = client.last_request["json"]["contents"][0]["parts"]
         self.assertIn("requestedCategory=Coin", parts[0]["text"])
-        self.assertEqual(parts[1]["inline_data"]["mime_type"], "image/png")
+        inline_parts = [part for part in parts if "inline_data" in part]
+        self.assertEqual(inline_parts[0]["inline_data"]["mime_type"], "image/png")
 
     def test_mapping_handles_missing_fields_safely(self) -> None:
         client = FakeGeminiClient(

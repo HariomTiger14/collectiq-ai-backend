@@ -18,13 +18,15 @@ class ApiImagePayload(BaseModel):
     sizeBytes: int
     imageSource: str
     localFilePath: str
+    imageRole: str | None = None
     base64Image: str | None = None
     base64Preview: str | None = None
 
 
 class ApiAnalyzeRequest(BaseModel):
     request: ApiAnalysisRequestMetadata
-    image: ApiImagePayload
+    image: ApiImagePayload | None = None
+    images: list[ApiImagePayload] = Field(default_factory=list)
 
 
 class ApiAlternativeMatchResponse(BaseModel):
@@ -104,6 +106,10 @@ class ApiAnalyzeResponse(BaseModel):
     attributes: dict[str, Any] = Field(default_factory=dict)
     images: list[str] = Field(default_factory=list)
     rawProviderPayload: dict[str, Any] = Field(default_factory=dict)
+    faceValue: int | None = None
+    estimatedMarketValue: int | None = None
+    askingPriceWarning: str | None = None
+    valuationConfidence: int | None = None
     lowEstimate: int
     highEstimate: int
     confidence: int

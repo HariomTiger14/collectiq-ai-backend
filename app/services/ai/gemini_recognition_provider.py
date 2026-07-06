@@ -61,12 +61,20 @@ class GeminiRecognitionProvider(AIRecognitionProvider):
         media_type = self._media_type_for(image_path)
         image_bytes = image_path.read_bytes()
         payload = self._build_payload(
-            image_base64=base64.b64encode(image_bytes).decode("ascii"),
-            mime_type=media_type,
+            images=[
+                {
+                    "imageRole": "front",
+                    "base64Image": base64.b64encode(image_bytes).decode("ascii"),
+                    "mimeType": media_type,
+                    "fileName": image_path.name,
+                }
+            ],
             prompt_context={
                 "imageSource": "uploaded file",
                 "fileName": image_path.name,
                 "mimeType": media_type,
+                "imageCount": 1,
+                "imageRoles": ["front"],
             },
         )
         return self._recognize_with_payload(payload, started_at)
@@ -83,11 +91,18 @@ class GeminiRecognitionProvider(AIRecognitionProvider):
             )
 
         started_at = time.perf_counter()
-        image_base64 = self._base64_from_api_payload(image_payload)
+        image_payloads = request_metadata.get("imagePayloads")
+        images = image_payloads if isinstance(image_payloads, list) else [image_payload]
         mime_type = str(image_payload.get("mimeType") or "application/octet-stream")
         payload = self._build_payload(
-            image_base64=image_base64,
-            mime_type=mime_type,
+            images=[
+                {
+                    **image,
+                    "base64Image": self._base64_from_api_payload(image),
+                }
+                for image in images
+                if isinstance(image, dict)
+            ],
             prompt_context={
                 "imageSource": request_metadata.get("imageSource")
                 or image_payload.get("imageSource")
@@ -96,6 +111,8 @@ class GeminiRecognitionProvider(AIRecognitionProvider):
                 "fileName": image_payload.get("fileName") or "unknown",
                 "mimeType": mime_type,
                 "appVersion": request_metadata.get("appVersion") or "unknown",
+                "imageCount": request_metadata.get("imageCount") or len(images),
+                "imageRoles": request_metadata.get("imageRoles") or [],
             },
         )
         return self._recognize_with_payload(payload, started_at)
@@ -105,10 +122,16 @@ class GeminiRecognitionProvider(AIRecognitionProvider):
         payload: dict[str, Any],
         started_at: float,
     ) -> RecognitionResult:
+        prompt_context = payload.get("_collectiqPromptContext")
         try:
+            api_payload = {
+                key: value
+                for key, value in payload.items()
+                if key != "_collectiqPromptContext"
+            }
             response = self._client.post(
                 self._endpoint_url(),
-                json=payload,
+                json=api_payload,
                 timeout=self._timeout_seconds,
             )
         except httpx.TimeoutException as exc:
@@ -143,7 +166,23 @@ class GeminiRecognitionProvider(AIRecognitionProvider):
                 processing_time_ms,
                 processing_time_ms,
             )
-        return self._to_recognition_result(result_payload, processing_time_ms)
+        image_roles = []
+        image_count = 1
+        if isinstance(prompt_context, dict):
+            image_count = _int(prompt_context.get("imageCount"), 1)
+            raw_roles = prompt_context.get("imageRoles")
+            if isinstance(raw_roles, list):
+                image_roles = [
+                    role.strip()
+                    for role in raw_roles
+                    if isinstance(role, str) and role.strip()
+                ]
+        return self._to_recognition_result(
+            result_payload,
+            processing_time_ms,
+            image_count=image_count,
+            image_roles=image_roles,
+        )
 
     def _endpoint_url(self) -> str:
         return f"{self.api_base_url}/models/{self._model}:generateContent?key={self._api_key}"
@@ -151,23 +190,36 @@ class GeminiRecognitionProvider(AIRecognitionProvider):
     def _build_payload(
         self,
         *,
-        image_base64: str,
-        mime_type: str,
+        images: list[dict[str, Any]],
         prompt_context: dict[str, Any],
     ) -> dict[str, Any]:
+        parts: list[dict[str, Any]] = [{"text": self._prompt_text(prompt_context)}]
+        for index, image in enumerate(images, start=1):
+            role = str(image.get("imageRole") or "other")
+            mime_type = str(image.get("mimeType") or "application/octet-stream")
+            parts.append(
+                {
+                    "text": (
+                        f"Image {index} role: {role}. Analyze this image "
+                        "together with the other supplied photos."
+                    )
+                }
+            )
+            parts.append(
+                {
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": str(image.get("base64Image") or ""),
+                    }
+                }
+            )
+
         return {
+            "_collectiqPromptContext": prompt_context,
             "contents": [
                 {
                     "role": "user",
-                    "parts": [
-                        {"text": self._prompt_text(prompt_context)},
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": image_base64,
-                            }
-                        },
-                    ],
+                    "parts": parts,
                 }
             ],
             "generationConfig": {
@@ -187,16 +239,32 @@ class GeminiRecognitionProvider(AIRecognitionProvider):
             "primaryMatch, alternativeMatches, confidenceExplanation, "
             "detectionQuality, aiReasoning, year, brand, setName, series, "
             "cardNumber, playerOrCharacter, rarity, estimatedGrade, language, "
-            "edition, country, mint, material, notes. Use null or Unknown when "
+            "edition, country, mint, material, notes, faceValue, "
+            "estimatedMarketValue, askingPriceWarning, valuationConfidence. "
+            "Use null or Unknown when "
             "not visible. Confidence must be 0-100 and based on image quality, "
             "visible identifiers, and ambiguity. If value is unavailable, use "
             "0 because the existing API contract requires a number. Include "
             "exactly three alternativeMatches with title, category, confidence, "
-            "and reason. Do not invent market movement. Context: "
+            "and reason. Analyze all supplied images together. For coins, use "
+            "both obverse/front and reverse/back photos when present. If a coin "
+            "or card has only one side supplied, reduce confidence and ask for "
+            "the missing side in scanRecommendations. Never report face value "
+            "incorrectly: if the item is an Australian $2 coin, faceValue must "
+            "be 2 and currency is AUD. Separate faceValue from market estimate; "
+            "estimatedValue and estimatedMarketValue are market value only. Do "
+            "not overvalue from eBay asking/listing prices. Prefer sold or "
+            "completed comparable logic when valuation data is visible; if "
+            "market value is uncertain, set estimatedValue and "
+            "estimatedMarketValue to 0 and explain insufficient evidence. Add "
+            "askingPriceWarning when visible listed/asking prices differ from "
+            "likely market value. Do not invent market movement. Context: "
             f"imageSource={context.get('imageSource')}; "
             f"requestedCategory={context.get('requestedCategory')}; "
             f"fileName={context.get('fileName')}; "
             f"mimeType={context.get('mimeType')}; "
+            f"imageCount={context.get('imageCount')}; "
+            f"imageRoles={context.get('imageRoles')}; "
             f"appVersion={context.get('appVersion')}."
         )
 
@@ -273,6 +341,9 @@ class GeminiRecognitionProvider(AIRecognitionProvider):
         self,
         payload: dict[str, Any],
         processing_time_ms: int,
+        *,
+        image_count: int = 1,
+        image_roles: list[str] | None = None,
     ) -> RecognitionResult:
         title = _string(payload.get("title"), "Unknown collectible")
         category = _string(payload.get("category"), "Other")
@@ -344,6 +415,12 @@ class GeminiRecognitionProvider(AIRecognitionProvider):
             lowConfidenceReasons=_string_list(payload.get("lowConfidenceReasons")),
             imageQualityIssues=_string_list(payload.get("imageQualityIssues")),
             scanRecommendations=_string_list(payload.get("scanRecommendations")),
+            faceValue=_optional_int(payload.get("faceValue")),
+            estimatedMarketValue=_optional_int(payload.get("estimatedMarketValue")),
+            askingPriceWarning=_optional_string(payload.get("askingPriceWarning")),
+            valuationConfidence=_confidence(payload.get("valuationConfidence"), confidence),
+            photosUsed=image_count,
+            photoRoles=image_roles or [],
         )
 
     def _parse_alternative_matches(
@@ -430,6 +507,15 @@ def _int(value: Any, fallback: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _confidence(value: Any, fallback: int) -> int:

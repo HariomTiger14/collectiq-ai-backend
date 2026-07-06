@@ -23,6 +23,7 @@ class AnalyzerPipelineResult:
     recognition: RecognitionResult
     request_metadata: dict
     image_payload: dict
+    image_payloads: list[dict]
     stages: list[str]
 
 
@@ -40,7 +41,14 @@ class BackendAnalyzerService:
     def analyze(self, payload: ApiAnalyzeRequest) -> AnalyzerPipelineResult:
         stages: list[str] = []
         request_metadata = self._normalize_request_metadata(payload)
-        image_payload = self._normalize_image_metadata(payload)
+        image_payloads = self._normalize_image_metadata(payload)
+        image_payload = image_payloads[0]
+        request_metadata["imageCount"] = len(image_payloads)
+        request_metadata["imageRoles"] = [
+            image.get("imageRole", "other") for image in image_payloads
+        ]
+        request_metadata["images"] = _image_context(image_payloads)
+        request_metadata["imagePayloads"] = image_payloads
         stages.extend(["validate_image", "normalize_image_metadata"])
 
         provider = self._resolve_provider()
@@ -57,6 +65,7 @@ class BackendAnalyzerService:
             recognition=recognition,
             request_metadata=request_metadata,
             image_payload=image_payload,
+            image_payloads=image_payloads,
             stages=stages,
         )
 
@@ -70,10 +79,25 @@ class BackendAnalyzerService:
         )
         return request_metadata
 
-    def _normalize_image_metadata(self, payload: ApiAnalyzeRequest) -> dict:
-        image_payload = _model_to_dict(payload.image)
-        normalized = self._image_validator.validate_metadata(image_payload)
-        return normalized.to_api_payload()
+    def _normalize_image_metadata(self, payload: ApiAnalyzeRequest) -> list[dict]:
+        raw_images = []
+        if payload.images:
+            raw_images.extend(_model_to_dict(image) for image in payload.images)
+        if payload.image is not None:
+            legacy_image = _model_to_dict(payload.image)
+            existing_paths = {
+                str(image.get("localFilePath") or "") for image in raw_images
+            }
+            if str(legacy_image.get("localFilePath") or "") not in existing_paths:
+                raw_images.insert(0, legacy_image)
+
+        normalized_images = [
+            self._image_validator.validate_metadata(image_payload).to_api_payload()
+            for image_payload in raw_images
+        ]
+        if not normalized_images:
+            raise ValueError("At least one image is required for analysis.")
+        return normalized_images
 
     def _normalize_provider_output(
         self,
@@ -131,3 +155,16 @@ def _optional_string(value) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
     return value.strip()
+
+
+def _image_context(image_payloads: list[dict]) -> list[dict]:
+    return [
+        {
+            "fileName": image.get("fileName"),
+            "mimeType": image.get("mimeType"),
+            "sizeBytes": image.get("sizeBytes"),
+            "imageSource": image.get("imageSource"),
+            "imageRole": image.get("imageRole", "other"),
+        }
+        for image in image_payloads
+    ]

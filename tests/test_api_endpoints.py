@@ -614,6 +614,107 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertEqual(payload["condition"], "Unknown")
         self.assertEqual(payload["diagnostics"]["aiProvider"], "gemini")
 
+    def test_api_analyze_accepts_multi_image_payload(self) -> None:
+        gemini_client = _FakeGeminiClient(
+            response=_FakeOpenAIResponse(
+                body=_gemini_response(
+                    _openai_output(
+                        title="Australian $2 Coin",
+                        category="Coin",
+                        confidence=82,
+                        estimated_value=12,
+                        condition="Circulated",
+                    )
+                    | {
+                        "faceValue": 2,
+                        "estimatedMarketValue": 12,
+                        "valuationConfidence": 70,
+                        "scanRecommendations": [],
+                    }
+                )
+            )
+        )
+        provider = FallbackAnalyzerProvider(
+            requested_provider="gemini",
+            providers=[
+                GeminiRecognitionProvider(api_key="gemini-key", client=gemini_client)
+            ],
+        )
+        payload = _api_analyze_payload(base64_image=True)
+        payload["image"]["imageRole"] = "front"
+        payload["images"] = [
+            payload["image"],
+            {
+                **payload["image"],
+                "fileName": "coin-back.jpg",
+                "localFilePath": "/local/app/path/coin-back.jpg",
+                "imageRole": "back",
+            },
+        ]
+
+        with patch(
+            "app.services.analyzer.backend_analyzer_service.BackendAnalyzerService._resolve_provider",
+            return_value=provider,
+        ):
+            response = self.client.post("/analyze", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["itemName"], "Australian $2 Coin")
+        self.assertEqual(body["faceValue"], 2)
+        self.assertEqual(body["estimatedMarketValue"], 12)
+        self.assertEqual(body["rawProviderPayload"]["photosUsed"], 2)
+        self.assertEqual(body["rawProviderPayload"]["photoRoles"], ["front", "back"])
+        sent_parts = gemini_client.last_request["json"]["contents"][0]["parts"]
+        image_parts = [part for part in sent_parts if "inline_data" in part]
+        self.assertEqual(len(image_parts), 2)
+
+    def test_api_analyze_single_coin_image_recommends_reverse(self) -> None:
+        provider = FallbackAnalyzerProvider(
+            requested_provider="gemini",
+            providers=[
+                GeminiRecognitionProvider(
+                    api_key="gemini-key",
+                    client=_FakeGeminiClient(
+                        response=_FakeOpenAIResponse(
+                            body=_gemini_response(
+                                _openai_output(
+                                    title="Australian $2 Coin",
+                                    category="Coin",
+                                    confidence=58,
+                                    estimated_value=0,
+                                    condition="Unknown",
+                                )
+                                | {
+                                    "faceValue": 2,
+                                    "estimatedMarketValue": 0,
+                                    "valuationConfidence": 35,
+                                    "scanRecommendations": [
+                                        "Add a reverse/back photo to verify the coin."
+                                    ],
+                                }
+                            )
+                        )
+                    ),
+                )
+            ],
+        )
+        payload = _api_analyze_payload(base64_image=True)
+        payload["image"]["imageRole"] = "front"
+
+        with patch(
+            "app.services.analyzer.backend_analyzer_service.BackendAnalyzerService._resolve_provider",
+            return_value=provider,
+        ):
+            response = self.client.post("/analyze", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["faceValue"], 2)
+        self.assertEqual(body["estimatedValue"], 0)
+        self.assertEqual(body["estimatedMarketValue"], 0)
+        self.assertIn("reverse", " ".join(body["scanRecommendations"]).lower())
+
     def test_api_analyze_response_contract_keys_remain_unchanged(self) -> None:
         response = self.client.post("/analyze", json=_api_analyze_payload())
 
@@ -637,6 +738,10 @@ class ApiEndpointsTest(unittest.TestCase):
                 "attributes",
                 "images",
                 "rawProviderPayload",
+                "faceValue",
+                "estimatedMarketValue",
+                "askingPriceWarning",
+                "valuationConfidence",
                 "lowEstimate",
                 "highEstimate",
                 "confidence",

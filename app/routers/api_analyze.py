@@ -212,6 +212,14 @@ async def _analyze_collectible(payload: ApiAnalyzeRequest) -> ApiAnalyzeResponse
             diagnostics.pricingFallbackReason or "",
         )
 
+    estimated_market_value = (
+        recognition.estimatedMarketValue
+        if recognition.estimatedMarketValue is not None
+        else pricing.estimatedMarketValue
+    )
+    low_estimate = 0 if estimated_market_value == 0 else pricing.lowEstimate
+    high_estimate = 0 if estimated_market_value == 0 else pricing.highEstimate
+
     return ApiAnalyzeResponse(
         id=f"backend-{uuid4()}",
         itemName=recognition.title,
@@ -221,8 +229,8 @@ async def _analyze_collectible(payload: ApiAnalyzeRequest) -> ApiAnalyzeResponse
         year=recognition.year,
         series=recognition.series,
         variant=recognition.edition,
-        estimatedValue=pricing.estimatedMarketValue,
-        estimated_value=pricing.estimatedMarketValue,
+        estimatedValue=estimated_market_value,
+        estimated_value=estimated_market_value,
         currency=pricing.currency,
         tags=recognition.detectedObjects,
         description=recognition.description,
@@ -231,10 +239,19 @@ async def _analyze_collectible(payload: ApiAnalyzeRequest) -> ApiAnalyzeResponse
         rawProviderPayload={
             "provider": diagnostics.aiProvider,
             "pipelineStages": pipeline_result.stages,
+            "photosUsed": len(pipeline_result.image_payloads),
+            "photoRoles": [
+                image.get("imageRole", "other")
+                for image in pipeline_result.image_payloads
+            ],
             **_selection_diagnostics(provider),
         },
-        lowEstimate=pricing.lowEstimate,
-        highEstimate=pricing.highEstimate,
+        faceValue=recognition.faceValue,
+        estimatedMarketValue=estimated_market_value,
+        askingPriceWarning=recognition.askingPriceWarning,
+        valuationConfidence=recognition.valuationConfidence,
+        lowEstimate=low_estimate,
+        highEstimate=high_estimate,
         confidence=recognition.confidence,
         condition=recognition.condition,
         marketTrend=pricing.marketTrend,
@@ -327,19 +344,29 @@ async def _payload_from_multipart_request(request: Request) -> ApiAnalyzeRequest
             "imageSource": image_source,
             "localFilePath": local_file_path,
             "base64Image": base64.b64encode(image_bytes).decode("ascii"),
+            "imageRole": str(form.get("imageRole") or "front"),
         },
     )
 
 
 def _validate_contract(payload: ApiAnalyzeRequest) -> None:
     request = payload.request
-    image = payload.image
+    images = [*payload.images]
+    if payload.image is not None:
+        images.insert(0, payload.image)
 
-    if not request.imagePath.strip() or not image.localFilePath.strip():
+    if not request.imagePath.strip() or not images:
         raise _api_error(
             status.HTTP_400_BAD_REQUEST,
             "invalid_image",
             "Image metadata is required.",
+            retryable=False,
+        )
+    if not any(image.localFilePath.strip() for image in images):
+        raise _api_error(
+            status.HTTP_400_BAD_REQUEST,
+            "invalid_image",
+            "At least one image path is required.",
             retryable=False,
         )
 
