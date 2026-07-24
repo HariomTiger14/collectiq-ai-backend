@@ -45,7 +45,7 @@ class SharedPricingCacheRepository:
     def cache_key(self, recognition: RecognitionResult) -> str:
         identity = _normalized_identity(recognition)
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-        return f"pricing:{digest}"
+        return f"pricing:v2:{digest}"
 
     def get(self, recognition: RecognitionResult) -> PricingResult | None:
         if not self.is_configured:
