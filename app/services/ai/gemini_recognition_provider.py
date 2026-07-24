@@ -142,6 +142,7 @@ class GeminiRecognitionProvider(OpenAIRecognitionProvider):
 
         output_text = self._extract_gemini_text(response_body)
         result_payload = self._parse_json_object(output_text)
+        result_payload = self._rescue_unknown_title(payload, result_payload)
         processing_time_ms = int((time.perf_counter() - started_at) * 1000)
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -154,6 +155,66 @@ class GeminiRecognitionProvider(OpenAIRecognitionProvider):
             _gemini_payload_with_safe_defaults(result_payload),
             processing_time_ms,
         )
+
+    def _rescue_unknown_title(
+        self,
+        original_payload: dict[str, Any],
+        result_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        title = str(result_payload.get("title") or "").strip().lower()
+        confidence = _int(result_payload.get("confidence"), 0)
+        if title and title not in {"unknown", "unknown collectible"} and confidence > 0:
+            return result_payload
+
+        rescue_payload = _gemini_title_rescue_payload(original_payload)
+        try:
+            response = self._client.post(
+                self._generate_content_url(),
+                headers={"Content-Type": "application/json"},
+                json=rescue_payload,
+                timeout=self._timeout_seconds,
+            )
+            if response.status_code >= 400:
+                return result_payload
+            rescue_body = response.json()
+            rescue_text = self._extract_gemini_text(rescue_body)
+            rescue = self._parse_json_object(rescue_text)
+        except (GeminiProviderError, GeminiInvalidResponseError, ValueError, httpx.HTTPError):
+            return result_payload
+
+        rescued_title = _text(rescue.get("title"), "Unknown collectible")
+        if rescued_title.lower() in {"unknown", "unknown collectible"}:
+            return result_payload
+
+        rescued_category = _text(rescue.get("category"), _text(result_payload.get("category"), "Other"))
+        rescued_confidence = max(_int(rescue.get("confidence"), 55), 55)
+        merged = dict(result_payload)
+        merged.update(
+            {
+                "title": rescued_title,
+                "category": rescued_category,
+                "confidence": rescued_confidence,
+                "primaryMatch": rescued_title,
+                "description": _text(
+                    result_payload.get("description"),
+                    f"Visible packaging or cover title: {rescued_title}.",
+                ),
+                "confidenceExplanation": _text(
+                    rescue.get("reason"),
+                    "Recovered title from visible package or cover text.",
+                ),
+                "detectionQuality": _text(result_payload.get("detectionQuality"), "Partial"),
+                "aiReasoning": _text(
+                    rescue.get("reason"),
+                    "A focused second pass recovered the visible title text.",
+                ),
+            }
+        )
+        if isinstance(rescue.get("brand"), str) and rescue["brand"].strip():
+            merged["brand"] = rescue["brand"].strip()
+        if isinstance(rescue.get("series"), str) and rescue["series"].strip():
+            merged["series"] = rescue["series"].strip()
+        return merged
 
     def _build_gemini_payload(
         self,
@@ -296,6 +357,29 @@ def _gemini_payload_without_structured_schema(payload: dict[str, Any]) -> dict[s
     generation_config.pop("responseFormat", None)
     generation_config["response_mime_type"] = "application/json"
     retry_payload["generationConfig"] = generation_config
+    return retry_payload
+
+
+def _gemini_title_rescue_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    retry_payload = _gemini_payload_without_structured_schema(payload)
+    contents = retry_payload.get("contents")
+    if not isinstance(contents, list) or not contents:
+        return retry_payload
+    first_content = contents[0]
+    if not isinstance(first_content, dict):
+        return retry_payload
+    parts = first_content.get("parts")
+    if not isinstance(parts, list) or not parts:
+        return retry_payload
+    rescue_prompt = (
+        "Look only at visible text/logo/cover art in the image. If a product, "
+        "game, card, toy, shoe, or collectible title is readable, return JSON "
+        "with title, category, brand, series, confidence, and reason. Do not "
+        "price the item. If the visible title says MARIOKART 8 DELUXE, return "
+        "title Mario Kart 8 Deluxe and category Video Game. Use Unknown only "
+        "when no title or franchise text can be read."
+    )
+    parts[0] = {"text": rescue_prompt}
     return retry_payload
 
 

@@ -57,6 +57,7 @@ SUPPORTED_CATEGORIES = {
     "comic",
     "game",
     "video game",
+    "video games",
     "lego",
     "funko",
     "memorabilia",
