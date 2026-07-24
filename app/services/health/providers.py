@@ -132,6 +132,8 @@ class AnalyzerHealthProvider:
     def check(self) -> HealthCheckResult:
         started_at = time.perf_counter()
         provider = settings.ai_provider.strip().lower()
+        gemini_configured = bool(settings.gemini_api_key.strip())
+        openai_configured = bool(settings.openai_api_key.strip())
         if provider == "mock":
             return HealthCheckResult(
                 name=self.name,
@@ -141,19 +143,56 @@ class AnalyzerHealthProvider:
                 message="Mock analyzer provider is available.",
                 details={"provider": provider},
             )
-        if provider == "openai":
-            configured = bool(settings.openai_api_key.strip())
+        if provider == "auto":
+            configured = gemini_configured or openai_configured
             return HealthCheckResult(
                 name=self.name,
                 healthy=configured,
                 required=self.required,
                 latency_ms=_latency_ms(started_at),
                 message=(
-                    "OpenAI analyzer provider is configured."
+                    "Auto analyzer provider is configured."
                     if configured
+                    else "GEMINI_API_KEY or OPENAI_API_KEY is required when AI_PROVIDER=auto."
+                ),
+                details={
+                    "provider": provider,
+                    "configured": str(configured).lower(),
+                    "geminiConfigured": str(gemini_configured).lower(),
+                    "openaiConfigured": str(openai_configured).lower(),
+                },
+            )
+        if provider == "gemini":
+            return HealthCheckResult(
+                name=self.name,
+                healthy=gemini_configured,
+                required=self.required,
+                latency_ms=_latency_ms(started_at),
+                message=(
+                    "Gemini analyzer provider is configured."
+                    if gemini_configured
+                    else "GEMINI_API_KEY is required when AI_PROVIDER=gemini."
+                ),
+                details={
+                    "provider": provider,
+                    "configured": str(gemini_configured).lower(),
+                },
+            )
+        if provider == "openai":
+            return HealthCheckResult(
+                name=self.name,
+                healthy=openai_configured,
+                required=self.required,
+                latency_ms=_latency_ms(started_at),
+                message=(
+                    "OpenAI analyzer provider is configured."
+                    if openai_configured
                     else "OPENAI_API_KEY is required when AI_PROVIDER=openai."
                 ),
-                details={"provider": provider, "configured": str(configured).lower()},
+                details={
+                    "provider": provider,
+                    "configured": str(openai_configured).lower(),
+                },
             )
 
         return HealthCheckResult(

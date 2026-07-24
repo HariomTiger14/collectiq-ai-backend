@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import httpx
 
@@ -83,6 +84,30 @@ class HealthServiceTest(unittest.TestCase):
 
         self.assertEqual(result.name, "analyzer")
         self.assertIn(result.healthy, {True, False})
+
+    def test_analyzer_auto_is_healthy_when_gemini_is_configured(self) -> None:
+        with patch("app.services.health.providers.settings") as mock_settings:
+            mock_settings.ai_provider = "auto"
+            mock_settings.gemini_api_key = "gemini-key"
+            mock_settings.openai_api_key = ""
+
+            result = AnalyzerHealthProvider().check()
+
+        self.assertTrue(result.healthy)
+        self.assertEqual(result.details["provider"], "auto")
+        self.assertEqual(result.details["geminiConfigured"], "true")
+        self.assertEqual(result.details["openaiConfigured"], "false")
+
+    def test_analyzer_auto_is_unhealthy_without_live_provider_key(self) -> None:
+        with patch("app.services.health.providers.settings") as mock_settings:
+            mock_settings.ai_provider = "auto"
+            mock_settings.gemini_api_key = ""
+            mock_settings.openai_api_key = ""
+
+            result = AnalyzerHealthProvider().check()
+
+        self.assertFalse(result.healthy)
+        self.assertEqual(result.details["configured"], "false")
 
     def test_service_reports_unhealthy_required_dependency(self) -> None:
         service = HealthCheckService(
