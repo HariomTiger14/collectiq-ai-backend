@@ -46,6 +46,8 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
         self.assertEqual(row["loose_price_cents"], 3150)
         self.assertEqual(row["cib_price_cents"], 3500)
         self.assertEqual(row["new_price_cents"], 4009)
+        self.assertIsNone(row["graded_price_cents"])
+        self.assertIsNone(row["asin"])
         self.assertEqual(row["release_date"], "2017-04-28")
         self.assertEqual(row["normalized_identity"], "mario kart 8 deluxe nintendo switch")
 

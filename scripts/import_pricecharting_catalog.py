@@ -40,6 +40,29 @@ PRICECHARTING_CSV_ENV_VARS = {
     "one_piece": "PRICECHARTING_CSV_ONE_PIECE_URL",
 }
 
+CATALOG_COLUMNS = (
+    "pricecharting_id",
+    "product_name",
+    "console_name",
+    "category",
+    "upc",
+    "asin",
+    "epid",
+    "release_date",
+    "loose_price_cents",
+    "cib_price_cents",
+    "new_price_cents",
+    "graded_price_cents",
+    "box_only_price_cents",
+    "manual_only_price_cents",
+    "currency",
+    "product_url",
+    "normalized_identity",
+    "raw_payload",
+    "source_file",
+    "source_downloaded_at",
+)
+
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
@@ -225,10 +248,13 @@ def to_catalog_row(
     }
     for target, aliases in PRICE_FIELDS.items():
         catalog_row[target] = parse_price_cents(pick_text(row, aliases))
+    return normalize_catalog_row(catalog_row)
+
+
+def normalize_catalog_row(row: dict[str, Any]) -> dict[str, Any]:
     return {
-        key: value
-        for key, value in catalog_row.items()
-        if value is not None and value != ""
+        column: row.get(column) if row.get(column) != "" else None
+        for column in CATALOG_COLUMNS
     }
 
 
