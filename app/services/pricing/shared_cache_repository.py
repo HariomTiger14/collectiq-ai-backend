@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.services.ai.base_recognition_service import RecognitionResult
 from app.services.pricing.base_pricing_provider import PricingResult, utc_timestamp
 from app.services.pricing.cache_policy import PricingCachePolicy, pricing_cache_policy
+from app.services.pricing.currency_conversion import normalize_display_currency
 
 
 class SharedPricingCacheError(Exception):
@@ -42,16 +43,27 @@ class SharedPricingCacheRepository:
     def is_configured(self) -> bool:
         return bool(self._supabase_url and self._service_role_key)
 
-    def cache_key(self, recognition: RecognitionResult) -> str:
+    def cache_key(
+        self,
+        recognition: RecognitionResult,
+        *,
+        display_currency: str | None = None,
+    ) -> str:
         identity = _normalized_identity(recognition)
-        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-        return f"pricing:v2:{digest}"
+        currency = normalize_display_currency(display_currency)
+        digest = hashlib.sha256(f"{currency}|{identity}".encode("utf-8")).hexdigest()
+        return f"pricing:v3:{currency}:{digest}"
 
-    def get(self, recognition: RecognitionResult) -> PricingResult | None:
+    def get(
+        self,
+        recognition: RecognitionResult,
+        *,
+        display_currency: str | None = None,
+    ) -> PricingResult | None:
         if not self.is_configured:
             return None
 
-        cache_key = self.cache_key(recognition)
+        cache_key = self.cache_key(recognition, display_currency=display_currency)
         now = datetime.now(timezone.utc).isoformat()
         params = {
             "cache_key": f"eq.{cache_key}",
@@ -68,10 +80,17 @@ class SharedPricingCacheRepository:
         self._increment_hit_count(cache_key)
         return _pricing_result_from_row(row)
 
-    def set(self, recognition: RecognitionResult, pricing: PricingResult) -> None:
+    def set(
+        self,
+        recognition: RecognitionResult,
+        pricing: PricingResult,
+        *,
+        display_currency: str | None = None,
+    ) -> None:
         if not self.is_configured:
             return
 
+        currency = normalize_display_currency(display_currency or pricing.currency)
         policy = pricing_cache_policy(
             category=recognition.category,
             valuation_status=pricing.valuationStatus,
@@ -79,7 +98,7 @@ class SharedPricingCacheRepository:
         now = datetime.now(timezone.utc)
         expires_at = now + timedelta(seconds=policy.ttl_seconds)
         row = _row_from_pricing(
-            cache_key=self.cache_key(recognition),
+            cache_key=self.cache_key(recognition, display_currency=currency),
             recognition=recognition,
             pricing=pricing,
             policy=policy,
@@ -200,10 +219,12 @@ def _row_from_pricing(
         else pricing.valuationStatus.upper(),
         "match_reason": diagnostics.get("priceExplanation")
         or diagnostics.get("confidenceCalculation"),
-        "original_price": _nullable_number(pricing.estimatedMarketValue),
-        "original_currency": pricing.currency,
-        "exchange_rate_used": 1,
-        "exchange_rate_date": pricing.lastUpdated,
+        "original_price": _nullable_number(
+            pricing.originalMarketValue or pricing.estimatedMarketValue
+        ),
+        "original_currency": pricing.originalCurrency or pricing.currency,
+        "exchange_rate_used": pricing.exchangeRateUsed,
+        "exchange_rate_date": pricing.exchangeRateDate or pricing.lastUpdated,
         "checked_at": checked_at.isoformat(),
         "expires_at": expires_at.isoformat(),
         "evidence_json": {
@@ -219,11 +240,14 @@ def _pricing_result_from_row(row: dict) -> PricingResult:
     evidence = row.get("evidence_json") if isinstance(row.get("evidence_json"), dict) else {}
     provider = str(row.get("pricing_provider") or "shared_cache")
     match_reason = str(row.get("match_reason") or "Served from PackLox shared pricing cache.")
+    exchange_rate = _float_number(row.get("exchange_rate_used"), default=1)
+    original_currency = str(row.get("original_currency") or "").upper() or None
+    display_currency = _display_currency_from_row(row) or original_currency or "AUD"
     return PricingResult(
         estimatedMarketValue=_int_number(row.get("value_aud")),
         lowEstimate=_int_number(row.get("low_estimate_aud")),
         highEstimate=_int_number(row.get("high_estimate_aud")),
-        currency="AUD",
+        currency=display_currency,
         pricingSource=provider,
         pricingConfidence=_confidence_int(row.get("confidence_score")),
         lastUpdated=str(row.get("checked_at") or utc_timestamp()),
@@ -245,6 +269,12 @@ def _pricing_result_from_row(row: dict) -> PricingResult:
             "confidenceCalculation": match_reason,
             "priceExplanation": match_reason,
         },
+        originalMarketValue=_int_number(row.get("original_price")),
+        originalLowEstimate=None,
+        originalHighEstimate=None,
+        originalCurrency=original_currency,
+        exchangeRateUsed=exchange_rate,
+        exchangeRateDate=str(row.get("exchange_rate_date") or row.get("checked_at") or ""),
     )
 
 
@@ -270,6 +300,23 @@ def _int_number(value) -> int:
     if value is None:
         return 0
     return max(0, round(float(value)))
+
+
+def _float_number(value, *, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _display_currency_from_row(row: dict) -> str | None:
+    display_string = str(row.get("display_string") or "").strip().upper()
+    for currency in ("AUD", "CAD", "GBP", "USD"):
+        if display_string.endswith(currency):
+            return currency
+    return None
 
 
 def _confidence_score(value) -> float:

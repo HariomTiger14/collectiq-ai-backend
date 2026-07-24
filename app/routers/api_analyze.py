@@ -33,6 +33,10 @@ from app.services.pricing.base_pricing_provider import (
     PricingProviderUnavailableError,
 )
 from app.services.pricing.cache_policy import pricing_cache_policy
+from app.services.pricing.currency_conversion import (
+    convert_pricing_result,
+    normalize_display_currency,
+)
 from app.services.pricing.provider_factory import get_pricing_provider
 from app.services.pricing.shared_cache_repository import (
     SharedPricingCacheError,
@@ -112,7 +116,12 @@ async def _analyze_collectible(
         pipeline_result = BackendAnalyzerService().analyze(payload)
         provider = pipeline_result.provider
         recognition = pipeline_result.recognition
-        pricing = _price_recognition(recognition, trace_id=trace_id)
+        display_currency = _target_display_currency(payload)
+        pricing = _price_recognition(
+            recognition,
+            trace_id=trace_id,
+            display_currency=display_currency,
+        )
         logger.info(
             "analyze response traceId=%s selectedAnalyzerProvider=%s "
             "aiProvider=%s itemName=%s confidence=%s valuationStatus=%s "
@@ -277,6 +286,13 @@ async def _analyze_collectible(
     display_string = (
         f"${display_value:,.2f} {pricing.currency}" if display_value else None
     )
+    original_market_value = pricing.originalMarketValue or display_value
+    original_currency = pricing.originalCurrency or pricing.currency
+    source_display_string = (
+        f"${original_market_value:,.2f} {original_currency}"
+        if original_market_value
+        else None
+    )
     attribution_text = (
         f"Pricing data powered by {diagnostics.pricingProvider}"
         if market_estimated_value and diagnostics.pricingProvider
@@ -322,15 +338,23 @@ async def _analyze_collectible(
                 "lastChecked": pricing.lastUpdated,
             },
             "originalMarket": {
-                "price": display_value,
-                "currency": pricing.currency,
-                "exchangeRateUsed": 1,
-                "exchangeRateDate": pricing.lastUpdated,
+                "price": original_market_value,
+                "currency": original_currency,
+                "exchangeRateUsed": pricing.exchangeRateUsed,
+                "exchangeRateDate": pricing.exchangeRateDate or pricing.lastUpdated,
+                "displayPrice": display_value,
+                "displayCurrency": pricing.currency,
+                "displayString": display_string,
+                "sourceDisplayString": source_display_string,
             },
             "matchMetadata": {
                 "reason": diagnostics.pricingExplanation,
+                "lowEstimate": low_estimate,
+                "highEstimate": high_estimate,
                 "lowEstimateAud": low_estimate,
                 "highEstimateAud": high_estimate,
+                "lowEstimateOriginal": pricing.originalLowEstimate or low_estimate,
+                "highEstimateOriginal": pricing.originalHighEstimate or high_estimate,
             },
             "pipelineStages": pipeline_result.stages,
             "photosUsed": len(pipeline_result.image_payloads),
@@ -584,7 +608,12 @@ def _selection_diagnostics(provider) -> dict[str, object]:
     return {"mockSelection": diagnostics}
 
 
-def _price_recognition(recognition, *, trace_id: str):
+def _price_recognition(
+    recognition,
+    *,
+    trace_id: str,
+    display_currency: str,
+):
     provider_name = settings.pricing_provider.strip().lower()
     lookup_query = _pricing_lookup_query(recognition)
     logger.info(
@@ -633,7 +662,10 @@ def _price_recognition(recognition, *, trace_id: str):
         return result
 
     try:
-        cached_result = _shared_pricing_cache.get(recognition)
+        cached_result = _shared_pricing_cache.get(
+            recognition,
+            display_currency=display_currency,
+        )
     except SharedPricingCacheError as exc:
         logger.warning(
             "pricing shared cache read failed traceId=%s error=%s",
@@ -678,8 +710,13 @@ def _price_recognition(recognition, *, trace_id: str):
             source=provider_name,
             reason=str(exc),
         )
+    result = convert_pricing_result(result, target_currency=display_currency)
     try:
-        _shared_pricing_cache.set(recognition, result)
+        _shared_pricing_cache.set(
+            recognition,
+            result,
+            display_currency=display_currency,
+        )
         result = with_shared_cache_status(result, "shared_miss")
     except SharedPricingCacheError as exc:
         logger.warning(
@@ -699,6 +736,16 @@ def _price_recognition(recognition, *, trace_id: str):
         len(result.comparableSales),
     )
     return result
+
+
+def _target_display_currency(payload: ApiAnalyzeRequest) -> str:
+    metadata = payload.request.deviceMetadata or {}
+    return normalize_display_currency(
+        metadata.get("currency")
+        or metadata.get("displayCurrency")
+        or metadata.get("preferredCurrency")
+        or metadata.get("regionCurrency")
+    )
 
 
 def _valuation_placeholder(

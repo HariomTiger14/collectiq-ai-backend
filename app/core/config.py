@@ -145,6 +145,10 @@ class Settings:
     pricing_provider_min_interval_ms: int = int(
         os.getenv("PRICING_PROVIDER_MIN_INTERVAL_MS", "250")
     )
+    default_display_currency: str = os.getenv("DEFAULT_DISPLAY_CURRENCY", "AUD")
+    fx_usd_to_aud: float = float(os.getenv("FX_USD_TO_AUD", "1.52"))
+    fx_usd_to_cad: float = float(os.getenv("FX_USD_TO_CAD", "1.37"))
+    fx_usd_to_gbp: float = float(os.getenv("FX_USD_TO_GBP", "0.78"))
     admin_import_token: str = os.getenv("ADMIN_IMPORT_TOKEN", "")
 
 

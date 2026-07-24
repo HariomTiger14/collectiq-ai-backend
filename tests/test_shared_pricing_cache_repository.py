@@ -17,6 +17,18 @@ class SharedPricingCacheRepositoryTest(unittest.TestCase):
 
         self.assertEqual(repository.cache_key(first), repository.cache_key(second))
 
+    def test_cache_key_is_separate_per_display_currency(self) -> None:
+        repository = SharedPricingCacheRepository(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+        )
+        recognition = _recognition()
+
+        self.assertNotEqual(
+            repository.cache_key(recognition, display_currency="AUD"),
+            repository.cache_key(recognition, display_currency="GBP"),
+        )
+
     def test_get_returns_pricing_result_from_fresh_cache_row(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             if request.method == "GET":
@@ -26,12 +38,16 @@ class SharedPricingCacheRepositoryTest(unittest.TestCase):
                         {
                             "cache_key": "pricing:test",
                             "valuation_status": "market_estimated",
-                            "value_aud": 420,
-                            "low_estimate_aud": 390,
-                            "high_estimate_aud": 450,
+                            "value_aud": 638,
+                            "low_estimate_aud": 593,
+                            "high_estimate_aud": 684,
                             "pricing_provider": "PriceCharting",
                             "confidence_score": 0.86,
                             "checked_at": "2026-07-24T22:06:00Z",
+                            "display_string": "$638.00 AUD",
+                            "original_price": 420,
+                            "original_currency": "USD",
+                            "exchange_rate_used": 1.52,
                             "match_reason": "Matched by card number and set.",
                             "evidence_json": {"sourceCount": 1},
                         }
@@ -50,7 +66,11 @@ class SharedPricingCacheRepositoryTest(unittest.TestCase):
 
         self.assertIsNotNone(pricing)
         assert pricing is not None
-        self.assertEqual(pricing.estimatedMarketValue, 420)
+        self.assertEqual(pricing.estimatedMarketValue, 638)
+        self.assertEqual(pricing.currency, "AUD")
+        self.assertEqual(pricing.originalMarketValue, 420)
+        self.assertEqual(pricing.originalCurrency, "USD")
+        self.assertEqual(pricing.exchangeRateUsed, 1.52)
         self.assertEqual(pricing.cacheStatus, "shared_hit")
         self.assertEqual(pricing.valuationSource, "PriceCharting")
 

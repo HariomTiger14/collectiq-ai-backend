@@ -55,6 +55,12 @@ class PricingResult:
     fallbackUsed: bool = False
     cacheStatus: str = "miss"
     providerDiagnostics: dict[str, str] = field(default_factory=dict)
+    originalMarketValue: int | None = None
+    originalLowEstimate: int | None = None
+    originalHighEstimate: int | None = None
+    originalCurrency: str | None = None
+    exchangeRateUsed: float = 1
+    exchangeRateDate: str | None = None
 
 
 class PricingProvider(Protocol):

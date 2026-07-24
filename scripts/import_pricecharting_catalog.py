@@ -71,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     source_summaries: list[dict[str, Any]] = []
     for source in sources:
         rows = source.rows
+        print(f"Preparing {source.name}: {len(rows)} input rows...", flush=True)
         source_rows = [
             to_catalog_row(row, source.name, args.source_downloaded_at)
             for row in rows
@@ -86,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     imported_rows = dedupe_catalog_rows(imported_rows)
+    print(f"Prepared {len(imported_rows)} unique catalog rows.", flush=True)
     if args.dry_run:
         print(
             json.dumps(
@@ -106,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
         service_role_key=args.service_role_key or os.getenv("SUPABASE_SERVICE_ROLE_KEY", ""),
         timeout_seconds=args.timeout_seconds,
     )
+    print(f"Starting Supabase import with batch size {args.batch_size}...", flush=True)
     total = client.upsert_rows(imported_rows, batch_size=args.batch_size)
     print(f"Imported {total} PriceCharting catalog rows into Supabase.")
     return 0
@@ -192,9 +195,11 @@ def download_env_sources(
             url = os.getenv(env_name, "").strip()
             if not url:
                 continue
+            print(f"Downloading {category} CSV...", flush=True)
             response = client.get(url, headers={"Accept": "text/csv,*/*"})
             response.raise_for_status()
             rows = load_rows_from_text(response.text)
+            print(f"Downloaded {category}.csv with {len(rows)} rows.", flush=True)
             sources.append(CatalogSource(name=f"{category}.csv", rows=rows))
     if not sources:
         if source_filter:
