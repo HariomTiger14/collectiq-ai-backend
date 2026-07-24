@@ -320,13 +320,23 @@ class PriceChartingPricingProvider(PricingProvider):
     def _parse_price(self, value) -> int | None:
         if value is None:
             return None
+
+        raw_value = value
+        is_penny_value = isinstance(value, int | float)
         if isinstance(value, str):
-            value = value.replace("$", "").replace(",", "").strip()
+            raw_value = value.replace(",", "").strip()
+            has_currency_marker = "$" in raw_value or "." in raw_value
+            is_penny_value = not has_currency_marker
+            raw_value = raw_value.replace("$", "")
+
         try:
-            price = round(float(value))
+            price = float(raw_value)
         except (TypeError, ValueError):
             return None
-        return price if price > 0 else None
+        if is_penny_value:
+            price = price / 100
+        rounded_price = round(price)
+        return rounded_price if rounded_price > 0 else None
 
     def _query_for(self, recognition: RecognitionResult) -> str:
         parts = [
