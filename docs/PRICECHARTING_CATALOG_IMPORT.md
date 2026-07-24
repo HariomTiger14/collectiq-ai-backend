@@ -65,6 +65,30 @@ python scripts/import_pricecharting_catalog.py --from-env
 
 Do not commit the CSV URLs to GitHub. They may contain your private PriceCharting token.
 
+## Import Through Backend Admin Endpoint
+
+Configure this private Render environment variable:
+
+- `ADMIN_IMPORT_TOKEN`
+
+Then trigger a compact dry-run response without using Render Shell:
+
+```bash
+curl -X POST \
+  "https://api-sit.packlox.com/admin/pricecharting/import?dryRun=true" \
+  -H "X-Admin-Token: YOUR_ADMIN_IMPORT_TOKEN"
+```
+
+If the row counts look correct, run the real import:
+
+```bash
+curl -X POST \
+  "https://api-sit.packlox.com/admin/pricecharting/import?dryRun=false" \
+  -H "X-Admin-Token: YOUR_ADMIN_IMPORT_TOKEN"
+```
+
+The endpoint returns only source names and row counts. It does not echo private CSV URLs.
+
 ## Frequency
 
 PriceCharting CSV files are generated once every 24 hours, so PackLox should import at most once per day.

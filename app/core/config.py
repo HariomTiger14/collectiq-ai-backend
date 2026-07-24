@@ -145,6 +145,7 @@ class Settings:
     pricing_provider_min_interval_ms: int = int(
         os.getenv("PRICING_PROVIDER_MIN_INTERVAL_MS", "250")
     )
+    admin_import_token: str = os.getenv("ADMIN_IMPORT_TOKEN", "")
 
 
 settings = Settings()

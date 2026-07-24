@@ -56,3 +56,5 @@ services:
         value: "900"
       - key: PRICING_PROVIDER_MIN_INTERVAL_MS
         value: "250"
+      - key: ADMIN_IMPORT_TOKEN
+        sync: false
