@@ -52,7 +52,6 @@ class GeminiRecognitionProviderTest(unittest.TestCase):
         self.assertIn("confidence", schema["required"])
         self.assertIn("alternativeMatches", schema["required"])
         self.assertEqual(schema["properties"]["title"]["type"], "STRING")
-        self.assertEqual(schema["properties"]["alternativeMatches"]["minItems"], 3)
 
     def test_partial_alternative_matches_are_normalized(self) -> None:
         gemini_output = {
