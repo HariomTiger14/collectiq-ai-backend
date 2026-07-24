@@ -391,10 +391,12 @@ class OpenAIRecognitionProvider(AIRecognitionProvider):
 
     def _image_data_url_from_api_payload(self, image_payload: dict) -> str:
         mime_type = str(image_payload.get("mimeType") or "application/octet-stream")
-        local_path = Path(str(image_payload.get("localFilePath") or ""))
-        if str(local_path).strip() and local_path.exists():
-            encoded_image = base64.b64encode(local_path.read_bytes()).decode("ascii")
-            return f"data:{mime_type};base64,{encoded_image}"
+        local_path_value = str(image_payload.get("localFilePath") or "").strip()
+        if local_path_value:
+            local_path = Path(local_path_value)
+            if local_path.exists() and local_path.is_file():
+                encoded_image = base64.b64encode(local_path.read_bytes()).decode("ascii")
+                return f"data:{mime_type};base64,{encoded_image}"
 
         encoded_image = image_payload.get("base64Image") or image_payload.get(
             "base64Preview"
