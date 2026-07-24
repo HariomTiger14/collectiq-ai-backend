@@ -45,13 +45,14 @@ class GeminiRecognitionProviderTest(unittest.TestCase):
         )
 
         generation_config = payload["generationConfig"]
-        schema = generation_config["response_schema"]
-        self.assertEqual(generation_config["response_mime_type"], "application/json")
+        text_format = generation_config["responseFormat"]["text"]
+        schema = text_format["schema"]
+        self.assertEqual(text_format["mimeType"], "application/json")
         self.assertIn("title", schema["required"])
         self.assertIn("category", schema["required"])
         self.assertIn("confidence", schema["required"])
         self.assertIn("alternativeMatches", schema["required"])
-        self.assertEqual(schema["properties"]["title"]["type"], "STRING")
+        self.assertEqual(schema["properties"]["title"]["type"], "string")
 
     def test_partial_alternative_matches_are_normalized(self) -> None:
         gemini_output = {
