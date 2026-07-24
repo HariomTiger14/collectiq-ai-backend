@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.import_pricecharting_catalog import (
+    dedupe_catalog_rows,
     download_env_sources,
     load_rows_from_text,
     normalized_identity,
@@ -56,6 +57,19 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["product-name"], "Mario Kart 8 Deluxe")
+
+    def test_dedupe_catalog_rows_keeps_latest_row_for_same_product(self) -> None:
+        rows = dedupe_catalog_rows(
+            [
+                {"pricecharting_id": "12345", "product_name": "Old"},
+                {"pricecharting_id": "12345", "product_name": "New"},
+                {"pricecharting_id": "67890", "product_name": "Other"},
+            ]
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["product_name"], "New")
+        self.assertEqual(rows[1]["product_name"], "Other")
 
     def test_download_env_sources_uses_configured_category_urls(self) -> None:
         transport = _FakeTransport(

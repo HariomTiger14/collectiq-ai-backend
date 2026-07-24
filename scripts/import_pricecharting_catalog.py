@@ -62,6 +62,7 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
 
+    imported_rows = dedupe_catalog_rows(imported_rows)
     if args.dry_run:
         print(
             json.dumps(
@@ -185,6 +186,16 @@ def load_rows_from_text(csv_text: str) -> list[dict[str, str]]:
     return [dict(row) for row in csv.DictReader(handle)]
 
 
+def dedupe_catalog_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        product_id = str(row.get("pricecharting_id", "")).strip()
+        if not product_id:
+            continue
+        deduped[product_id] = row
+    return list(deduped.values())
+
+
 def to_catalog_row(
     row: dict[str, Any],
     source_file: str,
@@ -298,8 +309,16 @@ class SupabaseCatalogClient:
                     headers=headers,
                     json=batch,
                 )
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    raise SystemExit(
+                        "Supabase catalog import failed "
+                        f"at rows {index + 1}-{index + len(batch)} "
+                        f"with HTTP {response.status_code}: {response.text}"
+                    ) from exc
                 total += len(batch)
+                print(f"Imported {total} / {len(rows)} rows...", flush=True)
         return total
 
 
