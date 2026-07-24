@@ -37,6 +37,34 @@ SUPABASE_SERVICE_ROLE_KEY="YOUR_SERVICE_ROLE_KEY" \
 python scripts/import_pricecharting_catalog.py /path/to/pricecharting.csv
 ```
 
+## Import From Configured CSV URLs
+
+If Render has these private CSV URL environment variables configured:
+
+- `PRICECHARTING_CSV_VIDEO_GAMES_URL`
+- `PRICECHARTING_CSV_POKEMON_URL`
+- `PRICECHARTING_CSV_MAGIC_URL`
+- `PRICECHARTING_CSV_YUGIOH_URL`
+- `PRICECHARTING_CSV_ONE_PIECE_URL`
+
+then import all configured CSV downloads in one run:
+
+```bash
+SUPABASE_URL="https://YOUR_PROJECT.supabase.co" \
+SUPABASE_SERVICE_ROLE_KEY="YOUR_SERVICE_ROLE_KEY" \
+PRICECHARTING_CSV_VIDEO_GAMES_URL="https://..." \
+PRICECHARTING_CSV_POKEMON_URL="https://..." \
+python scripts/import_pricecharting_catalog.py --from-env --dry-run
+```
+
+Remove `--dry-run` after the summary looks right:
+
+```bash
+python scripts/import_pricecharting_catalog.py --from-env
+```
+
+Do not commit the CSV URLs to GitHub. They may contain your private PriceCharting token.
+
 ## Frequency
 
 PriceCharting CSV files are generated once every 24 hours, so PackLox should import at most once per day.

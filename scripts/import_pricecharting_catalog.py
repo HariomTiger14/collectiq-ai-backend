@@ -1,5 +1,6 @@
 import argparse
 import csv
+import io
 import json
 import os
 import re
@@ -31,18 +32,42 @@ TEXT_FIELDS = {
     "product_url": ["url", "product-url", "productUrl"],
 }
 
+PRICECHARTING_CSV_ENV_VARS = {
+    "video_games": "PRICECHARTING_CSV_VIDEO_GAMES_URL",
+    "pokemon": "PRICECHARTING_CSV_POKEMON_URL",
+    "magic": "PRICECHARTING_CSV_MAGIC_URL",
+    "yugioh": "PRICECHARTING_CSV_YUGIOH_URL",
+    "one_piece": "PRICECHARTING_CSV_ONE_PIECE_URL",
+}
+
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    rows = load_rows(args.csv)
-    imported_rows = [to_catalog_row(row, args.csv.name, args.source_downloaded_at) for row in rows]
-    imported_rows = [row for row in imported_rows if row is not None]
+    sources = load_sources(args)
+    imported_rows: list[dict[str, Any]] = []
+    source_summaries: list[dict[str, Any]] = []
+    for source in sources:
+        rows = source.rows
+        source_rows = [
+            to_catalog_row(row, source.name, args.source_downloaded_at)
+            for row in rows
+        ]
+        source_rows = [row for row in source_rows if row is not None]
+        imported_rows.extend(source_rows)
+        source_summaries.append(
+            {
+                "source": source.name,
+                "inputRows": len(rows),
+                "validRows": len(source_rows),
+            }
+        )
 
     if args.dry_run:
         print(
             json.dumps(
                 {
-                    "inputRows": len(rows),
+                    "sources": source_summaries,
+                    "inputRows": sum(source["inputRows"] for source in source_summaries),
                     "validRows": len(imported_rows),
                     "firstRow": imported_rows[0] if imported_rows else None,
                 },
@@ -66,7 +91,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Import a PriceCharting Legendary CSV download into PackLox pricing catalog."
     )
-    parser.add_argument("csv", type=Path, help="Path to the downloaded PriceCharting CSV file.")
+    parser.add_argument(
+        "csv",
+        type=Path,
+        nargs="?",
+        help="Path to a downloaded PriceCharting CSV file.",
+    )
+    parser.add_argument(
+        "--from-env",
+        action="store_true",
+        help="Download and import all configured PRICECHARTING_CSV_*_URL env vars.",
+    )
     parser.add_argument("--supabase-url", default="", help="Supabase project URL. Defaults to SUPABASE_URL.")
     parser.add_argument(
         "--service-role-key",
@@ -84,9 +119,49 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+class CatalogSource:
+    def __init__(self, *, name: str, rows: list[dict[str, str]]) -> None:
+        self.name = name
+        self.rows = rows
+
+
+def load_sources(args: argparse.Namespace) -> list[CatalogSource]:
+    sources: list[CatalogSource] = []
+    if args.csv is not None:
+        sources.append(CatalogSource(name=args.csv.name, rows=load_rows(args.csv)))
+    if args.from_env:
+        sources.extend(
+            download_env_sources(timeout_seconds=args.timeout_seconds)
+        )
+    if not sources:
+        raise SystemExit("Provide a CSV path or use --from-env.")
+    return sources
+
+
 def load_rows(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         return [dict(row) for row in csv.DictReader(handle)]
+
+
+def download_env_sources(*, timeout_seconds: float) -> list[CatalogSource]:
+    sources: list[CatalogSource] = []
+    with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as client:
+        for category, env_name in PRICECHARTING_CSV_ENV_VARS.items():
+            url = os.getenv(env_name, "").strip()
+            if not url:
+                continue
+            response = client.get(url, headers={"Accept": "text/csv,*/*"})
+            response.raise_for_status()
+            rows = load_rows_from_text(response.text)
+            sources.append(CatalogSource(name=f"{category}.csv", rows=rows))
+    if not sources:
+        raise SystemExit("No PRICECHARTING_CSV_*_URL environment variables were configured.")
+    return sources
+
+
+def load_rows_from_text(csv_text: str) -> list[dict[str, str]]:
+    handle = io.StringIO(csv_text)
+    return [dict(row) for row in csv.DictReader(handle)]
 
 
 def to_catalog_row(
