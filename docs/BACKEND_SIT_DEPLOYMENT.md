@@ -534,7 +534,7 @@ For current SIT real analyzer validation, configure the Render service with:
 ```text
 AI_PROVIDER=auto
 GEMINI_API_KEY=<server-side Gemini secret>
-GEMINI_MODEL=gemini-1.5-flash
+GEMINI_MODEL=gemini-3.6-flash
 GEMINI_TIMEOUT_SECONDS=30
 OPENAI_API_KEY=<optional server-side OpenAI backup secret>
 OPENAI_MODEL=gpt-4.1-mini
