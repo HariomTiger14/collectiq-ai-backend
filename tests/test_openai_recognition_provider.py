@@ -78,6 +78,8 @@ class OpenAIRecognitionProviderTest(unittest.TestCase):
         self.assertIn("video games", prompt)
         self.assertIn("Do not return 'Unknown collectible'", prompt)
         self.assertIn("visible title", prompt)
+        self.assertIn("MARIOKART 8 DELUXE", prompt)
+        self.assertIn("Read large logo/title text with OCR", prompt)
 
     def test_recognize_returns_structured_result_from_mocked_openai(self) -> None:
         output = {
