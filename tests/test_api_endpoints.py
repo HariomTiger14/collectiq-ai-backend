@@ -16,10 +16,19 @@ from app.main import app
 from app.services.ai.gemini_recognition_provider import GeminiRecognitionProvider
 from app.services.ai.openai_recognition_provider import OpenAIRecognitionProvider
 from app.services.analyzer.backend_analyzer_service import BackendAnalyzerService
+from app.services.analyzer.errors import AnalyzerPipelineError
 from app.services.analyzer.providers import (
     AutoAnalyzerProvider,
     FallbackAnalyzerProvider,
     MockAnalyzerProvider,
+)
+from app.services.pricing.base_pricing_provider import (
+    EmptyMarketDataError,
+    MarketComparableSale,
+    PricingProviderError,
+    PricingProviderUnavailableError,
+    PricingResult,
+    utc_timestamp,
 )
 from app.services.health.health_check_service import HealthCheckService
 from app.services.health.providers import HealthCheckResult
@@ -211,12 +220,9 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertIn("notes", payload)
         self.assertIn("pricing", payload)
         pricing = payload["pricing"]
-        self.assertEqual(payload["estimatedValue"], pricing["estimatedMarketValue"])
-        self.assertGreater(pricing["lowEstimate"], 0)
-        self.assertGreaterEqual(
-            pricing["highEstimate"],
-            pricing["estimatedMarketValue"],
-        )
+        self.assertEqual(pricing["estimatedMarketValue"], 0)
+        self.assertEqual(pricing["lowEstimate"], 0)
+        self.assertEqual(pricing["highEstimate"], 0)
         self.assertEqual(payload["estimated_value_low"], pricing["lowEstimate"])
         self.assertEqual(payload["estimated_value_high"], pricing["highEstimate"])
         self.assertEqual(pricing["currency"], "AUD")
@@ -237,8 +243,10 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertIn("attributes", payload)
         self.assertIn("rawProviderPayload", payload)
         self.assertGreater(payload["estimatedValue"], 0)
-        self.assertGreater(payload["lowEstimate"], 0)
-        self.assertGreaterEqual(payload["highEstimate"], payload["estimatedValue"])
+        self.assertEqual(payload["valuationStatus"], "provider_not_configured")
+        self.assertEqual(payload["valuationSource"], "not_configured")
+        self.assertEqual(payload["lowEstimate"], 0)
+        self.assertEqual(payload["highEstimate"], 0)
         self.assertGreaterEqual(payload["confidence"], 0)
         self.assertLessEqual(payload["confidence"], 100)
         self.assertTrue(payload["condition"])
@@ -249,8 +257,8 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertEqual(len(payload["alternatives"]), 3)
         self.assertTrue(payload["recommendation"])
         self.assertIn("marketSummary", payload)
-        self.assertGreaterEqual(payload["marketSummary"]["salesCount"], 1)
-        self.assertGreaterEqual(len(payload["comparableSales"]), 1)
+        self.assertEqual(payload["marketSummary"]["salesCount"], 0)
+        self.assertEqual(len(payload["comparableSales"]), 0)
         self.assertEqual(payload["timestamp"], "2026-06-30T09:00:00Z")
         self.assertIn(payload["confidenceLevel"], ["High", "Medium", "Low"])
         self.assertIsInstance(payload["fieldConfidence"], dict)
@@ -298,7 +306,7 @@ class ApiEndpointsTest(unittest.TestCase):
         ):
             response = self.client.post(
                 "/api/analyze",
-                json=_api_analyze_payload(),
+                json=_api_analyze_payload(base64_image=True),
             )
 
         self.assertEqual(response.status_code, 503)
@@ -370,8 +378,9 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertEqual(payload["confidence"], 94)
         self.assertEqual(payload["aiReview"]["primaryMatch"], payload["itemName"])
         self.assertEqual(len(payload["alternatives"]), 3)
-        self.assertGreaterEqual(payload["marketSummary"]["salesCount"], 1)
-        self.assertEqual(payload["comparableSales"][0]["currency"], "AUD")
+        self.assertEqual(payload["marketSummary"]["salesCount"], 0)
+        self.assertEqual(payload["valuationStatus"], "provider_not_configured")
+        self.assertEqual(payload["comparableSales"], [])
         self.assertEqual(payload["confidenceLevel"], "High")
         self.assertEqual(payload["fieldConfidence"]["itemName"], 96)
         self.assertEqual(payload["imageQualityIssues"], ["none"])
@@ -395,13 +404,14 @@ class ApiEndpointsTest(unittest.TestCase):
                 environment="sit",
                 gemini_api_key="",
                 openai_api_key="test-key",
+                allow_mock_analyzer=False,
             ),
         ):
             provider = BackendAnalyzerService()._resolve_provider()
 
         self.assertIsInstance(provider, AutoAnalyzerProvider)
 
-    def test_backend_analyzer_sit_mock_without_real_key_keeps_mock_provider(self) -> None:
+    def test_backend_analyzer_sit_mock_without_real_key_returns_config_error(self) -> None:
         with patch(
             "app.services.analyzer.backend_analyzer_service.settings",
             SimpleNamespace(
@@ -409,6 +419,23 @@ class ApiEndpointsTest(unittest.TestCase):
                 environment="sit",
                 gemini_api_key="",
                 openai_api_key="",
+                allow_mock_analyzer=False,
+            ),
+        ):
+            with self.assertRaises(AnalyzerPipelineError) as context:
+                BackendAnalyzerService()._resolve_provider()
+
+        self.assertEqual(context.exception.code, "AI_PROVIDER_NOT_CONFIGURED")
+
+    def test_backend_analyzer_sit_mock_allowed_only_when_explicit(self) -> None:
+        with patch(
+            "app.services.analyzer.backend_analyzer_service.settings",
+            SimpleNamespace(
+                ai_provider="mock",
+                environment="sit",
+                gemini_api_key="",
+                openai_api_key="",
+                allow_mock_analyzer=True,
             ),
         ):
             provider = BackendAnalyzerService()._resolve_provider()
@@ -423,6 +450,7 @@ class ApiEndpointsTest(unittest.TestCase):
                 environment="sit",
                 gemini_api_key="test-key",
                 openai_api_key="",
+                allow_mock_analyzer=False,
             ),
         ):
             provider = BackendAnalyzerService()._resolve_provider()
@@ -507,6 +535,33 @@ class ApiEndpointsTest(unittest.TestCase):
             "openai",
         )
 
+    def test_api_analyze_real_provider_rejects_missing_image_bytes(self) -> None:
+        gemini_client = _FakeGeminiClient(
+            response=_FakeOpenAIResponse(
+                body=_gemini_response(_openai_output(title="Should Not Run"))
+            )
+        )
+        provider = AutoAnalyzerProvider(
+            providers=[
+                GeminiRecognitionProvider(
+                    api_key="gemini-key",
+                    client=gemini_client,
+                )
+            ],
+            allow_mock_fallback=False,
+        )
+
+        with patch(
+            "app.services.analyzer.backend_analyzer_service.BackendAnalyzerService._resolve_provider",
+            return_value=provider,
+        ):
+            response = self.client.post("/analyze", json=_api_analyze_payload())
+
+        self.assertEqual(response.status_code, 422)
+        error = response.json()["error"]
+        self.assertEqual(error["code"], "INVALID_IMAGE_PAYLOAD")
+        self.assertIsNone(gemini_client.last_request)
+
     def test_api_analyze_auto_provider_handles_unknown_low_confidence(self) -> None:
         provider = AutoAnalyzerProvider(
             providers=[
@@ -550,12 +605,48 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertIn("blurry image", payload["imageQualityIssues"])
         self.assertEqual(payload["diagnostics"]["aiProvider"], "gemini")
 
-    def test_api_analyze_auto_provider_falls_back_with_reason(self) -> None:
+    def test_api_analyze_auto_provider_returns_error_without_mock_fallback(self) -> None:
         provider = AutoAnalyzerProvider(
             providers=[
                 GeminiRecognitionProvider(api_key=""),
                 OpenAIRecognitionProvider(api_key=""),
-            ]
+            ],
+            allow_mock_fallback=False,
+        )
+
+        with patch(
+            "app.services.analyzer.backend_analyzer_service.BackendAnalyzerService._resolve_provider",
+            return_value=provider,
+        ):
+            response = self.client.post(
+                "/analyze",
+                json=_api_analyze_payload(base64_image=True),
+            )
+
+        self.assertEqual(response.status_code, 503)
+        error = response.json()["error"]
+        self.assertEqual(error["code"], "AI_PROVIDER_NOT_CONFIGURED")
+        provider_errors = error["details"]["providerErrors"]
+        self.assertTrue(
+            any(
+                message.startswith("gemini:AIProviderNotConfiguredError")
+                for message in provider_errors
+            ),
+        )
+        self.assertTrue(
+            any(
+                message.startswith("openai:AIProviderNotConfiguredError")
+                for message in provider_errors
+            ),
+        )
+
+    def test_api_analyze_auto_provider_can_fallback_to_mock_when_explicit(self) -> None:
+        provider = AutoAnalyzerProvider(
+            providers=[
+                GeminiRecognitionProvider(api_key=""),
+                OpenAIRecognitionProvider(api_key=""),
+            ],
+            allow_mock_fallback=True,
         )
 
         with patch(
@@ -570,11 +661,10 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["diagnostics"]["aiProvider"], "mock")
-        selection = payload["rawProviderPayload"]["providerSelection"]
-        self.assertEqual(selection["selectedProvider"], "mock")
-        self.assertIn("gemini:AIProviderNotConfiguredError", selection["fallbackReason"])
-        self.assertIn("openai:AIProviderNotConfiguredError", selection["fallbackReason"])
-        self.assertIn("mockSelection", selection)
+        self.assertEqual(
+            payload["rawProviderPayload"]["providerSelection"]["selectedProvider"],
+            "mock",
+        )
 
     def test_api_analyze_gemini_mapping_handles_missing_fields_safely(self) -> None:
         provider = FallbackAnalyzerProvider(
@@ -662,7 +752,9 @@ class ApiEndpointsTest(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["itemName"], "Australian $2 Coin")
         self.assertEqual(body["faceValue"], 2)
-        self.assertEqual(body["estimatedMarketValue"], 12)
+        self.assertIsNone(body["estimatedMarketValue"])
+        self.assertEqual(body["aiEstimatedValue"], 12)
+        self.assertEqual(body["valuationStatus"], "provider_not_configured")
         self.assertEqual(body["rawProviderPayload"]["photosUsed"], 2)
         self.assertEqual(body["rawProviderPayload"]["photoRoles"], ["front", "back"])
         sent_parts = gemini_client.last_request["json"]["contents"][0]["parts"]
@@ -712,7 +804,8 @@ class ApiEndpointsTest(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["faceValue"], 2)
         self.assertEqual(body["estimatedValue"], 0)
-        self.assertEqual(body["estimatedMarketValue"], 0)
+        self.assertIsNone(body["estimatedMarketValue"])
+        self.assertEqual(body["valuationStatus"], "provider_not_configured")
         self.assertIn("reverse", " ".join(body["scanRecommendations"]).lower())
 
     def test_api_analyze_response_contract_keys_remain_unchanged(self) -> None:
@@ -740,6 +833,9 @@ class ApiEndpointsTest(unittest.TestCase):
                 "rawProviderPayload",
                 "faceValue",
                 "estimatedMarketValue",
+                "aiEstimatedValue",
+                "valuationStatus",
+                "valuationSource",
                 "askingPriceWarning",
                 "valuationConfidence",
                 "lowEstimate",
@@ -763,6 +859,73 @@ class ApiEndpointsTest(unittest.TestCase):
                 "diagnostics",
             },
         )
+
+    def test_api_analyze_successful_identification_without_pricing_provider(self) -> None:
+        response = self.client.post("/analyze", json=_api_analyze_payload())
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["valuationStatus"], "provider_not_configured")
+        self.assertEqual(payload["valuationSource"], "not_configured")
+        self.assertGreater(payload["aiEstimatedValue"], 0)
+        self.assertIsNone(payload["estimatedMarketValue"])
+        self.assertEqual(payload["marketSummary"]["salesCount"], 0)
+        self.assertEqual(payload["comparableSales"], [])
+
+    def test_api_analyze_market_estimated_value_from_pricing_provider(self) -> None:
+        with patch("app.routers.api_analyze.settings", _settings_with_pricing("ebay")), patch(
+            "app.routers.api_analyze.get_pricing_provider",
+            return_value=_FakePricingProvider(),
+        ):
+            response = self.client.post("/analyze", json=_api_analyze_payload())
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["valuationStatus"], "market_estimated")
+        self.assertEqual(payload["valuationSource"], "eBay sold comps")
+        self.assertEqual(payload["estimatedMarketValue"], 42)
+        self.assertEqual(payload["estimatedValue"], 42)
+        self.assertEqual(payload["marketSummary"]["salesCount"], 1)
+
+    def test_api_analyze_no_market_match_status(self) -> None:
+        with patch("app.routers.api_analyze.settings", _settings_with_pricing("ebay")), patch(
+            "app.routers.api_analyze.get_pricing_provider",
+            return_value=_FailingPricingProvider(EmptyMarketDataError("no comps")),
+        ):
+            response = self.client.post("/analyze", json=_api_analyze_payload())
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["valuationStatus"], "no_market_match")
+        self.assertEqual(payload["valuationSource"], "ebay")
+        self.assertIsNone(payload["estimatedMarketValue"])
+
+    def test_api_analyze_pricing_lookup_failed_status(self) -> None:
+        with patch("app.routers.api_analyze.settings", _settings_with_pricing("ebay")), patch(
+            "app.routers.api_analyze.get_pricing_provider",
+            return_value=_FailingPricingProvider(PricingProviderError("upstream failed")),
+        ):
+            response = self.client.post("/analyze", json=_api_analyze_payload())
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["valuationStatus"], "lookup_failed")
+        self.assertEqual(payload["valuationSource"], "ebay")
+        self.assertIsNone(payload["estimatedMarketValue"])
+
+    def test_api_analyze_pricing_provider_not_configured_status(self) -> None:
+        with patch("app.routers.api_analyze.settings", _settings_with_pricing("ebay")), patch(
+            "app.routers.api_analyze.get_pricing_provider",
+            return_value=_FailingPricingProvider(
+                PricingProviderUnavailableError("EBAY_ACCESS_TOKEN is missing")
+            ),
+        ):
+            response = self.client.post("/analyze", json=_api_analyze_payload())
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["valuationStatus"], "provider_not_configured")
+        self.assertEqual(payload["valuationSource"], "ebay")
 
     def test_api_analyze_openai_invalid_json_returns_safe_error(self) -> None:
         provider = OpenAIRecognitionProvider(
@@ -1048,6 +1211,58 @@ def _valid_png_bytes() -> bytes:
 
 def _valid_jpeg_bytes() -> bytes:
     return b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+
+
+def _settings_with_pricing(provider: str):
+    return SimpleNamespace(
+        environment="test",
+        ai_provider="mock",
+        allow_mock_analyzer=True,
+        pricing_provider=provider,
+    )
+
+
+class _FakePricingProvider:
+    provider_name = "fake_market"
+
+    def price(self, recognition) -> PricingResult:
+        return PricingResult(
+            estimatedMarketValue=42,
+            lowEstimate=35,
+            highEstimate=50,
+            currency="AUD",
+            pricingSource="eBay sold comps",
+            pricingConfidence=82,
+            lastUpdated=utc_timestamp(),
+            valuationStatus="market_estimated",
+            valuationSource="eBay sold comps",
+            aiEstimatedValue=recognition.estimatedValue,
+            comparableSales=[
+                MarketComparableSale(
+                    source="eBay sold comps",
+                    title=f"{recognition.title} sold listing",
+                    soldPrice=42,
+                    currency="AUD",
+                    soldDate="2026-07-01T00:00:00Z",
+                    condition=recognition.condition,
+                )
+            ],
+            providerDiagnostics={
+                "providerCount": "1",
+                "providers": "eBay sold comps",
+                "comparableCount": "1",
+            },
+        )
+
+
+class _FailingPricingProvider:
+    provider_name = "failing_market"
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def price(self, recognition):
+        raise self._error
 
 
 def _openai_output(

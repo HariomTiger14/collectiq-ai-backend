@@ -60,9 +60,6 @@ Copy `.env.example` to `.env`.
 ```text
 AI_PROVIDER=mock
 PRICING_PROVIDER=mock
-GEMINI_API_KEY=
-GEMINI_MODEL=gemini-2.5-flash
-GEMINI_TIMEOUT_SECONDS=30
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-4.1-mini
 OPENAI_TIMEOUT_SECONDS=30
@@ -82,9 +79,9 @@ PRICING_PROVIDER_MIN_INTERVAL_MS=250
 ```
 
 For v1.0 preparation, keep `AI_PROVIDER=mock` until the production backend AI
-provider is intentionally enabled. For SIT real analysis, use `AI_PROVIDER=auto`
-with `GEMINI_API_KEY` configured server-side. `OPENAI_API_KEY` can remain
-configured as a backup provider. Do not commit real secrets.
+provider is intentionally enabled. If `AI_PROVIDER=openai` is selected without
+`OPENAI_API_KEY`, `/api/analyze` returns a safe `ai_provider_not_configured`
+error instead of making a provider call. Do not commit real secrets.
 
 ## POST /api/analyze
 
@@ -116,15 +113,8 @@ The MVP returns mock recognition and mock pricing data shaped like Flutter's
 Provider selection:
 
 - `AI_PROVIDER=mock`: default, no external calls.
-- `AI_PROVIDER=auto`: tries Gemini first, then OpenAI, then deterministic mock
-  fallback.
-- `AI_PROVIDER=gemini`: tries Gemini Vision first, then deterministic mock
-  fallback if unavailable.
-- `AI_PROVIDER=openai`: tries OpenAI Vision first, then deterministic mock
-  fallback if unavailable.
-
-Keep `GEMINI_API_KEY` and `OPENAI_API_KEY` server-side in `backend/.env` or the
-hosting provider secret store only.
+- `AI_PROVIDER=openai`: OpenAI Vision provider path. Requires
+  `OPENAI_API_KEY`; keep this key server-side in `backend/.env` only.
 
 Pricing selection:
 
@@ -166,19 +156,16 @@ The prompt also asks OpenAI to:
   dark image, low resolution, and multiple collectibles in one photo;
 - return actionable scan recommendations.
 
-### Enable Real AI Locally
+### Enable OpenAI Locally
 
-Gemini and OpenAI are opt-in and may incur API cost. Keep mock mode for normal
-development and tests.
+OpenAI is opt-in and may incur API cost. Keep mock mode for normal development
+and tests.
 
 1. Copy `.env.example` to `.env`.
 2. Set:
 
 ```text
-AI_PROVIDER=auto
-GEMINI_API_KEY=<server-side-gemini-key>
-GEMINI_MODEL=gemini-2.5-flash
-GEMINI_TIMEOUT_SECONDS=30
+AI_PROVIDER=openai
 OPENAI_API_KEY=<server-side-openai-key>
 OPENAI_MODEL=gpt-4.1-mini
 OPENAI_TIMEOUT_SECONDS=30
@@ -190,8 +177,8 @@ OPENAI_TIMEOUT_SECONDS=30
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Never pass `GEMINI_API_KEY` or `OPENAI_API_KEY` to Flutter with `--dart-define`,
-local storage, or source code. Flutter should only know the CollectIQ backend URL.
+Never pass `OPENAI_API_KEY` to Flutter with `--dart-define`, local storage, or
+source code. Flutter should only know the CollectIQ backend URL.
 
 ### Confidence Interpretation
 

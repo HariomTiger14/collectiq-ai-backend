@@ -9,7 +9,7 @@ from app.services.auth.signup_start_guard import (
 )
 
 
-router = APIRouter(prefix="/auth", tags=["Auth"])
+router = APIRouter(prefix="/auth", tags=["auth"])
 _throttle = SignupStartThrottle()
 
 

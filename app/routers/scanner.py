@@ -20,6 +20,15 @@ from app.services.ai.openai_recognition_provider import (
     OpenAITimeoutError,
 )
 from app.services.ai.provider_factory import get_ai_recognition_provider
+from app.services.pricing.base_pricing_provider import (
+    EmptyMarketDataError,
+    PricingProviderError,
+    PricingProviderRateLimitError,
+    PricingProviderTimeoutError,
+    PricingProviderUnavailableError,
+    PricingResult,
+    utc_timestamp,
+)
 from app.services.pricing.provider_factory import get_pricing_provider
 
 
@@ -75,7 +84,6 @@ async def analyze_scanner_image(
     image_url = str(request.url_for("uploads", path=filename))
     try:
         recognition = get_ai_recognition_provider().recognize(destination)
-        pricing = get_pricing_provider().price(recognition)
     except ValueError as exc:
         destination.unlink(missing_ok=True)
         raise HTTPException(
@@ -106,6 +114,19 @@ async def analyze_scanner_image(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=str(exc),
         ) from exc
+    try:
+        pricing = get_pricing_provider().price(recognition)
+    except PricingProviderUnavailableError as exc:
+        pricing = _pricing_placeholder("provider_not_configured", "not_configured", str(exc))
+    except EmptyMarketDataError as exc:
+        pricing = _pricing_placeholder("no_market_match", "auto", str(exc))
+    except (
+        PricingProviderTimeoutError,
+        PricingProviderRateLimitError,
+        PricingProviderError,
+        ValueError,
+    ) as exc:
+        pricing = _pricing_placeholder("lookup_failed", "auto", str(exc))
     logger.info(
         "Scanner analysis completed filename=%s processingTimeMs=%s aiProvider=%s",
         filename,
@@ -120,7 +141,7 @@ async def analyze_scanner_image(
         title=recognition.title,
         category=recognition.category,
         confidence=recognition.confidence,
-        estimatedValue=pricing.estimatedMarketValue,
+        estimatedValue=pricing.estimatedMarketValue or recognition.estimatedValue,
         condition=recognition.condition,
         recommendation=recognition.recommendation,
         description=recognition.description,
@@ -165,5 +186,36 @@ async def analyze_scanner_image(
             "pricingSource": pricing.pricingSource,
             "pricingConfidence": pricing.pricingConfidence,
             "lastUpdated": pricing.lastUpdated,
+        },
+    )
+
+
+def _pricing_placeholder(status: str, source: str, reason: str) -> PricingResult:
+    return PricingResult(
+        estimatedMarketValue=0,
+        lowEstimate=0,
+        highEstimate=0,
+        currency="AUD",
+        pricingSource=source,
+        pricingConfidence=0,
+        lastUpdated=utc_timestamp(),
+        valuationStatus=status,
+        valuationSource=source,
+        marketTrend="Unknown",
+        sourceCount=0,
+        pricingAge="unknown",
+        comparableSales=[],
+        fallbackUsed=False,
+        cacheStatus="unavailable",
+        providerDiagnostics={
+            "providerCount": "0",
+            "providers": source,
+            "fallbackUsed": "false",
+            "fallbackReason": reason,
+            "cacheStatus": "unavailable",
+            "responseTimeMs": "0",
+            "comparableCount": "0",
+            "confidenceCalculation": reason,
+            "priceExplanation": reason,
         },
     )

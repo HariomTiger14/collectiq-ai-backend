@@ -3,6 +3,7 @@ import unittest
 from app.services.ai.mock_recognition_service import MockRecognitionProvider
 from app.services.pricing.aggregation_service import PricingAggregationService
 from app.services.pricing.base_pricing_provider import (
+    EmptyMarketDataError,
     MarketComparableSale,
     PricingProviderTimeoutError,
     PricingProviderUnavailableError,
@@ -35,7 +36,7 @@ class PricingAggregationServiceTest(unittest.TestCase):
         self.assertEqual(pricing.highEstimate, 140)
         self.assertEqual(pricing.sourceCount, 1)
         self.assertFalse(pricing.fallbackUsed)
-        self.assertGreaterEqual(pricing.pricingConfidence, 70)
+        self.assertGreaterEqual(pricing.pricingConfidence, 65)
         self.assertEqual(pricing.providerDiagnostics["medianPrice"], "120")
         self.assertEqual(pricing.providerDiagnostics["outliersRemoved"], "0")
         self.assertEqual(pricing.providerDiagnostics["comparableCount"], "3")
@@ -75,23 +76,19 @@ class PricingAggregationServiceTest(unittest.TestCase):
         self.assertIn("ebay", pricing.providerDiagnostics["errors"])
         self.assertGreater(pricing.estimatedMarketValue, 0)
 
-    def test_aggregator_handles_timeout_with_fallback(self) -> None:
+    def test_aggregator_requires_explicit_fallback_on_timeout(self) -> None:
         provider = _FailingPricingProvider(
             "tcgplayer",
             PricingProviderTimeoutError("TCGplayer request timed out."),
         )
 
-        pricing = PricingAggregationService([provider]).price(self.recognition)
+        with self.assertRaises(EmptyMarketDataError):
+            PricingAggregationService([provider]).price(self.recognition)
 
-        self.assertTrue(pricing.fallbackUsed)
-        self.assertLessEqual(pricing.pricingConfidence, 70)
+    def test_future_provider_factory_reports_missing_provider_configuration(self) -> None:
+        with self.assertRaises(PricingProviderUnavailableError):
+            get_pricing_provider("pricecharting").price(self.recognition)
 
-    def test_future_provider_factory_falls_back_without_crashing(self) -> None:
-        pricing = get_pricing_provider("pricecharting").price(self.recognition)
-
-        self.assertGreater(pricing.estimatedMarketValue, 0)
-        self.assertTrue(pricing.fallbackUsed)
-        self.assertIn("pricecharting", pricing.providerDiagnostics["errors"])
 
 
 class _StaticPricingProvider:

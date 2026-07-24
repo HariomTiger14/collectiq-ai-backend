@@ -42,7 +42,7 @@ class AuthSignupStartGuardTest(unittest.TestCase):
         self.assertNotIn("secret", serialized)
         self.assertNotIn("token", serialized)
 
-    def test_confirmed_existing_email_is_blocked_ambiguously(self) -> None:
+    def test_existing_email_is_blocked_ambiguously(self) -> None:
         with patch(
             "app.routers.auth.SupabaseSignupStartGuard",
             return_value=SimpleNamespace(
@@ -62,7 +62,7 @@ class AuthSignupStartGuardTest(unittest.TestCase):
         self.assertNotIn("exists", json.dumps(payload).lower())
         self.assertNotIn("registered", json.dumps(payload).lower())
 
-    def test_config_or_supabase_failure_is_retryable(self) -> None:
+    def test_config_or_backend_failure_is_retryable(self) -> None:
         def fail(email):
             raise SignupStartGuardError("Supabase admin lookup failed.")
 
@@ -149,3 +149,7 @@ class AuthSignupStartGuardTest(unittest.TestCase):
         decision = guard.start(email="new@example.com")
 
         self.assertTrue(decision.safe_for_account_creation)
+
+
+if __name__ == "__main__":
+    unittest.main()

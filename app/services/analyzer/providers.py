@@ -1,28 +1,11 @@
 from pathlib import Path
-import logging
-import re
-import time
 from typing import Protocol
 
-from app.core.config import settings
 from app.services.ai.base_recognition_service import RecognitionResult
-from app.services.ai.gemini_recognition_provider import (
-    GeminiInvalidResponseError,
-    GeminiProviderError,
-    GeminiRecognitionProvider,
-    GeminiTimeoutError,
-)
+from app.services.ai.gemini_recognition_provider import GeminiRecognitionProvider
 from app.services.ai.mock_recognition_service import MockRecognitionProvider
-from app.services.ai.openai_recognition_provider import (
-    AIProviderNotConfiguredError,
-    OpenAIInvalidResponseError,
-    OpenAIProviderError,
-    OpenAIRecognitionProvider,
-    OpenAITimeoutError,
-)
-
-
-logger = logging.getLogger("collectiq.analyzer.providers")
+from app.services.ai.openai_recognition_provider import OpenAIRecognitionProvider
+from app.services.analyzer.errors import AnalyzerPipelineError
 
 
 class BackendAnalyzerProvider(Protocol):
@@ -77,10 +60,6 @@ class OpenAIAnalyzerProvider:
             image_payload=image_payload,
         )
 
-    @property
-    def _model(self) -> str:
-        return getattr(self._delegate, "_model", "openai")
-
 
 class GeminiAnalyzerProvider:
     provider_name = "gemini"
@@ -99,34 +78,26 @@ class GeminiAnalyzerProvider:
             image_payload=image_payload,
         )
 
-    @property
-    def _model(self) -> str:
-        return getattr(self._delegate, "_model", "gemini")
 
-
-class FallbackAnalyzerProvider:
+class AutoAnalyzerProvider:
     provider_name = "auto"
 
     def __init__(
         self,
         *,
-        requested_provider: str,
         providers: list[BackendAnalyzerProvider],
-        fallback_provider: MockAnalyzerProvider | None = None,
+        requested_provider: str = "auto",
+        confidence_threshold: int = 0,
+        allow_mock_fallback: bool = False,
     ) -> None:
-        self._requested_provider = requested_provider
         self._providers = providers
-        self._fallback_provider = fallback_provider or MockAnalyzerProvider()
-        self._selected_provider_name = requested_provider
-        self._selected_model = requested_provider
-        self._fallback_reason: str | None = None
+        self._requested_provider = requested_provider
+        self._confidence_threshold = max(0, min(100, confidence_threshold))
+        self._allow_mock_fallback = allow_mock_fallback
         self._selection_diagnostics: dict[str, object] = {
-            "requestedProvider": requested_provider,
-            "preferredOrder": [
-                getattr(provider, "provider_name", "unknown")
-                for provider in providers
-            ]
-            + ["mock"],
+            "requestedProvider": self._requested_provider,
+            "preferredOrder": [item.provider_name for item in self._providers]
+            + ([MockAnalyzerProvider.provider_name] if allow_mock_fallback else []),
         }
 
     def recognize_api_payload(
@@ -135,128 +106,81 @@ class FallbackAnalyzerProvider:
         request_metadata: dict,
         image_payload: dict,
     ) -> RecognitionResult:
-        errors: list[str] = []
+        attempts: list[dict[str, object]] = []
+        provider_errors: list[str] = []
         for provider in self._providers:
-            started_at = time.perf_counter()
             try:
-                recognition = provider.recognize_api_payload(
+                result = provider.recognize_api_payload(
                     request_metadata=request_metadata,
                     image_payload=image_payload,
                 )
-            except _FALLBACK_PROVIDER_ERRORS as exc:
-                provider_name = getattr(provider, "provider_name", "unknown")
-                errors.append(f"{provider_name}:{_safe_exception_summary(exc)}")
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "Analyzer provider failed provider=%s fallbackReason=%s",
-                        provider_name,
-                        _safe_exception_summary(exc),
-                    )
-                continue
-
-            duration_ms = int((time.perf_counter() - started_at) * 1000)
-            self._selected_provider_name = getattr(
-                provider,
-                "provider_name",
-                recognition.aiProvider,
-            )
-            self._selected_model = getattr(provider, "_model", "unknown")
-            self._selection_diagnostics = {
-                "requestedProvider": self._requested_provider,
-                "selectedProvider": self._selected_provider_name,
-                "model": self._selected_model,
-                "analysisDurationMs": duration_ms,
-                "confidence": recognition.confidence,
-            }
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "Analyzer provider selected=%s model=%s latencyMs=%s confidence=%s",
-                    self._selected_provider_name,
-                    self._selected_model,
-                    duration_ms,
-                    recognition.confidence,
+                attempts.append(
+                    {
+                        "provider": provider.provider_name,
+                        "status": "completed",
+                        "confidence": result.confidence,
+                    }
                 )
-            return recognition
+                self._selection_diagnostics = {
+                    "selectedProvider": provider.provider_name,
+                    "requestedProvider": self._requested_provider,
+                    "fallbackUsed": len(attempts) > 1,
+                    "attempts": attempts,
+                    "preferredOrder": [item.provider_name for item in self._providers],
+                    "confidenceThreshold": self._confidence_threshold,
+                }
+                return result
+            except AnalyzerPipelineError:
+                raise
+            except Exception as exc:
+                provider_errors.append(
+                    f"{provider.provider_name}:{exc.__class__.__name__}: {exc}"
+                )
+                attempts.append(
+                    {
+                        "provider": provider.provider_name,
+                        "status": "failed",
+                        "error": exc.__class__.__name__,
+                    }
+                )
 
-        self._fallback_reason = ";".join(errors) or "provider_unavailable"
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "Analyzer provider fallback selectedProvider=mock fallbackReason=%s",
-                self._fallback_reason,
+        if self._allow_mock_fallback:
+            mock = MockAnalyzerProvider()
+            result = mock.recognize_api_payload(
+                request_metadata=request_metadata,
+                image_payload=image_payload,
             )
-        recognition = self._fallback_provider.recognize_api_payload(
-            request_metadata=request_metadata,
-            image_payload=image_payload,
+            attempts.append(
+                {
+                    "provider": mock.provider_name,
+                    "status": "completed",
+                    "confidence": result.confidence,
+                }
+            )
+            self._selection_diagnostics = {
+                "selectedProvider": mock.provider_name,
+                "requestedProvider": self._requested_provider,
+                "fallbackUsed": True,
+                "attempts": attempts,
+                "preferredOrder": [item.provider_name for item in self._providers]
+                + [mock.provider_name],
+            }
+            return result
+
+        raise AnalyzerPipelineError(
+            status_code=503,
+            code="AI_PROVIDER_NOT_CONFIGURED",
+            message="No configured AI provider could analyze this image.",
+            retryable=False,
+            details={"providerErrors": provider_errors},
         )
-        self._selected_provider_name = self._fallback_provider.provider_name
-        self._selected_model = getattr(self._fallback_provider, "_model", "mock")
-        self._selection_diagnostics = {
-            "requestedProvider": self._requested_provider,
-            "selectedProvider": self._selected_provider_name,
-            "fallbackReason": self._fallback_reason,
-            "mockSelection": self._fallback_provider.selection_diagnostics,
-        }
-        return recognition
-
-    @property
-    def provider_name(self) -> str:
-        return self._selected_provider_name
-
-    @property
-    def _model(self) -> str:
-        return self._selected_model
 
     @property
     def selection_diagnostics(self) -> dict[str, object]:
         return self._selection_diagnostics
 
 
-class AutoAnalyzerProvider(FallbackAnalyzerProvider):
-    def __init__(
-        self,
-        *,
-        providers: list[BackendAnalyzerProvider] | None = None,
-        fallback_provider: MockAnalyzerProvider | None = None,
-    ) -> None:
-        super().__init__(
-            requested_provider="auto",
-            providers=providers or [GeminiAnalyzerProvider(), OpenAIAnalyzerProvider()],
-            fallback_provider=fallback_provider,
-        )
-
-
-_FALLBACK_PROVIDER_ERRORS = (
-    AIProviderNotConfiguredError,
-    GeminiInvalidResponseError,
-    GeminiProviderError,
-    GeminiTimeoutError,
-    OpenAIInvalidResponseError,
-    OpenAIProviderError,
-    OpenAITimeoutError,
-)
-
-
-def _safe_exception_summary(exc: Exception) -> str:
-    message = _sanitize_error_text(str(exc).strip())
-    error_type = type(exc).__name__
-    if not message:
-        return error_type
-    return f"{error_type}:{message}"
-
-
-def _sanitize_error_text(message: str) -> str:
-    sanitized = message
-    for secret in (settings.gemini_api_key, settings.openai_api_key):
-        if secret and len(secret) >= 8:
-            sanitized = sanitized.replace(secret, "<redacted>")
-
-    sanitized = re.sub(
-        r"(?i)(key|api_key|token|access_token)=([^&\s]+)",
-        r"\1=<redacted>",
-        sanitized,
-    )
-    sanitized = re.sub(r"[A-Za-z0-9+/]{160,}={0,2}", "<redacted>", sanitized)
-    return sanitized[:500]
+FallbackAnalyzerProvider = AutoAnalyzerProvider
 
 
 def recognize_with_legacy_provider(

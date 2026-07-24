@@ -16,6 +16,7 @@ from app.schemas.api_analysis import (
     ApiMarketSummaryResponse,
     ApiReviewResponse,
 )
+from app.core.config import settings
 from app.services.ai.openai_recognition_provider import (
     AIProviderNotConfiguredError,
     OpenAIInvalidResponseError,
@@ -31,12 +32,19 @@ from app.services.pricing.base_pricing_provider import (
     PricingProviderTimeoutError,
     PricingProviderUnavailableError,
 )
+from app.services.pricing.cache_policy import pricing_cache_policy
 from app.services.pricing.provider_factory import get_pricing_provider
+from app.services.pricing.shared_cache_repository import (
+    SharedPricingCacheError,
+    SharedPricingCacheRepository,
+    with_shared_cache_status,
+)
 
 
 router = APIRouter(prefix="/api", tags=["Analyze API"])
 root_router = APIRouter(tags=["Analyzer API"])
 logger = logging.getLogger("collectiq.api.analyze")
+_shared_pricing_cache = SharedPricingCacheRepository()
 
 SUPPORTED_CATEGORIES = {
     "pokemon",
@@ -70,18 +78,49 @@ async def analyze_collectible(payload: ApiAnalyzeRequest) -> ApiAnalyzeResponse:
 )
 async def analyze_collectible_root(request: Request) -> ApiAnalyzeResponse:
     payload = await _payload_from_request(request)
-    return await _analyze_collectible(payload)
+    return await _analyze_collectible(
+        payload,
+        request_payload_type=request.headers.get("content-type", "application/json"),
+    )
 
 
-async def _analyze_collectible(payload: ApiAnalyzeRequest) -> ApiAnalyzeResponse:
+async def _analyze_collectible(
+    payload: ApiAnalyzeRequest,
+    *,
+    request_payload_type: str = "application/json",
+) -> ApiAnalyzeResponse:
     _validate_contract(payload)
     started_at = time.perf_counter()
+    trace_id = _trace_id_for(payload)
+    logger.info(
+        "analyze request traceId=%s environment=%s aiProvider=%s "
+        "allowMockAnalyzer=%s payloadType=%s images=%s",
+        trace_id,
+        settings.environment,
+        settings.ai_provider,
+        settings.allow_mock_analyzer,
+        _safe_payload_type(request_payload_type),
+        _image_trace_details(payload),
+    )
 
     try:
         pipeline_result = BackendAnalyzerService().analyze(payload)
         provider = pipeline_result.provider
         recognition = pipeline_result.recognition
-        pricing = get_pricing_provider().price(recognition)
+        pricing = _price_recognition(recognition, trace_id=trace_id)
+        logger.info(
+            "analyze response traceId=%s selectedAnalyzerProvider=%s "
+            "aiProvider=%s itemName=%s confidence=%s valuationStatus=%s "
+            "valuationSource=%s finalValue=%s",
+            trace_id,
+            getattr(provider, "provider_name", "unknown"),
+            getattr(recognition, "aiProvider", "unknown"),
+            recognition.title,
+            recognition.confidence,
+            pricing.valuationStatus,
+            pricing.valuationSource,
+            pricing.estimatedMarketValue,
+        )
     except AnalyzerPipelineError as exc:
         raise _api_error(
             exc.status_code,
@@ -212,13 +251,36 @@ async def _analyze_collectible(payload: ApiAnalyzeRequest) -> ApiAnalyzeResponse
             diagnostics.pricingFallbackReason or "",
         )
 
-    estimated_market_value = (
-        recognition.estimatedMarketValue
-        if recognition.estimatedMarketValue is not None
-        else pricing.estimatedMarketValue
+    ai_estimated_value = recognition.estimatedValue if recognition.estimatedValue > 0 else None
+    market_estimated_value = (
+        pricing.estimatedMarketValue if pricing.valuationStatus == "market_estimated" else None
     )
-    low_estimate = 0 if estimated_market_value == 0 else pricing.lowEstimate
-    high_estimate = 0 if estimated_market_value == 0 else pricing.highEstimate
+    display_value = market_estimated_value or ai_estimated_value or 0
+    low_estimate = pricing.lowEstimate if market_estimated_value else 0
+    high_estimate = pricing.highEstimate if market_estimated_value else 0
+    valuation_strategy = (
+        "sold_completed" if market_estimated_value else "unavailable"
+    )
+    reason_code = (
+        None
+        if market_estimated_value
+        else (
+            diagnostics.pricingFallbackReason
+            or pricing.valuationStatus.upper()
+        )
+    )
+    display_string = (
+        f"${display_value:,.2f} {pricing.currency}" if display_value else None
+    )
+    attribution_text = (
+        f"Pricing data powered by {diagnostics.pricingProvider}"
+        if market_estimated_value and diagnostics.pricingProvider
+        else None
+    )
+    cache_policy = pricing_cache_policy(
+        category=recognition.category,
+        valuation_status=pricing.valuationStatus,
+    )
 
     return ApiAnalyzeResponse(
         id=f"backend-{uuid4()}",
@@ -229,8 +291,8 @@ async def _analyze_collectible(payload: ApiAnalyzeRequest) -> ApiAnalyzeResponse
         year=recognition.year,
         series=recognition.series,
         variant=recognition.edition,
-        estimatedValue=estimated_market_value,
-        estimated_value=estimated_market_value,
+        estimatedValue=display_value,
+        estimated_value=display_value,
         currency=pricing.currency,
         tags=recognition.detectedObjects,
         description=recognition.description,
@@ -238,6 +300,33 @@ async def _analyze_collectible(payload: ApiAnalyzeRequest) -> ApiAnalyzeResponse
         images=[],
         rawProviderPayload={
             "provider": diagnostics.aiProvider,
+            "pricingProvider": diagnostics.pricingProvider,
+            "pricingExplanation": diagnostics.pricingExplanation,
+            "pricingFallbackReason": diagnostics.pricingFallbackReason,
+            "reasonCode": reason_code,
+            "valuationStrategy": valuation_strategy,
+            "displayString": display_string,
+            "cachePolicy": {
+                "ttlSeconds": cache_policy.ttl_seconds,
+                "expiresAt": None,
+                "reason": cache_policy.reason,
+            },
+            "pricingSource": {
+                "name": diagnostics.pricingProvider,
+                "attributionText": attribution_text,
+                "lastChecked": pricing.lastUpdated,
+            },
+            "originalMarket": {
+                "price": display_value,
+                "currency": pricing.currency,
+                "exchangeRateUsed": 1,
+                "exchangeRateDate": pricing.lastUpdated,
+            },
+            "matchMetadata": {
+                "reason": diagnostics.pricingExplanation,
+                "lowEstimateAud": low_estimate,
+                "highEstimateAud": high_estimate,
+            },
             "pipelineStages": pipeline_result.stages,
             "photosUsed": len(pipeline_result.image_payloads),
             "photoRoles": [
@@ -247,9 +336,16 @@ async def _analyze_collectible(payload: ApiAnalyzeRequest) -> ApiAnalyzeResponse
             **_selection_diagnostics(provider),
         },
         faceValue=recognition.faceValue,
-        estimatedMarketValue=estimated_market_value,
+        estimatedMarketValue=market_estimated_value,
+        aiEstimatedValue=ai_estimated_value,
+        valuationStatus=pricing.valuationStatus,
+        valuationSource=pricing.valuationSource,
         askingPriceWarning=recognition.askingPriceWarning,
-        valuationConfidence=recognition.valuationConfidence,
+        valuationConfidence=(
+            pricing.pricingConfidence
+            if market_estimated_value
+            else recognition.valuationConfidence
+        ),
         lowEstimate=low_estimate,
         highEstimate=high_estimate,
         confidence=recognition.confidence,
@@ -400,6 +496,36 @@ def _api_error(
     )
 
 
+def _trace_id_for(payload: ApiAnalyzeRequest) -> str:
+    metadata = payload.request.deviceMetadata or {}
+    for key in ("scannerTraceId", "traceId", "requestId"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:80]
+    return str(uuid4())
+
+
+def _safe_payload_type(value: str) -> str:
+    return value.split(";", 1)[0].strip().lower() or "unknown"
+
+
+def _image_trace_details(payload: ApiAnalyzeRequest) -> list[dict]:
+    images = [*payload.images]
+    if payload.image is not None:
+        images.insert(0, payload.image)
+    return [
+        {
+            "fileName": image.fileName,
+            "mimeType": image.mimeType,
+            "sizeBytes": image.sizeBytes,
+            "imageRole": image.imageRole or "other",
+            "hasBase64Image": bool(image.base64Image),
+            "base64Length": len(image.base64Image or ""),
+        }
+        for image in images
+    ]
+
+
 def _optional_form_value(value) -> str | None:
     if value is None:
         return None
@@ -446,6 +572,163 @@ def _selection_diagnostics(provider) -> dict[str, object]:
     if isinstance(diagnostics, dict) and "seedSource" not in diagnostics:
         return {"providerSelection": diagnostics}
     return {"mockSelection": diagnostics}
+
+
+def _price_recognition(recognition, *, trace_id: str):
+    provider_name = settings.pricing_provider.strip().lower()
+    lookup_query = _pricing_lookup_query(recognition)
+    logger.info(
+        "pricing lookup traceId=%s itemName=%s category=%s manufacturer=%s "
+        "normalizedLookupQuery=%s attempted=%s selectedPricingProvider=%s",
+        trace_id,
+        recognition.title,
+        recognition.category,
+        recognition.brand or "",
+        lookup_query,
+        provider_name != "mock",
+        provider_name,
+    )
+    if provider_name == "mock":
+        result = _valuation_placeholder(
+            recognition,
+            status="provider_not_configured",
+            source="not_configured",
+            reason="PRICING_PROVIDER is mock; no real pricing source is connected.",
+        )
+        logger.info(
+            "pricing result traceId=%s status=%s provider=%s finalMarketValue=%s",
+            trace_id,
+            result.valuationStatus,
+            provider_name,
+            result.estimatedMarketValue,
+        )
+        return result
+
+    try:
+        cached_result = _shared_pricing_cache.get(recognition)
+    except SharedPricingCacheError as exc:
+        logger.warning(
+            "pricing shared cache read failed traceId=%s error=%s",
+            trace_id,
+            exc,
+        )
+        cached_result = None
+    if cached_result is not None:
+        logger.info(
+            "pricing shared cache hit traceId=%s itemName=%s cacheStatus=%s",
+            trace_id,
+            recognition.title,
+            cached_result.cacheStatus,
+        )
+        return cached_result
+
+    try:
+        result = get_pricing_provider().price(recognition)
+    except PricingProviderUnavailableError as exc:
+        result = _valuation_placeholder(
+            recognition,
+            status="provider_not_configured",
+            source="not_configured" if provider_name in {"auto", "real"} else provider_name,
+            reason=str(exc),
+        )
+    except EmptyMarketDataError as exc:
+        result = _valuation_placeholder(
+            recognition,
+            status="no_market_match",
+            source=provider_name,
+            reason=str(exc),
+        )
+    except (
+        PricingProviderTimeoutError,
+        PricingProviderRateLimitError,
+        PricingProviderError,
+        ValueError,
+    ) as exc:
+        result = _valuation_placeholder(
+            recognition,
+            status="lookup_failed",
+            source=provider_name,
+            reason=str(exc),
+        )
+    try:
+        _shared_pricing_cache.set(recognition, result)
+        result = with_shared_cache_status(result, "shared_miss")
+    except SharedPricingCacheError as exc:
+        logger.warning(
+            "pricing shared cache write failed traceId=%s error=%s",
+            trace_id,
+            exc,
+        )
+    logger.info(
+        "pricing result traceId=%s status=%s provider=%s source=%s "
+        "marketValue=%s confidence=%s comparableCount=%s",
+        trace_id,
+        result.valuationStatus,
+        provider_name,
+        result.valuationSource,
+        result.estimatedMarketValue,
+        result.pricingConfidence,
+        len(result.comparableSales),
+    )
+    return result
+
+
+def _valuation_placeholder(
+    recognition,
+    *,
+    status: str,
+    source: str,
+    reason: str,
+):
+    from app.services.pricing.base_pricing_provider import PricingResult, utc_timestamp
+
+    return PricingResult(
+        estimatedMarketValue=0,
+        lowEstimate=0,
+        highEstimate=0,
+        currency="AUD",
+        pricingSource=source,
+        pricingConfidence=0,
+        lastUpdated=utc_timestamp(),
+        valuationStatus=status,
+        valuationSource=source,
+        aiEstimatedValue=recognition.estimatedValue
+        if recognition.estimatedValue > 0
+        else None,
+        marketTrend="Unknown",
+        sourceCount=0,
+        pricingAge="unknown",
+        comparableSales=[],
+        fallbackUsed=False,
+        cacheStatus="unavailable",
+        providerDiagnostics={
+            "providerCount": "0",
+            "providers": source,
+            "fallbackUsed": "false",
+            "fallbackReason": reason,
+            "cacheStatus": "unavailable",
+            "responseTimeMs": "0",
+            "comparableCount": "0",
+            "confidenceCalculation": reason,
+            "priceExplanation": reason,
+        },
+    )
+
+
+def _pricing_lookup_query(recognition) -> str:
+    parts = [
+        recognition.title,
+        recognition.brand,
+        recognition.series,
+        recognition.year,
+        recognition.category,
+        recognition.condition,
+    ]
+    return " ".join(
+        part.strip()
+        for part in parts
+        if isinstance(part, str) and part.strip()
+    )
 
 
 def _field_confidence(recognition) -> dict[str, int]:
@@ -525,17 +808,7 @@ def _clamp_confidence(value: int) -> int:
 
 def _comparable_sales_from_pricing(pricing) -> list[ApiMarketCompResponse]:
     if not pricing.comparableSales:
-        return [
-            ApiMarketCompResponse(
-                source=pricing.pricingSource,
-                title="Market pricing reference",
-                soldPrice=max(1, pricing.estimatedMarketValue),
-                currency=pricing.currency,
-                soldDate=pricing.lastUpdated,
-                condition="Unknown",
-                url=None,
-            )
-        ]
+        return []
 
     return [
         ApiMarketCompResponse(
@@ -586,12 +859,14 @@ def _diagnostics_response(
     confidence_level: str,
     total_processing_time_ms: int,
 ) -> ApiAnalyzeDiagnosticsResponse:
+    provider_selection = getattr(provider, "selection_diagnostics", {}) or {}
+    selected_ai_provider = provider_selection.get("selectedProvider") or getattr(
+        provider,
+        "provider_name",
+        getattr(recognition, "aiProvider", "unknown"),
+    )
     return ApiAnalyzeDiagnosticsResponse(
-        aiProvider=getattr(
-            provider,
-            "provider_name",
-            getattr(recognition, "aiProvider", "unknown"),
-        ),
+        aiProvider=selected_ai_provider,
         aiModel=getattr(provider, "_model", "mock"),
         aiLatencyMs=_parse_int(
             getattr(recognition, "processingTimeMs", total_processing_time_ms),
@@ -635,6 +910,8 @@ def _diagnostics_response(
         pricingExplanation=pricing.providerDiagnostics.get("priceExplanation") or None,
         pricingComparableQuality=pricing.providerDiagnostics.get("comparableQuality")
         or None,
+        valuationStatus=pricing.valuationStatus,
+        valuationSource=pricing.valuationSource,
         confidenceLevel=confidence_level,
         totalLatencyMs=total_processing_time_ms,
     )

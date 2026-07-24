@@ -11,7 +11,6 @@ from app.services.pricing.base_pricing_provider import (
     PricingResult,
     utc_timestamp,
 )
-from app.services.pricing.mock_pricing_provider import MockPricingProvider
 from app.services.pricing.pricing_intelligence_engine import PricingConfidenceEngine
 
 
@@ -29,7 +28,7 @@ class PricingAggregationService:
         confidence_engine: PricingConfidenceEngine | None = None,
     ) -> None:
         self._providers = providers
-        self._fallback_provider = fallback_provider or MockPricingProvider()
+        self._fallback_provider = fallback_provider
         self._confidence_engine = confidence_engine or PricingConfidenceEngine()
 
     def price(self, recognition: RecognitionResult) -> PricingResult:
@@ -59,11 +58,19 @@ class PricingAggregationService:
 
         fallback_used = False
         if not provider_results:
+            if self._fallback_provider is None:
+                details = " | ".join(provider_errors)
+                message = "No pricing provider returned usable market data."
+                if details:
+                    message = f"{message} {details}"
+                raise EmptyMarketDataError(message)
             fallback_used = True
             try:
                 provider_results.append(self._fallback_provider.price(recognition))
             except Exception as exc:
-                raise EmptyMarketDataError("No pricing provider returned usable market data.") from exc
+                raise EmptyMarketDataError(
+                    "No pricing provider returned usable market data."
+                ) from exc
 
         aggregate = self._aggregate_results(
             recognition=recognition,
@@ -157,6 +164,11 @@ class PricingAggregationService:
             pricingSource=", ".join(sources) if sources else "Mock pricing fallback",
             pricingConfidence=confidence,
             lastUpdated=utc_timestamp(),
+            valuationStatus="market_estimated",
+            valuationSource=", ".join(sources) if sources else "market",
+            aiEstimatedValue=recognition.estimatedValue
+            if recognition.estimatedValue > 0
+            else None,
             marketTrend=trend,
             sourceCount=len(sources),
             pricingAge=self._pricing_age(provider_results),

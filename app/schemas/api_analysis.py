@@ -19,6 +19,9 @@ class ApiImagePayload(BaseModel):
     imageSource: str
     localFilePath: str
     imageRole: str | None = None
+    slotType: str | None = None
+    systemTag: str | None = None
+    capturedAt: str | None = None
     base64Image: str | None = None
     base64Preview: str | None = None
 
@@ -85,6 +88,8 @@ class ApiAnalyzeDiagnosticsResponse(BaseModel):
     pricingConfidenceCalculation: str | None = None
     pricingExplanation: str | None = None
     pricingComparableQuality: str | None = None
+    valuationStatus: str | None = None
+    valuationSource: str | None = None
     confidenceLevel: str
     totalLatencyMs: int
 
@@ -108,6 +113,9 @@ class ApiAnalyzeResponse(BaseModel):
     rawProviderPayload: dict[str, Any] = Field(default_factory=dict)
     faceValue: int | None = None
     estimatedMarketValue: int | None = None
+    aiEstimatedValue: int | None = None
+    valuationStatus: str
+    valuationSource: str
     askingPriceWarning: str | None = None
     valuationConfidence: int | None = None
     lowEstimate: int

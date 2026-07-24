@@ -141,41 +141,6 @@ class AnalyzerHealthProvider:
                 message="Mock analyzer provider is available.",
                 details={"provider": provider},
             )
-        if provider in {"auto", "real", "vision"}:
-            gemini_configured = bool(settings.gemini_api_key.strip())
-            openai_configured = bool(settings.openai_api_key.strip())
-            configured = gemini_configured or openai_configured
-            return HealthCheckResult(
-                name=self.name,
-                healthy=configured,
-                required=self.required,
-                latency_ms=_latency_ms(started_at),
-                message=(
-                    "Auto analyzer provider is configured."
-                    if configured
-                    else "GEMINI_API_KEY or OPENAI_API_KEY is required when AI_PROVIDER=auto."
-                ),
-                details={
-                    "provider": provider,
-                    "configured": str(configured).lower(),
-                    "geminiConfigured": str(gemini_configured).lower(),
-                    "openaiConfigured": str(openai_configured).lower(),
-                },
-            )
-        if provider == "gemini":
-            configured = bool(settings.gemini_api_key.strip())
-            return HealthCheckResult(
-                name=self.name,
-                healthy=configured,
-                required=self.required,
-                latency_ms=_latency_ms(started_at),
-                message=(
-                    "Gemini analyzer provider is configured."
-                    if configured
-                    else "GEMINI_API_KEY is required when AI_PROVIDER=gemini."
-                ),
-                details={"provider": provider, "configured": str(configured).lower()},
-            )
         if provider == "openai":
             configured = bool(settings.openai_api_key.strip())
             return HealthCheckResult(

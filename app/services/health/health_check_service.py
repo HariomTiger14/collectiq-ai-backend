@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from app.services.health.providers import (
     ApplicationHealthProvider,
@@ -40,6 +40,6 @@ class HealthCheckService:
         )
         return HealthReport(
             healthy=required_checks_healthy,
-            timestamp=datetime.now(UTC).isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
             checks=checks,
         )

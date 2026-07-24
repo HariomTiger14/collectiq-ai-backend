@@ -9,7 +9,6 @@ from app.services.analyzer.image_validation import AnalyzerImageValidator
 from app.services.analyzer.providers import (
     AutoAnalyzerProvider,
     BackendAnalyzerProvider,
-    FallbackAnalyzerProvider,
     GeminiAnalyzerProvider,
     MockAnalyzerProvider,
     OpenAIAnalyzerProvider,
@@ -43,12 +42,6 @@ class BackendAnalyzerService:
         request_metadata = self._normalize_request_metadata(payload)
         image_payloads = self._normalize_image_metadata(payload)
         image_payload = image_payloads[0]
-        request_metadata["imageCount"] = len(image_payloads)
-        request_metadata["imageRoles"] = [
-            image.get("imageRole", "other") for image in image_payloads
-        ]
-        request_metadata["images"] = _image_context(image_payloads)
-        request_metadata["imagePayloads"] = image_payloads
         stages.extend(["validate_image", "normalize_image_metadata"])
 
         provider = self._resolve_provider()
@@ -56,7 +49,7 @@ class BackendAnalyzerService:
         recognition = recognize_with_legacy_provider(
             provider,
             request_metadata=request_metadata,
-            image_payload=image_payload,
+            image_payload={**image_payload, "images": image_payloads},
         )
         recognition = self._normalize_provider_output(recognition)
         stages.extend(["normalize_provider_output", "assign_confidence"])
@@ -80,24 +73,24 @@ class BackendAnalyzerService:
         return request_metadata
 
     def _normalize_image_metadata(self, payload: ApiAnalyzeRequest) -> list[dict]:
-        raw_images = []
-        if payload.images:
-            raw_images.extend(_model_to_dict(image) for image in payload.images)
+        images = [*payload.images]
         if payload.image is not None:
-            legacy_image = _model_to_dict(payload.image)
-            existing_paths = {
-                str(image.get("localFilePath") or "") for image in raw_images
-            }
-            if str(legacy_image.get("localFilePath") or "") not in existing_paths:
-                raw_images.insert(0, legacy_image)
+            images.insert(0, payload.image)
 
-        normalized_images = [
-            self._image_validator.validate_metadata(image_payload).to_api_payload()
-            for image_payload in raw_images
-        ]
-        if not normalized_images:
-            raise ValueError("At least one image is required for analysis.")
-        return normalized_images
+        normalized_payloads: list[dict] = []
+        seen_keys: set[tuple[str, str | None]] = set()
+        for image in images:
+            image_payload = _model_to_dict(image)
+            key = (
+                str(image_payload.get("localFilePath") or ""),
+                image_payload.get("imageRole"),
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            normalized = self._image_validator.validate_metadata(image_payload)
+            normalized_payloads.append(normalized.to_api_payload())
+        return normalized_payloads
 
     def _normalize_provider_output(
         self,
@@ -118,29 +111,44 @@ class BackendAnalyzerService:
             return self._provider_factory(None)
 
         selected_provider = settings.ai_provider.strip().lower()
-        if selected_provider in {"auto", "real", "vision"}:
-            return AutoAnalyzerProvider()
-        if selected_provider == "gemini":
-            return FallbackAnalyzerProvider(
-                requested_provider="gemini",
-                providers=[GeminiAnalyzerProvider()],
-            )
-        if selected_provider == "openai":
-            return FallbackAnalyzerProvider(
-                requested_provider="openai",
-                providers=[OpenAIAnalyzerProvider()],
-            )
-        if (
-            selected_provider == "mock"
-            and settings.environment.strip().lower() == "sit"
-            and (
-                settings.gemini_api_key.strip()
-                or settings.openai_api_key.strip()
-            )
-        ):
-            return AutoAnalyzerProvider()
         if selected_provider == "mock":
+            if (
+                settings.environment.strip().lower() != "local"
+                and not getattr(settings, "allow_mock_analyzer", False)
+            ):
+                if settings.gemini_api_key.strip() or settings.openai_api_key.strip():
+                    return AutoAnalyzerProvider(
+                        providers=_configured_real_providers(),
+                        requested_provider="auto",
+                        confidence_threshold=_fallback_confidence_threshold(),
+                        allow_mock_fallback=False,
+                    )
+                from app.services.analyzer.errors import AnalyzerPipelineError
+
+                raise AnalyzerPipelineError(
+                    status_code=503,
+                    code="AI_PROVIDER_NOT_CONFIGURED",
+                    message="Real AI provider credentials are required in SIT.",
+                    retryable=False,
+                    details={"providerErrors": ["gemini:missing", "openai:missing"]},
+                )
             return MockAnalyzerProvider()
+        if selected_provider == "openai":
+            return OpenAIAnalyzerProvider()
+        if selected_provider == "gemini":
+            return AutoAnalyzerProvider(
+                providers=[GeminiAnalyzerProvider(), MockAnalyzerProvider()],
+                requested_provider="gemini",
+                confidence_threshold=_fallback_confidence_threshold(),
+                allow_mock_fallback=getattr(settings, "allow_mock_analyzer", False),
+            )
+        if selected_provider in {"auto", "gemini_openai", "gemini+openai"}:
+            return AutoAnalyzerProvider(
+                providers=_configured_real_providers(),
+                requested_provider=selected_provider,
+                confidence_threshold=_fallback_confidence_threshold(),
+                allow_mock_fallback=getattr(settings, "allow_mock_analyzer", False),
+            )
 
         return get_ai_recognition_provider(selected_provider)
 
@@ -157,14 +165,16 @@ def _optional_string(value) -> str | None:
     return value.strip()
 
 
-def _image_context(image_payloads: list[dict]) -> list[dict]:
-    return [
-        {
-            "fileName": image.get("fileName"),
-            "mimeType": image.get("mimeType"),
-            "sizeBytes": image.get("sizeBytes"),
-            "imageSource": image.get("imageSource"),
-            "imageRole": image.get("imageRole", "other"),
-        }
-        for image in image_payloads
-    ]
+def _fallback_confidence_threshold() -> int:
+    return int(getattr(settings, "ai_fallback_confidence_threshold", 0) or 0)
+
+
+def _configured_real_providers() -> list[BackendAnalyzerProvider]:
+    providers: list[BackendAnalyzerProvider] = []
+    if settings.gemini_api_key.strip():
+        providers.append(GeminiAnalyzerProvider())
+    if settings.openai_api_key.strip():
+        providers.append(OpenAIAnalyzerProvider())
+    if not providers:
+        providers.extend([GeminiAnalyzerProvider(), OpenAIAnalyzerProvider()])
+    return providers

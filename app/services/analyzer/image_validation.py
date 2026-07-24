@@ -14,9 +14,12 @@ class NormalizedImageMetadata:
     size_bytes: int
     image_source: str
     local_file_path: str
-    image_role: str = "other"
     base64_image: str | None = None
     base64_preview: str | None = None
+    image_role: str | None = None
+    slot_type: str | None = None
+    system_tag: str | None = None
+    captured_at: str | None = None
 
     def to_api_payload(self) -> dict:
         return {
@@ -25,9 +28,12 @@ class NormalizedImageMetadata:
             "sizeBytes": self.size_bytes,
             "imageSource": self.image_source,
             "localFilePath": self.local_file_path,
-            "imageRole": self.image_role,
             **({"base64Image": self.base64_image} if self.base64_image else {}),
             **({"base64Preview": self.base64_preview} if self.base64_preview else {}),
+            **({"imageRole": self.image_role} if self.image_role else {}),
+            **({"slotType": self.slot_type} if self.slot_type else {}),
+            **({"systemTag": self.system_tag} if self.system_tag else {}),
+            **({"capturedAt": self.captured_at} if self.captured_at else {}),
         }
 
 
@@ -38,9 +44,12 @@ class AnalyzerImageValidator:
         size_bytes = _parse_int(image_payload.get("sizeBytes"))
         image_source = str(image_payload.get("imageSource") or "unknown").strip() or "unknown"
         local_file_path = str(image_payload.get("localFilePath") or "").strip()
-        image_role = _normalize_image_role(image_payload.get("imageRole"))
         base64_image = _optional_string(image_payload.get("base64Image"))
         base64_preview = _optional_string(image_payload.get("base64Preview"))
+        image_role = _optional_string(image_payload.get("imageRole"))
+        slot_type = _optional_string(image_payload.get("slotType"))
+        system_tag = _optional_string(image_payload.get("systemTag"))
+        captured_at = _optional_string(image_payload.get("capturedAt"))
 
         self._validate_type(file_name=file_name, mime_type=mime_type)
         self._validate_size(size_bytes)
@@ -60,9 +69,12 @@ class AnalyzerImageValidator:
             size_bytes=size_bytes,
             image_source=image_source,
             local_file_path=local_file_path,
-            image_role=image_role,
             base64_image=base64_image,
             base64_preview=base64_preview,
+            image_role=image_role,
+            slot_type=slot_type,
+            system_tag=system_tag,
+            captured_at=captured_at,
         )
 
     def validate_bytes(
@@ -161,25 +173,3 @@ def _optional_string(value) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
     return value.strip()
-
-
-def _normalize_image_role(value) -> str:
-    if not isinstance(value, str):
-        return "other"
-    normalized = value.strip().lower()
-    aliases = {
-        "obverse": "front",
-        "front": "front",
-        "reverse": "back",
-        "back": "back",
-        "close-up": "closeup",
-        "closeup": "closeup",
-        "detail": "closeup",
-        "serial": "closeup",
-        "signature": "closeup",
-        "damage": "closeup",
-        "packaging": "packaging",
-        "package": "packaging",
-        "other": "other",
-    }
-    return aliases.get(normalized, "other")

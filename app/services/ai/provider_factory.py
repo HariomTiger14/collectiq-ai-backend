@@ -18,11 +18,11 @@ def get_ai_recognition_provider(
     if selected_provider == "mock":
         return _mock_provider
 
-    if selected_provider == "gemini":
-        return _gemini_provider
-
     if selected_provider == "openai":
         return _openai_provider
+
+    if selected_provider == "gemini":
+        return _gemini_provider
 
     raise ValueError(
         f"Unsupported AI_PROVIDER '{selected_provider}'. "

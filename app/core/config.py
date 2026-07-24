@@ -1,7 +1,7 @@
 import os
 import subprocess
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -45,7 +45,7 @@ def resolve_commit_sha() -> str:
 
 def resolve_build_time() -> str:
     return _first_env_value("BUILD_TIME", "CF_PAGES_COMMIT_TIME") or datetime.now(
-        UTC
+        timezone.utc
     ).isoformat()
 
 
@@ -100,13 +100,23 @@ class Settings:
         "",
     ).strip().lower() in {"1", "true", "yes", "required"}
     ai_provider: str = os.getenv("AI_PROVIDER", "mock")
-    pricing_provider: str = os.getenv("PRICING_PROVIDER", "mock")
+    allow_mock_analyzer: bool = os.getenv("ALLOW_MOCK_ANALYZER", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    pricing_provider: str = os.getenv("PRICING_PROVIDER", "auto")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     openai_timeout_seconds: float = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "30"))
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
     gemini_timeout_seconds: float = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "30"))
+    ai_fallback_provider: str = os.getenv("AI_FALLBACK_PROVIDER", "openai")
+    ai_fallback_confidence_threshold: int = int(
+        os.getenv("AI_FALLBACK_CONFIDENCE_THRESHOLD", "70")
+    )
     ebay_access_token: str = os.getenv("EBAY_ACCESS_TOKEN", "")
     ebay_browse_api_url: str = os.getenv(
         "EBAY_BROWSE_API_URL",

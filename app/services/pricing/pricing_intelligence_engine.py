@@ -1,7 +1,7 @@
 import math
 import statistics
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from app.services.ai.base_recognition_service import RecognitionResult
 from app.services.pricing.base_pricing_provider import MarketComparableSale
@@ -328,8 +328,8 @@ class PricingConfidenceEngine:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except (TypeError, ValueError):
             return None
-        now = datetime.now(UTC)
-        return max(0, (now - parsed.astimezone(UTC)).days)
+        now = datetime.now(timezone.utc)
+        return max(0, (now - parsed.astimezone(timezone.utc)).days)
 
     def _quality_label(self, score: int) -> str:
         if score >= 80:

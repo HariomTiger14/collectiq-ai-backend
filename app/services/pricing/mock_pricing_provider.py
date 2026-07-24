@@ -33,6 +33,11 @@ class MockPricingProvider(PricingProvider):
             pricingSource=source,
             pricingConfidence=confidence,
             lastUpdated=utc_timestamp(),
+            valuationStatus="ai_estimated",
+            valuationSource="mock",
+            aiEstimatedValue=recognition.estimatedValue
+            if recognition.estimatedValue > 0
+            else None,
             marketTrend=self._trend_for(recognition.category),
             sourceCount=2,
             pricingAge="fresh",

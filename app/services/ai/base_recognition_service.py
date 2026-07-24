@@ -48,11 +48,8 @@ class RecognitionResult:
     imageQualityIssues: list[str] = field(default_factory=list)
     scanRecommendations: list[str] = field(default_factory=list)
     faceValue: int | None = None
-    estimatedMarketValue: int | None = None
     askingPriceWarning: str | None = None
     valuationConfidence: int | None = None
-    photosUsed: int | None = None
-    photoRoles: list[str] = field(default_factory=list)
 
 
 class AIRecognitionProvider(Protocol):
