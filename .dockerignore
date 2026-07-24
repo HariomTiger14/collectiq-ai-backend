@@ -9,6 +9,5 @@ __pycache__/
 .venv/
 venv/
 tests/
-scripts/
 uploads/
 audit_uploads/
