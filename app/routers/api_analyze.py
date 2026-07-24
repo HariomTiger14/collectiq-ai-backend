@@ -462,11 +462,16 @@ def _validate_contract(payload: ApiAnalyzeRequest) -> None:
             "Image metadata is required.",
             retryable=False,
         )
-    if not any(image.localFilePath.strip() for image in images):
+    if not any(
+        image.localFilePath.strip()
+        or (image.base64Image and image.base64Image.strip())
+        or (image.base64Preview and image.base64Preview.strip())
+        for image in images
+    ):
         raise _api_error(
             status.HTTP_400_BAD_REQUEST,
             "invalid_image",
-            "At least one image path is required.",
+            "At least one image path or base64 image is required.",
             retryable=False,
         )
 
