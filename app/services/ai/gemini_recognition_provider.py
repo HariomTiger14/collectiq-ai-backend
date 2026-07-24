@@ -176,6 +176,7 @@ class GeminiRecognitionProvider(OpenAIRecognitionProvider):
             "generationConfig": {
                 "temperature": 0.1,
                 "response_mime_type": "application/json",
+                "response_schema": _gemini_recognition_schema(),
             },
         }
 
@@ -313,6 +314,125 @@ def _gemini_payload_with_safe_defaults(payload: dict[str, Any]) -> dict[str, Any
                 "valuationConfidence",
             ]
             if key in payload
+        },
+    }
+
+
+def _gemini_recognition_schema() -> dict[str, Any]:
+    required_fields = [
+        "title",
+        "category",
+        "confidence",
+        "estimatedValue",
+        "condition",
+        "recommendation",
+        "description",
+        "detectedObjects",
+        "fieldConfidence",
+        "confidenceLevel",
+        "lowConfidenceReasons",
+        "imageQualityIssues",
+        "scanRecommendations",
+        "primaryMatch",
+        "alternativeMatches",
+        "confidenceExplanation",
+        "detectionQuality",
+        "aiReasoning",
+        "year",
+        "brand",
+        "setName",
+        "series",
+        "cardNumber",
+        "playerOrCharacter",
+        "rarity",
+        "estimatedGrade",
+        "language",
+        "edition",
+        "country",
+        "mint",
+        "material",
+        "notes",
+    ]
+    nullable_text_field = {
+        "type": "string",
+        "nullable": True,
+    }
+    return {
+        "type": "object",
+        "required": required_fields,
+        "properties": {
+            "title": {"type": "string"},
+            "category": {"type": "string"},
+            "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+            "estimatedValue": {"type": "integer", "minimum": 0},
+            "condition": {"type": "string"},
+            "recommendation": {"type": "string"},
+            "description": {"type": "string"},
+            "detectedObjects": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "fieldConfidence": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                },
+            },
+            "confidenceLevel": {
+                "type": "string",
+                "enum": ["High", "Medium", "Low"],
+            },
+            "lowConfidenceReasons": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "imageQualityIssues": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "scanRecommendations": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "primaryMatch": {"type": "string"},
+            "alternativeMatches": {
+                "type": "array",
+                "minItems": 3,
+                "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "required": ["title", "category", "confidence", "reason"],
+                    "properties": {
+                        "title": {"type": "string"},
+                        "category": {"type": "string"},
+                        "confidence": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
+                        },
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+            "confidenceExplanation": {"type": "string"},
+            "detectionQuality": {"type": "string"},
+            "aiReasoning": {"type": "string"},
+            "year": nullable_text_field,
+            "brand": nullable_text_field,
+            "setName": nullable_text_field,
+            "series": nullable_text_field,
+            "cardNumber": nullable_text_field,
+            "playerOrCharacter": nullable_text_field,
+            "rarity": nullable_text_field,
+            "estimatedGrade": nullable_text_field,
+            "language": nullable_text_field,
+            "edition": nullable_text_field,
+            "country": nullable_text_field,
+            "mint": nullable_text_field,
+            "material": nullable_text_field,
+            "notes": nullable_text_field,
         },
     }
 

@@ -25,6 +25,35 @@ class FakeClient:
 
 
 class GeminiRecognitionProviderTest(unittest.TestCase):
+    def test_payload_includes_response_schema_for_required_scan_fields(self) -> None:
+        provider = GeminiRecognitionProvider(
+            api_key="test-key",
+            model="gemini-test",
+            client=FakeClient(FakeResponse({})),
+        )
+
+        payload = provider._build_gemini_payload(
+            image_base64=base64.b64encode(b"jpeg-bytes").decode("ascii"),
+            mime_type="image/jpeg",
+            prompt_context={
+                "imageSource": "test",
+                "requestedCategory": "video games",
+                "fileName": "mario-kart.jpg",
+                "mimeType": "image/jpeg",
+                "appVersion": "test",
+            },
+        )
+
+        generation_config = payload["generationConfig"]
+        schema = generation_config["response_schema"]
+        self.assertEqual(generation_config["response_mime_type"], "application/json")
+        self.assertIn("title", schema["required"])
+        self.assertIn("category", schema["required"])
+        self.assertIn("confidence", schema["required"])
+        self.assertIn("alternativeMatches", schema["required"])
+        self.assertEqual(schema["properties"]["title"]["type"], "string")
+        self.assertEqual(schema["properties"]["alternativeMatches"]["minItems"], 3)
+
     def test_partial_alternative_matches_are_normalized(self) -> None:
         gemini_output = {
             "title": "Charizard",
