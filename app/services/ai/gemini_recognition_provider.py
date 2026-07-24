@@ -118,6 +118,15 @@ class GeminiRecognitionProvider(OpenAIRecognitionProvider):
                 f"Gemini recognition request failed: {exc}"
             ) from exc
 
+        if response.status_code >= 400 and _gemini_payload_has_structured_schema(payload):
+            retry_payload = _gemini_payload_without_structured_schema(payload)
+            response = self._client.post(
+                self._generate_content_url(),
+                headers={"Content-Type": "application/json"},
+                json=retry_payload,
+                timeout=self._timeout_seconds,
+            )
+
         if response.status_code >= 400:
             raise GeminiProviderError(
                 "Gemini recognition request failed with "
@@ -268,6 +277,26 @@ class GeminiRecognitionProvider(OpenAIRecognitionProvider):
                 }
             )
         return parts
+
+
+def _gemini_payload_has_structured_schema(payload: dict[str, Any]) -> bool:
+    generation_config = payload.get("generationConfig")
+    if not isinstance(generation_config, dict):
+        return False
+    if "response_schema" in generation_config:
+        return True
+    response_format = generation_config.get("responseFormat")
+    return isinstance(response_format, dict) and bool(response_format.get("text"))
+
+
+def _gemini_payload_without_structured_schema(payload: dict[str, Any]) -> dict[str, Any]:
+    retry_payload = dict(payload)
+    generation_config = dict(retry_payload.get("generationConfig") or {})
+    generation_config.pop("response_schema", None)
+    generation_config.pop("responseFormat", None)
+    generation_config["response_mime_type"] = "application/json"
+    retry_payload["generationConfig"] = generation_config
+    return retry_payload
 
 
 def _gemini_payload_with_safe_defaults(payload: dict[str, Any]) -> dict[str, Any]:

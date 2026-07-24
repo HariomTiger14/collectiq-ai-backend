@@ -7,8 +7,8 @@ from app.services.ai.gemini_recognition_provider import GeminiRecognitionProvide
 
 
 class FakeResponse:
-    def __init__(self, body: dict[str, Any]) -> None:
-        self.status_code = 200
+    def __init__(self, body: dict[str, Any], status_code: int = 200) -> None:
+        self.status_code = status_code
         self.text = json.dumps(body)
         self._body = body
 
@@ -17,11 +17,13 @@ class FakeResponse:
 
 
 class FakeClient:
-    def __init__(self, response: FakeResponse) -> None:
-        self.response = response
+    def __init__(self, response: FakeResponse | list[FakeResponse]) -> None:
+        self.responses = response if isinstance(response, list) else [response]
+        self.requests: list[dict[str, Any]] = []
 
     def post(self, url: str, **kwargs: Any) -> FakeResponse:
-        return self.response
+        self.requests.append(kwargs)
+        return self.responses[min(len(self.requests) - 1, len(self.responses) - 1)]
 
 
 class GeminiRecognitionProviderTest(unittest.TestCase):
@@ -53,6 +55,69 @@ class GeminiRecognitionProviderTest(unittest.TestCase):
         self.assertIn("confidence", schema["required"])
         self.assertIn("alternativeMatches", schema["required"])
         self.assertEqual(schema["properties"]["title"]["type"], "string")
+
+    def test_retries_without_schema_when_gemini_rejects_structured_output(self) -> None:
+        gemini_output = {
+            "title": "Mario Kart 8 Deluxe",
+            "category": "Video Game",
+            "confidence": 82,
+            "estimatedValue": 0,
+            "condition": "Unknown",
+            "recommendation": "Confirm region and cartridge/case condition.",
+            "description": "Nintendo Switch Mario Kart 8 Deluxe cover art.",
+            "detectedObjects": ["Nintendo Switch case", "Mario Kart 8 Deluxe"],
+            "primaryMatch": "Mario Kart 8 Deluxe Nintendo Switch",
+            "alternativeMatches": [],
+            "confidenceExplanation": "Visible title and platform.",
+            "detectionQuality": "Good",
+            "aiReasoning": "The front cover title is readable.",
+        }
+        client = FakeClient(
+            [
+                FakeResponse({"error": {"message": "schema rejected"}}, status_code=400),
+                FakeResponse(
+                    {
+                        "candidates": [
+                            {
+                                "content": {
+                                    "parts": [{"text": json.dumps(gemini_output)}],
+                                },
+                            }
+                        ],
+                    }
+                ),
+            ]
+        )
+        provider = GeminiRecognitionProvider(
+            api_key="test-key",
+            model="gemini-test",
+            client=client,
+        )
+
+        result = provider.recognize_api_payload(
+            request_metadata={
+                "imageSource": "test",
+                "requestedCategory": "video games",
+                "appVersion": "test",
+            },
+            image_payload={
+                "fileName": "mario-kart.jpg",
+                "mimeType": "image/jpeg",
+                "sizeBytes": 20,
+                "imageSource": "test",
+                "localFilePath": "/tmp/missing-mario-kart.jpg",
+                "base64Image": base64.b64encode(b"jpeg-bytes").decode("ascii"),
+            },
+        )
+
+        self.assertEqual(result.title, "Mario Kart 8 Deluxe")
+        self.assertEqual(len(client.requests), 2)
+        self.assertIn("responseFormat", client.requests[0]["json"]["generationConfig"])
+        self.assertNotIn("responseFormat", client.requests[1]["json"]["generationConfig"])
+        self.assertEqual(
+            client.requests[1]["json"]["generationConfig"]["response_mime_type"],
+            "application/json",
+        )
 
     def test_partial_alternative_matches_are_normalized(self) -> None:
         gemini_output = {
