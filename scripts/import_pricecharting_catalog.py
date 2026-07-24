@@ -102,6 +102,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Download and import all configured PRICECHARTING_CSV_*_URL env vars.",
     )
+    parser.add_argument(
+        "--source",
+        choices=sorted(PRICECHARTING_CSV_ENV_VARS),
+        help="When used with --from-env, import only one configured source.",
+    )
     parser.add_argument("--supabase-url", default="", help="Supabase project URL. Defaults to SUPABASE_URL.")
     parser.add_argument(
         "--service-role-key",
@@ -131,7 +136,10 @@ def load_sources(args: argparse.Namespace) -> list[CatalogSource]:
         sources.append(CatalogSource(name=args.csv.name, rows=load_rows(args.csv)))
     if args.from_env:
         sources.extend(
-            download_env_sources(timeout_seconds=args.timeout_seconds)
+            download_env_sources(
+                timeout_seconds=args.timeout_seconds,
+                source_filter=args.source,
+            )
         )
     if not sources:
         raise SystemExit("Provide a CSV path or use --from-env.")
@@ -143,10 +151,20 @@ def load_rows(path: Path) -> list[dict[str, str]]:
         return [dict(row) for row in csv.DictReader(handle)]
 
 
-def download_env_sources(*, timeout_seconds: float) -> list[CatalogSource]:
+def download_env_sources(
+    *,
+    timeout_seconds: float,
+    source_filter: str | None = None,
+) -> list[CatalogSource]:
     sources: list[CatalogSource] = []
+    if source_filter is not None and source_filter not in PRICECHARTING_CSV_ENV_VARS:
+        allowed_sources = ", ".join(sorted(PRICECHARTING_CSV_ENV_VARS))
+        raise SystemExit(f"Unsupported source. Use one of: {allowed_sources}.")
+
     with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as client:
         for category, env_name in PRICECHARTING_CSV_ENV_VARS.items():
+            if source_filter is not None and category != source_filter:
+                continue
             url = os.getenv(env_name, "").strip()
             if not url:
                 continue
@@ -155,6 +173,9 @@ def download_env_sources(*, timeout_seconds: float) -> list[CatalogSource]:
             rows = load_rows_from_text(response.text)
             sources.append(CatalogSource(name=f"{category}.csv", rows=rows))
     if not sources:
+        if source_filter:
+            env_name = PRICECHARTING_CSV_ENV_VARS[source_filter]
+            raise SystemExit(f"{env_name} is not configured.")
         raise SystemExit("No PRICECHARTING_CSV_*_URL environment variables were configured.")
     return sources
 

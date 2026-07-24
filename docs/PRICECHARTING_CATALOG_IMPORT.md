@@ -89,6 +89,24 @@ curl -X POST \
 
 The endpoint returns only source names and row counts. It does not echo private CSV URLs.
 
+For large CSVs, import one source at a time:
+
+```bash
+curl -X POST \
+  "https://api-sit.packlox.com/admin/pricecharting/import?dryRun=true&source=video_games" \
+  -H "X-Admin-Token: YOUR_ADMIN_IMPORT_TOKEN"
+```
+
+Supported `source` values:
+
+- `video_games`
+- `pokemon`
+- `magic`
+- `yugioh`
+- `one_piece`
+
+After the dry-run succeeds, change `dryRun=false` for that same source.
+
 ## Frequency
 
 PriceCharting CSV files are generated once every 24 hours, so PackLox should import at most once per day.

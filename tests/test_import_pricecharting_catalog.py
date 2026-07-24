@@ -90,6 +90,31 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
         self.assertEqual(sources[0].rows[0]["product-name"], "Mario Kart 8 Deluxe")
         self.assertEqual(sources[1].rows[0]["product-name"], "Charizard")
 
+    def test_download_env_sources_can_filter_to_one_source(self) -> None:
+        transport = _FakeTransport(
+            {
+                "https://pricecharting.test/video-games.csv": (
+                    "id,product-name,console-name,loose-price\n"
+                    "12345,Mario Kart 8 Deluxe,Nintendo Switch,3150\n"
+                ),
+            }
+        )
+
+        with patch.dict(
+            "os.environ",
+            {
+                "PRICECHARTING_CSV_VIDEO_GAMES_URL": "https://pricecharting.test/video-games.csv",
+                "PRICECHARTING_CSV_POKEMON_URL": "https://pricecharting.test/pokemon.csv",
+            },
+            clear=False,
+        ), patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+
+            sources = download_env_sources(timeout_seconds=1, source_filter="video_games")
+
+        self.assertEqual([source.name for source in sources], ["video_games.csv"])
+        self.assertEqual(sources[0].rows[0]["product-name"], "Mario Kart 8 Deluxe")
+
     def test_download_env_sources_requires_at_least_one_url(self) -> None:
         with patch.dict(
             "os.environ",
