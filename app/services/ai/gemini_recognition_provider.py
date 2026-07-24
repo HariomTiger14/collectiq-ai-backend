@@ -340,10 +340,7 @@ def _alternative_matches(
     category: str,
     confidence: int,
 ) -> list[dict[str, object]]:
-    matches = payload.get("alternativeMatches")
-    if isinstance(matches, list) and len(matches) == 3:
-        return matches
-    return [
+    fallback_matches = [
         {
             "title": title,
             "category": category,
@@ -363,6 +360,30 @@ def _alternative_matches(
             "reason": "Low-confidence fallback match.",
         },
     ]
+    matches = payload.get("alternativeMatches")
+    if not isinstance(matches, list):
+        return fallback_matches
+
+    normalized_matches: list[dict[str, object]] = []
+    for index, match in enumerate(matches[:3]):
+        fallback = fallback_matches[index]
+        if not isinstance(match, dict):
+            normalized_matches.append(fallback)
+            continue
+
+        normalized_matches.append(
+            {
+                "title": _text(match.get("title"), str(fallback["title"])),
+                "category": _text(match.get("category"), str(fallback["category"])),
+                "confidence": _int(match.get("confidence"), int(fallback["confidence"])),
+                "reason": _text(match.get("reason"), str(fallback["reason"])),
+            }
+        )
+
+    while len(normalized_matches) < 3:
+        normalized_matches.append(fallback_matches[len(normalized_matches)])
+
+    return normalized_matches
 
 
 def _confidence_level(confidence: int) -> str:
