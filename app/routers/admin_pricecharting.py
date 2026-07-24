@@ -22,6 +22,13 @@ def import_pricecharting_catalog(
         default=None,
         description="Optional source key, for example video_games or pokemon.",
     ),
+    timeout_seconds: int = Query(
+        180,
+        alias="timeoutSeconds",
+        ge=10,
+        le=600,
+        description="Download/import timeout in seconds.",
+    ),
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
@@ -33,7 +40,7 @@ def import_pricecharting_catalog(
     source_filter = _normalized_source_filter(source)
     try:
         sources = download_env_sources(
-            timeout_seconds=30,
+            timeout_seconds=timeout_seconds,
             source_filter=source_filter,
         )
     except SystemExit as exc:
@@ -88,7 +95,7 @@ def import_pricecharting_catalog(
             client = SupabaseCatalogClient(
                 supabase_url=settings.supabase_url,
                 service_role_key=settings.supabase_service_role_key,
-                timeout_seconds=30,
+                timeout_seconds=timeout_seconds,
             )
             imported_count = client.upsert_rows(imported_rows, batch_size=500)
         except SystemExit as exc:

@@ -93,7 +93,7 @@ For large CSVs, import one source at a time:
 
 ```bash
 curl -X POST \
-  "https://api-sit.packlox.com/admin/pricecharting/import?dryRun=true&source=video_games" \
+  "https://api-sit.packlox.com/admin/pricecharting/import?dryRun=true&source=video_games&timeoutSeconds=600" \
   -H "X-Admin-Token: YOUR_ADMIN_IMPORT_TOKEN"
 ```
 
@@ -105,7 +105,8 @@ Supported `source` values:
 - `yugioh`
 - `one_piece`
 
-After the dry-run succeeds, change `dryRun=false` for that same source.
+After the dry-run succeeds, change `dryRun=false` for that same source. The endpoint
+defaults to a 180-second timeout and accepts `timeoutSeconds` from 10 to 600.
 
 ## Frequency
 

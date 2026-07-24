@@ -88,7 +88,7 @@ class AdminPriceChartingImportTest(unittest.TestCase):
             ],
         )
         self.assertEqual(payload["source"], "all")
-        download_sources.assert_called_once_with(timeout_seconds=30, source_filter=None)
+        download_sources.assert_called_once_with(timeout_seconds=180, source_filter=None)
 
     def test_dry_run_accepts_single_source_filter(self) -> None:
         sources = [
@@ -113,7 +113,7 @@ class AdminPriceChartingImportTest(unittest.TestCase):
             settings.build_time = "2026-07-25T00:00:00Z"
 
             response = self.client.post(
-                "/admin/pricecharting/import?dryRun=true&source=video-games",
+                "/admin/pricecharting/import?dryRun=true&source=video-games&timeoutSeconds=240",
                 headers={"X-Admin-Token": "secret-token"},
             )
 
@@ -123,7 +123,7 @@ class AdminPriceChartingImportTest(unittest.TestCase):
         self.assertEqual(payload["inputRows"], 1)
         self.assertEqual(payload["validRows"], 1)
         download_sources.assert_called_once_with(
-            timeout_seconds=30,
+            timeout_seconds=240,
             source_filter="video_games",
         )
 
