@@ -61,6 +61,24 @@ class OpenAIRecognitionProviderTest(unittest.TestCase):
         with self.assertRaises(AIProviderNotConfiguredError):
             provider.recognize(Path("uploads/card.png"))
 
+    def test_prompt_prefers_visible_product_titles_over_unknown(self) -> None:
+        provider = OpenAIRecognitionProvider(api_key="test-key", client=FakeClient())
+
+        prompt = provider._prompt_text(
+            {
+                "imageSource": "test",
+                "requestedCategory": "video game",
+                "fileName": "mario-kart.jpg",
+                "mimeType": "image/jpeg",
+                "appVersion": "test",
+                "imageEvidence": "role=front",
+            }
+        )
+
+        self.assertIn("video games", prompt)
+        self.assertIn("Do not return 'Unknown collectible'", prompt)
+        self.assertIn("visible title", prompt)
+
     def test_recognize_returns_structured_result_from_mocked_openai(self) -> None:
         output = {
             "title": "1952 Topps Mickey Mantle",
