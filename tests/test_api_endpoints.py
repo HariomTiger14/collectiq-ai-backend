@@ -41,7 +41,7 @@ class ApiEndpointsTest(unittest.TestCase):
     def test_health(self) -> None:
         response = self.client.get("/health")
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
         self.assertEqual(payload["status"], "healthy")
         self.assertTrue(payload["services"]["api"])
@@ -79,7 +79,7 @@ class ApiEndpointsTest(unittest.TestCase):
             response = self.client.get("/health")
 
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 200, response.text)
         self.assertLess(elapsed_ms, 250)
 
     def test_version(self) -> None:
@@ -887,6 +887,44 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertEqual(payload["estimatedValue"], 42)
         self.assertEqual(payload["marketSummary"]["salesCount"], 1)
 
+    def test_api_analyze_skips_pricing_for_uncertain_recognition(self) -> None:
+        provider = OpenAIRecognitionProvider(
+            api_key="test-key",
+            client=_FakeOpenAIClient(
+                response=_FakeOpenAIResponse(
+                    body={
+                        "output_text": json.dumps(
+                            _openai_output(
+                                title="Unknown collectible",
+                                category="Other",
+                                confidence=0,
+                                estimated_value=0,
+                            )
+                        )
+                    }
+                )
+            ),
+        )
+
+        with patch("app.routers.api_analyze.settings", _settings_with_pricing("ebay")), patch(
+            "app.routers.api_analyze.get_pricing_provider",
+            return_value=_ExplodingPricingProvider(),
+        ), patch(
+            "app.services.analyzer.backend_analyzer_service.BackendAnalyzerService._resolve_provider",
+            return_value=provider,
+        ):
+            response = self.client.post(
+                "/analyze",
+                json=_api_analyze_payload(base64_image=True),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["valuationStatus"], "unavailable")
+        self.assertEqual(payload["valuationSource"], "not_priced")
+        self.assertIsNone(payload["estimatedMarketValue"])
+        self.assertEqual(payload["marketSummary"]["salesCount"], 0)
+
     def test_api_analyze_no_market_match_status(self) -> None:
         with patch("app.routers.api_analyze.settings", _settings_with_pricing("ebay")), patch(
             "app.routers.api_analyze.get_pricing_provider",
@@ -1263,6 +1301,13 @@ class _FailingPricingProvider:
 
     def price(self, recognition):
         raise self._error
+
+
+class _ExplodingPricingProvider:
+    provider_name = "exploding_market"
+
+    def price(self, recognition):
+        raise AssertionError("Pricing provider should not be called.")
 
 
 def _openai_output(

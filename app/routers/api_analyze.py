@@ -588,6 +588,24 @@ def _price_recognition(recognition, *, trace_id: str):
         provider_name != "mock",
         provider_name,
     )
+    if _recognition_too_uncertain_for_pricing(recognition):
+        result = _valuation_placeholder(
+            recognition,
+            status="unavailable",
+            source="not_priced",
+            reason=(
+                "Recognition was too uncertain for provider pricing. "
+                "Capture a clearer image or confirm the item details before valuation."
+            ),
+        )
+        logger.info(
+            "pricing skipped traceId=%s status=%s itemName=%s confidence=%s",
+            trace_id,
+            result.valuationStatus,
+            recognition.title,
+            recognition.confidence,
+        )
+        return result
     if provider_name == "mock":
         result = _valuation_placeholder(
             recognition,
@@ -729,6 +747,16 @@ def _pricing_lookup_query(recognition) -> str:
         for part in parts
         if isinstance(part, str) and part.strip()
     )
+
+
+def _recognition_too_uncertain_for_pricing(recognition) -> bool:
+    title = (recognition.title or "").strip().lower()
+    category = (recognition.category or "").strip().lower()
+    if not title or title in {"unknown", "unknown collectible", "unidentified collectible"}:
+        return True
+    if category in {"", "other", "unknown"} and recognition.confidence < 70:
+        return True
+    return recognition.confidence < 25
 
 
 def _field_confidence(recognition) -> dict[str, int]:
