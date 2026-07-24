@@ -299,6 +299,14 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertEqual(error["code"], "unsupported_media_type")
         self.assertFalse(error["retryable"])
 
+    def test_api_analyze_accepts_video_game_launch_category(self) -> None:
+        payload = _api_analyze_payload()
+        payload["request"]["requestedCategory"] = "video game"
+
+        response = self.client.post("/analyze", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+
     def test_api_analyze_openai_without_key_returns_safe_error(self) -> None:
         with patch(
             "app.services.analyzer.backend_analyzer_service.BackendAnalyzerService._resolve_provider",
