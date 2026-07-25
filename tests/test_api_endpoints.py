@@ -895,6 +895,46 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertEqual(payload["estimatedValue"], 42)
         self.assertEqual(payload["marketSummary"]["salesCount"], 1)
 
+    def test_api_pricing_quote_uses_confirmed_details(self) -> None:
+        with patch("app.routers.api_analyze.settings", _settings_with_pricing("ebay")), patch(
+            "app.routers.api_analyze.get_pricing_provider",
+            return_value=_FakePricingProvider(),
+        ):
+            response = self.client.post(
+                "/api/pricing/quote",
+                json={
+                    "itemName": "1999 Pokemon Charizard Holo",
+                    "category": "Pokemon Card",
+                    "condition": "Near Mint",
+                    "estimatedValue": 120,
+                    "displayCurrency": "AUD",
+                    "brand": "Pokemon",
+                    "setName": "Base Set",
+                    "cardNumber": "4/102",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["valuationStatus"], "market_estimated")
+        self.assertEqual(payload["estimatedMarketValue"], 42)
+        self.assertEqual(payload["pricing"]["pricingSource"], "eBay sold comps")
+        self.assertEqual(payload["marketSummary"]["salesCount"], 1)
+        self.assertEqual(payload["comparableSales"][0]["condition"], "Near Mint")
+
+    def test_api_pricing_quote_requires_item_name(self) -> None:
+        response = self.client.post(
+            "/api/pricing/quote",
+            json={
+                "itemName": " ",
+                "category": "Pokemon Card",
+                "condition": "Near Mint",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "invalid_request")
+
     def test_api_analyze_skips_pricing_for_uncertain_recognition(self) -> None:
         provider = OpenAIRecognitionProvider(
             api_key="test-key",

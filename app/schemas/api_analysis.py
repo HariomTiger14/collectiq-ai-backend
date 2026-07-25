@@ -32,6 +32,25 @@ class ApiAnalyzeRequest(BaseModel):
     images: list[ApiImagePayload] = Field(default_factory=list)
 
 
+class ApiPricingQuoteRequest(BaseModel):
+    itemName: str
+    category: str
+    condition: str | None = None
+    estimatedValue: int | None = None
+    displayCurrency: str | None = None
+    year: str | None = None
+    manufacturer: str | None = None
+    brand: str | None = None
+    setName: str | None = None
+    series: str | None = None
+    cardNumber: str | None = None
+    playerOrCharacter: str | None = None
+    rarity: str | None = None
+    edition: str | None = None
+    language: str | None = None
+    notes: str | None = None
+
+
 class ApiAlternativeMatchResponse(BaseModel):
     title: str
     category: str
@@ -67,6 +86,27 @@ class ApiMarketSummaryResponse(BaseModel):
     lastUpdated: str
     sources: list[str]
     comps: list[ApiMarketCompResponse] = Field(default_factory=list)
+
+
+class ApiPricingQuoteResponse(BaseModel):
+    itemName: str
+    category: str
+    condition: str
+    estimatedValue: int
+    currency: str
+    estimatedMarketValue: int | None = None
+    aiEstimatedValue: int | None = None
+    lowEstimate: int
+    highEstimate: int
+    valuationStatus: str
+    valuationSource: str
+    valuationConfidence: int | None = None
+    marketTrend: str
+    pricing: dict[str, Any]
+    marketSummary: ApiMarketSummaryResponse
+    comparableSales: list[ApiMarketCompResponse]
+    rawProviderPayload: dict[str, Any] = Field(default_factory=dict)
+    timestamp: str
 
 
 class ApiAnalyzeDiagnosticsResponse(BaseModel):

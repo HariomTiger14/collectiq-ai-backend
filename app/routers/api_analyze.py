@@ -14,9 +14,12 @@ from app.schemas.api_analysis import (
     ApiAnalyzeResponse,
     ApiMarketCompResponse,
     ApiMarketSummaryResponse,
+    ApiPricingQuoteRequest,
+    ApiPricingQuoteResponse,
     ApiReviewResponse,
 )
 from app.core.config import settings
+from app.services.ai.base_recognition_service import RecognitionResult
 from app.services.ai.openai_recognition_provider import (
     AIProviderNotConfiguredError,
     OpenAIInvalidResponseError,
@@ -78,6 +81,17 @@ SUPPORTED_CATEGORIES = {
 )
 async def analyze_collectible(payload: ApiAnalyzeRequest) -> ApiAnalyzeResponse:
     return await _analyze_collectible(payload)
+
+
+@router.post(
+    "/pricing/quote",
+    response_model=ApiPricingQuoteResponse,
+    summary="Refresh market pricing for user-confirmed collectible details",
+)
+async def quote_collectible_pricing(
+    payload: ApiPricingQuoteRequest,
+) -> ApiPricingQuoteResponse:
+    return _quote_collectible_pricing(payload)
 
 
 @root_router.post(
@@ -413,6 +427,218 @@ async def _analyze_collectible(
             or _scan_recommendations(recognition.confidence, recognition.detectionQuality)
         ),
         diagnostics=diagnostics,
+    )
+
+
+def _quote_collectible_pricing(
+    payload: ApiPricingQuoteRequest,
+) -> ApiPricingQuoteResponse:
+    started_at = time.perf_counter()
+    trace_id = f"pricing-{uuid4()}"
+    recognition = _recognition_from_pricing_quote(payload)
+    display_currency = normalize_display_currency(payload.displayCurrency)
+    logger.info(
+        "pricing quote request traceId=%s itemName=%s category=%s currency=%s",
+        trace_id,
+        recognition.title,
+        recognition.category,
+        display_currency,
+    )
+    pricing = _price_recognition(
+        recognition,
+        trace_id=trace_id,
+        display_currency=display_currency,
+    )
+    logger.info(
+        "pricing quote response traceId=%s status=%s source=%s value=%s latencyMs=%s",
+        trace_id,
+        pricing.valuationStatus,
+        pricing.valuationSource,
+        pricing.estimatedMarketValue,
+        int((time.perf_counter() - started_at) * 1000),
+    )
+    return _pricing_quote_response(recognition, pricing)
+
+
+def _recognition_from_pricing_quote(payload: ApiPricingQuoteRequest) -> RecognitionResult:
+    title = payload.itemName.strip()
+    if not title:
+        raise _api_error(
+            status.HTTP_400_BAD_REQUEST,
+            "invalid_request",
+            "itemName is required for pricing refresh.",
+            retryable=False,
+        )
+    category = payload.category.strip() if payload.category else "Collectible"
+    condition = (payload.condition or "Unknown").strip() or "Unknown"
+    estimated_value = payload.estimatedValue or 0
+    return RecognitionResult(
+        title=title,
+        category=category,
+        confidence=90,
+        estimatedValue=estimated_value,
+        condition=condition,
+        recommendation="Review the refreshed pricing before saving.",
+        description="User-confirmed collectible details supplied for pricing refresh.",
+        detectedObjects=[],
+        aiProvider="user_review",
+        processingTimeMs=0,
+        primaryMatch=title,
+        alternativeMatches=[],
+        confidenceExplanation="User-confirmed details were used for pricing refresh.",
+        detectionQuality="Reviewed",
+        aiReasoning="Pricing-only refresh; no second image analysis was performed.",
+        year=_blank_as_none(payload.year),
+        brand=_blank_as_none(payload.brand or payload.manufacturer),
+        setName=_blank_as_none(payload.setName),
+        series=_blank_as_none(payload.series),
+        cardNumber=_blank_as_none(payload.cardNumber),
+        playerOrCharacter=_blank_as_none(payload.playerOrCharacter),
+        rarity=_blank_as_none(payload.rarity),
+        language=_blank_as_none(payload.language),
+        edition=_blank_as_none(payload.edition),
+        notes=_blank_as_none(payload.notes),
+    )
+
+
+def _pricing_quote_response(
+    recognition: RecognitionResult,
+    pricing,
+) -> ApiPricingQuoteResponse:
+    comparable_sales = _comparable_sales_from_pricing(pricing)
+    market_estimated_value = (
+        pricing.estimatedMarketValue if pricing.valuationStatus == "market_estimated" else None
+    )
+    ai_estimated_value = recognition.estimatedValue if recognition.estimatedValue > 0 else None
+    display_value = market_estimated_value or ai_estimated_value or 0
+    low_estimate = pricing.lowEstimate if market_estimated_value else 0
+    high_estimate = pricing.highEstimate if market_estimated_value else 0
+    valuation_strategy = "sold_completed" if market_estimated_value else "unavailable"
+    pricing_explanation = (
+        pricing.providerDiagnostics.get("priceExplanation")
+        or pricing.providerDiagnostics.get("confidenceCalculation")
+        or pricing.providerDiagnostics.get("fallbackReason")
+    )
+    reason_code = None if market_estimated_value else (
+        pricing.providerDiagnostics.get("fallbackReason") or pricing.valuationStatus.upper()
+    )
+    display_string = _format_currency_display(display_value, pricing.currency)
+    original_market_value = pricing.originalMarketValue or display_value
+    original_currency = pricing.originalCurrency or pricing.currency
+    source_display_string = _format_currency_display(
+        original_market_value,
+        original_currency,
+    )
+    attribution_text = (
+        f"Pricing data powered by {pricing.pricingSource}"
+        if market_estimated_value and pricing.pricingSource
+        else None
+    )
+    cache_policy = pricing_cache_policy(
+        category=recognition.category,
+        valuation_status=pricing.valuationStatus,
+    )
+    pricing_json = {
+        "estimatedMarketValue": market_estimated_value or 0,
+        "lowEstimate": low_estimate,
+        "highEstimate": high_estimate,
+        "currency": pricing.currency,
+        "pricingSource": pricing.pricingSource,
+        "pricingConfidence": pricing.pricingConfidence,
+        "lastUpdated": pricing.lastUpdated,
+        "valuationStatus": pricing.valuationStatus,
+        "valuationSource": pricing.valuationSource,
+        "aiEstimatedValue": ai_estimated_value,
+        "pricingExplanation": pricing_explanation,
+        "reasonCode": reason_code,
+        "valuationStrategy": valuation_strategy,
+        "attributionText": attribution_text,
+        "displayString": display_string,
+        "originalPrice": original_market_value,
+        "originalCurrency": original_currency,
+        "exchangeRateUsed": pricing.exchangeRateUsed,
+        "exchangeRateDate": pricing.exchangeRateDate or pricing.lastUpdated,
+        "lowEstimateAud": low_estimate,
+        "highEstimateAud": high_estimate,
+        "cacheTtlSeconds": cache_policy.ttl_seconds,
+        "cacheExpiresAt": None,
+        "cachePolicyReason": cache_policy.reason,
+    }
+    market_summary = ApiMarketSummaryResponse(
+        averagePrice=_average_price(comparable_sales, market_estimated_value or display_value),
+        medianPrice=_median_price(comparable_sales, market_estimated_value or display_value),
+        lowPrice=low_estimate,
+        highPrice=high_estimate,
+        salesCount=len(comparable_sales),
+        trendLabel=pricing.marketTrend,
+        confidence=pricing.pricingConfidence,
+        lastUpdated=pricing.lastUpdated,
+        sources=_market_sources(pricing),
+        comps=comparable_sales,
+    )
+
+    return ApiPricingQuoteResponse(
+        itemName=recognition.title,
+        category=recognition.category,
+        condition=recognition.condition,
+        estimatedValue=display_value,
+        currency=pricing.currency,
+        estimatedMarketValue=market_estimated_value,
+        aiEstimatedValue=ai_estimated_value,
+        lowEstimate=low_estimate,
+        highEstimate=high_estimate,
+        valuationStatus=pricing.valuationStatus,
+        valuationSource=pricing.valuationSource,
+        valuationConfidence=pricing.pricingConfidence,
+        marketTrend=pricing.marketTrend,
+        pricing=pricing_json,
+        marketSummary=market_summary,
+        comparableSales=comparable_sales,
+        rawProviderPayload={
+            "pricingProvider": pricing.pricingSource,
+            "pricingExplanation": pricing_explanation,
+            "pricingFallbackReason": pricing.providerDiagnostics.get("fallbackReason"),
+            "reasonCode": reason_code,
+            "valuationStrategy": valuation_strategy,
+            "displayString": display_string,
+            "cachePolicy": {
+                "ttlSeconds": cache_policy.ttl_seconds,
+                "expiresAt": None,
+                "reason": cache_policy.reason,
+            },
+            "pricingSource": {
+                "name": pricing.pricingSource,
+                "attributionText": attribution_text,
+                "lastChecked": pricing.lastUpdated,
+            },
+            "originalMarket": {
+                "price": original_market_value,
+                "currency": original_currency,
+                "exchangeRateUsed": pricing.exchangeRateUsed,
+                "exchangeRateDate": pricing.exchangeRateDate or pricing.lastUpdated,
+                "displayPrice": display_value,
+                "displayCurrency": pricing.currency,
+                "displayString": display_string,
+                "sourceDisplayString": source_display_string,
+            },
+            "matchMetadata": {
+                "reason": pricing_explanation,
+                "lowEstimate": low_estimate,
+                "highEstimate": high_estimate,
+                "lowEstimateAud": low_estimate,
+                "highEstimateAud": high_estimate,
+                "lowEstimateOriginal": pricing.originalLowEstimate or low_estimate,
+                "highEstimateOriginal": pricing.originalHighEstimate or high_estimate,
+            },
+            "diagnostics": {
+                "pricingCacheStatus": pricing.cacheStatus,
+                "pricingFreshness": pricing.pricingAge,
+                "pricingProviderCount": pricing.sourceCount,
+                "pricingFallbackUsed": pricing.fallbackUsed,
+                "pricingComparableCount": len(pricing.comparableSales),
+            },
+        },
+        timestamp=pricing.lastUpdated,
     )
 
 
@@ -801,6 +1027,13 @@ def _pricing_lookup_query(recognition) -> str:
         for part in parts
         if isinstance(part, str) and part.strip()
     )
+
+
+def _blank_as_none(value: str | None) -> str | None:
+    if value is None:
+        return None
+    trimmed = value.strip()
+    return trimmed or None
 
 
 def _recognition_too_uncertain_for_pricing(recognition) -> bool:
