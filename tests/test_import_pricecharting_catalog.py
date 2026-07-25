@@ -1,7 +1,10 @@
 import unittest
+import base64
+import json
 from unittest.mock import patch
 
 from scripts.import_pricecharting_catalog import (
+    SupabaseCatalogClient,
     dedupe_catalog_rows,
     download_env_sources,
     load_rows_from_text,
@@ -161,6 +164,17 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
             "mario kart 8 deluxe nintendo switch",
         )
 
+    def test_supabase_client_rejects_anon_key_for_imports(self) -> None:
+        with self.assertRaises(SystemExit) as context:
+            SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("anon"),
+                timeout_seconds=1,
+            )
+
+        self.assertIn("service_role", str(context.exception))
+        self.assertIn("anon", str(context.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -180,3 +194,14 @@ class _FakeTransport:
 
     def get(self, url: str, **kwargs):
         return _FakeResponse(self._responses[url])
+
+
+def _fake_supabase_jwt(role: str) -> str:
+    header = _b64_json({"alg": "HS256", "typ": "JWT"})
+    payload = _b64_json({"role": role})
+    return f"{header}.{payload}.signature"
+
+
+def _b64_json(payload: dict[str, str]) -> str:
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    return encoded.rstrip("=")

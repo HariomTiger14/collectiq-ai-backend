@@ -1,4 +1,5 @@
 import argparse
+import base64
 import csv
 import io
 import json
@@ -320,6 +321,12 @@ class SupabaseCatalogClient:
         self.timeout_seconds = timeout_seconds
         if not self.supabase_url or not self.service_role_key:
             raise SystemExit("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.")
+        role = _supabase_jwt_role(self.service_role_key)
+        if role and role != "service_role":
+            raise SystemExit(
+                "SUPABASE_SERVICE_ROLE_KEY must be the Supabase service_role key "
+                f"for catalog imports, but the configured key has role '{role}'."
+            )
 
     def upsert_rows(self, rows: list[dict[str, Any]], *, batch_size: int) -> int:
         if batch_size <= 0:
@@ -351,6 +358,21 @@ class SupabaseCatalogClient:
                 total += len(batch)
                 print(f"Imported {total} / {len(rows)} rows...", flush=True)
         return total
+
+
+def _supabase_jwt_role(token: str) -> str | None:
+    parts = token.split(".")
+    if len(parts) < 2:
+        return None
+    payload = parts[1]
+    padding = "=" * (-len(payload) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(payload + padding)
+        data = json.loads(decoded)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    role = data.get("role")
+    return role if isinstance(role, str) else None
 
 
 if __name__ == "__main__":
