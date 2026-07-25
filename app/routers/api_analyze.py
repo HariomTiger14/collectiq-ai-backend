@@ -1019,11 +1019,11 @@ def _format_currency_display(value: int | float | None, currency: str | None) ->
     normalized_currency = (currency or "AUD").strip().upper()
     amount = f"{float(value):,.2f}"
     if normalized_currency == "USD":
-        return f"US${amount}"
+        return f"USD ${amount}"
     if normalized_currency == "GBP":
         return f"£{amount}"
     if normalized_currency == "CAD":
-        return f"CA${amount}"
+        return f"CAD ${amount}"
     if normalized_currency == "AUD":
         return f"${amount} AUD"
     return f"{normalized_currency} {amount}"
