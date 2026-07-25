@@ -10,7 +10,11 @@ import httpx
 
 from app.core.config import settings
 from app.services.ai.base_recognition_service import RecognitionResult
-from app.services.pricing.base_pricing_provider import PricingResult, utc_timestamp
+from app.services.pricing.base_pricing_provider import (
+    MarketComparableSale,
+    PricingResult,
+    utc_timestamp,
+)
 from app.services.pricing.cache_policy import PricingCachePolicy, pricing_cache_policy
 from app.services.pricing.currency_conversion import normalize_display_currency
 
@@ -232,12 +236,25 @@ def _row_from_pricing(
             "sourceCount": pricing.sourceCount,
             "pricingAge": pricing.pricingAge,
             "cacheStatus": pricing.cacheStatus,
+            "comparableSales": [
+                {
+                    "source": sale.source,
+                    "title": sale.title,
+                    "soldPrice": sale.soldPrice,
+                    "currency": sale.currency,
+                    "soldDate": sale.soldDate,
+                    "condition": sale.condition,
+                    "url": sale.url,
+                }
+                for sale in pricing.comparableSales
+            ],
         },
     }
 
 
 def _pricing_result_from_row(row: dict) -> PricingResult:
     evidence = row.get("evidence_json") if isinstance(row.get("evidence_json"), dict) else {}
+    comparable_sales = _comparable_sales_from_evidence(evidence)
     provider = str(row.get("pricing_provider") or "shared_cache")
     match_reason = str(row.get("match_reason") or "Served from PackLox shared pricing cache.")
     exchange_rate = _float_number(row.get("exchange_rate_used"), default=1)
@@ -256,7 +273,7 @@ def _pricing_result_from_row(row: dict) -> PricingResult:
         marketTrend="Stable",
         sourceCount=int(evidence.get("sourceCount") or 1),
         pricingAge=str(evidence.get("pricingAge") or "cached"),
-        comparableSales=[],
+        comparableSales=comparable_sales,
         fallbackUsed=False,
         cacheStatus="shared_hit",
         providerDiagnostics={
@@ -265,7 +282,7 @@ def _pricing_result_from_row(row: dict) -> PricingResult:
             "fallbackUsed": "false",
             "cacheStatus": "shared_hit",
             "responseTimeMs": "0",
-            "comparableCount": "0",
+            "comparableCount": str(len(comparable_sales)),
             "confidenceCalculation": match_reason,
             "priceExplanation": match_reason,
         },
@@ -276,6 +293,32 @@ def _pricing_result_from_row(row: dict) -> PricingResult:
         exchangeRateUsed=exchange_rate,
         exchangeRateDate=str(row.get("exchange_rate_date") or row.get("checked_at") or ""),
     )
+
+
+def _comparable_sales_from_evidence(evidence: dict) -> list[MarketComparableSale]:
+    rows = evidence.get("comparableSales")
+    if not isinstance(rows, list):
+        return []
+
+    sales: list[MarketComparableSale] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title") or "").strip()
+        if not title:
+            continue
+        sales.append(
+            MarketComparableSale(
+                source=str(row.get("source") or "Shared pricing cache"),
+                title=title,
+                soldPrice=_int_number(row.get("soldPrice")),
+                currency=str(row.get("currency") or "").upper() or "AUD",
+                soldDate=str(row.get("soldDate") or utc_timestamp()),
+                condition=str(row.get("condition") or "Unknown"),
+                url=str(row.get("url") or "").strip() or None,
+            )
+        )
+    return sales
 
 
 def with_shared_cache_status(pricing: PricingResult, cache_status: str) -> PricingResult:

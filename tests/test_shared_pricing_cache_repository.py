@@ -49,7 +49,19 @@ class SharedPricingCacheRepositoryTest(unittest.TestCase):
                             "original_currency": "USD",
                             "exchange_rate_used": 1.52,
                             "match_reason": "Matched by card number and set.",
-                            "evidence_json": {"sourceCount": 1},
+                            "evidence_json": {
+                                "sourceCount": 1,
+                                "comparableSales": [
+                                    {
+                                        "source": "PriceCharting",
+                                        "title": "Charizard Base Set sold comp",
+                                        "soldPrice": 638,
+                                        "currency": "AUD",
+                                        "soldDate": "2026-07-24T22:06:00Z",
+                                        "condition": "Near Mint",
+                                    }
+                                ],
+                            },
                         }
                     ],
                 )
@@ -73,6 +85,9 @@ class SharedPricingCacheRepositoryTest(unittest.TestCase):
         self.assertEqual(pricing.exchangeRateUsed, 1.52)
         self.assertEqual(pricing.cacheStatus, "shared_hit")
         self.assertEqual(pricing.valuationSource, "PriceCharting")
+        self.assertEqual(len(pricing.comparableSales), 1)
+        self.assertEqual(pricing.comparableSales[0].title, "Charizard Base Set sold comp")
+        self.assertEqual(pricing.providerDiagnostics["comparableCount"], "1")
 
 
 def _recognition(title: str = "Charizard Base Set") -> RecognitionResult:
