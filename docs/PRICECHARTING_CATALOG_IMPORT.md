@@ -122,7 +122,7 @@ PackLox includes a Render cron job in `render.yaml`:
 - Command:
 
 ```bash
-python scripts/refresh_pricecharting_catalog.py --batch-size 1000 --timeout-seconds 600 --sleep-between-sources-seconds 600
+python -m scripts.refresh_pricecharting_catalog --batch-size 1000 --timeout-seconds 600 --sleep-between-sources-seconds 600
 ```
 
 The refresh script imports each configured source one at a time:
@@ -148,13 +148,13 @@ The cron service needs these private Render env vars:
 To test the cron command safely in Render Shell:
 
 ```bash
-python scripts/refresh_pricecharting_catalog.py --sources pokemon --dry-run --timeout-seconds 600 --sleep-between-sources-seconds 0
+python -m scripts.refresh_pricecharting_catalog --sources pokemon --dry-run --timeout-seconds 600 --sleep-between-sources-seconds 0
 ```
 
 To manually refresh one source:
 
 ```bash
-python scripts/refresh_pricecharting_catalog.py --sources pokemon --batch-size 1000 --timeout-seconds 600 --sleep-between-sources-seconds 0
+python -m scripts.refresh_pricecharting_catalog --sources pokemon --batch-size 1000 --timeout-seconds 600 --sleep-between-sources-seconds 0
 ```
 
 ## Next Integration Step

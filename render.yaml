@@ -77,7 +77,7 @@ services:
     branch: main
     schedule: "30 14 * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python scripts/refresh_pricecharting_catalog.py --batch-size 1000 --timeout-seconds 600 --sleep-between-sources-seconds 600
+    startCommand: python -m scripts.refresh_pricecharting_catalog --batch-size 1000 --timeout-seconds 600 --sleep-between-sources-seconds 600
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
