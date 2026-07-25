@@ -283,15 +283,12 @@ async def _analyze_collectible(
             or pricing.valuationStatus.upper()
         )
     )
-    display_string = (
-        f"${display_value:,.2f} {pricing.currency}" if display_value else None
-    )
+    display_string = _format_currency_display(display_value, pricing.currency)
     original_market_value = pricing.originalMarketValue or display_value
     original_currency = pricing.originalCurrency or pricing.currency
-    source_display_string = (
-        f"${original_market_value:,.2f} {original_currency}"
-        if original_market_value
-        else None
+    source_display_string = _format_currency_display(
+        original_market_value,
+        original_currency,
     )
     attribution_text = (
         f"Pricing data powered by {diagnostics.pricingProvider}"
@@ -1014,3 +1011,19 @@ def _parse_optional_int(value) -> int | None:
 def _parse_int(value, *, fallback: int) -> int:
     parsed = _parse_optional_int(value)
     return fallback if parsed is None else parsed
+
+
+def _format_currency_display(value: int | float | None, currency: str | None) -> str | None:
+    if not value:
+        return None
+    normalized_currency = (currency or "AUD").strip().upper()
+    amount = f"{float(value):,.2f}"
+    if normalized_currency == "USD":
+        return f"US${amount}"
+    if normalized_currency == "GBP":
+        return f"£{amount}"
+    if normalized_currency == "CAD":
+        return f"CA${amount}"
+    if normalized_currency == "AUD":
+        return f"${amount} AUD"
+    return f"{normalized_currency} {amount}"
