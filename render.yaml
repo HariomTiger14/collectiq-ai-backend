@@ -58,3 +58,42 @@ services:
         value: "250"
       - key: ADMIN_IMPORT_TOKEN
         sync: false
+      - key: PRICECHARTING_CSV_VIDEO_GAMES_URL
+        sync: false
+      - key: PRICECHARTING_CSV_POKEMON_URL
+        sync: false
+      - key: PRICECHARTING_CSV_MAGIC_URL
+        sync: false
+      - key: PRICECHARTING_CSV_YUGIOH_URL
+        sync: false
+      - key: PRICECHARTING_CSV_ONE_PIECE_URL
+        sync: false
+
+  - type: cron
+    name: collectiq-pricecharting-refresh-sit
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    schedule: "30 14 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scripts/refresh_pricecharting_catalog.py --batch-size 1000 --timeout-seconds 600 --sleep-between-sources-seconds 600
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ENVIRONMENT
+        value: sit
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: PRICECHARTING_CSV_VIDEO_GAMES_URL
+        sync: false
+      - key: PRICECHARTING_CSV_POKEMON_URL
+        sync: false
+      - key: PRICECHARTING_CSV_MAGIC_URL
+        sync: false
+      - key: PRICECHARTING_CSV_YUGIOH_URL
+        sync: false
+      - key: PRICECHARTING_CSV_ONE_PIECE_URL
+        sync: false

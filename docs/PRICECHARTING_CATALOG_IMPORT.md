@@ -112,6 +112,51 @@ defaults to a 180-second timeout and accepts `timeoutSeconds` from 10 to 600.
 
 PriceCharting CSV files are generated once every 24 hours, so PackLox should import at most once per day.
 
+## Daily Render Cron Refresh
+
+PackLox includes a Render cron job in `render.yaml`:
+
+- Service name: `collectiq-pricecharting-refresh-sit`
+- Schedule: `30 14 * * *`
+- Timezone: Render cron schedules are UTC
+- Command:
+
+```bash
+python scripts/refresh_pricecharting_catalog.py --batch-size 1000 --timeout-seconds 600 --sleep-between-sources-seconds 600
+```
+
+The refresh script imports each configured source one at a time:
+
+1. `video_games`
+2. `pokemon`
+3. `magic`
+4. `yugioh`
+5. `one_piece`
+
+It waits 600 seconds between sources because PriceCharting limits CSV calls to one every 10 minutes. Each source is a full CSV snapshot. The importer upserts by `pricecharting_id`, so existing products are updated/overwritten and new products are inserted.
+
+The cron service needs these private Render env vars:
+
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `PRICECHARTING_CSV_VIDEO_GAMES_URL`
+- `PRICECHARTING_CSV_POKEMON_URL`
+- `PRICECHARTING_CSV_MAGIC_URL`
+- `PRICECHARTING_CSV_YUGIOH_URL`
+- `PRICECHARTING_CSV_ONE_PIECE_URL`
+
+To test the cron command safely in Render Shell:
+
+```bash
+python scripts/refresh_pricecharting_catalog.py --sources pokemon --dry-run --timeout-seconds 600 --sleep-between-sources-seconds 0
+```
+
+To manually refresh one source:
+
+```bash
+python scripts/refresh_pricecharting_catalog.py --sources pokemon --batch-size 1000 --timeout-seconds 600 --sleep-between-sources-seconds 0
+```
+
 ## Next Integration Step
 
 After importing the CSV, wire analyzer pricing lookup order as:
