@@ -4,7 +4,16 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.core.config import UPLOAD_DIR, settings
-from app.routers import admin_pricecharting, api_analyze, auth, health, portfolio, scanner, search
+from app.routers import (
+    admin_pricecharting,
+    api_analyze,
+    auth,
+    health,
+    portfolio,
+    push,
+    scanner,
+    search,
+)
 
 
 app = FastAPI(
@@ -28,6 +37,7 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(admin_pricecharting.router)
+app.include_router(push.router)
 app.include_router(api_analyze.root_router)
 app.include_router(api_analyze.router)
 app.include_router(scanner.router)

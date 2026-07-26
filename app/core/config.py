@@ -150,6 +150,10 @@ class Settings:
     fx_usd_to_cad: float = float(os.getenv("FX_USD_TO_CAD", "1.37"))
     fx_usd_to_gbp: float = float(os.getenv("FX_USD_TO_GBP", "0.78"))
     admin_import_token: str = os.getenv("ADMIN_IMPORT_TOKEN", "")
+    admin_job_token: str = os.getenv("ADMIN_JOB_TOKEN", os.getenv("ADMIN_IMPORT_TOKEN", ""))
+    firebase_project_id: str = os.getenv("FIREBASE_PROJECT_ID", "")
+    firebase_service_account_json: str = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+    firebase_access_token: str = os.getenv("FIREBASE_ACCESS_TOKEN", "")
 
 
 settings = Settings()
