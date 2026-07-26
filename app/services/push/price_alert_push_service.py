@@ -153,6 +153,48 @@ class PriceAlertPushService:
             skipped_deliveries=skipped,
         )
 
+    def dispatch_test_price_alert_notification(
+        self,
+        *,
+        portfolio_item_id: str,
+        user_id: str | None = None,
+        limit: int = 10,
+        dry_run: bool = False,
+    ) -> PushDeliverySummary:
+        self._ensure_configured(require_firebase=not dry_run)
+        devices = self._fetch_enabled_devices(user_id=user_id, limit=limit)
+        alert = {
+            "id": "admin-test-price-alert",
+            "user_id": user_id,
+            "portfolio_item_id": portfolio_item_id,
+            "item_title": "PackLox test item",
+            "message": "Open this alert to review your collectible.",
+        }
+
+        attempted = sent = failed = skipped = 0
+        for device in devices:
+            attempted += 1
+            if dry_run:
+                skipped += 1
+                continue
+            status, _provider_message_id, _error_message = self._send_fcm(
+                alert,
+                device,
+            )
+            if status == "sent":
+                sent += 1
+            else:
+                failed += 1
+
+        return PushDeliverySummary(
+            success=failed == 0,
+            scanned_alerts=0,
+            attempted_deliveries=attempted,
+            sent_deliveries=sent,
+            failed_deliveries=failed,
+            skipped_deliveries=skipped,
+        )
+
     def _ensure_configured(self, *, require_firebase: bool) -> None:
         if not self._supabase_url or not self._service_role_key:
             raise PushNotificationError("Supabase service role configuration is missing.")

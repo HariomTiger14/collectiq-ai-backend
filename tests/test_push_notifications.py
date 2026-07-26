@@ -74,6 +74,38 @@ class PushNotificationServiceTest(unittest.TestCase):
             "test_push",
         )
 
+    def test_test_price_alert_notification_sends_portfolio_route_data(self) -> None:
+        client = _FakePushHttpClient()
+        service = PriceAlertPushService(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            firebase_project_id="packlox-test",
+            firebase_access_token="firebase-access",
+            client=client,
+        )
+
+        summary = service.dispatch_test_price_alert_notification(
+            portfolio_item_id="item-123",
+            dry_run=False,
+        )
+
+        self.assertTrue(summary.success)
+        self.assertEqual(summary.attempted_deliveries, 1)
+        self.assertEqual(summary.sent_deliveries, 1)
+        fcm_request = [
+            request
+            for request in client.requests
+            if "fcm.googleapis.com" in request["url"]
+        ][0]
+        self.assertEqual(
+            fcm_request["json"]["message"]["data"],
+            {
+                "type": "price_alert",
+                "priceAlertId": "admin-test-price-alert",
+                "portfolioItemId": "item-123",
+            },
+        )
+
 
 class _FakePushHttpClient:
     def __init__(self) -> None:
