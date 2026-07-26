@@ -68,7 +68,10 @@ class CatalogSearchService:
 
         history_rows = self._fetch_history_rows(normalized_id, bounded_history_limit)
         return CatalogDetailResponse(
-            result=_row_to_result(row, str(row.get("product_name") or "")),
+            result=_row_to_result(
+                row,
+                _normalize_query(str(row.get("product_name") or "")),
+            ),
             history=[_history_row_to_point(row) for row in history_rows],
         )
 

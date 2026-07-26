@@ -148,6 +148,7 @@ class CatalogSearchServiceTest(unittest.TestCase):
         response = service.detail("999", history_limit=10)
 
         self.assertEqual(response.result.id, "999")
+        self.assertEqual(response.result.confidence, 0.96)
         self.assertEqual(response.result.pricing.marketValue, 161)
         self.assertEqual(len(response.history), 2)
         self.assertTrue(response.history[0].isCurrent)
