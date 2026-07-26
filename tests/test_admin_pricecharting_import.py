@@ -80,6 +80,7 @@ class AdminPriceChartingImportTest(unittest.TestCase):
         self.assertEqual(payload["inputRows"], 2)
         self.assertEqual(payload["validRows"], 2)
         self.assertEqual(payload["importedRows"], 0)
+        self.assertEqual(payload["historyRows"], 0)
         self.assertEqual(
             payload["sources"],
             [
@@ -122,6 +123,7 @@ class AdminPriceChartingImportTest(unittest.TestCase):
         self.assertEqual(payload["source"], "video_games")
         self.assertEqual(payload["inputRows"], 1)
         self.assertEqual(payload["validRows"], 1)
+        self.assertEqual(payload["historyRows"], 0)
         download_sources.assert_called_once_with(
             timeout_seconds=240,
             source_filter="video_games",

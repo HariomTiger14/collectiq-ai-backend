@@ -59,6 +59,7 @@ def main(argv: list[str] | None = None) -> int:
                 "inputRows": sum(summary["inputRows"] for summary in summaries),
                 "validRows": sum(summary["validRows"] for summary in summaries),
                 "importedRows": sum(summary["importedRows"] for summary in summaries),
+                "historyRows": sum(summary["historyRows"] for summary in summaries),
             },
             indent=2,
         ),
@@ -144,6 +145,7 @@ def import_source_file(
     input_rows = 0
     valid_rows = 0
     imported_rows = 0
+    history_rows = 0
     batch: list[dict[str, Any]] = []
     seen_in_batch: set[str] = set()
 
@@ -160,24 +162,28 @@ def import_source_file(
             batch.append(catalog_row)
             valid_rows += 1
             if len(batch) >= batch_size:
-                imported_rows += import_batch(
+                result = import_batch(
                     batch=batch,
                     batch_size=batch_size,
                     dry_run=dry_run,
                     client=client,
                     imported_rows=imported_rows,
                 )
+                imported_rows += result["importedRows"]
+                history_rows += result["historyRows"]
                 batch = []
                 seen_in_batch = set()
 
     if batch:
-        imported_rows += import_batch(
+        result = import_batch(
             batch=batch,
             batch_size=batch_size,
             dry_run=dry_run,
             client=client,
             imported_rows=imported_rows,
         )
+        imported_rows += result["importedRows"]
+        history_rows += result["historyRows"]
 
     print(f"Processed {source_name} with {input_rows} rows.", flush=True)
     return {
@@ -185,6 +191,7 @@ def import_source_file(
         "inputRows": input_rows,
         "validRows": valid_rows,
         "importedRows": imported_rows,
+        "historyRows": history_rows,
     }
 
 
@@ -195,14 +202,15 @@ def import_batch(
     dry_run: bool,
     client: SupabaseCatalogClient | None,
     imported_rows: int,
-) -> int:
+) -> dict[str, int]:
     if dry_run:
-        return 0
+        return {"importedRows": 0, "historyRows": 0}
     if client is None:
         raise SystemExit("Supabase client is required for non-dry-run refresh.")
+    history_total = client.sync_scd2_history_rows(batch, batch_size=batch_size)
     total = client.upsert_rows(batch, batch_size=batch_size)
     print(f"Imported {imported_rows + total} rows for current source...", flush=True)
-    return total
+    return {"importedRows": total, "historyRows": history_total}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

@@ -1,6 +1,7 @@
 import argparse
 import base64
 import csv
+import hashlib
 import io
 import json
 import os
@@ -64,6 +65,52 @@ CATALOG_COLUMNS = (
     "source_downloaded_at",
 )
 
+CATALOG_HISTORY_COLUMNS = (
+    "pricecharting_id",
+    "product_name",
+    "console_name",
+    "category",
+    "upc",
+    "asin",
+    "epid",
+    "release_date",
+    "loose_price_cents",
+    "cib_price_cents",
+    "new_price_cents",
+    "graded_price_cents",
+    "box_only_price_cents",
+    "manual_only_price_cents",
+    "currency",
+    "product_url",
+    "normalized_identity",
+    "raw_payload",
+    "source_file",
+    "source_downloaded_at",
+    "valid_from",
+    "valid_to",
+    "is_current",
+    "change_hash",
+)
+
+CATALOG_HISTORY_SIGNATURE_COLUMNS = (
+    "product_name",
+    "console_name",
+    "category",
+    "upc",
+    "asin",
+    "epid",
+    "release_date",
+    "loose_price_cents",
+    "cib_price_cents",
+    "new_price_cents",
+    "graded_price_cents",
+    "box_only_price_cents",
+    "manual_only_price_cents",
+    "currency",
+    "product_url",
+    "normalized_identity",
+)
+
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
@@ -110,8 +157,13 @@ def main(argv: list[str] | None = None) -> int:
         timeout_seconds=args.timeout_seconds,
     )
     print(f"Starting Supabase import with batch size {args.batch_size}...", flush=True)
+    history_total = client.sync_scd2_history_rows(
+        imported_rows,
+        batch_size=args.batch_size,
+    )
     total = client.upsert_rows(imported_rows, batch_size=args.batch_size)
     print(f"Imported {total} PriceCharting catalog rows into Supabase.")
+    print(f"Recorded {history_total} PriceCharting catalog history versions into Supabase.")
     return 0
 
 
@@ -264,6 +316,43 @@ def normalize_catalog_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def to_catalog_history_row(catalog_row: dict[str, Any]) -> dict[str, Any]:
+    valid_from = source_timestamp(catalog_row.get("source_downloaded_at"))
+    row = {
+        **catalog_row,
+        "valid_from": valid_from,
+        "valid_to": None,
+        "is_current": True,
+        "change_hash": catalog_history_change_hash(catalog_row),
+    }
+    return {
+        column: row.get(column) if row.get(column) != "" else None
+        for column in CATALOG_HISTORY_COLUMNS
+    }
+
+
+def source_timestamp(source_downloaded_at: Any) -> str:
+    if isinstance(source_downloaded_at, datetime):
+        return source_downloaded_at.astimezone(timezone.utc).isoformat()
+    value = str(source_downloaded_at or "").strip()
+    if not value:
+        return datetime.now(timezone.utc).isoformat()
+    normalized = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized).astimezone(timezone.utc).isoformat()
+    except ValueError:
+        return datetime.now(timezone.utc).isoformat()
+
+
+def catalog_history_change_hash(catalog_row: dict[str, Any]) -> str:
+    payload = {
+        column: catalog_row.get(column)
+        for column in CATALOG_HISTORY_SIGNATURE_COLUMNS
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def pick_text(row: dict[str, Any], aliases: list[str]) -> str:
     normalized = {normalize_key(key): value for key, value in row.items()}
     for alias in aliases:
@@ -329,21 +418,161 @@ class SupabaseCatalogClient:
             )
 
     def upsert_rows(self, rows: list[dict[str, Any]], *, batch_size: int) -> int:
+        return self._upsert(
+            table="pricecharting_catalog",
+            rows=rows,
+            batch_size=batch_size,
+            on_conflict="pricecharting_id",
+            label="catalog",
+        )
+
+    def sync_scd2_history_rows(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        batch_size: int,
+    ) -> int:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero")
+        inserted = 0
+        with httpx.Client(timeout=self.timeout_seconds) as client:
+            for index in range(0, len(rows), batch_size):
+                batch = rows[index : index + batch_size]
+                current_by_id = self._fetch_current_history_rows(client, batch)
+                rows_to_insert = []
+                changed_ids = []
+                for row in batch:
+                    product_id = str(row.get("pricecharting_id") or "").strip()
+                    if not product_id:
+                        continue
+                    history_row = to_catalog_history_row(row)
+                    current = current_by_id.get(product_id)
+                    if current and current.get("change_hash") == history_row["change_hash"]:
+                        continue
+                    if current:
+                        changed_ids.append(product_id)
+                    rows_to_insert.append(history_row)
+
+                if changed_ids:
+                    self._close_current_history_rows(
+                        client,
+                        pricecharting_ids=changed_ids,
+                        valid_to=source_timestamp(batch[0].get("source_downloaded_at")),
+                    )
+                if rows_to_insert:
+                    inserted += self._insert_history_rows(
+                        client,
+                        rows_to_insert,
+                        batch_offset=index,
+                    )
+                print(
+                    f"Recorded {inserted} / {len(rows)} SCD2 history versions...",
+                    flush=True,
+                )
+        return inserted
+
+    def _fetch_current_history_rows(
+        self,
+        client: httpx.Client,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        ids = [
+            str(row.get("pricecharting_id") or "").strip()
+            for row in rows
+            if str(row.get("pricecharting_id") or "").strip()
+        ]
+        if not ids:
+            return {}
+        response = client.get(
+            f"{self.supabase_url}/rest/v1/pricecharting_catalog_history",
+            params={
+                "select": "pricecharting_id,change_hash",
+                "is_current": "eq.true",
+                "pricecharting_id": f"in.({','.join(ids)})",
+            },
+            headers=self._headers(),
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise SystemExit(
+                "Supabase catalog history lookup failed "
+                f"with HTTP {response.status_code}: {response.text}"
+            ) from exc
+        rows_payload = response.json()
+        if not isinstance(rows_payload, list):
+            raise SystemExit("Supabase catalog history lookup returned invalid data.")
+        return {
+            str(row.get("pricecharting_id")): row
+            for row in rows_payload
+            if isinstance(row, dict) and row.get("pricecharting_id")
+        }
+
+    def _close_current_history_rows(
+        self,
+        client: httpx.Client,
+        *,
+        pricecharting_ids: list[str],
+        valid_to: str,
+    ) -> None:
+        response = client.patch(
+            f"{self.supabase_url}/rest/v1/pricecharting_catalog_history",
+            params={
+                "pricecharting_id": f"in.({','.join(pricecharting_ids)})",
+                "is_current": "eq.true",
+            },
+            headers={**self._headers(), "Prefer": "return=minimal"},
+            json={"valid_to": valid_to, "is_current": False},
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise SystemExit(
+                "Supabase catalog history close-current failed "
+                f"with HTTP {response.status_code}: {response.text}"
+            ) from exc
+
+    def _insert_history_rows(
+        self,
+        client: httpx.Client,
+        rows: list[dict[str, Any]],
+        *,
+        batch_offset: int,
+    ) -> int:
+        response = client.post(
+            f"{self.supabase_url}/rest/v1/pricecharting_catalog_history",
+            headers={**self._headers(), "Prefer": "return=minimal"},
+            json=rows,
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise SystemExit(
+                "Supabase catalog history insert failed "
+                f"at rows {batch_offset + 1}-{batch_offset + len(rows)} "
+                f"with HTTP {response.status_code}: {response.text}"
+            ) from exc
+        return len(rows)
+
+    def _upsert(
+        self,
+        *,
+        table: str,
+        rows: list[dict[str, Any]],
+        batch_size: int,
+        on_conflict: str,
+        label: str,
+    ) -> int:
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
         total = 0
-        headers = {
-            "apikey": self.service_role_key,
-            "Authorization": f"Bearer {self.service_role_key}",
-            "Content-Type": "application/json",
-            "Prefer": "resolution=merge-duplicates,return=minimal",
-        }
+        headers = {**self._headers(), "Prefer": "resolution=merge-duplicates,return=minimal"}
         with httpx.Client(timeout=self.timeout_seconds) as client:
             for index in range(0, len(rows), batch_size):
                 batch = rows[index : index + batch_size]
                 response = client.post(
-                    f"{self.supabase_url}/rest/v1/pricecharting_catalog",
-                    params={"on_conflict": "pricecharting_id"},
+                    f"{self.supabase_url}/rest/v1/{table}",
+                    params={"on_conflict": on_conflict},
                     headers=headers,
                     json=batch,
                 )
@@ -351,13 +580,20 @@ class SupabaseCatalogClient:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as exc:
                     raise SystemExit(
-                        "Supabase catalog import failed "
+                        f"Supabase {label} import failed "
                         f"at rows {index + 1}-{index + len(batch)} "
                         f"with HTTP {response.status_code}: {response.text}"
                     ) from exc
                 total += len(batch)
-                print(f"Imported {total} / {len(rows)} rows...", flush=True)
+                print(f"Imported {total} / {len(rows)} {label} rows...", flush=True)
         return total
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "apikey": self.service_role_key,
+            "Authorization": f"Bearer {self.service_role_key}",
+            "Content-Type": "application/json",
+        }
 
 
 def _supabase_jwt_role(token: str) -> str | None:

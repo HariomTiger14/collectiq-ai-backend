@@ -7,6 +7,7 @@ from app.core.config import settings
 from scripts.import_pricecharting_catalog import PRICECHARTING_CSV_ENV_VARS
 from scripts.import_pricecharting_catalog import (
     SupabaseCatalogClient,
+    dedupe_catalog_rows,
     download_env_sources,
     to_catalog_row,
 )
@@ -89,7 +90,10 @@ def import_pricecharting_catalog(
             }
         )
 
+    imported_rows = dedupe_catalog_rows(imported_rows)
+
     imported_count = 0
+    history_count = 0
     if not dry_run:
         try:
             client = SupabaseCatalogClient(
@@ -97,6 +101,7 @@ def import_pricecharting_catalog(
                 service_role_key=settings.supabase_service_role_key,
                 timeout_seconds=timeout_seconds,
             )
+            history_count = client.sync_scd2_history_rows(imported_rows, batch_size=500)
             imported_count = client.upsert_rows(imported_rows, batch_size=500)
         except SystemExit as exc:
             raise _admin_import_error(
@@ -119,6 +124,7 @@ def import_pricecharting_catalog(
         "inputRows": sum(source["inputRows"] for source in source_summaries),
         "validRows": len(imported_rows),
         "importedRows": imported_count,
+        "historyRows": history_count,
     }
 
 

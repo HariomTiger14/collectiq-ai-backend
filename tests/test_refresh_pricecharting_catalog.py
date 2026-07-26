@@ -36,6 +36,7 @@ class RefreshPriceChartingCatalogTest(unittest.TestCase):
         self.assertEqual(summary["inputRows"], 1)
         self.assertEqual(summary["validRows"], 1)
         self.assertEqual(summary["importedRows"], 0)
+        self.assertEqual(summary["historyRows"], 0)
 
     def test_import_source_file_upserts_in_batches_without_loading_all_rows(self) -> None:
         path = _write_csv(
@@ -59,13 +60,20 @@ class RefreshPriceChartingCatalogTest(unittest.TestCase):
         self.assertEqual(summary["inputRows"], 3)
         self.assertEqual(summary["validRows"], 3)
         self.assertEqual(summary["importedRows"], 3)
+        self.assertEqual(summary["historyRows"], 3)
         self.assertEqual([len(batch) for batch in client.batches], [2, 1])
+        self.assertEqual([len(batch) for batch in client.history_batches], [2, 1])
         self.assertEqual(client.batches[0][0]["product_name"], "Charizard")
 
 
 class _RecordingCatalogClient:
     def __init__(self) -> None:
         self.batches = []
+        self.history_batches = []
+
+    def sync_scd2_history_rows(self, rows, *, batch_size):
+        self.history_batches.append(list(rows))
+        return len(rows)
 
     def upsert_rows(self, rows, *, batch_size):
         self.batches.append(list(rows))
