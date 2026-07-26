@@ -1,7 +1,9 @@
 import argparse
 import csv
+import hashlib
 import json
 import os
+import shutil
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -43,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
         summary = refresh_source(
             source=source,
             source_downloaded_at=source_downloaded_at,
+            archive_dir=args.archive_dir,
             batch_size=args.batch_size,
             timeout_seconds=args.timeout_seconds,
             dry_run=args.dry_run,
@@ -60,6 +63,11 @@ def main(argv: list[str] | None = None) -> int:
                 "validRows": sum(summary["validRows"] for summary in summaries),
                 "importedRows": sum(summary["importedRows"] for summary in summaries),
                 "historyRows": sum(summary["historyRows"] for summary in summaries),
+                "archivedFiles": [
+                    summary["archivePath"]
+                    for summary in summaries
+                    if summary.get("archivePath")
+                ],
             },
             indent=2,
         ),
@@ -72,6 +80,7 @@ def refresh_source(
     *,
     source: str,
     source_downloaded_at: str,
+    archive_dir: str,
     batch_size: int,
     timeout_seconds: float,
     dry_run: bool,
@@ -85,7 +94,14 @@ def refresh_source(
         timeout_seconds=timeout_seconds,
     )
     try:
-        return import_source_file(
+        archive_path = archive_source_file(
+            source_name=source_name,
+            path=temp_path,
+            source_downloaded_at=source_downloaded_at,
+            archive_dir=archive_dir,
+            dry_run=dry_run,
+        )
+        summary = import_source_file(
             source_name=source_name,
             path=temp_path,
             source_downloaded_at=source_downloaded_at,
@@ -93,6 +109,8 @@ def refresh_source(
             dry_run=dry_run,
             client=client,
         )
+        summary["archivePath"] = str(archive_path) if archive_path else None
+        return summary
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -237,6 +255,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Defaults to SUPABASE_SERVICE_ROLE_KEY.",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--archive-dir",
+        default=os.getenv("PRICECHARTING_CSV_ARCHIVE_DIR", ""),
+        help=(
+            "Optional directory for keeping raw daily CSV files. "
+            "Defaults to PRICECHARTING_CSV_ARCHIVE_DIR."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -257,6 +283,53 @@ def _selected_sources(raw_sources: str) -> list[str]:
             f"Unsupported source(s): {', '.join(unsupported)}. Use one of: {allowed}."
         )
     return selected
+
+
+def archive_source_file(
+    *,
+    source_name: str,
+    path: Path,
+    source_downloaded_at: str,
+    archive_dir: str,
+    dry_run: bool,
+) -> Path | None:
+    root = archive_dir.strip()
+    if not root:
+        return None
+
+    archive_root = Path(root)
+    archive_date = _archive_date(source_downloaded_at)
+    destination = archive_root / archive_date / source_name
+    checksum_path = destination.with_suffix(destination.suffix + ".sha256")
+
+    if dry_run:
+        print(f"Would archive {source_name} to {destination}.", flush=True)
+        return destination
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(path, destination)
+    checksum_path.write_text(
+        f"{_sha256_file(destination)}  {source_name}\n",
+        encoding="utf-8",
+    )
+    print(f"Archived {source_name} to {destination}.", flush=True)
+    return destination
+
+
+def _archive_date(source_downloaded_at: str) -> str:
+    value = source_downloaded_at.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(value).astimezone(timezone.utc).date().isoformat()
+    except ValueError:
+        return datetime.now(timezone.utc).date().isoformat()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 if __name__ == "__main__":

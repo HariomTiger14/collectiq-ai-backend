@@ -2,7 +2,11 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from scripts.refresh_pricecharting_catalog import _selected_sources, import_source_file
+from scripts.refresh_pricecharting_catalog import (
+    _selected_sources,
+    archive_source_file,
+    import_source_file,
+)
 
 
 class RefreshPriceChartingCatalogTest(unittest.TestCase):
@@ -64,6 +68,45 @@ class RefreshPriceChartingCatalogTest(unittest.TestCase):
         self.assertEqual([len(batch) for batch in client.batches], [2, 1])
         self.assertEqual([len(batch) for batch in client.history_batches], [2, 1])
         self.assertEqual(client.batches[0][0]["product_name"], "Charizard")
+
+    def test_archive_source_file_copies_raw_csv_with_checksum(self) -> None:
+        path = _write_csv(
+            "id,product-name,console-name,loose-price\n"
+            "1,Charizard,Pokemon Cards,79000\n"
+        )
+        self.addCleanup(path.unlink, missing_ok=True)
+        with tempfile.TemporaryDirectory() as archive_dir:
+            archive_path = archive_source_file(
+                source_name="pokemon.csv",
+                path=path,
+                source_downloaded_at="2026-07-25T10:30:00Z",
+                archive_dir=archive_dir,
+                dry_run=False,
+            )
+
+            assert archive_path is not None
+            self.assertEqual(archive_path.name, "pokemon.csv")
+            self.assertEqual(archive_path.parent.name, "2026-07-25")
+            self.assertEqual(archive_path.read_text(encoding="utf-8"), path.read_text())
+            checksum = archive_path.with_suffix(".csv.sha256")
+            self.assertTrue(checksum.exists())
+            self.assertIn("pokemon.csv", checksum.read_text(encoding="utf-8"))
+
+    def test_archive_source_file_dry_run_returns_destination_without_writing(self) -> None:
+        path = _write_csv("id,product-name\n1,Charizard\n")
+        self.addCleanup(path.unlink, missing_ok=True)
+        with tempfile.TemporaryDirectory() as archive_dir:
+            archive_path = archive_source_file(
+                source_name="pokemon.csv",
+                path=path,
+                source_downloaded_at="2026-07-25T10:30:00Z",
+                archive_dir=archive_dir,
+                dry_run=True,
+            )
+
+            assert archive_path is not None
+            self.assertEqual(archive_path.parent.name, "2026-07-25")
+            self.assertFalse(archive_path.exists())
 
 
 class _RecordingCatalogClient:
