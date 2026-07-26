@@ -1,7 +1,8 @@
+from pathlib import Path
+import tempfile
 import unittest
-from unittest.mock import patch
 
-from scripts.refresh_pricecharting_catalog import _selected_sources, refresh_source
+from scripts.refresh_pricecharting_catalog import _selected_sources, import_source_file
 
 
 class RefreshPriceChartingCatalogTest(unittest.TestCase):
@@ -15,42 +16,67 @@ class RefreshPriceChartingCatalogTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             _selected_sources("watches")
 
-    def test_refresh_source_dry_run_downloads_one_source_and_counts_rows(self) -> None:
-        with patch(
-            "scripts.refresh_pricecharting_catalog.download_env_sources",
-            return_value=[
-                _CatalogSource(
-                    name="pokemon.csv",
-                    rows=[
-                        {
-                            "id": "12345",
-                            "product-name": "Charizard",
-                            "console-name": "Pokemon Cards",
-                            "loose-price": "79000",
-                        }
-                    ],
-                )
-            ],
-        ):
-            summary = refresh_source(
-                source="pokemon",
-                source_downloaded_at="2026-07-25T00:00:00Z",
-                batch_size=1000,
-                timeout_seconds=1,
-                dry_run=True,
-                client=None,
-            )
+    def test_import_source_file_dry_run_streams_and_counts_rows(self) -> None:
+        path = _write_csv(
+            "id,product-name,console-name,loose-price\n"
+            "12345,Charizard,Pokemon Cards,79000\n"
+        )
+        self.addCleanup(path.unlink, missing_ok=True)
+
+        summary = import_source_file(
+            source_name="pokemon.csv",
+            path=path,
+            source_downloaded_at="2026-07-25T00:00:00Z",
+            batch_size=1000,
+            dry_run=True,
+            client=None,
+        )
 
         self.assertEqual(summary["source"], "pokemon.csv")
         self.assertEqual(summary["inputRows"], 1)
         self.assertEqual(summary["validRows"], 1)
         self.assertEqual(summary["importedRows"], 0)
 
+    def test_import_source_file_upserts_in_batches_without_loading_all_rows(self) -> None:
+        path = _write_csv(
+            "id,product-name,console-name,loose-price\n"
+            "1,Charizard,Pokemon Cards,79000\n"
+            "2,Pikachu,Pokemon Cards,1200\n"
+            "3,Blastoise,Pokemon Cards,3300\n"
+        )
+        self.addCleanup(path.unlink, missing_ok=True)
+        client = _RecordingCatalogClient()
 
-class _CatalogSource:
-    def __init__(self, *, name, rows) -> None:
-        self.name = name
-        self.rows = rows
+        summary = import_source_file(
+            source_name="pokemon.csv",
+            path=path,
+            source_downloaded_at="2026-07-25T00:00:00Z",
+            batch_size=2,
+            dry_run=False,
+            client=client,
+        )
+
+        self.assertEqual(summary["inputRows"], 3)
+        self.assertEqual(summary["validRows"], 3)
+        self.assertEqual(summary["importedRows"], 3)
+        self.assertEqual([len(batch) for batch in client.batches], [2, 1])
+        self.assertEqual(client.batches[0][0]["product_name"], "Charizard")
+
+
+class _RecordingCatalogClient:
+    def __init__(self) -> None:
+        self.batches = []
+
+    def upsert_rows(self, rows, *, batch_size):
+        self.batches.append(list(rows))
+        return len(rows)
+
+
+def _write_csv(text: str) -> Path:
+    handle = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w")
+    with handle:
+        handle.write(text)
+    return Path(handle.name)
 
 
 if __name__ == "__main__":
