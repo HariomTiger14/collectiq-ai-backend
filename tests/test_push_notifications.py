@@ -47,6 +47,33 @@ class PushNotificationServiceTest(unittest.TestCase):
         self.assertEqual(len(delivery_logs), 1)
         self.assertEqual(delivery_logs[0]["json"][0]["status"], "sent")
 
+    def test_test_notification_sends_to_registered_devices(self) -> None:
+        client = _FakePushHttpClient()
+        service = PriceAlertPushService(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            firebase_project_id="packlox-test",
+            firebase_access_token="firebase-access",
+            client=client,
+        )
+
+        summary = service.dispatch_test_notification(dry_run=False)
+
+        self.assertTrue(summary.success)
+        self.assertEqual(summary.scanned_alerts, 0)
+        self.assertEqual(summary.attempted_deliveries, 1)
+        self.assertEqual(summary.sent_deliveries, 1)
+        self.assertEqual(client.fcm_posts, 1)
+        fcm_request = [
+            request
+            for request in client.requests
+            if "fcm.googleapis.com" in request["url"]
+        ][0]
+        self.assertEqual(
+            fcm_request["json"]["message"]["data"]["type"],
+            "test_push",
+        )
+
 
 class _FakePushHttpClient:
     def __init__(self) -> None:

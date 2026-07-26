@@ -42,3 +42,39 @@ async def run_price_alert_push_job(
         ) from error
 
     return {**summary.to_dict(), "dryRun": dry_run}
+
+
+@router.post("/test")
+async def send_test_push_notification(
+    dry_run: bool = Query(False, alias="dryRun"),
+    limit: int = Query(10, ge=1, le=100),
+    user_id: str | None = Query(None, alias="userId"),
+    x_admin_token: str = Header("", alias="X-Admin-Token"),
+) -> dict:
+    if not settings.admin_job_token or x_admin_token != settings.admin_job_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "admin_token_required",
+                "message": "A valid admin token is required.",
+                "retryable": False,
+            },
+        )
+
+    try:
+        summary = PriceAlertPushService().dispatch_test_notification(
+            user_id=user_id,
+            limit=limit,
+            dry_run=dry_run,
+        )
+    except PushNotificationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "push_test_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+
+    return {**summary.to_dict(), "dryRun": dry_run}

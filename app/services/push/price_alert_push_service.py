@@ -122,6 +122,37 @@ class PriceAlertPushService:
             skipped_deliveries=skipped,
         )
 
+    def dispatch_test_notification(
+        self,
+        *,
+        user_id: str | None = None,
+        limit: int = 10,
+        dry_run: bool = False,
+    ) -> PushDeliverySummary:
+        self._ensure_configured(require_firebase=not dry_run)
+        devices = self._fetch_enabled_devices(user_id=user_id, limit=limit)
+
+        attempted = sent = failed = skipped = 0
+        for device in devices:
+            attempted += 1
+            if dry_run:
+                skipped += 1
+                continue
+            status, _provider_message_id, _error_message = self._send_test_fcm(device)
+            if status == "sent":
+                sent += 1
+            else:
+                failed += 1
+
+        return PushDeliverySummary(
+            success=failed == 0,
+            scanned_alerts=0,
+            attempted_deliveries=attempted,
+            sent_deliveries=sent,
+            failed_deliveries=failed,
+            skipped_deliveries=skipped,
+        )
+
     def _ensure_configured(self, *, require_firebase: bool) -> None:
         if not self._supabase_url or not self._service_role_key:
             raise PushNotificationError("Supabase service role configuration is missing.")
@@ -164,6 +195,28 @@ class PriceAlertPushService:
         data = response.json()
         return data if isinstance(data, list) else []
 
+    def _fetch_enabled_devices(
+        self,
+        *,
+        user_id: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        params = {
+            "select": "*",
+            "enabled": "eq.true",
+            "order": "updated_at.desc.nullslast,last_seen_at.desc.nullslast",
+            "limit": str(limit),
+        }
+        if user_id:
+            params["user_id"] = f"eq.{user_id}"
+        response = self._supabase_request(
+            "GET",
+            "/rest/v1/push_device_registrations",
+            params=params,
+        )
+        data = response.json()
+        return data if isinstance(data, list) else []
+
     def _send_fcm(
         self,
         alert: dict[str, Any],
@@ -192,6 +245,39 @@ class PriceAlertPushService:
                         "type": "price_alert",
                         "priceAlertId": str(alert.get("id") or ""),
                         "portfolioItemId": str(alert.get("portfolio_item_id") or ""),
+                    },
+                }
+            },
+        )
+        if 200 <= response.status_code < 300:
+            payload = response.json()
+            return "sent", str(payload.get("name") or ""), None
+        return "failed", None, response.text[:500]
+
+    def _send_test_fcm(
+        self,
+        device: dict[str, Any],
+    ) -> tuple[str, str | None, str | None]:
+        token = str(device.get("device_token") or "").strip()
+        if not token:
+            return "failed", None, "Device token is empty."
+
+        response = self._client.post(
+            f"https://fcm.googleapis.com/v1/projects/{self._firebase_project_id}/messages:send",
+            headers={
+                "Authorization": f"Bearer {self._firebase_bearer_token()}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "message": {
+                    "token": token,
+                    "notification": {
+                        "title": "PackLox test push",
+                        "body": "Your PackLox push notification setup is working.",
+                    },
+                    "data": {
+                        "type": "test_push",
+                        "source": "admin_test",
                     },
                 }
             },
