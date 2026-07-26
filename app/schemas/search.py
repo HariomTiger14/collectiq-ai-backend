@@ -33,3 +33,18 @@ class CatalogSearchResponse(BaseModel):
     query: str
     count: int
     results: list[CatalogSearchResult]
+
+
+class CatalogHistoryPoint(BaseModel):
+    validFrom: str
+    validTo: str | None = None
+    isCurrent: bool = False
+    sourceFile: str | None = None
+    sourceDownloadedAt: str | None = None
+    pricing: CatalogSearchPricing = Field(default_factory=CatalogSearchPricing)
+
+
+class CatalogDetailResponse(BaseModel):
+    success: bool = True
+    result: CatalogSearchResult
+    history: list[CatalogHistoryPoint] = Field(default_factory=list)

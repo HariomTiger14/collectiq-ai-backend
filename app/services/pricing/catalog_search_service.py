@@ -8,6 +8,8 @@ import httpx
 
 from app.core.config import settings
 from app.schemas.search import (
+    CatalogDetailResponse,
+    CatalogHistoryPoint,
     CatalogSearchPricing,
     CatalogSearchResponse,
     CatalogSearchResult,
@@ -16,6 +18,10 @@ from app.schemas.search import (
 
 class CatalogSearchError(Exception):
     """Raised when catalog search cannot be completed."""
+
+
+class CatalogItemNotFoundError(CatalogSearchError):
+    """Raised when a catalog item cannot be found."""
 
 
 @dataclass(frozen=True)
@@ -46,6 +52,24 @@ class CatalogSearchService:
             query=normalized_query,
             count=len(results),
             results=results,
+        )
+
+    def detail(self, catalog_id: str, history_limit: int = 30) -> CatalogDetailResponse:
+        normalized_id = str(catalog_id or "").strip()
+        bounded_history_limit = max(1, min(history_limit, 90))
+        if not normalized_id:
+            raise CatalogItemNotFoundError("Catalog item was not found.")
+        if not self.is_configured:
+            raise CatalogSearchError("Catalog search is not configured.")
+
+        row = self._fetch_catalog_row(normalized_id)
+        if row is None:
+            raise CatalogItemNotFoundError("Catalog item was not found.")
+
+        history_rows = self._fetch_history_rows(normalized_id, bounded_history_limit)
+        return CatalogDetailResponse(
+            result=_row_to_result(row, str(row.get("product_name") or "")),
+            history=[_history_row_to_point(row) for row in history_rows],
         )
 
     @property
@@ -81,6 +105,45 @@ class CatalogSearchService:
             "limit": str(min(max(limit * 3, limit), 100)),
         }
         payload = self._request("GET", "/rest/v1/pricecharting_catalog", params=params)
+        if not isinstance(payload, list):
+            return []
+        return [row for row in payload if isinstance(row, dict)]
+
+    def _fetch_catalog_row(self, catalog_id: str) -> dict[str, Any] | None:
+        params = {
+            "select": (
+                "pricecharting_id,product_name,console_name,category,upc,"
+                "loose_price_cents,cib_price_cents,new_price_cents,"
+                "graded_price_cents,box_only_price_cents,manual_only_price_cents,"
+                "currency,product_url,source_file,source_downloaded_at,"
+                "updated_at,normalized_identity"
+            ),
+            "pricecharting_id": f"eq.{catalog_id}",
+            "limit": "1",
+        }
+        payload = self._request("GET", "/rest/v1/pricecharting_catalog", params=params)
+        if not isinstance(payload, list) or not payload:
+            return None
+        row = payload[0]
+        return row if isinstance(row, dict) else None
+
+    def _fetch_history_rows(self, catalog_id: str, limit: int) -> list[dict[str, Any]]:
+        params = {
+            "select": (
+                "valid_from,valid_to,is_current,source_file,source_downloaded_at,"
+                "loose_price_cents,cib_price_cents,new_price_cents,"
+                "graded_price_cents,box_only_price_cents,manual_only_price_cents,"
+                "currency"
+            ),
+            "pricecharting_id": f"eq.{catalog_id}",
+            "order": "valid_from.desc",
+            "limit": str(limit),
+        }
+        payload = self._request(
+            "GET",
+            "/rest/v1/pricecharting_catalog_history",
+            params=params,
+        )
         if not isinstance(payload, list):
             return []
         return [row for row in payload if isinstance(row, dict)]
@@ -155,6 +218,17 @@ def _pricing_from_row(row: dict[str, Any]) -> CatalogSearchPricing:
         cibPrice=cib,
         newPrice=new,
         gradedPrice=graded,
+    )
+
+
+def _history_row_to_point(row: dict[str, Any]) -> CatalogHistoryPoint:
+    return CatalogHistoryPoint(
+        validFrom=str(row.get("valid_from") or ""),
+        validTo=_clean(row.get("valid_to")),
+        isCurrent=bool(row.get("is_current")),
+        sourceFile=_clean(row.get("source_file")),
+        sourceDownloadedAt=_clean(row.get("source_downloaded_at")),
+        pricing=_pricing_from_row(row),
     )
 
 
