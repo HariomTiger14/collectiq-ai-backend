@@ -308,6 +308,9 @@ def _provider_statuses(catalog_configured: bool) -> list[dict[str, Any]]:
     ebay_partner_denied = bool(
         ebay_credentials_present and not settings.ebay_partner_access_granted
     )
+    ebay_metadata_configured = bool(
+        ebay_credentials_present and settings.ebay_browse_api_url.strip()
+    )
     return [
         {
             "name": "PriceCharting Catalog",
@@ -340,6 +343,21 @@ def _provider_statuses(catalog_configured: bool) -> list[dict[str, Any]]:
             else "eBay sold-comps provider is not connected.",
             "nextRetry": None,
             "role": "sold_comps_future",
+            "marketplace": settings.ebay_marketplace_id,
+        },
+        {
+            "name": "eBay Metadata",
+            "key": "ebay_metadata",
+            "configured": ebay_metadata_configured,
+            "credentialsPresent": ebay_credentials_present,
+            "status": "configured" if ebay_metadata_configured else "not_configured",
+            "reasonCode": None if ebay_metadata_configured else "PROVIDER_NOT_CONNECTED",
+            "message": "eBay Browse API metadata is available. Active listing prices are not used for PackLox valuations."
+            if ebay_metadata_configured
+            else "eBay metadata provider is not connected.",
+            "role": "metadata_only",
+            "dataUse": "metadata_only",
+            "valuationStatus": "not_valuation",
             "marketplace": settings.ebay_marketplace_id,
         },
         {

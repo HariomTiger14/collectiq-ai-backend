@@ -492,6 +492,11 @@ PRICING_CACHE_TTL_SECONDS=900
 PRICING_PROVIDER_MIN_INTERVAL_MS=250
 ```
 
+Keep `EBAY_PARTNER_ACCESS_GRANTED=false` unless eBay has explicitly approved
+Marketplace Insights sold-comps access. The Browse API can still power
+`/api/metadata/ebay/search` for metadata-only discovery; active listing prices
+are not exposed as PackLox valuations.
+
 Never commit real values for `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_API_KEY`, `EBAY_ACCESS_TOKEN`, `TCGPLAYER_CLIENT_ID`, `TCGPLAYER_CLIENT_SECRET`, or `PRICECHARTING_API_KEY`.
 
 ### Custom Domain Setup

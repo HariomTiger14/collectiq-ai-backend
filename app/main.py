@@ -10,6 +10,7 @@ from app.routers import (
     api_analyze,
     auth,
     health,
+    metadata,
     pricing,
     portfolio,
     push,
@@ -47,6 +48,7 @@ app.include_router(scanner.router)
 app.include_router(portfolio.router)
 app.include_router(pricing.router)
 app.include_router(search.router)
+app.include_router(metadata.router)
 
 
 @app.exception_handler(HTTPException)

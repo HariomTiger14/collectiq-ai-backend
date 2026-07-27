@@ -144,6 +144,9 @@ class PricingHealthServiceTest(unittest.TestCase):
                 "https://api.ebay.com/buy/marketplace_insights/v1_beta/item_sales/search"
             )
             settings.ebay_partner_access_granted = False
+            settings.ebay_browse_api_url = (
+                "https://api.ebay.com/buy/browse/v1/item_summary/search"
+            )
             settings.tcgplayer_client_id = ""
             settings.tcgplayer_client_secret = ""
             settings.default_display_currency = "AUD"
@@ -163,6 +166,12 @@ class PricingHealthServiceTest(unittest.TestCase):
             "PARTNER_ACCESS_NOT_GRANTED",
         )
         self.assertIn("partner access not granted", providers["ebay"]["message"])
+        self.assertTrue(providers["ebay_metadata"]["configured"])
+        self.assertEqual(providers["ebay_metadata"]["dataUse"], "metadata_only")
+        self.assertEqual(
+            providers["ebay_metadata"]["valuationStatus"],
+            "not_valuation",
+        )
 
     def test_missing_supabase_config_is_unhealthy_without_secret_details(self) -> None:
         service = PricingHealthService(supabase_url="", service_role_key="")

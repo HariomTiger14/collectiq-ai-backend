@@ -145,6 +145,13 @@ missing, expired, rate-limited, not partner-approved, or the provider fails, the
 aggregation service falls back to the next deterministic provider. Flutter still
 receives the same response contract, and no third-party pricing API is called
 from the mobile app.
+
+eBay Browse API metadata is exposed separately at
+`GET /api/metadata/ebay/search?q=<query>`. This endpoint is metadata-only for
+item discovery, item aspects, category hints, and manual correction support. It
+does not return active listing prices and must not be used as a PackLox
+valuation source.
+
 The TCGPlayer provider requires `TCGPLAYER_CLIENT_ID` and
 `TCGPLAYER_CLIENT_SECRET` in backend `.env`. OAuth tokens are requested and
 refreshed server-side only. Flutter never receives TCGPlayer credentials or
