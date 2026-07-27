@@ -68,6 +68,37 @@ class RepriceEndpointTest(unittest.TestCase):
         self.assertEqual(pricing["reasonCode"], "PROVIDER_NOT_CONFIGURED")
         self.assertIn("provider missing", pricing["displayMessage"])
 
+    def test_reprice_converts_provider_usd_to_display_currency(self) -> None:
+        payload = _payload()
+        payload["displayCurrency"] = "AUD"
+        with patch(
+            "app.services.pricing.currency_conversion.settings",
+        ) as currency_settings, patch(
+            "app.services.pricing.reprice_service.get_pricing_provider",
+            return_value=_UsdPricingProvider(),
+        ):
+            currency_settings.default_display_currency = "AUD"
+            currency_settings.fx_usd_to_aud = 1.5
+            currency_settings.fx_usd_to_cad = 1.35
+            currency_settings.fx_usd_to_gbp = 0.8
+
+            response = self.client.post("/api/pricing/reprice", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        pricing = response.json()["pricing"]
+        self.assertEqual(pricing["status"], "available")
+        self.assertEqual(pricing["estimatedMarketValue"], 150)
+        self.assertEqual(pricing["lowEstimate"], 120)
+        self.assertEqual(pricing["highEstimate"], 180)
+        self.assertEqual(pricing["currency"], "AUD")
+        self.assertEqual(pricing["displayString"], "AUD $150.00")
+        self.assertEqual(pricing["originalMarketPayload"]["price"], 100)
+        self.assertEqual(pricing["originalMarketPayload"]["currency"], "USD")
+        self.assertEqual(pricing["originalMarketPayload"]["displayCurrency"], "AUD")
+        self.assertEqual(pricing["originalMarketPayload"]["exchangeRateUsed"], 1.5)
+        self.assertEqual(pricing["comparableSales"][0]["soldPrice"], 120)
+        self.assertEqual(pricing["comparableSales"][0]["currency"], "AUD")
+
     def test_reprice_rejects_missing_title(self) -> None:
         payload = _payload()
         payload["identity"]["title"] = " "
@@ -122,6 +153,51 @@ class _FailingPricingProvider:
 
     def price(self, recognition):
         raise self._error
+
+
+class _UsdPricingProvider:
+    provider_name = "usd"
+
+    def price(self, recognition) -> PricingResult:
+        return PricingResult(
+            estimatedMarketValue=100,
+            lowEstimate=80,
+            highEstimate=120,
+            currency="USD",
+            pricingSource="PriceCharting API",
+            pricingConfidence=80,
+            lastUpdated=utc_timestamp(),
+            valuationStatus="market_estimated",
+            valuationSource="PriceCharting API",
+            marketTrend="Stable",
+            sourceCount=1,
+            pricingAge="fresh",
+            comparableSales=[
+                MarketComparableSale(
+                    source="PriceCharting API",
+                    title="Charizard guide",
+                    soldPrice=80,
+                    currency="USD",
+                    soldDate="2026-07-26T00:00:00Z",
+                    condition="Ungraded",
+                ),
+                MarketComparableSale(
+                    source="PriceCharting API",
+                    title="Charizard graded",
+                    soldPrice=120,
+                    currency="USD",
+                    soldDate="2026-07-26T00:00:00Z",
+                    condition="Graded",
+                ),
+            ],
+            providerDiagnostics={
+                "providers": "PriceCharting API",
+                "providerCount": "1",
+                "comparableCount": "2",
+                "valuationStrategy": "catalog_guide",
+                "priceExplanation": "Matched by corrected identity.",
+            },
+        )
 
 
 def _sale(title: str, price: int) -> MarketComparableSale:

@@ -26,6 +26,7 @@ class RepriceRequest(BaseModel):
     itemId: str | None = None
     previousValue: float | None = None
     previousCurrency: str | None = None
+    displayCurrency: str | None = None
     correctionSource: str = "manual"
     identity: RepriceIdentityRequest
 

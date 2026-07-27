@@ -15,6 +15,10 @@ from app.services.pricing.base_pricing_provider import (
     PricingProviderUnavailableError,
     PricingResult,
 )
+from app.services.pricing.currency_conversion import (
+    convert_pricing_result,
+    normalize_display_currency,
+)
 from app.services.pricing.provider_factory import get_pricing_provider
 
 
@@ -25,6 +29,9 @@ class RepriceValidationError(Exception):
 class RepriceService:
     def reprice(self, request: RepriceRequest) -> RepriceResponse:
         recognition = _recognition_from_request(request)
+        display_currency = normalize_display_currency(
+            request.displayCurrency or request.previousCurrency
+        )
         try:
             pricing = get_pricing_provider().price(recognition)
         except PricingProviderUnavailableError as error:
@@ -34,6 +41,7 @@ class RepriceService:
                 source="not_configured",
                 reason=str(error),
                 reason_code="PROVIDER_NOT_CONFIGURED",
+                currency=display_currency,
             )
         except EmptyMarketDataError as error:
             pricing = _unavailable_pricing(
@@ -42,6 +50,7 @@ class RepriceService:
                 source="market",
                 reason=str(error),
                 reason_code="NO_MARKET_MATCH",
+                currency=display_currency,
             )
         except (PricingProviderTimeoutError, PricingProviderRateLimitError) as error:
             raise error
@@ -52,7 +61,9 @@ class RepriceService:
                 source="market",
                 reason=str(error),
                 reason_code="LOOKUP_FAILED",
+                currency=display_currency,
             )
+        pricing = convert_pricing_result(pricing, target_currency=display_currency)
 
         return RepriceResponse(
             itemId=request.itemId,
@@ -145,10 +156,19 @@ def _response_from_pricing(pricing: PricingResult) -> RepricePricingResponse:
             "lastChecked": pricing.lastUpdated,
         },
         originalMarketPayload={
-            "price": _number_or(value, diagnostics.get("originalPrice")),
-            "currency": diagnostics.get("originalCurrency") or pricing.currency,
-            "exchangeRateUsed": _number_or(1, diagnostics.get("exchangeRateUsed")),
-            "exchangeRateDate": diagnostics.get("exchangeRateDate") or pricing.lastUpdated,
+            "price": _pricing_original_value(pricing, value, diagnostics),
+            "currency": getattr(pricing, "originalCurrency", None)
+            or diagnostics.get("originalCurrency")
+            or pricing.currency,
+            "exchangeRateUsed": getattr(
+                pricing,
+                "exchangeRateUsed",
+                _number_or(1, diagnostics.get("exchangeRateUsed")),
+            ),
+            "exchangeRateDate": getattr(pricing, "exchangeRateDate", None)
+            or diagnostics.get("exchangeRateDate")
+            or pricing.lastUpdated,
+            "displayCurrency": pricing.currency,
         },
         matchMetadata={
             "reason": diagnostics.get("priceExplanation")
@@ -182,6 +202,7 @@ def _unavailable_pricing(
     source: str,
     reason: str,
     reason_code: str,
+    currency: str,
 ) -> PricingResult:
     from app.services.pricing.base_pricing_provider import utc_timestamp
 
@@ -189,7 +210,7 @@ def _unavailable_pricing(
         estimatedMarketValue=0,
         lowEstimate=0,
         highEstimate=0,
-        currency="AUD",
+        currency=currency,
         pricingSource=source,
         pricingConfidence=0,
         lastUpdated=utc_timestamp(),
@@ -244,6 +265,17 @@ def _display_string(value: float | None, currency: str) -> str | None:
 def _number_or(fallback, value):
     if value in (None, ""):
         return fallback
+
+
+def _pricing_original_value(
+    pricing: PricingResult,
+    fallback_value: float | None,
+    diagnostics: dict,
+):
+    original_value = getattr(pricing, "originalMarketValue", None)
+    if original_value is not None:
+        return original_value
+    return _number_or(fallback_value, diagnostics.get("originalPrice"))
     try:
         return float(value)
     except (TypeError, ValueError):
