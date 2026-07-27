@@ -186,6 +186,8 @@ class PricingAggregationService:
                     "providerResponseLatencyMs",
                     "",
                 ),
+                "marketDataTypes": provider_diagnostics.get("marketDataTypes", ""),
+                "trustNotes": provider_diagnostics.get("trustNotes", ""),
                 "pricingFreshness": self._pricing_age(provider_results),
                 "errors": " | ".join(provider_errors),
                 "providerAgreement": str(
@@ -329,6 +331,8 @@ class PricingAggregationService:
     ) -> dict[str, str]:
         providers = []
         latency_values = []
+        market_data_types = []
+        trust_notes = []
         for result in provider_results:
             provider = result.providerDiagnostics.get("provider")
             if provider:
@@ -336,7 +340,15 @@ class PricingAggregationService:
             latency = result.providerDiagnostics.get("responseLatencyMs")
             if latency:
                 latency_values.append(latency)
+            market_data_type = result.providerDiagnostics.get("marketDataType")
+            if market_data_type:
+                market_data_types.append(market_data_type)
+            trust_note = result.providerDiagnostics.get("trustNote")
+            if trust_note:
+                trust_notes.append(trust_note)
         return {
             "providers": ", ".join(sorted(set(providers))),
             "providerResponseLatencyMs": ", ".join(latency_values),
+            "marketDataTypes": ", ".join(sorted(set(market_data_types))),
+            "trustNotes": " | ".join(sorted(set(trust_notes))),
         }

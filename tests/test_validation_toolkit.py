@@ -32,7 +32,7 @@ class ValidationToolkitTest(unittest.TestCase):
 
         self.assertEqual(summary["itemName"], "1999 Pokemon Charizard Holo")
         self.assertEqual(summary["category"], "Pokemon Card")
-        self.assertEqual(summary["pricingSource"], "eBay Browse API")
+        self.assertEqual(summary["pricingSource"], "eBay active listing signal")
         self.assertEqual(summary["fallbackUsed"], "no")
         self.assertEqual(summary["requestLatencyMs"], 321)
         self.assertEqual(summary["imageQualityWarnings"], ["glare/reflections"])
@@ -44,7 +44,7 @@ class ValidationToolkitTest(unittest.TestCase):
         output = format_summary(summary)
 
         self.assertIn("Item name: 1999 Pokemon Charizard Holo", output)
-        self.assertIn("Pricing source: eBay Browse API", output)
+        self.assertIn("Pricing source: eBay active listing signal", output)
         self.assertIn("Fallback used: no", output)
         self.assertIn("Image quality warnings:", output)
         self.assertIn("Alternatives:", output)
@@ -60,7 +60,7 @@ def _sample_response() -> dict:
         "lowEstimate": 1600,
         "highEstimate": 2200,
         "marketSummary": {
-            "sources": ["eBay Browse API"],
+            "sources": ["eBay active listing signal"],
         },
         "imageQualityIssues": ["glare/reflections"],
         "alternatives": [

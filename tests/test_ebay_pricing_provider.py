@@ -6,6 +6,7 @@ import httpx
 from app.services.ai.mock_recognition_service import MockRecognitionProvider
 from app.services.pricing.aggregation_service import PricingAggregationService
 from app.services.pricing.base_pricing_provider import (
+    EmptyMarketDataError,
     PricingProviderRateLimitError,
     PricingProviderTimeoutError,
 )
@@ -17,20 +18,55 @@ class EbayPricingProviderTest(unittest.TestCase):
     def setUp(self) -> None:
         self.recognition = MockRecognitionProvider().recognize("uploads/card.png")
 
-    def test_successful_provider_response_normalizes_comparable_sales(self) -> None:
+    def test_browse_provider_response_is_active_listing_signal(self) -> None:
         client = _FakeHttpClient(response=_FakeResponse(body=_ebay_payload()))
         provider = _provider(client=client)
 
         pricing = provider.price(self.recognition)
 
         self.assertEqual(client.call_count, 1)
-        self.assertEqual(pricing.pricingSource, "eBay Browse API")
+        self.assertEqual(pricing.pricingSource, "eBay active listing signal")
         self.assertEqual(pricing.pricingAge, "live")
+        self.assertLessEqual(pricing.pricingConfidence, 65)
         self.assertEqual(pricing.cacheStatus, "miss")
         self.assertEqual(len(pricing.comparableSales), 3)
+        self.assertEqual(pricing.comparableSales[0].source, "eBay active listing signal")
+        self.assertEqual(
+            pricing.providerDiagnostics["trustNote"],
+            "Active listing asking-price signal, not sold comps",
+        )
         self.assertGreater(pricing.estimatedMarketValue, 0)
         self.assertGreaterEqual(pricing.highEstimate, pricing.lowEstimate)
         self.assertEqual(client.last_request["headers"]["X-EBAY-C-MARKETPLACE-ID"], "EBAY_AU")
+
+    def test_marketplace_insights_response_is_sold_comps(self) -> None:
+        client = _FakeHttpClient(response=_FakeResponse(body=_ebay_sold_payload()))
+        provider = _provider(
+            client=client,
+            marketplace_insights_api_url=(
+                "https://api.ebay.com/buy/marketplace_insights/v1_beta/item_sales/search"
+            ),
+        )
+
+        pricing = provider.price(self.recognition)
+
+        self.assertEqual(client.call_count, 1)
+        self.assertIn("marketplace_insights", client.last_request["url"])
+        self.assertEqual(pricing.pricingSource, "eBay sold comps")
+        self.assertEqual(pricing.pricingAge, "sold_comps")
+        self.assertEqual(pricing.providerDiagnostics["marketDataType"], "sold_comps")
+        self.assertEqual(pricing.comparableSales[0].source, "eBay sold comps")
+
+    def test_active_listing_requires_minimum_usable_results(self) -> None:
+        client = _FakeHttpClient(
+            response=_FakeResponse(
+                body={"itemSummaries": [_ebay_payload()["itemSummaries"][0]]},
+            ),
+        )
+        provider = _provider(client=client)
+
+        with self.assertRaises(EmptyMarketDataError):
+            provider.price(self.recognition)
 
     def test_timeout_maps_to_pricing_timeout(self) -> None:
         provider = _provider(
@@ -120,6 +156,7 @@ def _provider(
     access_token: str = "test-token",
     client_id: str = "",
     client_secret: str = "",
+    marketplace_insights_api_url: str = "",
     client=None,
     cache_ttl_seconds: int = 900,
     min_interval_ms: int = 0,
@@ -129,6 +166,8 @@ def _provider(
         client_id=client_id,
         client_secret=client_secret,
         oauth_token_url="https://api.ebay.com/identity/v1/oauth2/token",
+        oauth_scope="https://api.ebay.com/oauth/api_scope",
+        marketplace_insights_api_url=marketplace_insights_api_url,
         browse_api_url="https://api.ebay.com/buy/browse/v1/item_summary/search",
         marketplace_id="EBAY_AU",
         timeout_seconds=1,
@@ -163,6 +202,34 @@ def _ebay_payload() -> dict:
                 "itemWebUrl": "https://example.test/item/3",
             },
         ]
+    }
+
+
+def _ebay_sold_payload() -> dict:
+    return {
+        "itemSales": [
+            {
+                "title": "1999 Pokemon Charizard Holo PSA 8 sold",
+                "itemSoldPrice": {"value": "1750.00", "currency": "AUD"},
+                "condition": "Graded",
+                "itemSoldDate": "2026-06-25T00:00:00Z",
+                "itemWebUrl": "https://example.test/sold/1",
+            },
+            {
+                "title": "Pokemon Charizard Base Set Holo sold",
+                "itemSoldPrice": {"value": "1900.00", "currency": "AUD"},
+                "condition": "Near Mint",
+                "itemSoldDate": "2026-06-26T00:00:00Z",
+                "itemWebUrl": "https://example.test/sold/2",
+            },
+            {
+                "title": "Charizard Holo Pokemon Card sold",
+                "itemSoldPrice": {"value": "2050.00", "currency": "AUD"},
+                "condition": "Excellent",
+                "itemSoldDate": "2026-06-27T00:00:00Z",
+                "itemWebUrl": "https://example.test/sold/3",
+            },
+        ],
     }
 
 

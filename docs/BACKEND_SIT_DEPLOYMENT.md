@@ -471,6 +471,11 @@ Optional provider variables, only when intentionally validating those providers:
 OPENAI_API_KEY=<server-side secret>
 OPENAI_MODEL=gpt-4.1-mini
 OPENAI_TIMEOUT_SECONDS=30
+EBAY_CLIENT_ID=<server-side app id>
+EBAY_CLIENT_SECRET=<server-side cert id>
+EBAY_OAUTH_TOKEN_URL=https://api.ebay.com/identity/v1/oauth2/token
+EBAY_OAUTH_SCOPE=https://api.ebay.com/oauth/api_scope
+EBAY_MARKETPLACE_INSIGHTS_API_URL=
 EBAY_ACCESS_TOKEN=<server-side secret>
 EBAY_BROWSE_API_URL=https://api.ebay.com/buy/browse/v1/item_summary/search
 EBAY_MARKETPLACE_ID=EBAY_AU

@@ -124,6 +124,14 @@ class Settings:
         "EBAY_OAUTH_TOKEN_URL",
         "https://api.ebay.com/identity/v1/oauth2/token",
     )
+    ebay_oauth_scope: str = os.getenv(
+        "EBAY_OAUTH_SCOPE",
+        "https://api.ebay.com/oauth/api_scope",
+    )
+    ebay_marketplace_insights_api_url: str = os.getenv(
+        "EBAY_MARKETPLACE_INSIGHTS_API_URL",
+        "",
+    )
     ebay_browse_api_url: str = os.getenv(
         "EBAY_BROWSE_API_URL",
         "https://api.ebay.com/buy/browse/v1/item_summary/search",

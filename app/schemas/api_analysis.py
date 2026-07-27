@@ -128,6 +128,8 @@ class ApiAnalyzeDiagnosticsResponse(BaseModel):
     pricingConfidenceCalculation: str | None = None
     pricingExplanation: str | None = None
     pricingComparableQuality: str | None = None
+    pricingMarketDataTypes: str | None = None
+    pricingTrustNotes: str | None = None
     valuationStatus: str | None = None
     valuationSource: str | None = None
     confidenceLevel: str

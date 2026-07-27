@@ -66,6 +66,8 @@ OPENAI_TIMEOUT_SECONDS=30
 EBAY_CLIENT_ID=
 EBAY_CLIENT_SECRET=
 EBAY_OAUTH_TOKEN_URL=https://api.ebay.com/identity/v1/oauth2/token
+EBAY_OAUTH_SCOPE=https://api.ebay.com/oauth/api_scope
+EBAY_MARKETPLACE_INSIGHTS_API_URL=
 EBAY_ACCESS_TOKEN=
 EBAY_BROWSE_API_URL=https://api.ebay.com/buy/browse/v1/item_summary/search
 EBAY_MARKETPLACE_ID=EBAY_AU
@@ -122,7 +124,9 @@ Provider selection:
 Pricing selection:
 
 - `PRICING_PROVIDER=mock`: default deterministic pricing and comparable sales.
-- `PRICING_PROVIDER=ebay`: backend-only eBay Browse API provider.
+- `PRICING_PROVIDER=ebay`: backend-only eBay sold-comps provider when
+  Marketplace Insights is configured; otherwise an active-listing fallback
+  signal.
 - `PRICING_PROVIDER=tcgplayer`: backend-only TCGPlayer card pricing provider.
 - `PRICING_PROVIDER=pricecharting`: backend-only PriceCharting guide pricing
   provider.
@@ -238,7 +242,8 @@ The pricing layer contains:
 
 - `PricingProvider`: interface for provider implementations.
 - `MockPricingProvider`: deterministic default used in tests and local dev.
-- `EbayPricingProvider`: backend-only eBay Browse API integration.
+- `EbayPricingProvider`: backend-only eBay Marketplace Insights sold-comps
+  integration, with clearly labelled Browse active-listing fallback.
 - `TCGPlayerPricingProvider`: backend-only TCGPlayer OAuth/search/pricing
   integration for trading-card market prices.
 - `PriceChartingPricingProvider`: backend-only PriceCharting guide pricing
@@ -447,6 +452,8 @@ PRICING_PROVIDER=ebay
 EBAY_CLIENT_ID=your-production-app-id
 EBAY_CLIENT_SECRET=your-production-cert-id
 EBAY_OAUTH_TOKEN_URL=https://api.ebay.com/identity/v1/oauth2/token
+EBAY_OAUTH_SCOPE=https://api.ebay.com/oauth/api_scope
+EBAY_MARKETPLACE_INSIGHTS_API_URL=
 # Optional short-lived manual fallback if client credentials are not configured.
 EBAY_ACCESS_TOKEN=your-server-side-oauth-access-token
 EBAY_BROWSE_API_URL=https://api.ebay.com/buy/browse/v1/item_summary/search

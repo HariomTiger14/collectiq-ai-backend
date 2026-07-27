@@ -1225,6 +1225,9 @@ def _diagnostics_response(
         pricingExplanation=pricing.providerDiagnostics.get("priceExplanation") or None,
         pricingComparableQuality=pricing.providerDiagnostics.get("comparableQuality")
         or None,
+        pricingMarketDataTypes=pricing.providerDiagnostics.get("marketDataTypes")
+        or None,
+        pricingTrustNotes=pricing.providerDiagnostics.get("trustNotes") or None,
         valuationStatus=pricing.valuationStatus,
         valuationSource=pricing.valuationSource,
         confidenceLevel=confidence_level,

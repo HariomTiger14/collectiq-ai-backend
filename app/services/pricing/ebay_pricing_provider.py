@@ -26,6 +26,8 @@ logger = logging.getLogger("collectiq.pricing.ebay")
 
 class EbayPricingProvider(PricingProvider):
     provider_name = "ebay"
+    SOLD_COMPS_SOURCE = "eBay sold comps"
+    ACTIVE_LISTING_SOURCE = "eBay active listing signal"
 
     def __init__(
         self,
@@ -36,9 +38,12 @@ class EbayPricingProvider(PricingProvider):
         timeout_seconds: float,
         cache_ttl_seconds: int,
         min_interval_ms: int,
+        marketplace_insights_api_url: str = "",
         client_id: str = "",
         client_secret: str = "",
         oauth_token_url: str = "https://api.ebay.com/identity/v1/oauth2/token",
+        oauth_scope: str = "https://api.ebay.com/oauth/api_scope",
+        browse_min_results: int = 3,
         client=None,
         cache: InMemoryPricingCache | None = None,
         throttle: ProviderThrottle | None = None,
@@ -47,11 +52,14 @@ class EbayPricingProvider(PricingProvider):
         self._client_id = client_id.strip()
         self._client_secret = client_secret.strip()
         self._oauth_token_url = oauth_token_url.strip()
+        self._oauth_scope = oauth_scope.strip() or "https://api.ebay.com/oauth/api_scope"
         self._oauth_access_token = ""
         self._oauth_expires_at = 0.0
         self._browse_api_url = browse_api_url.strip()
+        self._marketplace_insights_api_url = marketplace_insights_api_url.strip()
         self._marketplace_id = marketplace_id.strip() or "EBAY_AU"
         self._timeout_seconds = timeout_seconds
+        self._browse_min_results = max(1, browse_min_results)
         self._client = client
         self._cache = cache or InMemoryPricingCache(cache_ttl_seconds)
         self._throttle = throttle or ProviderThrottle(min_interval_ms)
@@ -62,13 +70,16 @@ class EbayPricingProvider(PricingProvider):
             raise PricingProviderUnavailableError(
                 "Configure EBAY_CLIENT_ID/EBAY_CLIENT_SECRET or EBAY_ACCESS_TOKEN."
             )
-        if not self._is_valid_url(self._browse_api_url):
+        if not self._has_sold_comps_endpoint() and not self._is_valid_url(
+            self._browse_api_url
+        ):
             raise PricingProviderUnavailableError(
-                "EBAY_BROWSE_API_URL is missing or invalid."
+                "Configure EBAY_MARKETPLACE_INSIGHTS_API_URL or EBAY_BROWSE_API_URL."
             )
 
         query = self._query_for(recognition)
-        cache_key = self._cache_key(recognition, query)
+        market_mode = "sold" if self._has_sold_comps_endpoint() else "active_listing"
+        cache_key = self._cache_key(recognition, query, market_mode)
         cached = self._cache.get(cache_key)
         if isinstance(cached, PricingResult):
             return replace(
@@ -83,12 +94,27 @@ class EbayPricingProvider(PricingProvider):
 
         self._throttle.acquire(self.provider_name)
         started_at = time.perf_counter()
-        response = self._request(query)
+        response: dict
+        market_data_type = "active_listing"
+        sold_error = ""
+        if self._has_sold_comps_endpoint():
+            try:
+                response = self._request(query, self._marketplace_insights_api_url)
+                market_data_type = "sold_comps"
+            except PricingProviderError as exc:
+                sold_error = str(exc)
+                if not self._is_valid_url(self._browse_api_url):
+                    raise
+                response = self._request(query, self._browse_api_url)
+        else:
+            response = self._request(query, self._browse_api_url)
         latency_ms = int((time.perf_counter() - started_at) * 1000)
         result = self._parse_response(
             recognition=recognition,
             payload=response,
             latency_ms=latency_ms,
+            market_data_type=market_data_type,
+            fallback_reason=sold_error,
         )
         self._cache.set(cache_key, result)
         return result
@@ -116,7 +142,7 @@ class EbayPricingProvider(PricingProvider):
         }
         data = {
             "grant_type": "client_credentials",
-            "scope": "https://api.ebay.com/oauth/api_scope",
+            "scope": self._oauth_scope,
         }
 
         try:
@@ -172,7 +198,7 @@ class EbayPricingProvider(PricingProvider):
         self._oauth_expires_at = now + max(60, expires_in - 60)
         return token
 
-    def _request(self, query: str) -> dict:
+    def _request(self, query: str, api_url: str) -> dict:
         headers = {
             "Authorization": f"Bearer {self._current_access_token()}",
             "Accept": "application/json",
@@ -186,7 +212,7 @@ class EbayPricingProvider(PricingProvider):
         try:
             if self._client is not None:
                 response = self._client.get(
-                    self._browse_api_url,
+                    api_url,
                     headers=headers,
                     params=params,
                     timeout=self._timeout_seconds,
@@ -194,7 +220,7 @@ class EbayPricingProvider(PricingProvider):
             else:
                 with httpx.Client(timeout=self._timeout_seconds) as client:
                     response = client.get(
-                        self._browse_api_url,
+                        api_url,
                         headers=headers,
                         params=params,
                     )
@@ -231,8 +257,10 @@ class EbayPricingProvider(PricingProvider):
         recognition: RecognitionResult,
         payload: dict,
         latency_ms: int,
+        market_data_type: str,
+        fallback_reason: str = "",
     ) -> PricingResult:
-        items = payload.get("itemSummaries") or payload.get("items") or []
+        items = self._items_from_payload(payload, market_data_type)
         if not isinstance(items, list) or not items:
             raise EmptyMarketDataError("eBay returned no pricing results.")
 
@@ -240,48 +268,91 @@ class EbayPricingProvider(PricingProvider):
         for item in items:
             if not isinstance(item, dict):
                 continue
-            sale = self._sale_from_item(item, recognition)
+            sale = self._sale_from_item(item, recognition, market_data_type)
             if sale is not None:
                 comparable_sales.append(sale)
 
         if not comparable_sales:
             raise EmptyMarketDataError("eBay returned no usable pricing results.")
+        if (
+            market_data_type == "active_listing"
+            and len(comparable_sales) < self._browse_min_results
+        ):
+            raise EmptyMarketDataError(
+                "eBay active listings returned too few usable results."
+            )
 
         prices = [sale.soldPrice for sale in comparable_sales]
         estimated_value = round(sum(prices) / len(prices))
         low_estimate = min(prices)
         high_estimate = max(prices)
-        confidence = self._confidence(recognition, len(comparable_sales))
+        confidence = self._confidence(
+            recognition,
+            len(comparable_sales),
+            market_data_type=market_data_type,
+        )
+        source = (
+            self.SOLD_COMPS_SOURCE
+            if market_data_type == "sold_comps"
+            else self.ACTIVE_LISTING_SOURCE
+        )
 
         return PricingResult(
             estimatedMarketValue=max(1, estimated_value),
             lowEstimate=max(1, low_estimate),
             highEstimate=max(1, high_estimate),
             currency=comparable_sales[0].currency,
-            pricingSource="eBay Browse API",
+            pricingSource=source,
             pricingConfidence=confidence,
             lastUpdated=utc_timestamp(),
             marketTrend=self._trend(comparable_sales),
             sourceCount=1,
-            pricingAge="live",
+            pricingAge="sold_comps" if market_data_type == "sold_comps" else "live",
             comparableSales=comparable_sales,
             cacheStatus="miss",
             providerDiagnostics={
                 "provider": self.provider_name,
                 "cacheStatus": "miss",
                 "responseLatencyMs": str(latency_ms),
-                "pricingFreshness": "live",
-                "fallbackReason": "",
+                "pricingFreshness": "sold_comps"
+                if market_data_type == "sold_comps"
+                else "active_listing_live",
+                "fallbackReason": fallback_reason,
                 "resultCount": str(len(comparable_sales)),
+                "marketDataType": market_data_type,
+                "trustNote": "Sold/completed marketplace data"
+                if market_data_type == "sold_comps"
+                else "Active listing asking-price signal, not sold comps",
             },
         )
+
+    def _items_from_payload(self, payload: dict, market_data_type: str) -> list:
+        if market_data_type == "sold_comps":
+            items = (
+                payload.get("itemSales")
+                or payload.get("soldItems")
+                or payload.get("completedItems")
+                or payload.get("itemSummaries")
+                or payload.get("items")
+                or []
+            )
+        else:
+            items = payload.get("itemSummaries") or payload.get("items") or []
+        return items if isinstance(items, list) else []
 
     def _sale_from_item(
         self,
         item: dict,
         recognition: RecognitionResult,
+        market_data_type: str,
     ) -> MarketComparableSale | None:
-        price_payload = item.get("price") or item.get("currentBidPrice") or {}
+        price_payload = (
+            item.get("price")
+            or item.get("itemSoldPrice")
+            or item.get("soldPrice")
+            or item.get("currentBidPrice")
+            or {}
+        )
         if not isinstance(price_payload, dict):
             return None
         try:
@@ -292,14 +363,21 @@ class EbayPricingProvider(PricingProvider):
             return None
 
         currency = str(price_payload.get("currency") or "AUD").upper()
+        source = (
+            self.SOLD_COMPS_SOURCE
+            if market_data_type == "sold_comps"
+            else self.ACTIVE_LISTING_SOURCE
+        )
         return MarketComparableSale(
-            source="eBay Browse API",
+            source=source,
             title=str(item.get("title") or recognition.title),
             soldPrice=price,
             currency=currency,
             soldDate=str(
-                item.get("itemCreationDate")
+                item.get("itemSoldDate")
+                or item.get("soldDate")
                 or item.get("itemEndDate")
+                or item.get("itemCreationDate")
                 or utc_timestamp()
             ),
             condition=str(item.get("condition") or recognition.condition or "Unknown"),
@@ -325,10 +403,16 @@ class EbayPricingProvider(PricingProvider):
         )
         return query or recognition.category or "collectible"
 
-    def _cache_key(self, recognition: RecognitionResult, query: str) -> str:
+    def _cache_key(
+        self,
+        recognition: RecognitionResult,
+        query: str,
+        market_mode: str,
+    ) -> str:
         identity = "|".join(
             [
                 self.provider_name,
+                market_mode,
                 query,
                 recognition.category,
                 recognition.condition,
@@ -336,10 +420,19 @@ class EbayPricingProvider(PricingProvider):
         )
         return " ".join(identity.lower().split())
 
-    def _confidence(self, recognition: RecognitionResult, comparable_count: int) -> int:
+    def _confidence(
+        self,
+        recognition: RecognitionResult,
+        comparable_count: int,
+        *,
+        market_data_type: str,
+    ) -> int:
         comp_bonus = min(20, comparable_count * 4)
         base = min(85, max(45, round(recognition.confidence * 0.75)))
-        return max(40, min(92, base + comp_bonus))
+        confidence = max(40, min(92, base + comp_bonus))
+        if market_data_type == "active_listing":
+            confidence = min(confidence, 65)
+        return confidence
 
     def _trend(self, comparable_sales: list[MarketComparableSale]) -> str:
         if len(comparable_sales) < 3:
@@ -356,3 +449,6 @@ class EbayPricingProvider(PricingProvider):
     def _is_valid_url(self, value: str) -> bool:
         parsed = urlparse(value)
         return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    def _has_sold_comps_endpoint(self) -> bool:
+        return self._is_valid_url(self._marketplace_insights_api_url)
