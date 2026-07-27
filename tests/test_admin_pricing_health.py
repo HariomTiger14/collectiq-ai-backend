@@ -50,6 +50,39 @@ class AdminPricingHealthEndpointTest(unittest.TestCase):
 
 
 class PricingHealthServiceTest(unittest.TestCase):
+    def test_uses_pricecharting_summary_rpc_for_large_sources(self) -> None:
+        client = httpx.Client(transport=httpx.MockTransport(_supabase_summary_handler))
+        service = PricingHealthService(
+            supabase_url="https://packlox.supabase.co",
+            service_role_key="service-role-key",
+            client=client,
+            stale_after_hours=72,
+        )
+
+        with patch("app.services.pricing.admin_health_service.settings") as settings:
+            settings.pricecharting_api_key = ""
+            settings.ebay_access_token = ""
+            settings.ebay_client_id = ""
+            settings.ebay_client_secret = ""
+            settings.ebay_marketplace_id = "EBAY_AU"
+            settings.tcgplayer_client_id = ""
+            settings.tcgplayer_client_secret = ""
+            settings.default_display_currency = "AUD"
+            settings.fx_usd_to_aud = 1.52
+            settings.fx_usd_to_cad = 1.37
+            settings.fx_usd_to_gbp = 0.78
+
+            payload = service.health()
+
+        self.assertEqual(payload["status"], "healthy")
+        sources = {
+            source["source"]: source for source in payload["pricecharting"]["sources"]
+        }
+        self.assertEqual(sources["magic.csv"]["currentRows"], 129605)
+        self.assertEqual(sources["magic.csv"]["historyRows"], 134467)
+        self.assertEqual(sources["magic.csv"]["closedHistoryRows"], 4862)
+        self.assertEqual(payload["summary"]["errors"], [])
+
     def test_reports_pricecharting_counts_and_provider_configuration(self) -> None:
         client = httpx.Client(transport=httpx.MockTransport(_supabase_handler))
         service = PricingHealthService(
@@ -132,6 +165,51 @@ def _supabase_handler(request: httpx.Request) -> httpx.Response:
             ],
         )
     return httpx.Response(404, json={"message": "not found"})
+
+
+def _supabase_summary_handler(request: httpx.Request) -> httpx.Response:
+    if request.url.path.endswith("/rpc/pricecharting_catalog_health_summary"):
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "source_file": "magic.csv",
+                    "current_rows": 129605,
+                    "history_rows": 134467,
+                    "closed_history_rows": 4862,
+                    "last_loaded_at": "2026-07-27T00:00:00+00:00",
+                },
+                {
+                    "source_file": "one_piece.csv",
+                    "current_rows": 11847,
+                    "history_rows": 12466,
+                    "closed_history_rows": 619,
+                    "last_loaded_at": "2026-07-27T00:00:00+00:00",
+                },
+                {
+                    "source_file": "pokemon.csv",
+                    "current_rows": 91278,
+                    "history_rows": 96424,
+                    "closed_history_rows": 5146,
+                    "last_loaded_at": "2026-07-27T00:00:00+00:00",
+                },
+                {
+                    "source_file": "video_games.csv",
+                    "current_rows": 122186,
+                    "history_rows": 125947,
+                    "closed_history_rows": 3761,
+                    "last_loaded_at": "2026-07-27T00:00:00+00:00",
+                },
+                {
+                    "source_file": "yugioh.csv",
+                    "current_rows": 77428,
+                    "history_rows": 80188,
+                    "closed_history_rows": 2760,
+                    "last_loaded_at": "2026-07-27T00:00:00+00:00",
+                },
+            ],
+        )
+    return httpx.Response(500, json={"message": "unexpected slow health path"})
 
 
 def _current_count(source: str) -> int:

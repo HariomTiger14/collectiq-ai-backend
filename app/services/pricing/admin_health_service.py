@@ -29,25 +29,10 @@ class PricingHealthService:
         errors: list[dict[str, str]] = []
 
         if catalog_configured:
-            for source_key in sorted(PRICECHARTING_CSV_ENV_VARS):
-                source_file = f"{source_key}.csv"
-                try:
-                    sources.append(self._source_health(source_file, generated_at))
-                except PricingHealthError as error:
-                    sources.append(
-                        {
-                            "source": source_file,
-                            "status": "unhealthy",
-                            "currentRows": 0,
-                            "historyRows": 0,
-                            "closedHistoryRows": 0,
-                            "lastLoadedAt": None,
-                            "ageHours": None,
-                            "stale": True,
-                            "error": str(error),
-                        }
-                    )
-                    errors.append({"source": source_file, "message": str(error)})
+            try:
+                sources = self._summary_health(generated_at)
+            except PricingHealthError:
+                sources, errors = self._fallback_source_health(generated_at)
 
         provider_statuses = _provider_statuses(catalog_configured)
         currency_status = _currency_status()
@@ -98,6 +83,82 @@ class PricingHealthService:
             "providers": provider_statuses,
             "currency": currency_status,
         }
+
+    def _fallback_source_health(
+        self,
+        generated_at: datetime,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        sources: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        for source_key in sorted(PRICECHARTING_CSV_ENV_VARS):
+            source_file = f"{source_key}.csv"
+            try:
+                sources.append(self._source_health(source_file, generated_at))
+            except PricingHealthError as error:
+                sources.append(
+                    {
+                        "source": source_file,
+                        "status": "unhealthy",
+                        "currentRows": 0,
+                        "historyRows": 0,
+                        "closedHistoryRows": 0,
+                        "lastLoadedAt": None,
+                        "ageHours": None,
+                        "stale": True,
+                        "error": str(error),
+                    }
+                )
+                errors.append({"source": source_file, "message": str(error)})
+        return sources, errors
+
+    def _summary_health(self, generated_at: datetime) -> list[dict[str, Any]]:
+        payload = self._request(
+            "POST",
+            "/rest/v1/rpc/pricecharting_catalog_health_summary",
+            params={},
+            json_body={},
+        )
+        if not isinstance(payload, list):
+            raise PricingHealthError("Supabase pricing health summary shape was invalid.")
+
+        rows_by_source: dict[str, dict[str, Any]] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            source_file = str(row.get("source_file") or "").strip()
+            if source_file:
+                rows_by_source[source_file] = row
+
+        sources: list[dict[str, Any]] = []
+        for source_key in sorted(PRICECHARTING_CSV_ENV_VARS):
+            source_file = f"{source_key}.csv"
+            row = rows_by_source.get(source_file, {})
+            current_rows = _safe_int(row.get("current_rows"))
+            history_rows = _safe_int(row.get("history_rows"))
+            closed_history_rows = _safe_int(row.get("closed_history_rows"))
+            last_loaded_at = _parse_datetime(row.get("last_loaded_at"))
+            age_hours = _age_hours(last_loaded_at, generated_at)
+            stale = age_hours is None or age_hours > self.stale_after_hours
+            source_status = "healthy"
+            if current_rows <= 0:
+                source_status = "unhealthy"
+            elif stale:
+                source_status = "stale"
+            sources.append(
+                {
+                    "source": source_file,
+                    "status": source_status,
+                    "currentRows": current_rows,
+                    "historyRows": history_rows,
+                    "closedHistoryRows": closed_history_rows,
+                    "lastLoadedAt": last_loaded_at.isoformat()
+                    if last_loaded_at
+                    else None,
+                    "ageHours": age_hours,
+                    "stale": stale,
+                }
+            )
+        return sources
 
     @property
     def _supabase_url(self) -> str:
@@ -184,8 +245,9 @@ class PricingHealthService:
         path: str,
         *,
         params: dict[str, str] | None = None,
+        json_body: Any | None = None,
     ) -> Any:
-        response = self._raw_request(method, path, params=params)
+        response = self._raw_request(method, path, params=params, json_body=json_body)
         if not response.content:
             return None
         try:
@@ -199,6 +261,7 @@ class PricingHealthService:
         path: str,
         *,
         params: dict[str, str] | None = None,
+        json_body: Any | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> httpx.Response:
         headers = {
@@ -218,6 +281,7 @@ class PricingHealthService:
                 f"{self._supabase_url}{path}",
                 headers=headers,
                 params=params,
+                json=json_body,
             )
             response.raise_for_status()
             return response
@@ -334,6 +398,13 @@ def _age_hours(timestamp: datetime | None, generated_at: datetime) -> int | None
     if age < timedelta(0):
         return 0
     return round(age.total_seconds() / 3600)
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _count_from_content_range(value: str) -> int:
