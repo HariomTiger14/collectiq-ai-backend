@@ -70,15 +70,14 @@ class EbayPricingProvider(PricingProvider):
             raise PricingProviderUnavailableError(
                 "Configure EBAY_CLIENT_ID/EBAY_CLIENT_SECRET or EBAY_ACCESS_TOKEN."
             )
-        if not self._has_sold_comps_endpoint() and not self._is_valid_url(
-            self._browse_api_url
-        ):
+        if not self._has_sold_comps_endpoint():
             raise PricingProviderUnavailableError(
-                "Configure EBAY_MARKETPLACE_INSIGHTS_API_URL or EBAY_BROWSE_API_URL."
+                "eBay sold-comps unavailable: partner access not granted. "
+                "Active listing asking prices are not used for PackLox valuations."
             )
 
         query = self._query_for(recognition)
-        market_mode = "sold" if self._has_sold_comps_endpoint() else "active_listing"
+        market_mode = "sold"
         cache_key = self._cache_key(recognition, query, market_mode)
         cached = self._cache.get(cache_key)
         if isinstance(cached, PricingResult):
@@ -95,19 +94,12 @@ class EbayPricingProvider(PricingProvider):
         self._throttle.acquire(self.provider_name)
         started_at = time.perf_counter()
         response: dict
-        market_data_type = "active_listing"
+        market_data_type = "sold_comps"
         sold_error = ""
-        if self._has_sold_comps_endpoint():
-            try:
-                response = self._request(query, self._marketplace_insights_api_url)
-                market_data_type = "sold_comps"
-            except PricingProviderError as exc:
-                sold_error = str(exc)
-                if not self._is_valid_url(self._browse_api_url):
-                    raise
-                response = self._request(query, self._browse_api_url)
-        else:
-            response = self._request(query, self._browse_api_url)
+        try:
+            response = self._request(query, self._marketplace_insights_api_url)
+        except PricingProviderError:
+            raise
         latency_ms = int((time.perf_counter() - started_at) * 1000)
         result = self._parse_response(
             recognition=recognition,
@@ -274,13 +266,6 @@ class EbayPricingProvider(PricingProvider):
 
         if not comparable_sales:
             raise EmptyMarketDataError("eBay returned no usable pricing results.")
-        if (
-            market_data_type == "active_listing"
-            and len(comparable_sales) < self._browse_min_results
-        ):
-            raise EmptyMarketDataError(
-                "eBay active listings returned too few usable results."
-            )
 
         prices = [sale.soldPrice for sale in comparable_sales]
         estimated_value = round(sum(prices) / len(prices))
@@ -291,11 +276,7 @@ class EbayPricingProvider(PricingProvider):
             len(comparable_sales),
             market_data_type=market_data_type,
         )
-        source = (
-            self.SOLD_COMPS_SOURCE
-            if market_data_type == "sold_comps"
-            else self.ACTIVE_LISTING_SOURCE
-        )
+        source = self.SOLD_COMPS_SOURCE
 
         return PricingResult(
             estimatedMarketValue=max(1, estimated_value),
@@ -307,22 +288,18 @@ class EbayPricingProvider(PricingProvider):
             lastUpdated=utc_timestamp(),
             marketTrend=self._trend(comparable_sales),
             sourceCount=1,
-            pricingAge="sold_comps" if market_data_type == "sold_comps" else "live",
+            pricingAge="sold_comps",
             comparableSales=comparable_sales,
             cacheStatus="miss",
             providerDiagnostics={
                 "provider": self.provider_name,
                 "cacheStatus": "miss",
                 "responseLatencyMs": str(latency_ms),
-                "pricingFreshness": "sold_comps"
-                if market_data_type == "sold_comps"
-                else "active_listing_live",
+                "pricingFreshness": "sold_comps",
                 "fallbackReason": fallback_reason,
                 "resultCount": str(len(comparable_sales)),
                 "marketDataType": market_data_type,
-                "trustNote": "Sold/completed marketplace data"
-                if market_data_type == "sold_comps"
-                else "Active listing asking-price signal, not sold comps",
+                "trustNote": "Sold/completed marketplace data",
             },
         )
 
@@ -363,11 +340,7 @@ class EbayPricingProvider(PricingProvider):
             return None
 
         currency = str(price_payload.get("currency") or "AUD").upper()
-        source = (
-            self.SOLD_COMPS_SOURCE
-            if market_data_type == "sold_comps"
-            else self.ACTIVE_LISTING_SOURCE
-        )
+        source = self.SOLD_COMPS_SOURCE
         return MarketComparableSale(
             source=source,
             title=str(item.get("title") or recognition.title),
@@ -430,8 +403,6 @@ class EbayPricingProvider(PricingProvider):
         comp_bonus = min(20, comparable_count * 4)
         base = min(85, max(45, round(recognition.confidence * 0.75)))
         confidence = max(40, min(92, base + comp_bonus))
-        if market_data_type == "active_listing":
-            confidence = min(confidence, 65)
         return confidence
 
     def _trend(self, comparable_sales: list[MarketComparableSale]) -> str:

@@ -6,46 +6,40 @@ import httpx
 from app.services.ai.mock_recognition_service import MockRecognitionProvider
 from app.services.pricing.aggregation_service import PricingAggregationService
 from app.services.pricing.base_pricing_provider import (
-    EmptyMarketDataError,
     PricingProviderRateLimitError,
     PricingProviderTimeoutError,
+    PricingProviderUnavailableError,
 )
 from app.services.pricing.ebay_pricing_provider import EbayPricingProvider
 from app.services.pricing.mock_pricing_provider import MockPricingProvider
+
+
+_SOLD_COMPS_URL = (
+    "https://api.ebay.com/buy/marketplace_insights/v1_beta/item_sales/search"
+)
 
 
 class EbayPricingProviderTest(unittest.TestCase):
     def setUp(self) -> None:
         self.recognition = MockRecognitionProvider().recognize("uploads/card.png")
 
-    def test_browse_provider_response_is_active_listing_signal(self) -> None:
+    def test_browse_provider_is_unavailable_without_sold_comps_access(self) -> None:
         client = _FakeHttpClient(response=_FakeResponse(body=_ebay_payload()))
         provider = _provider(client=client)
 
-        pricing = provider.price(self.recognition)
+        with self.assertRaisesRegex(
+            PricingProviderUnavailableError,
+            "partner access not granted",
+        ):
+            provider.price(self.recognition)
 
-        self.assertEqual(client.call_count, 1)
-        self.assertEqual(pricing.pricingSource, "eBay active listing signal")
-        self.assertEqual(pricing.pricingAge, "live")
-        self.assertLessEqual(pricing.pricingConfidence, 65)
-        self.assertEqual(pricing.cacheStatus, "miss")
-        self.assertEqual(len(pricing.comparableSales), 3)
-        self.assertEqual(pricing.comparableSales[0].source, "eBay active listing signal")
-        self.assertEqual(
-            pricing.providerDiagnostics["trustNote"],
-            "Active listing asking-price signal, not sold comps",
-        )
-        self.assertGreater(pricing.estimatedMarketValue, 0)
-        self.assertGreaterEqual(pricing.highEstimate, pricing.lowEstimate)
-        self.assertEqual(client.last_request["headers"]["X-EBAY-C-MARKETPLACE-ID"], "EBAY_AU")
+        self.assertEqual(client.call_count, 0)
 
     def test_marketplace_insights_response_is_sold_comps(self) -> None:
         client = _FakeHttpClient(response=_FakeResponse(body=_ebay_sold_payload()))
         provider = _provider(
             client=client,
-            marketplace_insights_api_url=(
-                "https://api.ebay.com/buy/marketplace_insights/v1_beta/item_sales/search"
-            ),
+            marketplace_insights_api_url=_SOLD_COMPS_URL,
         )
 
         pricing = provider.price(self.recognition)
@@ -57,34 +51,31 @@ class EbayPricingProviderTest(unittest.TestCase):
         self.assertEqual(pricing.providerDiagnostics["marketDataType"], "sold_comps")
         self.assertEqual(pricing.comparableSales[0].source, "eBay sold comps")
 
-    def test_active_listing_requires_minimum_usable_results(self) -> None:
-        client = _FakeHttpClient(
-            response=_FakeResponse(
-                body={"itemSummaries": [_ebay_payload()["itemSummaries"][0]]},
-            ),
-        )
-        provider = _provider(client=client)
-
-        with self.assertRaises(EmptyMarketDataError):
-            provider.price(self.recognition)
-
     def test_timeout_maps_to_pricing_timeout(self) -> None:
         provider = _provider(
             client=_FakeHttpClient(exception=httpx.TimeoutException("slow")),
+            marketplace_insights_api_url=_SOLD_COMPS_URL,
         )
 
         with self.assertRaises(PricingProviderTimeoutError):
             provider.price(self.recognition)
 
     def test_rate_limit_maps_to_pricing_rate_limit(self) -> None:
-        provider = _provider(client=_FakeHttpClient(response=_FakeResponse(status_code=429)))
+        provider = _provider(
+            client=_FakeHttpClient(response=_FakeResponse(status_code=429)),
+            marketplace_insights_api_url=_SOLD_COMPS_URL,
+        )
 
         with self.assertRaises(PricingProviderRateLimitError):
             provider.price(self.recognition)
 
     def test_cache_hit_prevents_repeated_provider_request(self) -> None:
         client = _FakeHttpClient(response=_FakeResponse(body=_ebay_payload()))
-        provider = _provider(client=client, cache_ttl_seconds=60)
+        provider = _provider(
+            client=client,
+            cache_ttl_seconds=60,
+            marketplace_insights_api_url=_SOLD_COMPS_URL,
+        )
 
         first = provider.price(self.recognition)
         second = provider.price(self.recognition)
@@ -99,6 +90,7 @@ class EbayPricingProviderTest(unittest.TestCase):
             client=client,
             cache_ttl_seconds=1,
             min_interval_ms=0,
+            marketplace_insights_api_url=_SOLD_COMPS_URL,
         )
 
         provider.price(self.recognition)
@@ -119,6 +111,7 @@ class EbayPricingProviderTest(unittest.TestCase):
             client_id="client-id",
             client_secret="client-secret",
             client=client,
+            marketplace_insights_api_url=_SOLD_COMPS_URL,
         )
 
         first = provider.price(self.recognition)

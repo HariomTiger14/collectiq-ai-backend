@@ -293,12 +293,15 @@ class PricingHealthService:
 
 
 def _provider_statuses(catalog_configured: bool) -> list[dict[str, Any]]:
-    ebay_configured = bool(
+    ebay_credentials_present = bool(
         settings.ebay_access_token.strip()
         or (
             settings.ebay_client_id.strip()
             and settings.ebay_client_secret.strip()
         )
+    )
+    ebay_sold_comps_configured = bool(
+        ebay_credentials_present and settings.ebay_marketplace_insights_api_url.strip()
     )
     return [
         {
@@ -320,8 +323,16 @@ def _provider_statuses(catalog_configured: bool) -> list[dict[str, Any]]:
         {
             "name": "eBay",
             "key": "ebay",
-            "configured": ebay_configured,
-            "status": "configured" if ebay_configured else "pending",
+            "configured": ebay_sold_comps_configured,
+            "credentialsPresent": ebay_credentials_present,
+            "status": "configured" if ebay_sold_comps_configured else "unavailable",
+            "reasonCode": "PARTNER_ACCESS_NOT_GRANTED"
+            if ebay_credentials_present and not ebay_sold_comps_configured
+            else "PROVIDER_NOT_CONNECTED",
+            "message": "eBay sold-comps unavailable: partner access not granted."
+            if ebay_credentials_present and not ebay_sold_comps_configured
+            else "eBay sold-comps provider is not connected.",
+            "nextRetry": None,
             "role": "sold_comps_future",
             "marketplace": settings.ebay_marketplace_id,
         },

@@ -65,6 +65,7 @@ class PricingHealthServiceTest(unittest.TestCase):
             settings.ebay_client_id = ""
             settings.ebay_client_secret = ""
             settings.ebay_marketplace_id = "EBAY_AU"
+            settings.ebay_marketplace_insights_api_url = ""
             settings.tcgplayer_client_id = ""
             settings.tcgplayer_client_secret = ""
             settings.default_display_currency = "AUD"
@@ -98,6 +99,7 @@ class PricingHealthServiceTest(unittest.TestCase):
             settings.ebay_client_id = ""
             settings.ebay_client_secret = ""
             settings.ebay_marketplace_id = "EBAY_AU"
+            settings.ebay_marketplace_insights_api_url = ""
             settings.tcgplayer_client_id = ""
             settings.tcgplayer_client_secret = ""
             settings.default_display_currency = "AUD"
@@ -117,8 +119,44 @@ class PricingHealthServiceTest(unittest.TestCase):
         self.assertFalse(payload["pricecharting"]["sources"][0]["stale"])
         providers = {provider["key"]: provider for provider in payload["providers"]}
         self.assertTrue(providers["pricecharting_catalog"]["configured"])
-        self.assertEqual(providers["ebay"]["status"], "pending")
+        self.assertEqual(providers["ebay"]["status"], "unavailable")
+        self.assertEqual(providers["ebay"]["reasonCode"], "PROVIDER_NOT_CONNECTED")
         self.assertEqual(payload["currency"]["rates"]["AUD"], 1.52)
+
+    def test_ebay_credentials_without_partner_access_are_unavailable(self) -> None:
+        client = httpx.Client(transport=httpx.MockTransport(_supabase_handler))
+        service = PricingHealthService(
+            supabase_url="https://packlox.supabase.co",
+            service_role_key="service-role-key",
+            client=client,
+            stale_after_hours=72,
+        )
+
+        with patch("app.services.pricing.admin_health_service.settings") as settings:
+            settings.pricecharting_api_key = ""
+            settings.ebay_access_token = "token-present"
+            settings.ebay_client_id = ""
+            settings.ebay_client_secret = ""
+            settings.ebay_marketplace_id = "EBAY_AU"
+            settings.ebay_marketplace_insights_api_url = ""
+            settings.tcgplayer_client_id = ""
+            settings.tcgplayer_client_secret = ""
+            settings.default_display_currency = "AUD"
+            settings.fx_usd_to_aud = 1.52
+            settings.fx_usd_to_cad = 1.37
+            settings.fx_usd_to_gbp = 0.78
+
+            payload = service.health()
+
+        providers = {provider["key"]: provider for provider in payload["providers"]}
+        self.assertFalse(providers["ebay"]["configured"])
+        self.assertTrue(providers["ebay"]["credentialsPresent"])
+        self.assertEqual(providers["ebay"]["status"], "unavailable")
+        self.assertEqual(
+            providers["ebay"]["reasonCode"],
+            "PARTNER_ACCESS_NOT_GRANTED",
+        )
+        self.assertIn("partner access not granted", providers["ebay"]["message"])
 
     def test_missing_supabase_config_is_unhealthy_without_secret_details(self) -> None:
         service = PricingHealthService(supabase_url="", service_role_key="")

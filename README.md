@@ -124,9 +124,9 @@ Provider selection:
 Pricing selection:
 
 - `PRICING_PROVIDER=mock`: default deterministic pricing and comparable sales.
-- `PRICING_PROVIDER=ebay`: backend-only eBay sold-comps provider when
-  Marketplace Insights is configured; otherwise an active-listing fallback
-  signal.
+- `PRICING_PROVIDER=ebay`: backend-only eBay sold-comps provider. Requires
+  approved Marketplace Insights access; active listing asking prices are not
+  used for PackLox valuations.
 - `PRICING_PROVIDER=tcgplayer`: backend-only TCGPlayer card pricing provider.
 - `PRICING_PROVIDER=pricecharting`: backend-only PriceCharting guide pricing
   provider.
@@ -444,8 +444,10 @@ Real pricing providers should be protected by:
 
 ### Enabling eBay Pricing Locally
 
-Keep `PRICING_PROVIDER=mock` for normal development. To test eBay from the
-backend only:
+Keep `PRICING_PROVIDER=mock` for normal development. eBay pricing is disabled
+unless approved sold-comps access is available. Do not use Browse API active
+listings as a trusted valuation source. To test eBay from the backend only after
+Marketplace Insights access is granted:
 
 ```text
 PRICING_PROVIDER=ebay
@@ -453,7 +455,7 @@ EBAY_CLIENT_ID=your-production-app-id
 EBAY_CLIENT_SECRET=your-production-cert-id
 EBAY_OAUTH_TOKEN_URL=https://api.ebay.com/identity/v1/oauth2/token
 EBAY_OAUTH_SCOPE=https://api.ebay.com/oauth/api_scope
-EBAY_MARKETPLACE_INSIGHTS_API_URL=
+EBAY_MARKETPLACE_INSIGHTS_API_URL=your-approved-sold-comps-endpoint
 # Optional short-lived manual fallback if client credentials are not configured.
 EBAY_ACCESS_TOKEN=your-server-side-oauth-access-token
 EBAY_BROWSE_API_URL=https://api.ebay.com/buy/browse/v1/item_summary/search

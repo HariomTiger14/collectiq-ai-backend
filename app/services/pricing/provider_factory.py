@@ -52,8 +52,8 @@ class AutoPricingProvider(PricingProvider):
         if not providers:
             raise PricingProviderUnavailableError(
                 "No real pricing provider is configured for this collectible. "
-                "Set EBAY_ACCESS_TOKEN, TCGPLAYER_CLIENT_ID/TCGPLAYER_CLIENT_SECRET, "
-                "or PRICECHARTING_API_KEY."
+                "Set PRICECHARTING_API_KEY, TCGPLAYER_CLIENT_ID/TCGPLAYER_CLIENT_SECRET, "
+                "or an approved eBay sold-comps endpoint."
             )
         return PricingAggregationService(providers).price(recognition)
 
@@ -113,13 +113,7 @@ def _providers_for_recognition(recognition: RecognitionResult) -> list[PricingPr
 def _configured_providers(providers: list[PricingProvider]) -> list[PricingProvider]:
     configured: list[PricingProvider] = []
     for provider in providers:
-        if provider.provider_name == "ebay" and (
-            _provider_value(provider, "_access_token")
-            or (
-                _provider_value(provider, "_client_id")
-                and _provider_value(provider, "_client_secret")
-            )
-        ):
+        if provider.provider_name == "ebay" and _ebay_sold_comps_configured(provider):
             configured.append(provider)
         elif (
             provider.provider_name == "tcgplayer"
@@ -140,6 +134,19 @@ def _configured_providers(providers: list[PricingProvider]) -> list[PricingProvi
         seen.add(provider.provider_name)
         unique.append(provider)
     return unique
+
+
+def _ebay_sold_comps_configured(provider: PricingProvider) -> bool:
+    has_credentials = bool(
+        _provider_value(provider, "_access_token")
+        or (
+            _provider_value(provider, "_client_id")
+            and _provider_value(provider, "_client_secret")
+        )
+    )
+    return has_credentials and bool(
+        _provider_value(provider, "_marketplace_insights_api_url")
+    )
 
 
 def _provider_value(provider: PricingProvider, attribute: str) -> str:
