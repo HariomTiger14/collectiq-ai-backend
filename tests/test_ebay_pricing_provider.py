@@ -71,6 +71,36 @@ class EbayPricingProviderTest(unittest.TestCase):
 
         self.assertEqual(client.call_count, 2)
 
+    def test_client_credentials_fetch_and_cache_oauth_token(self) -> None:
+        client = _FakeHttpClient(
+            response=_FakeResponse(body=_ebay_payload()),
+            post_response=_FakeResponse(
+                body={"access_token": "oauth-token", "expires_in": 7200},
+            ),
+        )
+        provider = _provider(
+            access_token="",
+            client_id="client-id",
+            client_secret="client-secret",
+            client=client,
+        )
+
+        first = provider.price(self.recognition)
+        second = provider.price(self.recognition)
+
+        self.assertEqual(first.cacheStatus, "miss")
+        self.assertEqual(second.cacheStatus, "hit")
+        self.assertEqual(client.post_count, 1)
+        self.assertEqual(client.call_count, 1)
+        self.assertEqual(
+            client.last_post["data"]["scope"],
+            "https://api.ebay.com/oauth/api_scope",
+        )
+        self.assertEqual(
+            client.last_request["headers"]["Authorization"],
+            "Bearer oauth-token",
+        )
+
     def test_aggregator_falls_back_to_mock_when_ebay_unavailable(self) -> None:
         provider = _provider(access_token="", client=_FakeHttpClient())
 
@@ -81,19 +111,24 @@ class EbayPricingProviderTest(unittest.TestCase):
 
         self.assertTrue(pricing.fallbackUsed)
         self.assertEqual(pricing.cacheStatus, "fallback")
-        self.assertIn("EBAY_ACCESS_TOKEN", pricing.providerDiagnostics["fallbackReason"])
+        self.assertIn("EBAY_CLIENT_ID", pricing.providerDiagnostics["fallbackReason"])
         self.assertGreater(pricing.estimatedMarketValue, 0)
 
 
 def _provider(
     *,
     access_token: str = "test-token",
+    client_id: str = "",
+    client_secret: str = "",
     client=None,
     cache_ttl_seconds: int = 900,
     min_interval_ms: int = 0,
 ) -> EbayPricingProvider:
     return EbayPricingProvider(
         access_token=access_token,
+        client_id=client_id,
+        client_secret=client_secret,
+        oauth_token_url="https://api.ebay.com/identity/v1/oauth2/token",
         browse_api_url="https://api.ebay.com/buy/browse/v1/item_summary/search",
         marketplace_id="EBAY_AU",
         timeout_seconds=1,
@@ -145,12 +180,16 @@ class _FakeHttpClient:
         self,
         *,
         response: _FakeResponse | None = None,
+        post_response: _FakeResponse | None = None,
         exception: Exception | None = None,
     ) -> None:
         self.response = response or _FakeResponse()
+        self.post_response = post_response or _FakeResponse()
         self.exception = exception
         self.call_count = 0
+        self.post_count = 0
         self.last_request: dict | None = None
+        self.last_post: dict | None = None
 
     def get(self, url: str, **kwargs) -> _FakeResponse:
         self.call_count += 1
@@ -158,6 +197,13 @@ class _FakeHttpClient:
         if self.exception is not None:
             raise self.exception
         return self.response
+
+    def post(self, url: str, **kwargs) -> _FakeResponse:
+        self.post_count += 1
+        self.last_post = {"url": url, **kwargs}
+        if self.exception is not None:
+            raise self.exception
+        return self.post_response
 
 
 if __name__ == "__main__":

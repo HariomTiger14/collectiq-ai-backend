@@ -229,6 +229,13 @@ class PricingHealthService:
 
 
 def _provider_statuses(catalog_configured: bool) -> list[dict[str, Any]]:
+    ebay_configured = bool(
+        settings.ebay_access_token.strip()
+        or (
+            settings.ebay_client_id.strip()
+            and settings.ebay_client_secret.strip()
+        )
+    )
     return [
         {
             "name": "PriceCharting Catalog",
@@ -249,8 +256,8 @@ def _provider_statuses(catalog_configured: bool) -> list[dict[str, Any]]:
         {
             "name": "eBay",
             "key": "ebay",
-            "configured": bool(settings.ebay_access_token.strip()),
-            "status": "configured" if settings.ebay_access_token.strip() else "pending",
+            "configured": ebay_configured,
+            "status": "configured" if ebay_configured else "pending",
             "role": "sold_comps_future",
             "marketplace": settings.ebay_marketplace_id,
         },

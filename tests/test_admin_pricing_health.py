@@ -62,6 +62,8 @@ class PricingHealthServiceTest(unittest.TestCase):
         with patch("app.services.pricing.admin_health_service.settings") as settings:
             settings.pricecharting_api_key = ""
             settings.ebay_access_token = ""
+            settings.ebay_client_id = ""
+            settings.ebay_client_secret = ""
             settings.ebay_marketplace_id = "EBAY_AU"
             settings.tcgplayer_client_id = ""
             settings.tcgplayer_client_secret = ""

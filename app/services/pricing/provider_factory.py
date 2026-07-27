@@ -16,6 +16,9 @@ from app.services.pricing.tcgplayer_pricing_provider import TCGPlayerPricingProv
 _mock_provider = MockPricingProvider()
 _ebay_provider = EbayPricingProvider(
     access_token=settings.ebay_access_token,
+    client_id=settings.ebay_client_id,
+    client_secret=settings.ebay_client_secret,
+    oauth_token_url=settings.ebay_oauth_token_url,
     browse_api_url=settings.ebay_browse_api_url,
     marketplace_id=settings.ebay_marketplace_id,
     timeout_seconds=settings.ebay_timeout_seconds,
@@ -108,7 +111,13 @@ def _providers_for_recognition(recognition: RecognitionResult) -> list[PricingPr
 def _configured_providers(providers: list[PricingProvider]) -> list[PricingProvider]:
     configured: list[PricingProvider] = []
     for provider in providers:
-        if provider.provider_name == "ebay" and _provider_value(provider, "_access_token"):
+        if provider.provider_name == "ebay" and (
+            _provider_value(provider, "_access_token")
+            or (
+                _provider_value(provider, "_client_id")
+                and _provider_value(provider, "_client_secret")
+            )
+        ):
             configured.append(provider)
         elif (
             provider.provider_name == "tcgplayer"

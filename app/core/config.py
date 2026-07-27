@@ -118,6 +118,12 @@ class Settings:
         os.getenv("AI_FALLBACK_CONFIDENCE_THRESHOLD", "70")
     )
     ebay_access_token: str = os.getenv("EBAY_ACCESS_TOKEN", "")
+    ebay_client_id: str = os.getenv("EBAY_CLIENT_ID", "")
+    ebay_client_secret: str = os.getenv("EBAY_CLIENT_SECRET", "")
+    ebay_oauth_token_url: str = os.getenv(
+        "EBAY_OAUTH_TOKEN_URL",
+        "https://api.ebay.com/identity/v1/oauth2/token",
+    )
     ebay_browse_api_url: str = os.getenv(
         "EBAY_BROWSE_API_URL",
         "https://api.ebay.com/buy/browse/v1/item_summary/search",

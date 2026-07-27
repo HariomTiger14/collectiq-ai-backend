@@ -1,5 +1,6 @@
 import logging
 import time
+from base64 import b64encode
 from dataclasses import replace
 from urllib.parse import urlparse
 
@@ -35,11 +36,19 @@ class EbayPricingProvider(PricingProvider):
         timeout_seconds: float,
         cache_ttl_seconds: int,
         min_interval_ms: int,
+        client_id: str = "",
+        client_secret: str = "",
+        oauth_token_url: str = "https://api.ebay.com/identity/v1/oauth2/token",
         client=None,
         cache: InMemoryPricingCache | None = None,
         throttle: ProviderThrottle | None = None,
     ) -> None:
         self._access_token = access_token.strip()
+        self._client_id = client_id.strip()
+        self._client_secret = client_secret.strip()
+        self._oauth_token_url = oauth_token_url.strip()
+        self._oauth_access_token = ""
+        self._oauth_expires_at = 0.0
         self._browse_api_url = browse_api_url.strip()
         self._marketplace_id = marketplace_id.strip() or "EBAY_AU"
         self._timeout_seconds = timeout_seconds
@@ -48,9 +57,10 @@ class EbayPricingProvider(PricingProvider):
         self._throttle = throttle or ProviderThrottle(min_interval_ms)
 
     def price(self, recognition: RecognitionResult) -> PricingResult:
-        if not self._access_token:
+        access_token = self._current_access_token()
+        if not access_token:
             raise PricingProviderUnavailableError(
-                "EBAY_ACCESS_TOKEN is not configured on the backend."
+                "Configure EBAY_CLIENT_ID/EBAY_CLIENT_SECRET or EBAY_ACCESS_TOKEN."
             )
         if not self._is_valid_url(self._browse_api_url):
             raise PricingProviderUnavailableError(
@@ -83,9 +93,88 @@ class EbayPricingProvider(PricingProvider):
         self._cache.set(cache_key, result)
         return result
 
+    def _current_access_token(self) -> str:
+        if self._client_id and self._client_secret:
+            return self._oauth_application_token()
+        return self._access_token
+
+    def _oauth_application_token(self) -> str:
+        now = time.time()
+        if self._oauth_access_token and now < self._oauth_expires_at:
+            return self._oauth_access_token
+        if not self._is_valid_url(self._oauth_token_url):
+            raise PricingProviderUnavailableError(
+                "EBAY_OAUTH_TOKEN_URL is missing or invalid."
+            )
+
+        credentials = f"{self._client_id}:{self._client_secret}".encode("utf-8")
+        basic_token = b64encode(credentials).decode("ascii")
+        headers = {
+            "Authorization": f"Basic {basic_token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        }
+        data = {
+            "grant_type": "client_credentials",
+            "scope": "https://api.ebay.com/oauth/api_scope",
+        }
+
+        try:
+            if self._client is not None:
+                response = self._client.post(
+                    self._oauth_token_url,
+                    headers=headers,
+                    data=data,
+                    timeout=self._timeout_seconds,
+                )
+            else:
+                with httpx.Client(timeout=self._timeout_seconds) as client:
+                    response = client.post(
+                        self._oauth_token_url,
+                        headers=headers,
+                        data=data,
+                    )
+        except httpx.TimeoutException as exc:
+            raise PricingProviderTimeoutError(
+                "eBay OAuth token request timed out."
+            ) from exc
+        except httpx.RequestError as exc:
+            raise PricingProviderUnavailableError(
+                "eBay OAuth token request failed before receiving a response."
+            ) from exc
+
+        status_code = getattr(response, "status_code", 0)
+        if status_code >= 500:
+            raise PricingProviderUnavailableError(
+                f"eBay OAuth service returned HTTP {status_code}."
+            )
+        if status_code >= 400:
+            raise PricingProviderError(
+                f"eBay OAuth token request failed with HTTP {status_code}."
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise PricingProviderError("eBay OAuth response was not valid JSON.") from exc
+        if not isinstance(payload, dict):
+            raise PricingProviderError("eBay OAuth response shape was invalid.")
+
+        token = str(payload.get("access_token") or "").strip()
+        if not token:
+            raise PricingProviderError("eBay OAuth response did not include a token.")
+        try:
+            expires_in = int(payload.get("expires_in") or 7200)
+        except (TypeError, ValueError):
+            expires_in = 7200
+
+        self._oauth_access_token = token
+        self._oauth_expires_at = now + max(60, expires_in - 60)
+        return token
+
     def _request(self, query: str) -> dict:
         headers = {
-            "Authorization": f"Bearer {self._access_token}",
+            "Authorization": f"Bearer {self._current_access_token()}",
             "Accept": "application/json",
             "X-EBAY-C-MARKETPLACE-ID": self._marketplace_id,
         }

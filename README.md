@@ -63,6 +63,9 @@ PRICING_PROVIDER=mock
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-4.1-mini
 OPENAI_TIMEOUT_SECONDS=30
+EBAY_CLIENT_ID=
+EBAY_CLIENT_SECRET=
+EBAY_OAUTH_TOKEN_URL=https://api.ebay.com/identity/v1/oauth2/token
 EBAY_ACCESS_TOKEN=
 EBAY_BROWSE_API_URL=https://api.ebay.com/buy/browse/v1/item_summary/search
 EBAY_MARKETPLACE_ID=EBAY_AU
@@ -126,10 +129,13 @@ Pricing selection:
 - `PRICING_PROVIDER=aggregate`: blends available eBay, TCGPlayer, and
   PriceCharting provider data, with mock fallback when live providers fail.
 
-The eBay provider requires `EBAY_ACCESS_TOKEN` in backend `.env`. If the token
-is missing, expired, rate-limited, or the provider fails, the aggregation service
-falls back to deterministic mock pricing. Flutter still receives the same
-response contract, and no third-party pricing API is called from the mobile app.
+The eBay provider should use `EBAY_CLIENT_ID` and `EBAY_CLIENT_SECRET` so the
+backend can generate and cache OAuth application tokens automatically.
+`EBAY_ACCESS_TOKEN` remains supported as a short-lived manual fallback for local
+or SIT smoke tests. If eBay credentials are missing, expired, rate-limited, or
+the provider fails, the aggregation service falls back to deterministic mock
+pricing. Flutter still receives the same response contract, and no third-party
+pricing API is called from the mobile app.
 The TCGPlayer provider requires `TCGPLAYER_CLIENT_ID` and
 `TCGPLAYER_CLIENT_SECRET` in backend `.env`. OAuth tokens are requested and
 refreshed server-side only. Flutter never receives TCGPlayer credentials or
@@ -438,6 +444,10 @@ backend only:
 
 ```text
 PRICING_PROVIDER=ebay
+EBAY_CLIENT_ID=your-production-app-id
+EBAY_CLIENT_SECRET=your-production-cert-id
+EBAY_OAUTH_TOKEN_URL=https://api.ebay.com/identity/v1/oauth2/token
+# Optional short-lived manual fallback if client credentials are not configured.
 EBAY_ACCESS_TOKEN=your-server-side-oauth-access-token
 EBAY_BROWSE_API_URL=https://api.ebay.com/buy/browse/v1/item_summary/search
 EBAY_MARKETPLACE_ID=EBAY_AU
