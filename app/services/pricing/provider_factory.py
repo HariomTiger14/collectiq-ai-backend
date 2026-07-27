@@ -21,6 +21,7 @@ _ebay_provider = EbayPricingProvider(
     oauth_token_url=settings.ebay_oauth_token_url,
     oauth_scope=settings.ebay_oauth_scope,
     marketplace_insights_api_url=settings.ebay_marketplace_insights_api_url,
+    partner_access_granted=settings.ebay_partner_access_granted,
     browse_api_url=settings.ebay_browse_api_url,
     marketplace_id=settings.ebay_marketplace_id,
     timeout_seconds=settings.ebay_timeout_seconds,
@@ -144,7 +145,8 @@ def _ebay_sold_comps_configured(provider: PricingProvider) -> bool:
             and _provider_value(provider, "_client_secret")
         )
     )
-    return has_credentials and bool(
+    has_partner_access = bool(getattr(provider, "_partner_access_granted", False))
+    return has_partner_access and has_credentials and bool(
         _provider_value(provider, "_marketplace_insights_api_url")
     )
 

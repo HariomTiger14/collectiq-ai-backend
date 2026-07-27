@@ -132,6 +132,10 @@ class Settings:
         "EBAY_MARKETPLACE_INSIGHTS_API_URL",
         "",
     )
+    ebay_partner_access_granted: bool = (
+        os.getenv("EBAY_PARTNER_ACCESS_GRANTED", "false").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
     ebay_browse_api_url: str = os.getenv(
         "EBAY_BROWSE_API_URL",
         "https://api.ebay.com/buy/browse/v1/item_summary/search",

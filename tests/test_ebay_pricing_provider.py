@@ -40,6 +40,7 @@ class EbayPricingProviderTest(unittest.TestCase):
         provider = _provider(
             client=client,
             marketplace_insights_api_url=_SOLD_COMPS_URL,
+            partner_access_granted=True,
         )
 
         pricing = provider.price(self.recognition)
@@ -55,6 +56,7 @@ class EbayPricingProviderTest(unittest.TestCase):
         provider = _provider(
             client=_FakeHttpClient(exception=httpx.TimeoutException("slow")),
             marketplace_insights_api_url=_SOLD_COMPS_URL,
+            partner_access_granted=True,
         )
 
         with self.assertRaises(PricingProviderTimeoutError):
@@ -64,6 +66,7 @@ class EbayPricingProviderTest(unittest.TestCase):
         provider = _provider(
             client=_FakeHttpClient(response=_FakeResponse(status_code=429)),
             marketplace_insights_api_url=_SOLD_COMPS_URL,
+            partner_access_granted=True,
         )
 
         with self.assertRaises(PricingProviderRateLimitError):
@@ -75,6 +78,7 @@ class EbayPricingProviderTest(unittest.TestCase):
             client=client,
             cache_ttl_seconds=60,
             marketplace_insights_api_url=_SOLD_COMPS_URL,
+            partner_access_granted=True,
         )
 
         first = provider.price(self.recognition)
@@ -91,6 +95,7 @@ class EbayPricingProviderTest(unittest.TestCase):
             cache_ttl_seconds=1,
             min_interval_ms=0,
             marketplace_insights_api_url=_SOLD_COMPS_URL,
+            partner_access_granted=True,
         )
 
         provider.price(self.recognition)
@@ -112,6 +117,7 @@ class EbayPricingProviderTest(unittest.TestCase):
             client_secret="client-secret",
             client=client,
             marketplace_insights_api_url=_SOLD_COMPS_URL,
+            partner_access_granted=True,
         )
 
         first = provider.price(self.recognition)
@@ -150,6 +156,7 @@ def _provider(
     client_id: str = "",
     client_secret: str = "",
     marketplace_insights_api_url: str = "",
+    partner_access_granted: bool = False,
     client=None,
     cache_ttl_seconds: int = 900,
     min_interval_ms: int = 0,
@@ -161,6 +168,7 @@ def _provider(
         oauth_token_url="https://api.ebay.com/identity/v1/oauth2/token",
         oauth_scope="https://api.ebay.com/oauth/api_scope",
         marketplace_insights_api_url=marketplace_insights_api_url,
+        partner_access_granted=partner_access_granted,
         browse_api_url="https://api.ebay.com/buy/browse/v1/item_summary/search",
         marketplace_id="EBAY_AU",
         timeout_seconds=1,

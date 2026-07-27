@@ -68,6 +68,7 @@ EBAY_CLIENT_SECRET=
 EBAY_OAUTH_TOKEN_URL=https://api.ebay.com/identity/v1/oauth2/token
 EBAY_OAUTH_SCOPE=https://api.ebay.com/oauth/api_scope
 EBAY_MARKETPLACE_INSIGHTS_API_URL=
+EBAY_PARTNER_ACCESS_GRANTED=false
 EBAY_ACCESS_TOKEN=
 EBAY_BROWSE_API_URL=https://api.ebay.com/buy/browse/v1/item_summary/search
 EBAY_MARKETPLACE_ID=EBAY_AU
@@ -136,10 +137,14 @@ Pricing selection:
 The eBay provider should use `EBAY_CLIENT_ID` and `EBAY_CLIENT_SECRET` so the
 backend can generate and cache OAuth application tokens automatically.
 `EBAY_ACCESS_TOKEN` remains supported as a short-lived manual fallback for local
-or SIT smoke tests. If eBay credentials are missing, expired, rate-limited, or
-the provider fails, the aggregation service falls back to deterministic mock
-pricing. Flutter still receives the same response contract, and no third-party
-pricing API is called from the mobile app.
+or SIT smoke tests. eBay sold-comps pricing also requires approved Marketplace
+Insights partner access and `EBAY_PARTNER_ACCESS_GRANTED=true`; credentials or
+active Browse API access alone must remain unavailable because PackLox does not
+use active listing asking prices for valuations. If eBay credentials are
+missing, expired, rate-limited, not partner-approved, or the provider fails, the
+aggregation service falls back to the next deterministic provider. Flutter still
+receives the same response contract, and no third-party pricing API is called
+from the mobile app.
 The TCGPlayer provider requires `TCGPLAYER_CLIENT_ID` and
 `TCGPLAYER_CLIENT_SECRET` in backend `.env`. OAuth tokens are requested and
 refreshed server-side only. Flutter never receives TCGPlayer credentials or
@@ -456,6 +461,7 @@ EBAY_CLIENT_SECRET=your-production-cert-id
 EBAY_OAUTH_TOKEN_URL=https://api.ebay.com/identity/v1/oauth2/token
 EBAY_OAUTH_SCOPE=https://api.ebay.com/oauth/api_scope
 EBAY_MARKETPLACE_INSIGHTS_API_URL=your-approved-sold-comps-endpoint
+EBAY_PARTNER_ACCESS_GRANTED=false
 # Optional short-lived manual fallback if client credentials are not configured.
 EBAY_ACCESS_TOKEN=your-server-side-oauth-access-token
 EBAY_BROWSE_API_URL=https://api.ebay.com/buy/browse/v1/item_summary/search

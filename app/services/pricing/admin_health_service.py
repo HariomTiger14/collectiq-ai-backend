@@ -301,7 +301,12 @@ def _provider_statuses(catalog_configured: bool) -> list[dict[str, Any]]:
         )
     )
     ebay_sold_comps_configured = bool(
-        ebay_credentials_present and settings.ebay_marketplace_insights_api_url.strip()
+        settings.ebay_partner_access_granted
+        and ebay_credentials_present
+        and settings.ebay_marketplace_insights_api_url.strip()
+    )
+    ebay_partner_denied = bool(
+        ebay_credentials_present and not settings.ebay_partner_access_granted
     )
     return [
         {
@@ -325,12 +330,13 @@ def _provider_statuses(catalog_configured: bool) -> list[dict[str, Any]]:
             "key": "ebay",
             "configured": ebay_sold_comps_configured,
             "credentialsPresent": ebay_credentials_present,
+            "partnerAccessGranted": settings.ebay_partner_access_granted,
             "status": "configured" if ebay_sold_comps_configured else "unavailable",
             "reasonCode": "PARTNER_ACCESS_NOT_GRANTED"
-            if ebay_credentials_present and not ebay_sold_comps_configured
+            if ebay_partner_denied
             else "PROVIDER_NOT_CONNECTED",
             "message": "eBay sold-comps unavailable: partner access not granted."
-            if ebay_credentials_present and not ebay_sold_comps_configured
+            if ebay_partner_denied
             else "eBay sold-comps provider is not connected.",
             "nextRetry": None,
             "role": "sold_comps_future",

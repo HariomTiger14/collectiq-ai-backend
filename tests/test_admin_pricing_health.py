@@ -66,6 +66,7 @@ class PricingHealthServiceTest(unittest.TestCase):
             settings.ebay_client_secret = ""
             settings.ebay_marketplace_id = "EBAY_AU"
             settings.ebay_marketplace_insights_api_url = ""
+            settings.ebay_partner_access_granted = False
             settings.tcgplayer_client_id = ""
             settings.tcgplayer_client_secret = ""
             settings.default_display_currency = "AUD"
@@ -100,6 +101,7 @@ class PricingHealthServiceTest(unittest.TestCase):
             settings.ebay_client_secret = ""
             settings.ebay_marketplace_id = "EBAY_AU"
             settings.ebay_marketplace_insights_api_url = ""
+            settings.ebay_partner_access_granted = False
             settings.tcgplayer_client_id = ""
             settings.tcgplayer_client_secret = ""
             settings.default_display_currency = "AUD"
@@ -138,7 +140,10 @@ class PricingHealthServiceTest(unittest.TestCase):
             settings.ebay_client_id = ""
             settings.ebay_client_secret = ""
             settings.ebay_marketplace_id = "EBAY_AU"
-            settings.ebay_marketplace_insights_api_url = ""
+            settings.ebay_marketplace_insights_api_url = (
+                "https://api.ebay.com/buy/marketplace_insights/v1_beta/item_sales/search"
+            )
+            settings.ebay_partner_access_granted = False
             settings.tcgplayer_client_id = ""
             settings.tcgplayer_client_secret = ""
             settings.default_display_currency = "AUD"
@@ -151,6 +156,7 @@ class PricingHealthServiceTest(unittest.TestCase):
         providers = {provider["key"]: provider for provider in payload["providers"]}
         self.assertFalse(providers["ebay"]["configured"])
         self.assertTrue(providers["ebay"]["credentialsPresent"])
+        self.assertFalse(providers["ebay"]["partnerAccessGranted"])
         self.assertEqual(providers["ebay"]["status"], "unavailable")
         self.assertEqual(
             providers["ebay"]["reasonCode"],

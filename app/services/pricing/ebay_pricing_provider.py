@@ -39,6 +39,7 @@ class EbayPricingProvider(PricingProvider):
         cache_ttl_seconds: int,
         min_interval_ms: int,
         marketplace_insights_api_url: str = "",
+        partner_access_granted: bool = False,
         client_id: str = "",
         client_secret: str = "",
         oauth_token_url: str = "https://api.ebay.com/identity/v1/oauth2/token",
@@ -57,6 +58,7 @@ class EbayPricingProvider(PricingProvider):
         self._oauth_expires_at = 0.0
         self._browse_api_url = browse_api_url.strip()
         self._marketplace_insights_api_url = marketplace_insights_api_url.strip()
+        self._partner_access_granted = partner_access_granted
         self._marketplace_id = marketplace_id.strip() or "EBAY_AU"
         self._timeout_seconds = timeout_seconds
         self._browse_min_results = max(1, browse_min_results)
@@ -70,7 +72,7 @@ class EbayPricingProvider(PricingProvider):
             raise PricingProviderUnavailableError(
                 "Configure EBAY_CLIENT_ID/EBAY_CLIENT_SECRET or EBAY_ACCESS_TOKEN."
             )
-        if not self._has_sold_comps_endpoint():
+        if not self._partner_access_granted or not self._has_sold_comps_endpoint():
             raise PricingProviderUnavailableError(
                 "eBay sold-comps unavailable: partner access not granted. "
                 "Active listing asking prices are not used for PackLox valuations."
