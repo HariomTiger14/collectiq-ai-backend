@@ -229,12 +229,17 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
         self.assertIn("anon", str(context.exception))
 
     def test_supabase_client_syncs_scd2_history_only_for_changes(self) -> None:
+        unchanged_row = {
+            "pricecharting_id": "1",
+            "product_name": "Unchanged",
+            "console_name": "Pokemon Cards",
+            "loose_price_cents": 1000,
+            "currency": "USD",
+            "normalized_identity": "unchanged pokemon cards",
+            "source_downloaded_at": "2026-07-25T00:00:00Z",
+        }
         existing_hash = catalog_history_change_hash(
-            {
-                "product_name": "Unchanged",
-                "console_name": "Pokemon Cards",
-                "loose_price_cents": 1000,
-            }
+            unchanged_row
         )
         transport = _FakeSupabaseTransport(
             current_rows=[
@@ -252,15 +257,7 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
 
             inserted = client.sync_scd2_history_rows(
                 [
-                    {
-                        "pricecharting_id": "1",
-                        "product_name": "Unchanged",
-                        "console_name": "Pokemon Cards",
-                        "loose_price_cents": 1000,
-                        "currency": "USD",
-                        "normalized_identity": "unchanged pokemon cards",
-                        "source_downloaded_at": "2026-07-25T00:00:00Z",
-                    },
+                    unchanged_row,
                     {
                         "pricecharting_id": "2",
                         "product_name": "Changed",
