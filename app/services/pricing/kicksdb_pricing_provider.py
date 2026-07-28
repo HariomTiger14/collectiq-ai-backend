@@ -82,6 +82,11 @@ class KicksDBPricingProvider(PricingProvider):
                 product = {**product, **detailed_product}
                 comparable_sales = self._sales_from_product(product, recognition)
         if not comparable_sales:
+            unified_product = self._unified_product(recognition, product)
+            if unified_product:
+                product = {**product, **unified_product}
+                comparable_sales = self._sales_from_product(product, recognition)
+        if not comparable_sales:
             raise EmptyMarketDataError("KicksDB returned no usable sneaker market prices.")
 
         result = self._pricing_result(
@@ -181,6 +186,25 @@ class KicksDBPricingProvider(PricingProvider):
             return payload
         products = self._products_from_payload(payload)
         return products[0] if products else None
+
+    def _unified_product(self, recognition: RecognitionResult, product: dict) -> dict | None:
+        params: dict[str, object] = {
+            "source": "stockx",
+            "limit": 20,
+            "sort": "updated_at:desc",
+        }
+        sku = self._product_sku(product) or recognition.cardNumber
+        if sku:
+            params["sku"] = sku
+        else:
+            params["query"] = self._product_title(product) or self._query_for(recognition)
+
+        self._throttle.acquire(self.provider_name)
+        payload = self._request_json(self._url("v3/unified/gtin"), params=params)
+        products = self._products_from_payload(payload)
+        if not products:
+            return None
+        return self._best_product(products, recognition)
 
     def _best_product(
         self,
@@ -289,6 +313,7 @@ class KicksDBPricingProvider(PricingProvider):
             (("averagePrice",), "Average market price"),
             (("avgPrice",), "Average market price"),
             (("marketPrice",), "Market price"),
+            (("price",), "Market price"),
             (("lowestAsk",), "Lowest ask"),
             (("highestBid",), "Highest bid"),
             (("prices", "lastSale"), "Last sale"),
@@ -520,17 +545,25 @@ class KicksDBPricingProvider(PricingProvider):
             or product.get("style_id")
             or product.get("sku")
             or product.get("modelNumber")
+            or product.get("variant_id")
             or ""
         ).strip()
 
     def _product_id(self, product: dict) -> str:
-        return str(product.get("id") or product.get("uuid") or product.get("slug") or "").strip()
+        return str(
+            product.get("id")
+            or product.get("uuid")
+            or product.get("product_id")
+            or product.get("source_product_id")
+            or product.get("slug")
+            or ""
+        ).strip()
 
     def _product_slug(self, product: dict) -> str:
         return str(product.get("slug") or product.get("urlKey") or product.get("url_key") or "").strip()
 
     def _product_url(self, product: dict) -> str | None:
-        url = product.get("url") or product.get("productUrl") or product.get("stockxUrl")
+        url = product.get("url") or product.get("productUrl") or product.get("stockxUrl") or product.get("link")
         return str(url).strip() if url else None
 
     def _currency(self, product: dict, *, fallback: str = "USD") -> str:

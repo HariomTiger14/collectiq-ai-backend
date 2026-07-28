@@ -66,6 +66,28 @@ class KicksDBPricingProviderTest(unittest.TestCase):
         self.assertEqual(pricing.estimatedMarketValue, 298)
         self.assertEqual(pricing.providerDiagnostics["matchedProductId"], "stockx-1")
 
+    def test_uses_unified_sku_lookup_when_stockx_payload_has_no_price(self) -> None:
+        client = _FakeHttpClient(
+            responses=[
+                _FakeResponse(body=_stockx_metadata_only_payload()),
+                _FakeResponse(body=_stockx_detail_no_price_payload()),
+                _FakeResponse(body=_unified_gtin_payload()),
+            ]
+        )
+        provider = _provider(client=client)
+
+        pricing = provider.price(_sneaker_recognition())
+
+        self.assertEqual(client.call_count, 3)
+        self.assertIn("/v3/unified/gtin", client.requests[2]["url"])
+        self.assertEqual(client.requests[2]["params"]["sku"], "DN3707-160")
+        self.assertEqual(client.requests[2]["params"]["source"], "stockx")
+        self.assertEqual(pricing.lowEstimate, 299.99)
+        self.assertEqual(pricing.highEstimate, 299.99)
+        self.assertEqual(pricing.estimatedMarketValue, 300)
+        self.assertEqual(pricing.comparableSales[0].currency, "USD")
+        self.assertEqual(pricing.providerDiagnostics["matchedProductId"], "stockx-unified-1")
+
     def test_cache_hit_prevents_repeated_provider_request(self) -> None:
         client = _FakeHttpClient(response=_FakeResponse(body=_stockx_payload()))
         provider = _provider(client=client, cache_ttl_seconds=60)
@@ -226,6 +248,37 @@ def _stockx_detail_payload() -> dict:
                 }
             ],
         }
+    }
+
+
+def _stockx_detail_no_price_payload() -> dict:
+    return {
+        "data": {
+            "id": "stockx-1",
+            "title": "Nike Air Jordan 4 Retro Military Black",
+            "brand": "Nike",
+            "styleId": "DN3707-160",
+            "currency": "USD",
+        }
+    }
+
+
+def _unified_gtin_payload() -> dict:
+    return {
+        "data": [
+            {
+                "id": "stockx-unified-1",
+                "name": "Nike Air Jordan 4 Retro Military Black",
+                "brand": "Nike",
+                "sku": "DN3707-160",
+                "source": "stockx",
+                "price": 299.99,
+                "retail_price": 210,
+                "currency": "USD",
+                "link": "https://stockx.com/air-jordan-4-retro-military-black",
+                "updated_at": "2026-07-29T00:00:00Z",
+            }
+        ]
     }
 
 
