@@ -63,13 +63,7 @@ class KicksDBPricingProvider(PricingProvider):
         started_at = time.perf_counter()
         payload = self._request_json(
             self._url("v3/stockx/products"),
-            params={
-                "query": query,
-                "market": "US",
-                "display[prices]": "true",
-                "display[variants]": "true",
-                "display[statistics]": "true",
-            },
+            params=self._search_params(recognition, query),
         )
         latency_ms = int((time.perf_counter() - started_at) * 1000)
 
@@ -108,7 +102,7 @@ class KicksDBPricingProvider(PricingProvider):
     def _request_json(self, url: str, *, params: dict | None = None) -> dict:
         headers = {
             "Accept": "application/json",
-            "Authorization": f"Bearer {self._api_key}",
+            "Authorization": self._auth_header_value(),
         }
         try:
             response = self._send(url, headers=headers, params=params)
@@ -304,16 +298,29 @@ class KicksDBPricingProvider(PricingProvider):
             (("market", "avgPrice"), "Average market price"),
             (("market", "marketPrice"), "Market price"),
             (("market", "lowestAsk"), "Lowest ask"),
+            (("market", "min_price"), "Lowest market price"),
+            (("market", "max_price"), "Highest market price"),
+            (("market", "avg_price"), "Average market price"),
+            (("market", "lowest_price"), "Lowest market price"),
+            (("market", "highest_price"), "Highest market price"),
             (("market", "highestBid"), "Highest bid"),
             (("pricing", "lastSale"), "Last sale"),
             (("pricing", "averagePrice"), "Average market price"),
             (("pricing", "marketPrice"), "Market price"),
             (("pricing", "lowestAsk"), "Lowest ask"),
+            (("pricing", "min_price"), "Lowest market price"),
+            (("pricing", "max_price"), "Highest market price"),
+            (("pricing", "avg_price"), "Average market price"),
             (("lastSale",), "Last sale"),
             (("averagePrice",), "Average market price"),
             (("avgPrice",), "Average market price"),
+            (("avg_price",), "Average market price"),
             (("marketPrice",), "Market price"),
             (("price",), "Market price"),
+            (("min_price",), "Lowest market price"),
+            (("max_price",), "Highest market price"),
+            (("lowest_price",), "Lowest market price"),
+            (("highest_price",), "Highest market price"),
             (("lowestAsk",), "Lowest ask"),
             (("highestBid",), "Highest bid"),
             (("prices", "lastSale"), "Last sale"),
@@ -329,6 +336,9 @@ class KicksDBPricingProvider(PricingProvider):
             (("prices", "highest_bid"), "Highest bid"),
             (("statistics", "lastSale"), "Last sale"),
             (("statistics", "averagePrice"), "Average market price"),
+            (("statistics", "avg_price"), "Average market price"),
+            (("statistics", "min_price"), "Lowest market price"),
+            (("statistics", "max_price"), "Highest market price"),
             (("statistics", "lowestAsk"), "Lowest ask"),
             (("statistics", "highestBid"), "Highest bid"),
         ):
@@ -376,6 +386,12 @@ class KicksDBPricingProvider(PricingProvider):
         normalized = key.lower().replace("-", "_").replace(" ", "_")
         if normalized in {"retail", "retail_price", "msrp"}:
             return ""
+        if normalized in {"min_price", "lowest_price"}:
+            return "Lowest market price"
+        if normalized in {"max_price", "highest_price"}:
+            return "Highest market price"
+        if normalized in {"avg_price", "average_price"}:
+            return "Average market price"
         if "last" in normalized and "sale" in normalized:
             return "Last sale"
         if "lowest" in normalized and "ask" in normalized:
@@ -467,6 +483,19 @@ class KicksDBPricingProvider(PricingProvider):
         )
         return query or recognition.category or "sneakers"
 
+    def _search_params(self, recognition: RecognitionResult, query: str) -> dict[str, str]:
+        params = {
+            "query": query,
+            "market": "US",
+            "display[prices]": "true",
+            "display[variants]": "true",
+            "display[statistics]": "true",
+        }
+        sku = self._normalized_sku(recognition.cardNumber)
+        if sku:
+            params["sku"] = sku
+        return params
+
     def _cache_key(self, recognition: RecognitionResult, query: str) -> str:
         identity = "|".join(
             [
@@ -549,6 +578,12 @@ class KicksDBPricingProvider(PricingProvider):
             or ""
         ).strip()
 
+    def _normalized_sku(self, value: object) -> str:
+        if not isinstance(value, str):
+            return ""
+        text = value.strip()
+        return text if re.search(r"[A-Za-z]", text) and re.search(r"\d", text) else ""
+
     def _product_id(self, product: dict) -> str:
         return str(
             product.get("id")
@@ -576,6 +611,11 @@ class KicksDBPricingProvider(PricingProvider):
             or fallback
         )
         return str(currency).upper()
+
+    def _auth_header_value(self) -> str:
+        if self._api_key.lower().startswith("bearer "):
+            return self._api_key
+        return self._api_key
 
     def _url(self, path: str) -> str:
         return urljoin(self._api_base, path.lstrip("/"))

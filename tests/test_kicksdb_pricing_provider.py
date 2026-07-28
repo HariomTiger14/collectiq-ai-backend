@@ -29,8 +29,9 @@ class KicksDBPricingProviderTest(unittest.TestCase):
         self.assertEqual(pricing.estimatedMarketValue, 275)
         self.assertEqual(pricing.providerDiagnostics["provider"], "kicksdb")
         self.assertEqual(pricing.providerDiagnostics["matchedProductSku"], "DN3707-160")
-        self.assertIn("Bearer kicks-key", client.last_request["headers"]["Authorization"])
+        self.assertEqual(client.last_request["headers"]["Authorization"], "kicks-key")
         self.assertEqual(client.last_request["params"]["query"], "Nike Jordan 4 Military Black DN3707-160 2022")
+        self.assertEqual(client.last_request["params"]["sku"], "DN3707-160")
         self.assertEqual(client.last_request["params"]["market"], "US")
         self.assertEqual(client.last_request["params"]["display[prices]"], "true")
         self.assertEqual(client.last_request["params"]["display[variants]"], "true")
@@ -47,6 +48,16 @@ class KicksDBPricingProviderTest(unittest.TestCase):
         self.assertEqual(pricing.highEstimate, 314.99)
         self.assertEqual(pricing.estimatedMarketValue, 300)
         self.assertEqual(pricing.comparableSales[0].soldPrice, 299.99)
+
+    def test_successful_response_accepts_stockx_snake_case_aggregate_prices(self) -> None:
+        client = _FakeHttpClient(response=_FakeResponse(body=_stockx_aggregate_payload()))
+        provider = _provider(client=client)
+
+        pricing = provider.price(_sneaker_recognition())
+
+        self.assertEqual(pricing.lowEstimate, 280.25)
+        self.assertEqual(pricing.highEstimate, 320.5)
+        self.assertEqual(pricing.estimatedMarketValue, 300)
 
     def test_fetches_product_detail_when_search_has_no_prices(self) -> None:
         client = _FakeHttpClient(
@@ -212,6 +223,25 @@ def _stockx_prices_payload() -> dict:
                 }
             ]
         }
+    }
+
+
+def _stockx_aggregate_payload() -> dict:
+    return {
+        "products": [
+            {
+                "id": "stockx-1",
+                "title": "Nike Air Jordan 4 Retro Military Black",
+                "brand": "Nike",
+                "styleId": "DN3707-160",
+                "category": "sneakers",
+                "currency": "USD",
+                "min_price": 280.25,
+                "max_price": 320.5,
+                "avg_price": 300,
+                "retail_price": 210,
+            }
+        ]
     }
 
 
