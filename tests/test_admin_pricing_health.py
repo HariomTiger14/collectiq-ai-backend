@@ -69,6 +69,8 @@ class PricingHealthServiceTest(unittest.TestCase):
             settings.ebay_partner_access_granted = False
             settings.tcgplayer_client_id = ""
             settings.tcgplayer_client_secret = ""
+            settings.kicksdb_api_key = "kicks-key"
+            settings.kicksdb_api_base = "https://api.kicks.dev"
             settings.default_display_currency = "AUD"
             settings.fx_usd_to_aud = 1.52
             settings.fx_usd_to_cad = 1.37
@@ -112,7 +114,7 @@ class PricingHealthServiceTest(unittest.TestCase):
             payload = service.health()
 
         self.assertEqual(payload["status"], "healthy")
-        self.assertEqual(payload["summary"]["configuredProviderCount"], 1)
+        self.assertEqual(payload["summary"]["configuredProviderCount"], 2)
         self.assertEqual(payload["pricecharting"]["totalCurrentRows"], 5000)
         self.assertEqual(payload["pricecharting"]["totalHistoryRows"], 5500)
         self.assertEqual(payload["pricecharting"]["totalClosedHistoryRows"], 500)
@@ -121,6 +123,8 @@ class PricingHealthServiceTest(unittest.TestCase):
         self.assertFalse(payload["pricecharting"]["sources"][0]["stale"])
         providers = {provider["key"]: provider for provider in payload["providers"]}
         self.assertTrue(providers["pricecharting_catalog"]["configured"])
+        self.assertTrue(providers["kicksdb"]["configured"])
+        self.assertEqual(providers["kicksdb"]["role"], "sneakers_streetwear")
         self.assertEqual(providers["ebay"]["status"], "unavailable")
         self.assertEqual(providers["ebay"]["reasonCode"], "PROVIDER_NOT_CONNECTED")
         self.assertEqual(payload["currency"]["rates"]["AUD"], 1.52)

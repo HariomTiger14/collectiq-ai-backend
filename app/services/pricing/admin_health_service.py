@@ -361,6 +361,24 @@ def _provider_statuses(catalog_configured: bool) -> list[dict[str, Any]]:
             "marketplace": settings.ebay_marketplace_id,
         },
         {
+            "name": "KicksDB",
+            "key": "kicksdb",
+            "configured": bool(settings.kicksdb_api_key.strip()),
+            "credentialsPresent": bool(settings.kicksdb_api_key.strip()),
+            "status": "configured"
+            if settings.kicksdb_api_key.strip()
+            else "not_configured",
+            "reasonCode": None
+            if settings.kicksdb_api_key.strip()
+            else "PROVIDER_NOT_CONNECTED",
+            "message": "KicksDB sneaker/streetwear pricing is available."
+            if settings.kicksdb_api_key.strip()
+            else "KicksDB sneaker/streetwear provider is not connected.",
+            "role": "sneakers_streetwear",
+            "marketplace": "StockX",
+            "apiBase": settings.kicksdb_api_base,
+        },
+        {
             "name": "TCGplayer",
             "key": "tcgplayer",
             "configured": bool(
