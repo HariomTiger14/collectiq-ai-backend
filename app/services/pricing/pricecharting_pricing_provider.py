@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from dataclasses import replace
 from urllib.parse import urljoin, urlparse
@@ -167,6 +168,7 @@ class PriceChartingPricingProvider(PricingProvider):
             reverse=True,
         )
         product = products[0]
+        self._validate_category_match(product, recognition)
         comparable_sales = self._sales_from_product(product, recognition)
         if not comparable_sales:
             raise EmptyMarketDataError("PriceCharting returned no usable price fields.")
@@ -201,6 +203,8 @@ class PriceChartingPricingProvider(PricingProvider):
                     or product.get("productId")
                     or ""
                 ),
+                "matchedProductName": self._product_name(product, recognition),
+                "matchedProductCategory": self._product_category(product),
             },
         )
 
@@ -399,6 +403,176 @@ class PriceChartingPricingProvider(PricingProvider):
         comp_bonus = min(10, len(comparable_sales) * 2)
         base = min(78, max(42, round(recognition.confidence * 0.68)))
         return max(35, min(90, base + match_bonus + comp_bonus))
+
+    def _validate_category_match(
+        self,
+        product: dict,
+        recognition: RecognitionResult,
+    ) -> None:
+        expected_family = self._expected_category_family(recognition.category)
+        if expected_family is None:
+            return
+
+        product_text = self._product_text(product)
+        title_tokens = self._tokens(recognition.title)
+        matched_title_tokens = [
+            token for token in title_tokens if token in self._tokens(product_text)
+        ]
+        title_overlap = (
+            len(matched_title_tokens) / len(title_tokens) if title_tokens else 0
+        )
+        family_keywords = {
+            "lego": {"lego", "bricklink", "brick", "building", "set"},
+            "funko": {"funko", "pop", "vinyl"},
+            "coin": {"coin", "cent", "penny", "dollar", "quarter", "nickel", "mint"},
+            "comic": {"comic", "comics", "manga", "issue", "cover"},
+            "sports_card": {
+                "card",
+                "cards",
+                "baseball",
+                "basketball",
+                "football",
+                "hockey",
+                "rookie",
+                "topps",
+                "fleer",
+                "panini",
+                "upper",
+                "deck",
+            },
+        }[expected_family]
+        has_family_signal = any(keyword in product_text for keyword in family_keywords)
+        has_required_identity = self._has_required_category_identity(
+            expected_family,
+            product_text,
+            recognition,
+        )
+
+        if not has_family_signal or not has_required_identity or title_overlap < 0.45:
+            raise EmptyMarketDataError(
+                "PriceCharting match was rejected because the returned product "
+                f"did not satisfy {expected_family} category identity rules."
+            )
+
+    def _expected_category_family(self, category: str) -> str | None:
+        normalized = category.lower()
+        if any(value in normalized for value in {"lego", "building set"}):
+            return "lego"
+        if any(value in normalized for value in {"funko", "pop", "vinyl figure"}):
+            return "funko"
+        if any(value in normalized for value in {"coin", "numismatic"}):
+            return "coin"
+        if any(value in normalized for value in {"comic", "comic book", "manga"}):
+            return "comic"
+        if any(value in normalized for value in {"sports card", "rookie card"}):
+            return "sports_card"
+        return None
+
+    def _has_required_category_identity(
+        self,
+        expected_family: str,
+        product_text: str,
+        recognition: RecognitionResult,
+    ) -> bool:
+        if expected_family == "comic":
+            recognition_text = self._recognition_text(recognition)
+            if "homage" in product_text and "homage" not in recognition_text:
+                return False
+            issue = self._issue_number(recognition)
+            if issue and issue not in self._tokens(product_text):
+                return False
+            series_tokens = self._tokens(recognition.setName or recognition.series or "")
+            if series_tokens:
+                product_tokens = self._tokens(product_text)
+                matched_series = series_tokens.intersection(product_tokens)
+                return len(matched_series) / len(series_tokens) >= 0.5
+            return bool(issue)
+
+        if expected_family == "sports_card":
+            checks = [
+                recognition.year,
+                recognition.setName,
+                recognition.cardNumber,
+                recognition.playerOrCharacter,
+            ]
+            provided = [value for value in checks if isinstance(value, str) and value.strip()]
+            if not provided:
+                return False
+            product_tokens = self._tokens(product_text)
+            matched = 0
+            for value in provided:
+                value_tokens = self._tokens(value)
+                if value_tokens and value_tokens.issubset(product_tokens):
+                    matched += 1
+            return matched >= min(2, len(provided))
+
+        return True
+
+    def _recognition_text(self, recognition: RecognitionResult) -> str:
+        values = [
+            recognition.title,
+            recognition.category,
+            recognition.brand,
+            recognition.setName,
+            recognition.series,
+            recognition.cardNumber,
+            recognition.playerOrCharacter,
+            recognition.year,
+            recognition.notes,
+        ]
+        return " ".join(str(value).lower() for value in values if value)
+
+    def _issue_number(self, recognition: RecognitionResult) -> str | None:
+        candidates = [recognition.cardNumber, recognition.title]
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+            match = re.search(r"#?\b(\d{1,5})(?:[a-z])?\b", candidate.lower())
+            if match:
+                return match.group(1)
+        return None
+
+    def _product_text(self, product: dict) -> str:
+        values = [
+            product.get("product-name"),
+            product.get("productName"),
+            product.get("name"),
+            product.get("console-name"),
+            product.get("consoleName"),
+            product.get("console"),
+            product.get("category"),
+            product.get("set"),
+            product.get("series"),
+            product.get("url"),
+            product.get("product-url"),
+        ]
+        return " ".join(str(value).lower() for value in values if value)
+
+    def _product_category(self, product: dict) -> str:
+        return str(
+            product.get("console-name")
+            or product.get("consoleName")
+            or product.get("console")
+            or product.get("category")
+            or ""
+        )
+
+    def _tokens(self, value: str) -> set[str]:
+        stop_words = {
+            "a",
+            "an",
+            "and",
+            "for",
+            "new",
+            "pop",
+            "the",
+            "with",
+        }
+        return {
+            token
+            for token in re.findall(r"[a-z0-9]+", value.lower())
+            if len(token) > 1 and token not in stop_words
+        }
 
     def _product_name(self, product: dict, recognition: RecognitionResult) -> str:
         return str(

@@ -26,6 +26,10 @@ def _first_env_value(*names: str) -> str | None:
     return None
 
 
+def _env_flag(name: str, default: str = "") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def resolve_app_version() -> str:
     return _first_env_value("APP_VERSION", "BACKEND_VERSION") or "0.1.0"
 
@@ -151,6 +155,14 @@ class Settings:
     tcgplayer_timeout_seconds: float = float(
         os.getenv("TCGPLAYER_TIMEOUT_SECONDS", "10")
     )
+    kicksdb_api_key: str = os.getenv("KICKSDB_API_KEY", "")
+    kicksdb_api_base: str = os.getenv(
+        "KICKSDB_API_BASE",
+        "https://api.kicks.dev",
+    )
+    kicksdb_timeout_seconds: float = float(
+        os.getenv("KICKSDB_TIMEOUT_SECONDS", "10")
+    )
     pricecharting_api_key: str = os.getenv("PRICECHARTING_API_KEY", "")
     pricecharting_api_base: str = os.getenv(
         "PRICECHARTING_API_BASE",
@@ -158,6 +170,13 @@ class Settings:
     )
     pricecharting_timeout_seconds: float = float(
         os.getenv("PRICECHARTING_TIMEOUT_SECONDS", "10")
+    )
+    pricecharting_provider_min_interval_ms: int = int(
+        os.getenv("PRICECHARTING_PROVIDER_MIN_INTERVAL_MS", "1000")
+    )
+    pricecharting_shared_throttle_enabled: bool = _env_flag(
+        "PRICECHARTING_SHARED_THROTTLE_ENABLED",
+        "true",
     )
     pricing_cache_ttl_seconds: int = int(os.getenv("PRICING_CACHE_TTL_SECONDS", "900"))
     pricing_provider_min_interval_ms: int = int(

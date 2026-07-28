@@ -1,0 +1,409 @@
+import re
+import time
+from dataclasses import replace
+from urllib.parse import urljoin, urlparse
+
+import httpx
+
+from app.services.ai.base_recognition_service import RecognitionResult
+from app.services.pricing.base_pricing_provider import (
+    EmptyMarketDataError,
+    MarketComparableSale,
+    PricingProvider,
+    PricingProviderError,
+    PricingProviderRateLimitError,
+    PricingProviderTimeoutError,
+    PricingProviderUnavailableError,
+    PricingResult,
+    utc_timestamp,
+)
+from app.services.pricing.cache import InMemoryPricingCache, ProviderThrottle
+
+
+class KicksDBPricingProvider(PricingProvider):
+    provider_name = "kicksdb"
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        api_base: str,
+        timeout_seconds: float,
+        cache_ttl_seconds: int,
+        min_interval_ms: int,
+        client=None,
+        cache: InMemoryPricingCache | None = None,
+        throttle: ProviderThrottle | None = None,
+    ) -> None:
+        self._api_key = api_key.strip()
+        self._api_base = api_base.strip().rstrip("/") + "/"
+        self._timeout_seconds = timeout_seconds
+        self._client = client
+        self._cache = cache or InMemoryPricingCache(cache_ttl_seconds)
+        self._throttle = throttle or ProviderThrottle(min_interval_ms)
+
+    def price(self, recognition: RecognitionResult) -> PricingResult:
+        self._validate_configuration()
+
+        query = self._query_for(recognition)
+        cache_key = self._cache_key(recognition, query)
+        cached = self._cache.get(cache_key)
+        if isinstance(cached, PricingResult):
+            return replace(
+                cached,
+                cacheStatus="hit",
+                providerDiagnostics={
+                    **cached.providerDiagnostics,
+                    "cacheStatus": "hit",
+                    "provider": self.provider_name,
+                },
+            )
+
+        self._throttle.acquire(self.provider_name)
+        started_at = time.perf_counter()
+        payload = self._request_json(
+            self._url("v3/stockx/products"),
+            params={"query": query},
+        )
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+
+        products = self._products_from_payload(payload)
+        product = self._best_product(products, recognition)
+        comparable_sales = self._sales_from_product(product, recognition)
+        if not comparable_sales:
+            raise EmptyMarketDataError("KicksDB returned no usable sneaker market prices.")
+
+        result = self._pricing_result(
+            recognition=recognition,
+            query=query,
+            product=product,
+            comparable_sales=comparable_sales,
+            latency_ms=latency_ms,
+        )
+        self._cache.set(cache_key, result)
+        return result
+
+    def _validate_configuration(self) -> None:
+        if not self._api_key:
+            raise PricingProviderUnavailableError("KICKSDB_API_KEY is not configured.")
+        if not self._is_valid_url(self._api_base):
+            raise PricingProviderUnavailableError("KICKSDB_API_BASE is missing or invalid.")
+
+    def _request_json(self, url: str, *, params: dict | None = None) -> dict:
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self._api_key}",
+        }
+        try:
+            response = self._send(url, headers=headers, params=params)
+        except httpx.TimeoutException as exc:
+            raise PricingProviderTimeoutError("KicksDB pricing request timed out.") from exc
+        except httpx.RequestError as exc:
+            raise PricingProviderUnavailableError(
+                "KicksDB pricing request failed before receiving a response."
+            ) from exc
+
+        status_code = getattr(response, "status_code", 0)
+        if status_code in {401, 403}:
+            raise PricingProviderUnavailableError(
+                f"KicksDB credentials were rejected with HTTP {status_code}."
+            )
+        if status_code == 404:
+            raise EmptyMarketDataError("KicksDB returned no matching products.")
+        if status_code == 429:
+            raise PricingProviderRateLimitError("KicksDB pricing rate limit reached.")
+        if status_code >= 500:
+            raise PricingProviderUnavailableError(
+                f"KicksDB pricing service returned HTTP {status_code}."
+            )
+        if status_code >= 400:
+            raise PricingProviderError(
+                f"KicksDB pricing request failed with HTTP {status_code}."
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise PricingProviderError("KicksDB pricing response was not valid JSON.") from exc
+        if not isinstance(payload, dict):
+            raise PricingProviderError("KicksDB pricing response shape was invalid.")
+        return payload
+
+    def _send(self, url: str, **kwargs):
+        if self._client is not None:
+            return self._client.get(url, timeout=self._timeout_seconds, **kwargs)
+
+        with httpx.Client(timeout=self._timeout_seconds) as client:
+            return client.get(url, **kwargs)
+
+    def _products_from_payload(self, payload: dict) -> list[dict]:
+        for key in ("products", "results", "data", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                nested = self._products_from_payload(value)
+                if nested:
+                    return nested
+        return []
+
+    def _best_product(
+        self,
+        products: list[dict],
+        recognition: RecognitionResult,
+    ) -> dict:
+        if not products:
+            raise EmptyMarketDataError("KicksDB returned no product matches.")
+
+        ranked = sorted(
+            products,
+            key=lambda product: self._match_score(product, recognition),
+            reverse=True,
+        )
+        product = ranked[0]
+        if self._match_score(product, recognition) < 4:
+            raise EmptyMarketDataError("KicksDB product match was too weak to value.")
+        return product
+
+    def _sales_from_product(
+        self,
+        product: dict,
+        recognition: RecognitionResult,
+    ) -> list[MarketComparableSale]:
+        title = self._product_title(product) or recognition.title
+        currency = self._currency(product)
+        sales: list[MarketComparableSale] = []
+
+        for label, price in self._market_prices(product):
+            sales.append(
+                MarketComparableSale(
+                    source="KicksDB StockX",
+                    title=f"{title} - {label}",
+                    soldPrice=round(price),
+                    currency=currency,
+                    soldDate=str(
+                        product.get("lastUpdated")
+                        or product.get("updatedAt")
+                        or product.get("releaseDate")
+                        or utc_timestamp()
+                    ),
+                    condition=str(recognition.condition or "Market"),
+                    url=self._product_url(product),
+                )
+            )
+        return sales
+
+    def _market_prices(self, product: dict) -> list[tuple[str, float]]:
+        prices: list[tuple[str, float]] = []
+        for path, label in (
+            (("market", "lastSale"), "Last sale"),
+            (("market", "averagePrice"), "Average market price"),
+            (("market", "avgPrice"), "Average market price"),
+            (("market", "marketPrice"), "Market price"),
+            (("market", "lowestAsk"), "Lowest ask"),
+            (("market", "highestBid"), "Highest bid"),
+            (("pricing", "lastSale"), "Last sale"),
+            (("pricing", "averagePrice"), "Average market price"),
+            (("pricing", "marketPrice"), "Market price"),
+            (("pricing", "lowestAsk"), "Lowest ask"),
+            (("lastSale",), "Last sale"),
+            (("averagePrice",), "Average market price"),
+            (("avgPrice",), "Average market price"),
+            (("marketPrice",), "Market price"),
+            (("lowestAsk",), "Lowest ask"),
+            (("highestBid",), "Highest bid"),
+        ):
+            price = self._price_at_path(product, path)
+            if price is not None:
+                prices.append((label, price))
+
+        deduped: list[tuple[str, float]] = []
+        seen: set[tuple[str, int]] = set()
+        for label, price in prices:
+            key = (label, round(price * 100))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append((label, price))
+        return deduped
+
+    def _price_at_path(self, payload: dict, path: tuple[str, ...]) -> float | None:
+        value: object = payload
+        for key in path:
+            if not isinstance(value, dict):
+                return None
+            value = value.get(key)
+        return self._parse_price(value)
+
+    def _parse_price(self, value: object) -> float | None:
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+        if isinstance(value, str):
+            cleaned = re.sub(r"[^0-9.]", "", value)
+            try:
+                price = float(cleaned)
+            except ValueError:
+                return None
+            return price if price > 0 else None
+        return None
+
+    def _pricing_result(
+        self,
+        *,
+        recognition: RecognitionResult,
+        query: str,
+        product: dict,
+        comparable_sales: list[MarketComparableSale],
+        latency_ms: int,
+    ) -> PricingResult:
+        prices = [sale.soldPrice for sale in comparable_sales]
+        estimated_value = round(sum(prices) / len(prices))
+        confidence = self._confidence(recognition, product, comparable_sales)
+
+        return PricingResult(
+            estimatedMarketValue=max(1, estimated_value),
+            lowEstimate=max(1, min(prices)),
+            highEstimate=max(1, max(prices)),
+            currency=comparable_sales[0].currency,
+            pricingSource="KicksDB StockX API",
+            pricingConfidence=confidence,
+            lastUpdated=utc_timestamp(),
+            marketTrend=self._trend(comparable_sales),
+            sourceCount=1,
+            pricingAge="live",
+            comparableSales=comparable_sales,
+            cacheStatus="miss",
+            providerDiagnostics={
+                "provider": self.provider_name,
+                "cacheStatus": "miss",
+                "responseLatencyMs": str(latency_ms),
+                "pricingFreshness": "live",
+                "fallbackReason": "",
+                "sourceConfidence": str(confidence),
+                "resultCount": str(len(comparable_sales)),
+                "matchedProductId": self._product_id(product),
+                "matchedProductName": self._product_title(product),
+                "matchedProductSku": self._product_sku(product),
+                "query": query,
+                "marketplace": "StockX",
+            },
+        )
+
+    def _query_for(self, recognition: RecognitionResult) -> str:
+        parts = [
+            recognition.brand,
+            recognition.title,
+            recognition.series,
+            recognition.cardNumber,
+            recognition.year,
+        ]
+        query = " ".join(
+            str(part).strip()
+            for part in parts
+            if isinstance(part, str) and part.strip()
+        )
+        return query or recognition.category or "sneakers"
+
+    def _cache_key(self, recognition: RecognitionResult, query: str) -> str:
+        identity = "|".join(
+            [
+                self.provider_name,
+                query,
+                recognition.category,
+                recognition.condition,
+            ]
+        )
+        return " ".join(identity.lower().split())
+
+    def _match_score(self, product: dict, recognition: RecognitionResult) -> int:
+        haystack = self._product_text(product)
+        score = 0
+        for value, weight in [
+            (recognition.title, 6),
+            (recognition.brand, 5),
+            (recognition.series, 3),
+            (recognition.cardNumber, 6),
+            (recognition.year, 2),
+        ]:
+            if isinstance(value, str) and value.strip().lower() in haystack:
+                score += weight
+        if any(term in haystack for term in ("sneaker", "shoe", "streetwear", "stockx")):
+            score += 2
+        return score
+
+    def _confidence(
+        self,
+        recognition: RecognitionResult,
+        product: dict,
+        comparable_sales: list[MarketComparableSale],
+    ) -> int:
+        match_bonus = min(16, self._match_score(product, recognition) * 2)
+        comp_bonus = min(8, len(comparable_sales) * 2)
+        base = min(76, max(45, round(recognition.confidence * 0.68)))
+        return max(40, min(90, base + match_bonus + comp_bonus))
+
+    def _trend(self, comparable_sales: list[MarketComparableSale]) -> str:
+        prices = [sale.soldPrice for sale in comparable_sales]
+        if len(prices) < 2:
+            return "Stable"
+        if max(prices) >= min(prices) * 1.25:
+            return "Volatile"
+        return "Stable"
+
+    def _product_text(self, product: dict) -> str:
+        values = [
+            self._product_title(product),
+            product.get("brand"),
+            product.get("make"),
+            product.get("model"),
+            product.get("name"),
+            product.get("title"),
+            product.get("subtitle"),
+            product.get("category"),
+            product.get("gender"),
+            product.get("colorway"),
+            self._product_sku(product),
+            self._product_url(product),
+        ]
+        return " ".join(str(value).lower() for value in values if value)
+
+    def _product_title(self, product: dict) -> str:
+        return str(
+            product.get("title")
+            or product.get("name")
+            or product.get("productName")
+            or product.get("shoeName")
+            or ""
+        ).strip()
+
+    def _product_sku(self, product: dict) -> str:
+        return str(
+            product.get("styleId")
+            or product.get("style_id")
+            or product.get("sku")
+            or product.get("modelNumber")
+            or ""
+        ).strip()
+
+    def _product_id(self, product: dict) -> str:
+        return str(product.get("id") or product.get("uuid") or product.get("slug") or "").strip()
+
+    def _product_url(self, product: dict) -> str | None:
+        url = product.get("url") or product.get("productUrl") or product.get("stockxUrl")
+        return str(url).strip() if url else None
+
+    def _currency(self, product: dict) -> str:
+        currency = (
+            product.get("currency")
+            or (product.get("market") or {}).get("currency")
+            or (product.get("pricing") or {}).get("currency")
+            or "USD"
+        )
+        return str(currency).upper()
+
+    def _url(self, path: str) -> str:
+        return urljoin(self._api_base, path.lstrip("/"))
+
+    def _is_valid_url(self, value: str) -> bool:
+        parsed = urlparse(value)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)

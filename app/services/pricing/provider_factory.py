@@ -5,7 +5,13 @@ from app.services.pricing.base_pricing_provider import (
     PricingProviderUnavailableError,
 )
 from app.services.pricing.aggregation_service import PricingAggregationService
+from app.services.pricing.cache import (
+    ChainedProviderThrottle,
+    ProviderThrottle,
+    SharedProviderThrottle,
+)
 from app.services.pricing.ebay_pricing_provider import EbayPricingProvider
+from app.services.pricing.kicksdb_pricing_provider import KicksDBPricingProvider
 from app.services.pricing.mock_pricing_provider import MockPricingProvider
 from app.services.pricing.pricecharting_pricing_provider import (
     PriceChartingPricingProvider,
@@ -36,12 +42,25 @@ _tcgplayer_provider = TCGPlayerPricingProvider(
     cache_ttl_seconds=settings.pricing_cache_ttl_seconds,
     min_interval_ms=settings.pricing_provider_min_interval_ms,
 )
+_kicksdb_provider = KicksDBPricingProvider(
+    api_key=settings.kicksdb_api_key,
+    api_base=settings.kicksdb_api_base,
+    timeout_seconds=settings.kicksdb_timeout_seconds,
+    cache_ttl_seconds=settings.pricing_cache_ttl_seconds,
+    min_interval_ms=settings.pricing_provider_min_interval_ms,
+)
 _pricecharting_provider = PriceChartingPricingProvider(
     api_key=settings.pricecharting_api_key,
     api_base=settings.pricecharting_api_base,
     timeout_seconds=settings.pricecharting_timeout_seconds,
     cache_ttl_seconds=settings.pricing_cache_ttl_seconds,
-    min_interval_ms=settings.pricing_provider_min_interval_ms,
+    min_interval_ms=settings.pricecharting_provider_min_interval_ms,
+    throttle=ChainedProviderThrottle(
+        ProviderThrottle(settings.pricecharting_provider_min_interval_ms),
+        SharedProviderThrottle(settings.pricecharting_provider_min_interval_ms)
+        if settings.pricecharting_shared_throttle_enabled
+        else None,
+    ),
 )
 
 
@@ -53,8 +72,9 @@ class AutoPricingProvider(PricingProvider):
         if not providers:
             raise PricingProviderUnavailableError(
                 "No real pricing provider is configured for this collectible. "
-                "Set PRICECHARTING_API_KEY, TCGPLAYER_CLIENT_ID/TCGPLAYER_CLIENT_SECRET, "
-                "or an approved eBay sold-comps endpoint."
+                "Set PRICECHARTING_API_KEY, KICKSDB_API_KEY, "
+                "TCGPLAYER_CLIENT_ID/TCGPLAYER_CLIENT_SECRET, or an approved "
+                "eBay sold-comps endpoint."
             )
         return PricingAggregationService(providers).price(recognition)
 
@@ -77,12 +97,15 @@ def get_pricing_provider(provider_name: str | None = None) -> PricingProvider:
     if selected_provider == "tcgplayer":
         return _tcgplayer_provider
 
+    if selected_provider == "kicksdb":
+        return _kicksdb_provider
+
     if selected_provider == "pricecharting":
         return _pricecharting_provider
 
     if selected_provider == "aggregate":
         providers = _configured_providers(
-            [_ebay_provider, _tcgplayer_provider, _pricecharting_provider]
+            [_ebay_provider, _tcgplayer_provider, _kicksdb_provider, _pricecharting_provider]
         )
         if not providers:
             raise PricingProviderUnavailableError(
@@ -93,7 +116,7 @@ def get_pricing_provider(provider_name: str | None = None) -> PricingProvider:
 
     raise PricingProviderUnavailableError(
         f"Unsupported PRICING_PROVIDER '{selected_provider}'. "
-        "Supported providers: auto, mock, ebay, tcgplayer, pricecharting, aggregate."
+        "Supported providers: auto, mock, ebay, tcgplayer, kicksdb, pricecharting, aggregate."
     )
 
 
@@ -101,9 +124,11 @@ def _providers_for_recognition(recognition: RecognitionResult) -> list[PricingPr
     text = _recognition_text(recognition)
     preferred: list[PricingProvider] = []
 
-    if _looks_like_trading_card(text):
+    if _looks_like_sneaker_or_streetwear(text):
+        preferred.extend([_kicksdb_provider])
+    elif _looks_like_trading_card(text):
         preferred.extend([_tcgplayer_provider, _pricecharting_provider, _ebay_provider])
-    elif _looks_like_video_game_or_comic(text):
+    elif _looks_like_pricecharting_direct_category(text):
         preferred.extend([_pricecharting_provider, _ebay_provider])
     else:
         preferred.extend([_ebay_provider, _pricecharting_provider])
@@ -120,6 +145,11 @@ def _configured_providers(providers: list[PricingProvider]) -> list[PricingProvi
             provider.provider_name == "tcgplayer"
             and _provider_value(provider, "_client_id")
             and _provider_value(provider, "_client_secret")
+        ):
+            configured.append(provider)
+        elif (
+            provider.provider_name == "kicksdb"
+            and _provider_value(provider, "_api_key")
         ):
             configured.append(provider)
         elif (
@@ -192,7 +222,32 @@ def _looks_like_trading_card(text: str) -> bool:
     return any(keyword in text for keyword in keywords)
 
 
-def _looks_like_video_game_or_comic(text: str) -> bool:
+def _looks_like_sneaker_or_streetwear(text: str) -> bool:
+    keywords = {
+        "sneaker",
+        "sneakers",
+        "streetwear",
+        "shoe",
+        "shoes",
+        "trainer",
+        "trainers",
+        "nike",
+        "air jordan",
+        "jordan",
+        "adidas",
+        "yeezy",
+        "new balance",
+        "asics",
+        "puma",
+        "supreme",
+        "off-white",
+        "stockx",
+        "goat",
+    }
+    return any(keyword in text for keyword in keywords)
+
+
+def _looks_like_pricecharting_direct_category(text: str) -> bool:
     keywords = {
         "video game",
         "game cartridge",
@@ -202,5 +257,14 @@ def _looks_like_video_game_or_comic(text: str) -> bool:
         "comic",
         "comic book",
         "manga",
+        "lego",
+        "building set",
+        "funko",
+        "funko pop",
+        "vinyl figure",
+        "coin",
+        "numismatic",
+        "penny",
+        "cent",
     }
     return any(keyword in text for keyword in keywords)
