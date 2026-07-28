@@ -67,6 +67,7 @@ class KicksDBPricingProvider(PricingProvider):
                 "query": query,
                 "market": "US",
                 "display[prices]": "true",
+                "display[variants]": "true",
                 "display[statistics]": "true",
             },
         )
@@ -75,6 +76,11 @@ class KicksDBPricingProvider(PricingProvider):
         products = self._products_from_payload(payload)
         product = self._best_product(products, recognition)
         comparable_sales = self._sales_from_product(product, recognition)
+        if not comparable_sales:
+            detailed_product = self._detail_product(product)
+            if detailed_product:
+                product = {**product, **detailed_product}
+                comparable_sales = self._sales_from_product(product, recognition)
         if not comparable_sales:
             raise EmptyMarketDataError("KicksDB returned no usable sneaker market prices.")
 
@@ -152,6 +158,30 @@ class KicksDBPricingProvider(PricingProvider):
                     return nested
         return []
 
+    def _detail_product(self, product: dict) -> dict | None:
+        product_key = self._product_id(product) or self._product_slug(product)
+        if not product_key:
+            return None
+
+        self._throttle.acquire(self.provider_name)
+        payload = self._request_json(
+            self._url(f"v3/stockx/products/{product_key}"),
+            params={
+                "market": "US",
+                "display[prices]": "true",
+                "display[variants]": "true",
+                "display[statistics]": "true",
+            },
+        )
+        if isinstance(payload.get("data"), dict):
+            return payload["data"]
+        if isinstance(payload.get("product"), dict):
+            return payload["product"]
+        if all(key not in payload for key in ("products", "results", "items")):
+            return payload
+        products = self._products_from_payload(payload)
+        return products[0] if products else None
+
     def _best_product(
         self,
         products: list[dict],
@@ -196,7 +226,51 @@ class KicksDBPricingProvider(PricingProvider):
                     url=self._product_url(product),
                 )
             )
+        for variant in self._product_variants(product):
+            variant_title = self._variant_title(variant)
+            for label, price in self._market_prices(variant):
+                sales.append(
+                    MarketComparableSale(
+                        source="KicksDB StockX",
+                        title=f"{title} - {variant_title} {label}".strip(),
+                        soldPrice=round(price, 2),
+                        currency=self._currency(variant, fallback=currency),
+                        soldDate=str(
+                            variant.get("lastUpdated")
+                            or variant.get("updatedAt")
+                            or product.get("lastUpdated")
+                            or product.get("updatedAt")
+                            or utc_timestamp()
+                        ),
+                        condition=str(recognition.condition or "Market"),
+                        url=self._product_url(product),
+                    )
+                )
         return sales
+
+    def _product_variants(self, product: dict) -> list[dict]:
+        variants: list[dict] = []
+        for key in ("variants", "sizes", "children"):
+            value = product.get(key)
+            if isinstance(value, list):
+                variants.extend(item for item in value if isinstance(item, dict))
+            elif isinstance(value, dict):
+                variants.extend(item for item in value.values() if isinstance(item, dict))
+        return variants
+
+    def _variant_title(self, variant: dict) -> str:
+        value = (
+            variant.get("size")
+            or variant.get("shoeSize")
+            or variant.get("variant")
+            or variant.get("name")
+            or variant.get("title")
+            or "Market"
+        )
+        text = str(value).strip()
+        if text.lower().startswith("size"):
+            return text
+        return f"Size {text}" if text else "Market"
 
     def _market_prices(self, product: dict) -> list[tuple[str, float]]:
         prices: list[tuple[str, float]] = []
@@ -452,16 +526,21 @@ class KicksDBPricingProvider(PricingProvider):
     def _product_id(self, product: dict) -> str:
         return str(product.get("id") or product.get("uuid") or product.get("slug") or "").strip()
 
+    def _product_slug(self, product: dict) -> str:
+        return str(product.get("slug") or product.get("urlKey") or product.get("url_key") or "").strip()
+
     def _product_url(self, product: dict) -> str | None:
         url = product.get("url") or product.get("productUrl") or product.get("stockxUrl")
         return str(url).strip() if url else None
 
-    def _currency(self, product: dict) -> str:
+    def _currency(self, product: dict, *, fallback: str = "USD") -> str:
+        market = product.get("market")
+        pricing = product.get("pricing")
         currency = (
             product.get("currency")
-            or (product.get("market") or {}).get("currency")
-            or (product.get("pricing") or {}).get("currency")
-            or "USD"
+            or (market.get("currency") if isinstance(market, dict) else None)
+            or (pricing.get("currency") if isinstance(pricing, dict) else None)
+            or fallback
         )
         return str(currency).upper()
 

@@ -33,6 +33,7 @@ class KicksDBPricingProviderTest(unittest.TestCase):
         self.assertEqual(client.last_request["params"]["query"], "Nike Jordan 4 Military Black DN3707-160 2022")
         self.assertEqual(client.last_request["params"]["market"], "US")
         self.assertEqual(client.last_request["params"]["display[prices]"], "true")
+        self.assertEqual(client.last_request["params"]["display[variants]"], "true")
         self.assertEqual(client.last_request["params"]["display[statistics]"], "true")
 
     def test_successful_response_accepts_nested_prices_map(self) -> None:
@@ -46,6 +47,24 @@ class KicksDBPricingProviderTest(unittest.TestCase):
         self.assertEqual(pricing.highEstimate, 314.99)
         self.assertEqual(pricing.estimatedMarketValue, 300)
         self.assertEqual(pricing.comparableSales[0].soldPrice, 299.99)
+
+    def test_fetches_product_detail_when_search_has_no_prices(self) -> None:
+        client = _FakeHttpClient(
+            responses=[
+                _FakeResponse(body=_stockx_metadata_only_payload()),
+                _FakeResponse(body=_stockx_detail_payload()),
+            ]
+        )
+        provider = _provider(client=client)
+
+        pricing = provider.price(_sneaker_recognition())
+
+        self.assertEqual(client.call_count, 2)
+        self.assertIn("/v3/stockx/products/stockx-1", client.requests[1]["url"])
+        self.assertEqual(pricing.lowEstimate, 280)
+        self.assertEqual(pricing.highEstimate, 315)
+        self.assertEqual(pricing.estimatedMarketValue, 298)
+        self.assertEqual(pricing.providerDiagnostics["matchedProductId"], "stockx-1")
 
     def test_cache_hit_prevents_repeated_provider_request(self) -> None:
         client = _FakeHttpClient(response=_FakeResponse(body=_stockx_payload()))
@@ -174,6 +193,42 @@ def _stockx_prices_payload() -> dict:
     }
 
 
+def _stockx_metadata_only_payload() -> dict:
+    return {
+        "products": [
+            {
+                "id": "stockx-1",
+                "title": "Nike Air Jordan 4 Retro Military Black",
+                "brand": "Nike",
+                "styleId": "DN3707-160",
+                "category": "sneakers",
+            }
+        ]
+    }
+
+
+def _stockx_detail_payload() -> dict:
+    return {
+        "data": {
+            "id": "stockx-1",
+            "title": "Nike Air Jordan 4 Retro Military Black",
+            "brand": "Nike",
+            "styleId": "DN3707-160",
+            "currency": "USD",
+            "variants": [
+                {
+                    "size": "10",
+                    "prices": {
+                        "last_sale": 298,
+                        "lowest_ask": 315,
+                        "highest_bid": 280,
+                    },
+                }
+            ],
+        }
+    }
+
+
 def _weak_payload() -> dict:
     return {
         "products": [
@@ -190,17 +245,22 @@ def _weak_payload() -> dict:
 
 
 class _FakeHttpClient:
-    def __init__(self, response=None, exception=None) -> None:
+    def __init__(self, response=None, exception=None, responses=None) -> None:
         self.response = response or _FakeResponse()
+        self.responses = list(responses or [])
         self.exception = exception
         self.call_count = 0
         self.last_request = {}
+        self.requests = []
 
     def get(self, url, **kwargs):
         self.call_count += 1
         self.last_request = {"url": url, **kwargs}
+        self.requests.append(self.last_request)
         if self.exception is not None:
             raise self.exception
+        if self.responses:
+            return self.responses.pop(0)
         return self.response
 
 
