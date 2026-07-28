@@ -61,10 +61,7 @@ class KicksDBPricingProvider(PricingProvider):
 
         self._throttle.acquire(self.provider_name)
         started_at = time.perf_counter()
-        payload = self._request_json(
-            self._url("v3/stockx/products"),
-            params=self._search_params(recognition, query),
-        )
+        payload = self._search_products(recognition, query)
         latency_ms = int((time.perf_counter() - started_at) * 1000)
 
         products = self._products_from_payload(payload)
@@ -156,6 +153,22 @@ class KicksDBPricingProvider(PricingProvider):
                 if nested:
                     return nested
         return []
+
+    def _search_products(self, recognition: RecognitionResult, query: str) -> dict:
+        url = self._url("v3/stockx/products")
+        params = self._search_params(recognition, query)
+        payload = self._request_json(url, params=params)
+        if self._products_from_payload(payload):
+            return payload
+
+        sku = params.get("sku")
+        if sku:
+            retry_params = {key: value for key, value in params.items() if key != "sku"}
+            self._throttle.acquire(self.provider_name)
+            retry_payload = self._request_json(url, params=retry_params)
+            if self._products_from_payload(retry_payload):
+                return retry_payload
+        return payload
 
     def _detail_product(self, product: dict) -> dict | None:
         product_key = self._product_id(product) or self._product_slug(product)

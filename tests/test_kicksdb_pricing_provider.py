@@ -59,6 +59,22 @@ class KicksDBPricingProviderTest(unittest.TestCase):
         self.assertEqual(pricing.highEstimate, 320.5)
         self.assertEqual(pricing.estimatedMarketValue, 300)
 
+    def test_retries_stockx_search_without_sku_when_sku_filter_returns_no_products(self) -> None:
+        client = _FakeHttpClient(
+            responses=[
+                _FakeResponse(body={"products": []}),
+                _FakeResponse(body=_stockx_aggregate_payload()),
+            ]
+        )
+        provider = _provider(client=client)
+
+        pricing = provider.price(_sneaker_recognition())
+
+        self.assertEqual(client.call_count, 2)
+        self.assertEqual(client.requests[0]["params"]["sku"], "DN3707-160")
+        self.assertNotIn("sku", client.requests[1]["params"])
+        self.assertEqual(pricing.estimatedMarketValue, 300)
+
     def test_fetches_product_detail_when_search_has_no_prices(self) -> None:
         client = _FakeHttpClient(
             responses=[
