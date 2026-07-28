@@ -87,6 +87,43 @@ class PricingHealthServiceTest(unittest.TestCase):
         self.assertEqual(sources["magic.csv"]["closedHistoryRows"], 4862)
         self.assertEqual(payload["summary"]["errors"], [])
 
+    def test_retries_pricecharting_summary_rpc_with_get(self) -> None:
+        client = httpx.Client(
+            transport=httpx.MockTransport(_supabase_post_fails_get_summary_handler)
+        )
+        service = PricingHealthService(
+            supabase_url="https://packlox.supabase.co",
+            service_role_key="service-role-key",
+            client=client,
+            stale_after_hours=72,
+        )
+
+        with patch("app.services.pricing.admin_health_service.settings") as settings:
+            settings.pricecharting_api_key = ""
+            settings.ebay_access_token = ""
+            settings.ebay_client_id = ""
+            settings.ebay_client_secret = ""
+            settings.ebay_marketplace_id = "EBAY_AU"
+            settings.ebay_marketplace_insights_api_url = ""
+            settings.ebay_partner_access_granted = False
+            settings.tcgplayer_client_id = ""
+            settings.tcgplayer_client_secret = ""
+            settings.kicksdb_api_key = ""
+            settings.kicksdb_api_base = "https://api.kicks.dev"
+            settings.default_display_currency = "AUD"
+            settings.fx_usd_to_aud = 1.52
+            settings.fx_usd_to_cad = 1.37
+            settings.fx_usd_to_gbp = 0.78
+
+            payload = service.health()
+
+        self.assertEqual(payload["status"], "healthy")
+        sources = {
+            source["source"]: source for source in payload["pricecharting"]["sources"]
+        }
+        self.assertEqual(sources["magic.csv"]["currentRows"], 129605)
+        self.assertEqual(payload["summary"]["errors"], [])
+
     def test_reports_pricecharting_counts_and_provider_configuration(self) -> None:
         client = httpx.Client(transport=httpx.MockTransport(_supabase_handler))
         service = PricingHealthService(
@@ -267,6 +304,15 @@ def _supabase_summary_handler(request: httpx.Request) -> httpx.Response:
             ],
         )
     return httpx.Response(500, json={"message": "unexpected slow health path"})
+
+
+def _supabase_post_fails_get_summary_handler(request: httpx.Request) -> httpx.Response:
+    if (
+        request.url.path.endswith("/rpc/pricecharting_catalog_health_summary")
+        and request.method == "POST"
+    ):
+        return httpx.Response(404, json={"message": "schema cache miss"})
+    return _supabase_summary_handler(request)
 
 
 def _current_count(source: str) -> int:

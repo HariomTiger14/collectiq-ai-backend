@@ -18,7 +18,7 @@ class PricingHealthError(Exception):
 class PricingHealthService:
     supabase_url: str | None = None
     service_role_key: str | None = None
-    timeout_seconds: float = 5
+    timeout_seconds: float = 15
     stale_after_hours: int = 36
     client: httpx.Client | None = None
 
@@ -112,12 +112,7 @@ class PricingHealthService:
         return sources, errors
 
     def _summary_health(self, generated_at: datetime) -> list[dict[str, Any]]:
-        payload = self._request(
-            "POST",
-            "/rest/v1/rpc/pricecharting_catalog_health_summary",
-            params={},
-            json_body={},
-        )
+        payload = self._summary_payload()
         if not isinstance(payload, list):
             raise PricingHealthError("Supabase pricing health summary shape was invalid.")
 
@@ -159,6 +154,21 @@ class PricingHealthService:
                 }
             )
         return sources
+
+    def _summary_payload(self) -> Any:
+        try:
+            return self._request(
+                "POST",
+                "/rest/v1/rpc/pricecharting_catalog_health_summary",
+                params={},
+                json_body={},
+            )
+        except PricingHealthError:
+            return self._request(
+                "GET",
+                "/rest/v1/rpc/pricecharting_catalog_health_summary",
+                params={},
+            )
 
     @property
     def _supabase_url(self) -> str:
