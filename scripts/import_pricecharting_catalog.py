@@ -63,6 +63,7 @@ CATALOG_COLUMNS = (
     "raw_payload",
     "source_file",
     "source_downloaded_at",
+    "content_hash",
 )
 
 CATALOG_HISTORY_COLUMNS = (
@@ -306,7 +307,9 @@ def to_catalog_row(
     }
     for target, aliases in PRICE_FIELDS.items():
         catalog_row[target] = parse_price_cents(pick_text(row, aliases))
-    return normalize_catalog_row(catalog_row)
+    normalized_row = normalize_catalog_row(catalog_row)
+    normalized_row["content_hash"] = catalog_history_change_hash(normalized_row)
+    return normalized_row
 
 
 def normalize_catalog_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -418,13 +421,71 @@ class SupabaseCatalogClient:
             )
 
     def upsert_rows(self, rows: list[dict[str, Any]], *, batch_size: int) -> int:
-        return self._upsert(
-            table="pricecharting_catalog",
-            rows=rows,
-            batch_size=batch_size,
-            on_conflict="pricecharting_id",
-            label="catalog",
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero")
+        total = 0
+        skipped = 0
+        with httpx.Client(timeout=self.timeout_seconds) as client:
+            for index in range(0, len(rows), batch_size):
+                batch = rows[index : index + batch_size]
+                current_by_id = self._fetch_current_catalog_hashes(client, batch)
+                changed_rows = []
+                for row in batch:
+                    product_id = str(row.get("pricecharting_id") or "").strip()
+                    current = current_by_id.get(product_id)
+                    if current and current.get("content_hash") == row.get("content_hash"):
+                        skipped += 1
+                        continue
+                    changed_rows.append(row)
+                if changed_rows:
+                    total += self._upsert(
+                        table="pricecharting_catalog",
+                        rows=changed_rows,
+                        batch_size=batch_size,
+                        on_conflict="pricecharting_id",
+                        label="catalog",
+                    )
+                print(
+                    f"Skipped {skipped} unchanged catalog rows; upserted {total} changed/new rows...",
+                    flush=True,
+                )
+        return total
+
+    def _fetch_current_catalog_hashes(
+        self,
+        client: httpx.Client,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        ids = [
+            str(row.get("pricecharting_id") or "").strip()
+            for row in rows
+            if str(row.get("pricecharting_id") or "").strip()
+        ]
+        if not ids:
+            return {}
+        response = client.get(
+            f"{self.supabase_url}/rest/v1/pricecharting_catalog",
+            params={
+                "select": "pricecharting_id,content_hash",
+                "pricecharting_id": f"in.({','.join(ids)})",
+            },
+            headers=self._headers(),
         )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise SystemExit(
+                "Supabase catalog hash lookup failed "
+                f"with HTTP {response.status_code}: {response.text}"
+            ) from exc
+        rows_payload = response.json()
+        if not isinstance(rows_payload, list):
+            raise SystemExit("Supabase catalog hash lookup returned invalid data.")
+        return {
+            str(row.get("pricecharting_id")): row
+            for row in rows_payload
+            if isinstance(row, dict) and row.get("pricecharting_id")
+        }
 
     def sync_scd2_history_rows(
         self,

@@ -56,6 +56,7 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
         self.assertIsNone(row["asin"])
         self.assertEqual(row["release_date"], "2017-04-28")
         self.assertEqual(row["normalized_identity"], "mario kart 8 deluxe nintendo switch")
+        self.assertEqual(len(row["content_hash"]), 64)
 
     def test_to_catalog_history_row_creates_current_scd2_version(self) -> None:
         catalog_row = to_catalog_row(
@@ -284,6 +285,68 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
         self.assertEqual(transport.closed_ids, ["2"])
         self.assertEqual([row["pricecharting_id"] for row in transport.inserted_rows], ["2", "3"])
 
+    def test_supabase_client_upserts_only_changed_catalog_rows(self) -> None:
+        unchanged_row = to_catalog_row(
+            {
+                "id": "1",
+                "product-name": "Unchanged",
+                "console-name": "Pokemon Cards",
+                "loose-price": "1000",
+            },
+            source_file="pokemon.csv",
+            source_downloaded_at="2026-07-25T00:00:00Z",
+        )
+        changed_row = to_catalog_row(
+            {
+                "id": "2",
+                "product-name": "Changed",
+                "console-name": "Pokemon Cards",
+                "loose-price": "2500",
+            },
+            source_file="pokemon.csv",
+            source_downloaded_at="2026-07-25T00:00:00Z",
+        )
+        new_row = to_catalog_row(
+            {
+                "id": "3",
+                "product-name": "New",
+                "console-name": "Pokemon Cards",
+                "loose-price": "500",
+            },
+            source_file="pokemon.csv",
+            source_downloaded_at="2026-07-25T00:00:00Z",
+        )
+        assert unchanged_row is not None
+        assert changed_row is not None
+        assert new_row is not None
+        transport = _FakeSupabaseTransport(
+            current_rows=[
+                {
+                    "pricecharting_id": "1",
+                    "content_hash": unchanged_row["content_hash"],
+                },
+                {"pricecharting_id": "2", "content_hash": "old-hash"},
+            ]
+        )
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+
+            upserted = client.upsert_rows(
+                [unchanged_row, changed_row, new_row],
+                batch_size=100,
+            )
+
+        self.assertEqual(upserted, 2)
+        self.assertEqual(
+            [row["pricecharting_id"] for row in transport.upserted_rows],
+            ["2", "3"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -323,6 +386,7 @@ class _FakeSupabaseTransport:
         self.current_rows = current_rows
         self.closed_ids: list[str] = []
         self.inserted_rows: list[dict[str, object]] = []
+        self.upserted_rows: list[dict[str, object]] = []
 
     def get(self, url: str, **kwargs):
         return _FakeSupabaseResponse(self.current_rows)
@@ -334,7 +398,11 @@ class _FakeSupabaseTransport:
         return _FakeSupabaseResponse()
 
     def post(self, url: str, **kwargs):
-        self.inserted_rows.extend(kwargs.get("json", []))
+        rows = kwargs.get("json", [])
+        if url.endswith("/pricecharting_catalog_history"):
+            self.inserted_rows.extend(rows)
+        else:
+            self.upserted_rows.extend(rows)
         return _FakeSupabaseResponse()
 
 
