@@ -31,6 +31,21 @@ class KicksDBPricingProviderTest(unittest.TestCase):
         self.assertEqual(pricing.providerDiagnostics["matchedProductSku"], "DN3707-160")
         self.assertIn("Bearer kicks-key", client.last_request["headers"]["Authorization"])
         self.assertEqual(client.last_request["params"]["query"], "Nike Jordan 4 Military Black DN3707-160 2022")
+        self.assertEqual(client.last_request["params"]["market"], "US")
+        self.assertEqual(client.last_request["params"]["display[prices]"], "true")
+        self.assertEqual(client.last_request["params"]["display[statistics]"], "true")
+
+    def test_successful_response_accepts_nested_prices_map(self) -> None:
+        client = _FakeHttpClient(response=_FakeResponse(body=_stockx_prices_payload()))
+        provider = _provider(client=client)
+
+        pricing = provider.price(_sneaker_recognition())
+
+        self.assertEqual(pricing.pricingSource, "KicksDB StockX API")
+        self.assertEqual(pricing.lowEstimate, 284.5)
+        self.assertEqual(pricing.highEstimate, 314.99)
+        self.assertEqual(pricing.estimatedMarketValue, 300)
+        self.assertEqual(pricing.comparableSales[0].soldPrice, 299.99)
 
     def test_cache_hit_prevents_repeated_provider_request(self) -> None:
         client = _FakeHttpClient(response=_FakeResponse(body=_stockx_payload()))
@@ -133,6 +148,29 @@ def _stockx_payload() -> dict:
                 "url": "https://stockx.com/air-jordan-4-retro-military-black",
             }
         ]
+    }
+
+
+def _stockx_prices_payload() -> dict:
+    return {
+        "data": {
+            "products": [
+                {
+                    "id": "stockx-1",
+                    "title": "Nike Air Jordan 4 Retro Military Black",
+                    "brand": "Nike",
+                    "styleId": "DN3707-160",
+                    "category": "sneakers",
+                    "currency": "USD",
+                    "prices": {
+                        "last_sale": {"amount": 299.99, "currency": "USD"},
+                        "lowest_ask": {"amount": 314.99, "currency": "USD"},
+                        "highest_bid": {"amount": 284.5, "currency": "USD"},
+                        "retail_price": {"amount": 210, "currency": "USD"},
+                    },
+                }
+            ]
+        }
     }
 
 

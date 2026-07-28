@@ -63,7 +63,12 @@ class KicksDBPricingProvider(PricingProvider):
         started_at = time.perf_counter()
         payload = self._request_json(
             self._url("v3/stockx/products"),
-            params={"query": query},
+            params={
+                "query": query,
+                "market": "US",
+                "display[prices]": "true",
+                "display[statistics]": "true",
+            },
         )
         latency_ms = int((time.perf_counter() - started_at) * 1000)
 
@@ -179,7 +184,7 @@ class KicksDBPricingProvider(PricingProvider):
                 MarketComparableSale(
                     source="KicksDB StockX",
                     title=f"{title} - {label}",
-                    soldPrice=round(price),
+                    soldPrice=round(price, 2),
                     currency=currency,
                     soldDate=str(
                         product.get("lastUpdated")
@@ -212,10 +217,27 @@ class KicksDBPricingProvider(PricingProvider):
             (("marketPrice",), "Market price"),
             (("lowestAsk",), "Lowest ask"),
             (("highestBid",), "Highest bid"),
+            (("prices", "lastSale"), "Last sale"),
+            (("prices", "last_sale"), "Last sale"),
+            (("prices", "averagePrice"), "Average market price"),
+            (("prices", "average_price"), "Average market price"),
+            (("prices", "avgPrice"), "Average market price"),
+            (("prices", "marketPrice"), "Market price"),
+            (("prices", "market_price"), "Market price"),
+            (("prices", "lowestAsk"), "Lowest ask"),
+            (("prices", "lowest_ask"), "Lowest ask"),
+            (("prices", "highestBid"), "Highest bid"),
+            (("prices", "highest_bid"), "Highest bid"),
+            (("statistics", "lastSale"), "Last sale"),
+            (("statistics", "averagePrice"), "Average market price"),
+            (("statistics", "lowestAsk"), "Lowest ask"),
+            (("statistics", "highestBid"), "Highest bid"),
         ):
             price = self._price_at_path(product, path)
             if price is not None:
                 prices.append((label, price))
+
+        prices.extend(self._prices_from_map(product.get("prices")))
 
         deduped: list[tuple[str, float]] = []
         seen: set[tuple[str, int]] = set()
@@ -226,6 +248,48 @@ class KicksDBPricingProvider(PricingProvider):
             seen.add(key)
             deduped.append((label, price))
         return deduped
+
+    def _prices_from_map(self, value: object) -> list[tuple[str, float]]:
+        if not isinstance(value, dict):
+            return []
+
+        results: list[tuple[str, float]] = []
+        for key, nested_value in value.items():
+            label = self._price_label(str(key))
+            price = self._parse_price(nested_value)
+            if price is not None and label:
+                results.append((label, price))
+                continue
+            if isinstance(nested_value, dict):
+                nested_price = self._parse_price(
+                    nested_value.get("value")
+                    or nested_value.get("amount")
+                    or nested_value.get("price")
+                    or nested_value.get("lastSale")
+                    or nested_value.get("lowestAsk")
+                    or nested_value.get("highestBid")
+                )
+                if nested_price is not None and label:
+                    results.append((label, nested_price))
+        return results
+
+    def _price_label(self, key: str) -> str:
+        normalized = key.lower().replace("-", "_").replace(" ", "_")
+        if normalized in {"retail", "retail_price", "msrp"}:
+            return ""
+        if "last" in normalized and "sale" in normalized:
+            return "Last sale"
+        if "lowest" in normalized and "ask" in normalized:
+            return "Lowest ask"
+        if "highest" in normalized and "bid" in normalized:
+            return "Highest bid"
+        if "average" in normalized or normalized.startswith("avg"):
+            return "Average market price"
+        if "market" in normalized:
+            return "Market price"
+        if "price" in normalized:
+            return key.replace("_", " ").replace("-", " ").title()
+        return key.replace("_", " ").replace("-", " ").title()
 
     def _price_at_path(self, payload: dict, path: tuple[str, ...]) -> float | None:
         value: object = payload
