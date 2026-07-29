@@ -18,7 +18,7 @@ as $$
 declare
     now_value timestamptz;
     last_value timestamptz;
-    wait_ms integer;
+    wait_ms bigint;
 begin
     if provider_key_arg is null or btrim(provider_key_arg) = '' then
         return query select false, greatest(min_interval_ms_arg, 1000);
@@ -43,8 +43,8 @@ begin
     for update;
 
     now_value := clock_timestamp();
-    wait_ms := min_interval_ms_arg
-        - floor(extract(epoch from (now_value - last_value)) * 1000)::integer;
+    wait_ms := min_interval_ms_arg::bigint
+        - floor(extract(epoch from (now_value - last_value)) * 1000)::bigint;
 
     if wait_ms > 0 then
         return query select false, wait_ms;

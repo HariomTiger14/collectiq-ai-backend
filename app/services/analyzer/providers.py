@@ -4,7 +4,10 @@ from typing import Protocol
 from app.services.ai.base_recognition_service import RecognitionResult
 from app.services.ai.gemini_recognition_provider import GeminiRecognitionProvider
 from app.services.ai.mock_recognition_service import MockRecognitionProvider
-from app.services.ai.openai_recognition_provider import OpenAIRecognitionProvider
+from app.services.ai.openai_recognition_provider import (
+    AIProviderNotConfiguredError,
+    OpenAIRecognitionProvider,
+)
 from app.services.analyzer.errors import AnalyzerPipelineError
 
 
@@ -167,13 +170,7 @@ class AutoAnalyzerProvider:
             }
             return result
 
-        raise AnalyzerPipelineError(
-            status_code=503,
-            code="AI_PROVIDER_NOT_CONFIGURED",
-            message="No configured AI provider could analyze this image.",
-            retryable=False,
-            details={"providerErrors": provider_errors},
-        )
+        raise _pipeline_error_from_provider_failures(provider_errors)
 
     @property
     def selection_diagnostics(self) -> dict[str, object]:
@@ -181,6 +178,83 @@ class AutoAnalyzerProvider:
 
 
 FallbackAnalyzerProvider = AutoAnalyzerProvider
+
+
+def _pipeline_error_from_provider_failures(
+    provider_errors: list[str],
+) -> AnalyzerPipelineError:
+    combined_errors = " ".join(provider_errors).lower()
+
+    if provider_errors and all(
+        f":{AIProviderNotConfiguredError.__name__}:" in error
+        for error in provider_errors
+    ):
+        return AnalyzerPipelineError(
+            status_code=503,
+            code="AI_PROVIDER_NOT_CONFIGURED",
+            message="No configured AI provider could analyze this image.",
+            retryable=False,
+            details={"providerErrors": provider_errors},
+        )
+
+    if "timeout" in combined_errors or "timed out" in combined_errors:
+        return AnalyzerPipelineError(
+            status_code=504,
+            code="AI_PROVIDER_TIMEOUT",
+            message="AI image analysis timed out. Please retry the scan.",
+            retryable=True,
+            details={"providerErrors": provider_errors},
+        )
+
+    if (
+        "status 429" in combined_errors
+        or "resource_exhausted" in combined_errors
+        or "quota" in combined_errors
+        or "rate limit" in combined_errors
+    ):
+        return AnalyzerPipelineError(
+            status_code=429,
+            code="AI_PROVIDER_QUOTA_EXCEEDED",
+            message="AI image analysis quota is temporarily exhausted.",
+            retryable=True,
+            details={"providerErrors": provider_errors},
+        )
+
+    if (
+        "status 404" in combined_errors
+        or "not found for api version" in combined_errors
+        or "is not supported for generatecontent" in combined_errors
+        or "no longer available to new users" in combined_errors
+    ):
+        return AnalyzerPipelineError(
+            status_code=503,
+            code="AI_PROVIDER_MODEL_UNAVAILABLE",
+            message="The configured AI model is unavailable. Check the model setting.",
+            retryable=False,
+            details={"providerErrors": provider_errors},
+        )
+
+    if (
+        "structured output must be a json object" in combined_errors
+        or "structured output was not a json object" in combined_errors
+        or "structured output was not valid json" in combined_errors
+        or "invalidresponse" in combined_errors
+    ):
+        return AnalyzerPipelineError(
+            status_code=502,
+            code="AI_PROVIDER_INVALID_RESPONSE",
+            message="AI image analysis returned an invalid structured response.",
+            retryable=True,
+            details={"providerErrors": provider_errors},
+        )
+
+    return AnalyzerPipelineError(
+        status_code=503,
+        code="AI_PROVIDER_UNAVAILABLE",
+        message="AI image analysis is temporarily unavailable.",
+        retryable=True,
+        details={"providerErrors": provider_errors},
+    )
 
 
 def recognize_with_legacy_provider(

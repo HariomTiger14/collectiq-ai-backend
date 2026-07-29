@@ -181,6 +181,126 @@ class GeminiRecognitionProviderTest(unittest.TestCase):
         self.assertEqual(result.alternativeMatches[0].title, "Charizard")
         self.assertEqual(result.alternativeMatches[0].category, "Pokemon Card")
 
+    def test_markdown_fenced_json_is_parsed(self) -> None:
+        gemini_output = {
+            "title": "Blue-Eyes White Dragon",
+            "category": "Trading Card",
+            "confidence": 78,
+            "estimatedValue": 0,
+            "condition": "Unknown",
+            "recommendation": "Confirm edition and condition.",
+            "description": "Yu-Gi-Oh trading card.",
+            "detectedObjects": ["Yu-Gi-Oh card"],
+            "primaryMatch": "Blue-Eyes White Dragon",
+            "alternativeMatches": [],
+            "confidenceExplanation": "Visible card name.",
+            "detectionQuality": "Good",
+            "aiReasoning": "The card title is readable.",
+        }
+        response = FakeResponse(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"text": f"```json\n{json.dumps(gemini_output)}\n```"},
+                            ],
+                        },
+                    }
+                ],
+            }
+        )
+        provider = GeminiRecognitionProvider(
+            api_key="test-key",
+            model="gemini-test",
+            client=FakeClient(response),
+        )
+
+        result = provider.recognize_api_payload(
+            request_metadata={
+                "imageSource": "test",
+                "requestedCategory": "trading card",
+                "appVersion": "test",
+            },
+            image_payload={
+                "fileName": "blue-eyes.jpg",
+                "mimeType": "image/jpeg",
+                "sizeBytes": 20,
+                "imageSource": "test",
+                "base64Image": base64.b64encode(b"jpeg-bytes").decode("ascii"),
+            },
+        )
+
+        self.assertEqual(result.title, "Blue-Eyes White Dragon")
+        self.assertEqual(result.category, "Trading Card")
+
+    def test_invalid_structured_json_retries_without_schema(self) -> None:
+        gemini_output = {
+            "title": "Charizard",
+            "category": "Pokemon Card",
+            "confidence": 84,
+            "estimatedValue": 0,
+            "condition": "Unknown",
+            "recommendation": "Confirm card number and print run.",
+            "description": "Pokemon Base Set Charizard card.",
+            "detectedObjects": ["Pokemon card", "Charizard"],
+            "primaryMatch": "Charizard Base Set 4/102",
+            "alternativeMatches": [],
+            "confidenceExplanation": "Visible card name and number.",
+            "detectionQuality": "Good",
+            "aiReasoning": "The card title and number are readable.",
+        }
+        client = FakeClient(
+            [
+                FakeResponse(
+                    {
+                        "candidates": [
+                            {
+                                "content": {
+                                    "parts": [{"text": "not json"}],
+                                },
+                            }
+                        ],
+                    }
+                ),
+                FakeResponse(
+                    {
+                        "candidates": [
+                            {
+                                "content": {
+                                    "parts": [{"text": json.dumps([gemini_output])}],
+                                },
+                            }
+                        ],
+                    }
+                ),
+            ]
+        )
+        provider = GeminiRecognitionProvider(
+            api_key="test-key",
+            model="gemini-test",
+            client=client,
+        )
+
+        result = provider.recognize_api_payload(
+            request_metadata={
+                "imageSource": "test",
+                "requestedCategory": "trading card",
+                "appVersion": "test",
+            },
+            image_payload={
+                "fileName": "charizard.jpg",
+                "mimeType": "image/jpeg",
+                "sizeBytes": 20,
+                "imageSource": "test",
+                "base64Image": base64.b64encode(b"jpeg-bytes").decode("ascii"),
+            },
+        )
+
+        self.assertEqual(result.title, "Charizard")
+        self.assertEqual(len(client.requests), 2)
+        self.assertNotIn("responseFormat", client.requests[1]["json"]["generationConfig"])
+
 
 if __name__ == "__main__":
     unittest.main()

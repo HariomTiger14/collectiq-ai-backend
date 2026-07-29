@@ -115,8 +115,8 @@ class Settings:
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     openai_timeout_seconds: float = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "30"))
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-    gemini_timeout_seconds: float = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "30"))
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    gemini_timeout_seconds: float = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "60"))
     ai_fallback_provider: str = os.getenv("AI_FALLBACK_PROVIDER", "openai")
     ai_fallback_confidence_threshold: int = int(
         os.getenv("AI_FALLBACK_CONFIDENCE_THRESHOLD", "70")

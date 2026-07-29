@@ -1,5 +1,7 @@
 import base64
+import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -141,7 +143,13 @@ class GeminiRecognitionProvider(OpenAIRecognitionProvider):
             ) from exc
 
         output_text = self._extract_gemini_text(response_body)
-        result_payload = self._parse_json_object(output_text)
+        try:
+            result_payload = self._parse_json_object(output_text)
+        except OpenAIInvalidResponseError:
+            if not _gemini_payload_has_structured_schema(payload):
+                raise
+            retry_payload = _gemini_payload_without_structured_schema(payload)
+            result_payload = self._request_schema_free_json(retry_payload)
         result_payload = self._rescue_unknown_title(payload, result_payload)
         processing_time_ms = int((time.perf_counter() - started_at) * 1000)
         if logger.isEnabledFor(logging.DEBUG):
@@ -154,6 +162,58 @@ class GeminiRecognitionProvider(OpenAIRecognitionProvider):
         return self._to_recognition_result(
             _gemini_payload_with_safe_defaults(result_payload),
             processing_time_ms,
+        )
+
+    def _request_schema_free_json(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            response = self._client.post(
+                self._generate_content_url(),
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=self._timeout_seconds,
+            )
+        except httpx.TimeoutException as exc:
+            raise GeminiTimeoutError("Gemini recognition retry timed out.") from exc
+        except httpx.HTTPError as exc:
+            raise GeminiProviderError(
+                f"Gemini recognition retry failed: {exc}"
+            ) from exc
+
+        if response.status_code >= 400:
+            raise GeminiProviderError(
+                "Gemini recognition retry failed with "
+                f"status {response.status_code}: {response.text}"
+            )
+        try:
+            response_body = response.json()
+        except ValueError as exc:
+            raise GeminiInvalidResponseError(
+                "Gemini retry response body was not valid JSON."
+            ) from exc
+
+        output_text = self._extract_gemini_text(response_body)
+        return self._parse_json_object(output_text)
+
+    def _parse_json_object(self, output_text: str) -> dict[str, Any]:
+        candidate_texts = [output_text, *_json_object_candidates(output_text)]
+        seen: set[str] = set()
+        for candidate in candidate_texts:
+            normalized = candidate.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            try:
+                parsed = json.loads(normalized)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+            if isinstance(parsed, list):
+                first_object = next((item for item in parsed if isinstance(item, dict)), None)
+                if first_object is not None:
+                    return first_object
+        raise GeminiInvalidResponseError(
+            "Gemini structured output was not a JSON object."
         )
 
     def _rescue_unknown_title(
@@ -510,6 +570,24 @@ def _gemini_recognition_schema() -> dict[str, Any]:
             "notes": {"type": "string"},
         },
     }
+
+
+def _json_object_candidates(output_text: str) -> list[str]:
+    candidates: list[str] = []
+    fenced = re.findall(r"```(?:json)?\s*(.*?)```", output_text, flags=re.DOTALL | re.IGNORECASE)
+    candidates.extend(fenced)
+
+    first_brace = output_text.find("{")
+    last_brace = output_text.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        candidates.append(output_text[first_brace : last_brace + 1])
+
+    first_bracket = output_text.find("[")
+    last_bracket = output_text.rfind("]")
+    if first_bracket != -1 and last_bracket > first_bracket:
+        candidates.append(output_text[first_bracket : last_bracket + 1])
+    return candidates
+
 
 def _text(value, fallback: str) -> str:
     return value.strip() if isinstance(value, str) and value.strip() else fallback
