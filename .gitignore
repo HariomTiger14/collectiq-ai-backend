@@ -1,4 +1,4 @@
-﻿.venv/
+.venv/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -11,3 +11,5 @@ htmlcov/
 
 uploads/
 *.log
+.DS_Store
+database/.DS_Store

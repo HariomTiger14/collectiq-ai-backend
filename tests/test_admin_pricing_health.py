@@ -56,7 +56,7 @@ class PricingHealthServiceTest(unittest.TestCase):
             supabase_url="https://packlox.supabase.co",
             service_role_key="service-role-key",
             client=client,
-            stale_after_hours=72,
+            stale_after_hours=240,
         )
 
         with patch("app.services.pricing.admin_health_service.settings") as settings:
@@ -95,7 +95,7 @@ class PricingHealthServiceTest(unittest.TestCase):
             supabase_url="https://packlox.supabase.co",
             service_role_key="service-role-key",
             client=client,
-            stale_after_hours=72,
+            stale_after_hours=240,
         )
 
         with patch("app.services.pricing.admin_health_service.settings") as settings:
@@ -130,7 +130,7 @@ class PricingHealthServiceTest(unittest.TestCase):
             supabase_url="https://packlox.supabase.co",
             service_role_key="service-role-key",
             client=client,
-            stale_after_hours=72,
+            stale_after_hours=240,
         )
 
         with patch("app.services.pricing.admin_health_service.settings") as settings:
@@ -172,7 +172,7 @@ class PricingHealthServiceTest(unittest.TestCase):
             supabase_url="https://packlox.supabase.co",
             service_role_key="service-role-key",
             client=client,
-            stale_after_hours=72,
+            stale_after_hours=240,
         )
 
         with patch("app.services.pricing.admin_health_service.settings") as settings:
