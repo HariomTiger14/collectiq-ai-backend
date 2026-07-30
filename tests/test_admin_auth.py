@@ -39,22 +39,28 @@ class AdminAuthTest(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()["error"]["code"], "unauthorized")
 
-    def test_pricing_health_accepts_supabase_admin_session(self) -> None:
+    def test_pricing_health_accepts_supabase_admin_profile_role(self) -> None:
         with patch("app.routers.admin_auth.settings") as auth_settings, patch(
             "app.routers.admin_auth.httpx.get",
-        ) as get_user, patch(
+        ) as get_request, patch(
             "app.routers.admin_pricing.PricingHealthService",
         ) as service:
             auth_settings.admin_import_token = ""
             auth_settings.supabase_url = "https://packlox.supabase.co"
             auth_settings.supabase_anon_key = "anon-key"
-            auth_settings.supabase_service_role_key = ""
-            auth_settings.admin_allowed_emails = ("hrtechconsultingptyltd@gmail.com",)
-            get_user.return_value.status_code = 200
-            get_user.return_value.json.return_value = {
-                "id": "admin-user",
-                "email": "hrtechconsultingptyltd@gmail.com",
-            }
+            auth_settings.supabase_service_role_key = "service-role"
+            auth_settings.admin_profile_table = "profiles"
+            get_request.side_effect = [
+                _MockResponse(200, {
+                    "id": "admin-user",
+                    "email": "hrtechconsultingptyltd@gmail.com",
+                }),
+                _MockResponse(200, [{
+                    "id": "admin-user",
+                    "role": "admin",
+                    "display_name": "PackLox Admin",
+                }]),
+            ]
             service.return_value.health.return_value = {
                 "success": True,
                 "status": "healthy",
@@ -69,21 +75,28 @@ class AdminAuthTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "healthy")
-        get_user.assert_called_once()
+        self.assertEqual(get_request.call_count, 2)
+        profile_call = get_request.call_args_list[1]
+        self.assertEqual(profile_call.kwargs["params"]["id"], "eq.admin-user")
 
-    def test_admin_session_rejects_non_admin_supabase_email(self) -> None:
+    def test_admin_session_rejects_non_admin_profile_role(self) -> None:
         with patch("app.routers.admin_auth.settings") as auth_settings, patch(
             "app.routers.admin_auth.httpx.get",
-        ) as get_user:
+        ) as get_request:
             auth_settings.supabase_url = "https://packlox.supabase.co"
             auth_settings.supabase_anon_key = "anon-key"
-            auth_settings.supabase_service_role_key = ""
-            auth_settings.admin_allowed_emails = ("hrtechconsultingptyltd@gmail.com",)
-            get_user.return_value.status_code = 200
-            get_user.return_value.json.return_value = {
-                "id": "regular-user",
-                "email": "customer@example.com",
-            }
+            auth_settings.supabase_service_role_key = "service-role"
+            auth_settings.admin_profile_table = "profiles"
+            get_request.side_effect = [
+                _MockResponse(200, {
+                    "id": "regular-user",
+                    "email": "customer@example.com",
+                }),
+                _MockResponse(200, [{
+                    "id": "regular-user",
+                    "role": "user",
+                }]),
+            ]
 
             response = self.client.get(
                 "/auth/admin/session",
@@ -93,12 +106,12 @@ class AdminAuthTest(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()["error"]["code"], "unauthorized")
 
-    def test_admin_session_reports_unconfigured_supabase_admin_auth(self) -> None:
+    def test_admin_session_reports_unconfigured_profile_auth(self) -> None:
         with patch("app.routers.admin_auth.settings") as auth_settings:
-            auth_settings.supabase_url = ""
-            auth_settings.supabase_anon_key = ""
+            auth_settings.supabase_url = "https://packlox.supabase.co"
+            auth_settings.supabase_anon_key = "anon-key"
             auth_settings.supabase_service_role_key = ""
-            auth_settings.admin_allowed_emails = ()
+            auth_settings.admin_profile_table = "profiles"
 
             response = self.client.get(
                 "/auth/admin/session",
@@ -151,6 +164,15 @@ class AdminAuthTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["error"]["code"], "admin_job_not_configured")
+
+
+class _MockResponse:
+    def __init__(self, status_code: int, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
 
 
 if __name__ == "__main__":

@@ -58,8 +58,8 @@ services:
         value: "250"
       - key: ADMIN_IMPORT_TOKEN
         sync: false
-      - key: ADMIN_ALLOWED_EMAILS
-        value: hrtechconsultingptyltd@gmail.com
+      - key: ADMIN_PROFILE_TABLE
+        value: profiles
       - key: PRICECHARTING_CSV_VIDEO_GAMES_URL
         sync: false
       - key: PRICECHARTING_CSV_POKEMON_URL

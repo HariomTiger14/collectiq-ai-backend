@@ -95,11 +95,17 @@ def _require_supabase_admin(token: str) -> dict[str, str]:
         )
 
     user = _fetch_supabase_user(token)
+    user_id = str(user.get("id") or "").strip()
     email = str(user.get("email") or "").strip().lower()
-    if email not in _allowed_admin_emails():
+    profile = _fetch_admin_profile(user_id)
+    if not _profile_has_admin_role(profile):
         raise _unauthorized_admin_session()
 
-    return {"id": str(user.get("id") or ""), "email": email}
+    return {
+        "id": user_id,
+        "email": email,
+        "role": str(profile.get("role") or profile.get("admin_role") or "admin"),
+    }
 
 
 def _fetch_supabase_user(token: str) -> dict:
@@ -133,19 +139,60 @@ def _fetch_supabase_user(token: str) -> dict:
     return payload
 
 
+def _fetch_admin_profile(user_id: str) -> dict:
+    if not user_id:
+        raise _unauthorized_admin_session()
+    supabase_url = _setting_str("supabase_url").rstrip("/")
+    service_role_key = _setting_str("supabase_service_role_key")
+    table = _admin_profile_table()
+    try:
+        response = httpx.get(
+            f"{supabase_url}/rest/v1/{table}",
+            headers={
+                "apikey": service_role_key,
+                "Authorization": f"Bearer {service_role_key}",
+                "Accept": "application/json",
+            },
+            params={"id": f"eq.{user_id}", "select": "*", "limit": "1"},
+            timeout=5,
+        )
+    except httpx.HTTPError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_auth_unavailable",
+                "message": "Admin authentication is temporarily unavailable.",
+                "retryable": True,
+            },
+        )
+
+    if response.status_code != 200:
+        raise _unauthorized_admin_session()
+    payload = response.json()
+    if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
+        raise _unauthorized_admin_session()
+    return payload[0]
+
+
+def _profile_has_admin_role(profile: dict) -> bool:
+    if profile.get("is_admin") is True:
+        return True
+    role = str(profile.get("role") or profile.get("admin_role") or "").strip().lower()
+    return role in {"admin", "owner", "super_admin"}
+
+
 def _supabase_admin_auth_configured() -> bool:
     return bool(
         _setting_str("supabase_url")
         and (_setting_str("supabase_anon_key") or _setting_str("supabase_service_role_key"))
-        and _allowed_admin_emails()
+        and _setting_str("supabase_service_role_key")
+        and _admin_profile_table()
     )
 
 
-def _allowed_admin_emails() -> tuple[str, ...]:
-    emails = getattr(settings, "admin_allowed_emails", ())
-    if not isinstance(emails, (tuple, list, set)):
-        return ()
-    return tuple(str(email).strip().lower() for email in emails if str(email).strip())
+def _admin_profile_table() -> str:
+    value = _setting_str("admin_profile_table")
+    return value or "profiles"
 
 
 def _setting_str(name: str) -> str:
