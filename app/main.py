@@ -6,6 +6,7 @@ from fastapi.staticfiles import StaticFiles
 from app.core.config import UPLOAD_DIR, settings
 from app.routers import (
     admin_pricing,
+    admin_ops,
     admin_pricecharting,
     api_analyze,
     auth,
@@ -39,6 +40,7 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 app.include_router(health.router)
 app.include_router(auth.router)
+app.include_router(admin_ops.router)
 app.include_router(admin_pricecharting.router)
 app.include_router(admin_pricing.router)
 app.include_router(push.router)
