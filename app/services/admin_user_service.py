@@ -30,6 +30,14 @@ class AdminUserService:
             "users": users,
         }
 
+    def get_user_detail(self, user_id: str) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminUserServiceError("Supabase admin configuration is missing.")
+        return {
+            "success": True,
+            "user": self._repository.get_user_detail(user_id),
+        }
+
 
 class SupabaseAdminUserRepository:
     def __init__(
@@ -72,6 +80,30 @@ class SupabaseAdminUserRepository:
             ]
         return [self._admin_user_from_auth_user(user) for user in raw_users[:limit]]
 
+    def get_user_detail(self, user_id: str) -> dict[str, Any]:
+        auth_user = self._get_auth_user(user_id)
+        if auth_user is None:
+            raise AdminUserServiceError(f"Admin user {user_id} was not found.")
+        summary = self._admin_user_from_auth_user(auth_user)
+        portfolio_items = self._optional_rows("portfolio_items", user_id, limit=10)
+        scan_events = self._optional_rows("scan_analysis_events", user_id, limit=10)
+        pricing_review_items = [
+            item
+            for item in portfolio_items
+            if bool(item.get("needs_review") or item.get("requires_review"))
+            or _pricing_confidence(item) < 70
+            or _pricing_value(item) <= 0
+        ]
+        total_value = sum(_pricing_value(item) for item in portfolio_items)
+        return {
+            **summary,
+            "profile": self._optional_profile(user_id),
+            "portfolioValue": round(total_value, 2),
+            "recentPortfolioItems": [_compact_portfolio_item(item) for item in portfolio_items],
+            "recentScans": [_compact_scan_event(event) for event in scan_events],
+            "pricingReviewItems": [_compact_portfolio_item(item) for item in pricing_review_items[:10]],
+        }
+
     def _admin_user_from_auth_user(self, user: dict[str, Any]) -> dict[str, Any]:
         user_id = str(user.get("id") or "")
         email = str(user.get("email") or "")
@@ -97,6 +129,12 @@ class SupabaseAdminUserRepository:
             ),
         }
 
+    def _get_auth_user(self, user_id: str) -> dict[str, Any] | None:
+        payload = self._request("GET", f"/auth/v1/admin/users/{user_id}")
+        if isinstance(payload, dict) and payload.get("id"):
+            return payload
+        return None
+
     def _optional_profile(self, user_id: str) -> dict[str, Any]:
         if not user_id:
             return {}
@@ -115,15 +153,28 @@ class SupabaseAdminUserRepository:
     def _optional_count(self, table: str, user_id: str) -> int | None:
         if not user_id:
             return None
+        rows = self._optional_rows(table, user_id, limit=1000)
+        return len(rows) if isinstance(rows, list) else None
+
+    def _optional_rows(self, table: str, user_id: str, *, limit: int) -> list[dict[str, Any]]:
+        if not user_id:
+            return []
         try:
             payload = self._request(
                 "GET",
                 f"/rest/v1/{table}",
-                params={"user_id": f"eq.{user_id}", "select": "id", "limit": "1000"},
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "select": "*",
+                    "limit": str(limit),
+                    "order": "updated_at.desc.nullslast,created_at.desc.nullslast",
+                },
             )
         except AdminUserServiceError:
-            return None
-        return len(payload) if isinstance(payload, list) else None
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [row for row in payload if isinstance(row, dict)]
 
     def _request(
         self,
@@ -183,3 +234,76 @@ def _auth_status(user: dict[str, Any]) -> str:
 def _latest_text(*values: Any) -> str | None:
     strings = [str(value) for value in values if value]
     return max(strings) if strings else None
+
+
+def _compact_portfolio_item(row: dict[str, Any]) -> dict[str, Any]:
+    data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    pricing = row.get("pricing") if isinstance(row.get("pricing"), dict) else data.get("pricing")
+    if not isinstance(pricing, dict):
+        pricing = {}
+    return {
+        "id": row.get("id") or data.get("id"),
+        "title": (
+            row.get("title")
+            or row.get("item_name")
+            or data.get("title")
+            or data.get("itemName")
+            or "Untitled"
+        ),
+        "category": row.get("category") or data.get("category") or "Unknown",
+        "price": _pricing_value(row),
+        "currency": pricing.get("currency") or row.get("currency") or data.get("currency") or "USD",
+        "confidence": _pricing_confidence(row),
+        "needsReview": bool(row.get("needs_review") or data.get("needsReview") or data.get("requiresReview")),
+        "updatedAt": row.get("updated_at") or data.get("updatedAt") or data.get("lastUpdated"),
+    }
+
+
+def _compact_scan_event(row: dict[str, Any]) -> dict[str, Any]:
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else row
+    return {
+        "id": row.get("id") or payload.get("id"),
+        "title": row.get("title") or payload.get("title") or payload.get("itemName") or "Unknown scan",
+        "status": row.get("status") or payload.get("status") or "unknown",
+        "provider": row.get("provider") or payload.get("provider") or payload.get("aiProvider") or "Unknown",
+        "confidence": row.get("confidence") or payload.get("confidence"),
+        "createdAt": row.get("created_at") or payload.get("createdAt"),
+    }
+
+
+def _pricing_value(row: dict[str, Any]) -> float:
+    data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    pricing = row.get("pricing") if isinstance(row.get("pricing"), dict) else data.get("pricing")
+    if not isinstance(pricing, dict):
+        pricing = {}
+    value = (
+        pricing.get("estimatedMarketValue")
+        or pricing.get("marketValue")
+        or pricing.get("value")
+        or row.get("estimated_value")
+        or data.get("estimatedMarketValue")
+    )
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _pricing_confidence(row: dict[str, Any]) -> int:
+    data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    pricing = row.get("pricing") if isinstance(row.get("pricing"), dict) else data.get("pricing")
+    if not isinstance(pricing, dict):
+        pricing = {}
+    value = (
+        pricing.get("pricingConfidence")
+        or pricing.get("confidence")
+        or row.get("pricing_confidence")
+        or data.get("pricingConfidence")
+    )
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if 0 <= numeric <= 1:
+        numeric *= 100
+    return max(0, min(100, round(numeric)))

@@ -10,6 +10,35 @@ from app.services.admin_user_service import AdminUserService, AdminUserServiceEr
 router = APIRouter(prefix="/admin/users", tags=["Admin Users"])
 
 
+@router.get("/{user_id}")
+def get_admin_user_detail(
+    user_id: str,
+    _admin: None = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    try:
+        payload = AdminUserService().get_user_detail(user_id)
+        _record_audit(
+            action="admin_users.detail_viewed",
+            status="success",
+            metadata={"userId": user_id},
+        )
+        return payload
+    except AdminUserServiceError as error:
+        _record_audit(
+            action="admin_users.detail_viewed",
+            status="failure",
+            metadata={"userId": user_id, "error": str(error)},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_user_detail_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+
+
 @router.get("")
 def list_admin_users(
     q: str | None = Query(default=None, min_length=1),
