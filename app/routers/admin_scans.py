@@ -1,6 +1,7 @@
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 
 from app.routers.admin_auth import require_admin_import_token
 from app.services.admin_audit_service import AdminAuditService
@@ -12,6 +13,11 @@ from app.services.admin_scan_failure_service import (
 
 
 router = APIRouter(prefix="/admin/scans", tags=["Admin Scans"])
+
+
+class ScanFailureResolveRequest(BaseModel):
+    category: str = Field(pattern="^(provider_error|low_confidence|image_quality|unpriced|duplicate_invalid|needs_review)$")
+    note: str | None = Field(default=None, max_length=1000)
 
 
 @router.get("/failures")
@@ -73,6 +79,52 @@ def mark_scan_failure_reviewed(
     except ScanFailureQueueError as error:
         _record_audit(
             action="scan_failure_queue.mark_reviewed",
+            status="failure",
+            target_id=scan_id,
+            metadata={"error": str(error)},
+        )
+        raise _scan_queue_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "scan_failure_queue_unavailable",
+            str(error),
+            retryable=True,
+        ) from error
+
+
+@router.post("/failures/{scan_id}/resolved")
+def resolve_scan_failure(
+    scan_id: str,
+    request: ScanFailureResolveRequest,
+    _admin: None = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    try:
+        payload = AdminScanFailureService().resolve_failure(
+            scan_id,
+            category=request.category,
+            note=request.note,
+        )
+        _record_audit(
+            action="scan_failure_queue.resolve",
+            status="success",
+            target_id=scan_id,
+            metadata={"category": request.category, "hasNote": bool(request.note)},
+        )
+        return payload
+    except ScanFailureNotFoundError as error:
+        _record_audit(
+            action="scan_failure_queue.resolve",
+            status="failure",
+            target_id=scan_id,
+            metadata={"error": str(error)},
+        )
+        raise _scan_queue_error(
+            status.HTTP_404_NOT_FOUND,
+            "scan_failure_not_found",
+            str(error),
+        ) from error
+    except ScanFailureQueueError as error:
+        _record_audit(
+            action="scan_failure_queue.resolve",
             status="failure",
             target_id=scan_id,
             metadata={"error": str(error)},

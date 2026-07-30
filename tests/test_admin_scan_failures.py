@@ -92,6 +92,60 @@ class AdminScanFailureTest(unittest.TestCase):
         self.assertEqual(event["targetId"], "scan-review")
         self.assertEqual(event["status"], "success")
 
+    def test_resolve_scan_failure_records_category_note_and_audit(self) -> None:
+        seed_in_memory_scan(
+            {
+                "id": "scan-resolve",
+                "title": "Resolve Scan",
+                "category": "Card",
+                "status": "failed",
+                "errorCode": "AI_PROVIDER_INVALID_RESPONSE",
+                "rawError": {"message": "provider failed", "apiKey": "secret-key"},
+            }
+        )
+
+        with patch("app.routers.admin_auth.settings") as settings:
+            settings.admin_import_token = "secret-token"
+            response = self.client.post(
+                "/admin/scans/failures/scan-resolve/resolved",
+                headers={"Authorization": "Bearer secret-token"},
+                json={"category": "provider_error", "note": "Provider outage was confirmed."},
+            )
+            audit_response = self.client.get(
+                "/admin/audit/events?action=scan_failure_queue.resolve",
+                headers={"Authorization": "Bearer secret-token"},
+            )
+            queue_response = self.client.get(
+                "/admin/scans/failures",
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["reviewStatus"], "resolved")
+        self.assertEqual(response.json()["category"], "provider_error")
+        self.assertEqual(audit_response.json()["events"][0]["targetId"], "scan-resolve")
+        self.assertEqual(queue_response.json()["totalCount"], 0)
+
+    def test_scan_failure_payload_redacts_raw_error_details(self) -> None:
+        seed_in_memory_scan(
+            {
+                "id": "scan-raw",
+                "title": "Raw Error",
+                "status": "failed",
+                "rawError": {"message": "timeout", "token": "bearer secret"},
+            }
+        )
+
+        with patch("app.routers.admin_auth.settings") as settings:
+            settings.admin_import_token = "secret-token"
+            response = self.client.get(
+                "/admin/scans/failures",
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["items"][0]["rawError"]["token"], "[redacted]")
+
     def test_retry_scan_failure_requires_image_reference(self) -> None:
         seed_in_memory_scan(
             {
@@ -147,14 +201,19 @@ class AdminScanFailureTest(unittest.TestCase):
 
         listed = service.list_failures()
         retried = service.retry_analysis("scan-1")
+        resolved = service.resolve_failure("scan-1", category="provider_error", note="Done.")
 
         self.assertEqual(listed["items"][0]["id"], "scan-1")
         self.assertIn("provider_error", listed["items"][0]["reasons"])
         self.assertEqual(retried["status"], "retry_requested")
+        self.assertEqual(resolved["reviewStatus"], "resolved")
         self.assertEqual(client.requests[0]["method"], "GET")
         self.assertTrue(client.requests[0]["url"].endswith("/rest/v1/scan_analysis_events"))
         self.assertEqual(client.requests[-1]["method"], "PATCH")
         self.assertEqual(client.requests[-1]["headers"]["Authorization"], "Bearer service-role")
+        self.assertEqual(client.requests[-1]["json"]["review_status"], "resolved")
+        self.assertEqual(client.requests[-1]["json"]["triage_category"], "provider_error")
+        self.assertEqual(client.requests[-1]["json"]["resolution_note"], "Done.")
 
 
 class _FakeSupabaseClient:

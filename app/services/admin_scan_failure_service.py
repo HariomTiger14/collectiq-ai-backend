@@ -87,6 +87,37 @@ class AdminScanFailureService:
             _update_in_memory_scan(scan_id, update)
         return {"success": True, "scanId": scan_id, "status": "retry_requested"}
 
+    def resolve_failure(
+        self,
+        scan_id: str,
+        *,
+        category: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        resolved_at = _utc_now()
+        update = {
+            "reviewStatus": "resolved",
+            "resolvedAt": resolved_at,
+            "triageCategory": category,
+            "resolutionNote": note.strip() if isinstance(note, str) and note.strip() else None,
+            "needsReview": False,
+        }
+        scan = (
+            self._repository.update_scan(scan_id, update)
+            if self._repository.is_configured
+            else _update_in_memory_scan(scan_id, update)
+        )
+        if scan is None:
+            raise ScanFailureNotFoundError(f"Scan failure {scan_id} was not found.")
+        return {
+            "success": True,
+            "scanId": scan_id,
+            "reviewStatus": "resolved",
+            "category": category,
+            "note": update["resolutionNote"],
+            "resolvedAt": resolved_at,
+        }
+
 
 class SupabaseScanFailureRepository:
     def __init__(
@@ -223,7 +254,7 @@ def _failure_from_scan(scan: dict[str, Any]) -> dict[str, Any] | None:
         reasons.append("unpriced")
     if bool(scan.get("needsReview") or scan.get("needs_review")):
         reasons.append("needs_review")
-    if not reasons or _first_text(scan, "reviewStatus", "review_status") == "reviewed":
+    if not reasons or _first_text(scan, "reviewStatus", "review_status") in {"reviewed", "resolved"}:
         return None
 
     return {
@@ -236,6 +267,11 @@ def _failure_from_scan(scan: dict[str, Any]) -> dict[str, Any] | None:
         "reasonLabel": _reason_label(reasons),
         "failureReason": _first_text(scan, "failureReason", "errorMessage", "error_message")
         or _reason_label(reasons),
+        "triageCategory": _first_text(scan, "triageCategory", "triage_category"),
+        "resolutionNote": _first_text(scan, "resolutionNote", "resolution_note"),
+        "rawError": _safe_raw_error(scan),
+        "userId": _first_text(scan, "userId", "user_id"),
+        "itemId": _first_text(scan, "itemId", "item_id", "portfolioItemId", "portfolio_item_id"),
         "imageUrl": _first_text(scan, "imageUrl", "image_url", "imagePath", "image_path"),
         "createdAt": _first_text(scan, "createdAt", "created_at"),
         "updatedAt": _first_text(scan, "updatedAt", "updated_at"),
@@ -258,9 +294,15 @@ def _scan_from_row(row: dict[str, Any]) -> dict[str, Any]:
                 "detectionQuality": _first_value(row, "detection_quality", "image_quality"),
                 "errorCode": _first_value(row, "error_code"),
                 "errorMessage": _first_value(row, "error_message"),
+                "rawError": _first_value(row, "raw_error"),
+                "userId": _first_value(row, "user_id"),
+                "itemId": _first_value(row, "item_id", "portfolio_item_id"),
                 "imageUrl": _first_value(row, "image_url"),
                 "needsReview": _first_value(row, "needs_review"),
+                "triageCategory": _first_value(row, "triage_category"),
+                "resolutionNote": _first_value(row, "resolution_note"),
                 "reviewStatus": _first_value(row, "review_status"),
+                "resolvedAt": _first_value(row, "resolved_at"),
                 "createdAt": _first_value(row, "created_at"),
                 "updatedAt": _first_value(row, "updated_at"),
             }.items()
@@ -276,6 +318,9 @@ def _row_update_from_scan(scan: dict[str, Any]) -> dict[str, Any]:
         "review_status": scan.get("reviewStatus"),
         "reviewed_at": scan.get("reviewedAt"),
         "retry_requested_at": scan.get("retryRequestedAt"),
+        "resolved_at": scan.get("resolvedAt"),
+        "triage_category": scan.get("triageCategory"),
+        "resolution_note": scan.get("resolutionNote"),
         "updated_at": _utc_now(),
     }
 
@@ -290,6 +335,29 @@ def _update_in_memory_scan(scan_id: str, data: dict[str, Any]) -> dict[str, Any]
         return None
     scan.update(data)
     return scan
+
+
+def _safe_raw_error(scan: dict[str, Any]) -> dict[str, Any]:
+    raw = scan.get("rawError") or scan.get("raw_error")
+    if isinstance(raw, dict):
+        return {key: _redact_sensitive(value) for key, value in raw.items()}
+    return {
+        key: value
+        for key, value in {
+            "code": _first_text(scan, "errorCode", "error_code"),
+            "message": _first_text(scan, "errorMessage", "error_message"),
+            "provider": _first_text(scan, "aiProvider", "ai_provider", "provider"),
+        }.items()
+        if value
+    }
+
+
+def _redact_sensitive(value: Any) -> Any:
+    if isinstance(value, str) and any(marker in value.lower() for marker in ("token", "key", "secret", "bearer")):
+        return "[redacted]"
+    if isinstance(value, dict):
+        return {key: _redact_sensitive(child) for key, child in value.items()}
+    return value
 
 
 def _confidence(scan: dict[str, Any]) -> int | None:
