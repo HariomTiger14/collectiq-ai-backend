@@ -75,7 +75,7 @@ def parse_cors_allowed_origins(raw_value: str | None = None) -> tuple[str, ...]:
         "CORS_ALLOWED_ORIGINS",
         "http://localhost:8000,http://127.0.0.1:8000,"
         "http://localhost:3000,http://127.0.0.1:3000,"
-        "https://sit.packlox.com,https://admin.packlox.com",
+        "https://sit.packlox.com,https://admin.packlox.com,https://packlox-admin-portal.hariomritesh.workers.dev",
     )
     return tuple(
         origin.strip()

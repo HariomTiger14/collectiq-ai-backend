@@ -352,6 +352,7 @@ class ApiEndpointsTest(unittest.TestCase):
 
         self.assertIn("https://sit.packlox.com", origins)
         self.assertIn("https://admin.packlox.com", origins)
+        self.assertIn("https://packlox-admin-portal.hariomritesh.workers.dev", origins)
         self.assertIn("http://localhost:3000", origins)
 
     def test_api_analyze_openai_success_returns_contract_response(self) -> None:
