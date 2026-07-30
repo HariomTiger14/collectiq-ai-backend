@@ -1,0 +1,362 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+from uuid import uuid4
+
+import httpx
+
+from app.core.config import settings
+
+
+LOW_SCAN_CONFIDENCE_THRESHOLD = 70
+
+
+class ScanFailureQueueError(Exception):
+    """Raised when scan failure queue persistence cannot be read or written."""
+
+
+class ScanFailureNotFoundError(Exception):
+    """Raised when an admin action targets an unknown scan failure."""
+
+
+class AdminScanFailureService:
+    def __init__(
+        self,
+        *,
+        repository: "SupabaseScanFailureRepository | None" = None,
+    ) -> None:
+        self._repository = repository or SupabaseScanFailureRepository()
+
+    def list_failures(self, *, reason: str = "all", limit: int = 50) -> dict[str, Any]:
+        scans = (
+            self._repository.list_scans(limit=max(limit, 200))
+            if self._repository.is_configured
+            else list(_IN_MEMORY_SCANS)
+        )
+        failures = [
+            failure
+            for scan in scans
+            if (failure := _failure_from_scan(scan)) is not None
+        ]
+        if reason != "all":
+            failures = [failure for failure in failures if reason in failure["reasons"]]
+        failures.sort(key=_sort_key)
+        limited = failures[:limit]
+        return {
+            "success": True,
+            "filter": reason,
+            "count": len(limited),
+            "totalCount": len(failures),
+            "thresholds": {"lowConfidence": LOW_SCAN_CONFIDENCE_THRESHOLD},
+            "items": limited,
+        }
+
+    def mark_reviewed(self, scan_id: str) -> dict[str, Any]:
+        update = {
+            "reviewStatus": "reviewed",
+            "reviewedAt": _utc_now(),
+            "needsReview": False,
+        }
+        scan = (
+            self._repository.update_scan(scan_id, update)
+            if self._repository.is_configured
+            else _update_in_memory_scan(scan_id, update)
+        )
+        if scan is None:
+            raise ScanFailureNotFoundError(f"Scan failure {scan_id} was not found.")
+        return {"success": True, "scanId": scan_id, "reviewStatus": "reviewed"}
+
+    def retry_analysis(self, scan_id: str) -> dict[str, Any]:
+        scan = (
+            self._repository.get_scan(scan_id)
+            if self._repository.is_configured
+            else _get_in_memory_scan(scan_id)
+        )
+        if scan is None:
+            raise ScanFailureNotFoundError(f"Scan failure {scan_id} was not found.")
+        if not _first_text(scan, "imageUrl", "image_url", "imagePath", "image_path"):
+            raise ScanFailureQueueError("Original scan image reference is missing.")
+        update = {
+            "reviewStatus": "retry_requested",
+            "retryRequestedAt": _utc_now(),
+        }
+        if self._repository.is_configured:
+            self._repository.update_scan(scan_id, update)
+        else:
+            _update_in_memory_scan(scan_id, update)
+        return {"success": True, "scanId": scan_id, "status": "retry_requested"}
+
+
+class SupabaseScanFailureRepository:
+    def __init__(
+        self,
+        *,
+        supabase_url: str | None = None,
+        service_role_key: str | None = None,
+        table_name: str = "scan_analysis_events",
+        timeout_seconds: float = 5,
+        client: httpx.Client | None = None,
+    ) -> None:
+        self._supabase_url = (
+            supabase_url if supabase_url is not None else settings.supabase_url
+        ).strip().rstrip("/")
+        self._service_role_key = (
+            service_role_key
+            if service_role_key is not None
+            else settings.supabase_service_role_key
+        ).strip()
+        self._table_name = table_name.strip() or "scan_analysis_events"
+        self._timeout_seconds = timeout_seconds
+        self._client = client
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self._supabase_url and self._service_role_key)
+
+    def list_scans(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            f"/rest/v1/{self._table_name}",
+            params={
+                "select": "*",
+                "limit": str(limit),
+                "order": "created_at.desc",
+            },
+        )
+        if not isinstance(payload, list):
+            raise ScanFailureQueueError("Supabase scan failure response shape was invalid.")
+        return [_scan_from_row(row) for row in payload if isinstance(row, dict)]
+
+    def get_scan(self, scan_id: str) -> dict[str, Any] | None:
+        payload = self._request(
+            "GET",
+            f"/rest/v1/{self._table_name}",
+            params={"id": f"eq.{scan_id}", "select": "*", "limit": "1"},
+        )
+        if not isinstance(payload, list):
+            raise ScanFailureQueueError("Supabase scan failure response shape was invalid.")
+        if not payload:
+            return None
+        row = payload[0]
+        return _scan_from_row(row) if isinstance(row, dict) else None
+
+    def update_scan(self, scan_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+        current = self.get_scan(scan_id)
+        if current is None:
+            return None
+        merged = {**current, **data}
+        payload = self._request(
+            "PATCH",
+            f"/rest/v1/{self._table_name}",
+            params={"id": f"eq.{scan_id}", "select": "*"},
+            json_payload=_row_update_from_scan(merged),
+            extra_headers={"Prefer": "return=representation"},
+        )
+        if isinstance(payload, list) and payload:
+            row = payload[0]
+            return _scan_from_row(row) if isinstance(row, dict) else merged
+        return merged
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        json_payload: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ):
+        headers = {
+            "apikey": self._service_role_key,
+            "Authorization": f"Bearer {self._service_role_key}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+        client = self._client or httpx.Client(timeout=self._timeout_seconds)
+        should_close = self._client is None
+        try:
+            response = client.request(
+                method,
+                f"{self._supabase_url}{path}",
+                headers=headers,
+                params=params,
+                json=json_payload,
+            )
+            response.raise_for_status()
+            if not response.content:
+                return None
+            return response.json()
+        except (httpx.HTTPError, ValueError) as error:
+            raise ScanFailureQueueError("Supabase scan failure request failed.") from error
+        finally:
+            if should_close:
+                client.close()
+
+
+def seed_in_memory_scan(scan: dict[str, Any]) -> None:
+    _IN_MEMORY_SCANS.insert(0, {"id": scan.get("id") or str(uuid4()), **scan})
+
+
+def clear_in_memory_scans() -> None:
+    _IN_MEMORY_SCANS.clear()
+
+
+def _failure_from_scan(scan: dict[str, Any]) -> dict[str, Any] | None:
+    confidence = _confidence(scan)
+    status = (_first_text(scan, "status", "analysisStatus") or "completed").lower()
+    error_code = _first_text(scan, "errorCode", "error_code")
+    quality = (_first_text(scan, "detectionQuality", "imageQuality") or "").lower()
+    pricing = scan.get("pricing") if isinstance(scan.get("pricing"), dict) else {}
+    price_value = _number(_first_value(pricing, scan, "estimatedMarketValue", "value", "price"))
+
+    reasons: list[str] = []
+    if status in {"failed", "error", "provider_error"} or error_code:
+        reasons.append("provider_error")
+    if confidence is not None and confidence < LOW_SCAN_CONFIDENCE_THRESHOLD:
+        reasons.append("low_confidence")
+    if any(term in quality for term in ("blur", "dark", "poor", "bad", "low")):
+        reasons.append("image_quality")
+    if price_value is None or price_value <= 0:
+        reasons.append("unpriced")
+    if bool(scan.get("needsReview") or scan.get("needs_review")):
+        reasons.append("needs_review")
+    if not reasons or _first_text(scan, "reviewStatus", "review_status") == "reviewed":
+        return None
+
+    return {
+        "id": _first_text(scan, "id", "scanId", "scan_id") or "unknown",
+        "title": _first_text(scan, "title", "itemName", "item_name") or "Unknown scan",
+        "category": _first_text(scan, "category") or "Unknown",
+        "provider": _first_text(scan, "aiProvider", "ai_provider", "provider") or "Unknown",
+        "confidence": confidence,
+        "reasons": list(dict.fromkeys(reasons)),
+        "reasonLabel": _reason_label(reasons),
+        "failureReason": _first_text(scan, "failureReason", "errorMessage", "error_message")
+        or _reason_label(reasons),
+        "imageUrl": _first_text(scan, "imageUrl", "image_url", "imagePath", "image_path"),
+        "createdAt": _first_text(scan, "createdAt", "created_at"),
+        "updatedAt": _first_text(scan, "updatedAt", "updated_at"),
+    }
+
+
+def _scan_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    return {
+        **data,
+        **{
+            key: value
+            for key, value in {
+                "id": _first_value(row, "id", "scan_id"),
+                "title": _first_value(row, "title", "item_name"),
+                "category": _first_value(row, "category"),
+                "status": _first_value(row, "status", "analysis_status"),
+                "aiProvider": _first_value(row, "ai_provider", "provider"),
+                "confidence": _first_value(row, "confidence"),
+                "detectionQuality": _first_value(row, "detection_quality", "image_quality"),
+                "errorCode": _first_value(row, "error_code"),
+                "errorMessage": _first_value(row, "error_message"),
+                "imageUrl": _first_value(row, "image_url"),
+                "needsReview": _first_value(row, "needs_review"),
+                "reviewStatus": _first_value(row, "review_status"),
+                "createdAt": _first_value(row, "created_at"),
+                "updatedAt": _first_value(row, "updated_at"),
+            }.items()
+            if value not in (None, "")
+        },
+    }
+
+
+def _row_update_from_scan(scan: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "data": scan,
+        "needs_review": bool(scan.get("needsReview") or scan.get("needs_review")),
+        "review_status": scan.get("reviewStatus"),
+        "reviewed_at": scan.get("reviewedAt"),
+        "retry_requested_at": scan.get("retryRequestedAt"),
+        "updated_at": _utc_now(),
+    }
+
+
+def _get_in_memory_scan(scan_id: str) -> dict[str, Any] | None:
+    return next((scan for scan in _IN_MEMORY_SCANS if str(scan.get("id")) == scan_id), None)
+
+
+def _update_in_memory_scan(scan_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    scan = _get_in_memory_scan(scan_id)
+    if scan is None:
+        return None
+    scan.update(data)
+    return scan
+
+
+def _confidence(scan: dict[str, Any]) -> int | None:
+    value = _first_value(scan, "confidence", "scanConfidence", "confidenceScore")
+    number = _number(value)
+    if number is None:
+        return None
+    if 0 <= number <= 1:
+        number *= 100
+    return max(0, min(100, round(number)))
+
+
+def _number(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_text(*sources: Any) -> str | None:
+    value = _first_value(*sources)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _first_value(*sources: Any) -> Any:
+    dicts = [source for source in sources if isinstance(source, dict)]
+    keys = [source for source in sources if isinstance(source, str)]
+    for source in dicts:
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _reason_label(reasons: list[str]) -> str:
+    labels = {
+        "provider_error": "Provider error",
+        "low_confidence": "Low confidence",
+        "image_quality": "Image quality",
+        "unpriced": "Unpriced",
+        "needs_review": "Needs review",
+    }
+    return labels.get(reasons[0], "Needs review")
+
+
+def _sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
+    rank = {
+        "provider_error": 0,
+        "low_confidence": 1,
+        "image_quality": 2,
+        "unpriced": 3,
+        "needs_review": 4,
+    }
+    confidence = item.get("confidence")
+    return (
+        rank.get(item["reasons"][0], 9),
+        confidence if isinstance(confidence, int) else 101,
+        item["title"],
+    )
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+_IN_MEMORY_SCANS: list[dict[str, Any]] = []
