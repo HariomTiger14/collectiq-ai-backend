@@ -50,6 +50,34 @@ class AdminAuditTest(unittest.TestCase):
         self.assertEqual(payload["count"], 1)
         self.assertEqual(payload["events"][0]["targetId"], "item-1")
 
+    def test_audit_events_endpoint_filters_status_target_type_actor_and_dates(self) -> None:
+        AdminAuditService().record(
+            action="pricing_review_queue.override_price",
+            status="success",
+            target_type="portfolio_item",
+            target_id="item-1",
+            actor="admin_token",
+        )
+        AdminAuditService().record(
+            action="scan_failure_queue.resolve",
+            status="failure",
+            target_type="scan_analysis",
+            target_id="scan-1",
+            actor="admin_token",
+        )
+
+        with patch("app.routers.admin_auth.settings") as settings:
+            settings.admin_import_token = "secret-token"
+            response = self.client.get(
+                "/admin/audit/events?status=success&targetType=portfolio_item&actor=admin_token",
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["events"][0]["action"], "pricing_review_queue.override_price")
+
     def test_review_queue_action_records_audit_event(self) -> None:
         portfolio_service.add_item(
             PortfolioCreateRequest(
@@ -121,14 +149,29 @@ class AdminAuditTest(unittest.TestCase):
             target_id="item-1",
             metadata={"pricingConfidence": 92},
         )
-        listed = service.list_events(action="pricing_review_queue.retry_pricing")
+        listed = service.list_events(
+            action="pricing_review_queue.retry_pricing",
+            status="success",
+            target_type="portfolio_item",
+            target_id="item-1",
+            actor="admin_token",
+            since="2026-07-01T00:00:00+00:00",
+            until="2026-07-31T00:00:00+00:00",
+        )
 
         self.assertEqual(recorded["id"], "event-1")
         self.assertEqual(listed["events"][0]["targetId"], "item-1")
         self.assertEqual(client.requests[0]["method"], "POST")
         self.assertTrue(client.requests[0]["url"].endswith("/rest/v1/admin_audit_events"))
         self.assertEqual(client.requests[0]["headers"]["Authorization"], "Bearer service-role")
-        self.assertEqual(client.requests[1]["params"]["action"], "eq.pricing_review_queue.retry_pricing")
+        params = client.requests[1]["params"]
+        self.assertEqual(params["action"], "eq.pricing_review_queue.retry_pricing")
+        self.assertEqual(params["status"], "eq.success")
+        self.assertEqual(params["target_type"], "eq.portfolio_item")
+        self.assertEqual(params["target_id"], "eq.item-1")
+        self.assertEqual(params["actor"], "eq.admin_token")
+        self.assertIn("created_at.gte.2026-07-01", params["and"])
+        self.assertIn("created_at.lte.2026-07-31", params["and"])
 
 
 class _FakeAuditSupabaseClient:

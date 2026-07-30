@@ -50,21 +50,39 @@ class AdminAuditService:
         self,
         *,
         action: str | None = None,
+        status: str | None = None,
+        target_type: str | None = None,
         target_id: str | None = None,
+        actor: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
         limit: int = 50,
     ) -> dict[str, Any]:
         if self._repository.is_configured:
             events = self._repository.list_events(
                 action=action,
+                status=status,
+                target_type=target_type,
                 target_id=target_id,
+                actor=actor,
+                since=since,
+                until=until,
                 limit=limit,
             )
         else:
             events = [
                 event
                 for event in _IN_MEMORY_AUDIT_EVENTS
-                if (not action or event["action"] == action)
-                and (not target_id or event.get("targetId") == target_id)
+                if _event_matches(
+                    event,
+                    action=action,
+                    status=status,
+                    target_type=target_type,
+                    target_id=target_id,
+                    actor=actor,
+                    since=since,
+                    until=until,
+                )
             ][:limit]
         return {
             "success": True,
@@ -116,7 +134,12 @@ class SupabaseAdminAuditRepository:
         self,
         *,
         action: str | None = None,
+        status: str | None = None,
+        target_type: str | None = None,
         target_id: str | None = None,
+        actor: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         params = {
@@ -126,8 +149,20 @@ class SupabaseAdminAuditRepository:
         }
         if action:
             params["action"] = f"eq.{action}"
+        if status:
+            params["status"] = f"eq.{status}"
+        if target_type:
+            params["target_type"] = f"eq.{target_type}"
         if target_id:
             params["target_id"] = f"eq.{target_id}"
+        if actor:
+            params["actor"] = f"eq.{actor}"
+        if since and until:
+            params["and"] = f"(created_at.gte.{since},created_at.lte.{until})"
+        elif since:
+            params["created_at"] = f"gte.{since}"
+        elif until:
+            params["created_at"] = f"lte.{until}"
 
         payload = self._request(
             "GET",
@@ -175,6 +210,35 @@ class SupabaseAdminAuditRepository:
         finally:
             if should_close:
                 client.close()
+
+
+def _event_matches(
+    event: dict[str, Any],
+    *,
+    action: str | None,
+    status: str | None,
+    target_type: str | None,
+    target_id: str | None,
+    actor: str | None,
+    since: str | None,
+    until: str | None,
+) -> bool:
+    if action and event.get("action") != action:
+        return False
+    if status and event.get("status") != status:
+        return False
+    if target_type and event.get("targetType") != target_type:
+        return False
+    if target_id and event.get("targetId") != target_id:
+        return False
+    if actor and event.get("actor") != actor:
+        return False
+    created_at = str(event.get("createdAt") or "")
+    if since and created_at < since:
+        return False
+    if until and created_at > until:
+        return False
+    return True
 
 
 def clear_in_memory_audit_events() -> None:
