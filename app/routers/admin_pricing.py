@@ -3,6 +3,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.routers.admin_auth import require_admin_import_token
+from app.services.admin_audit_service import AdminAuditService
 from app.services.pricing.admin_review_queue_service import (
     AdminPricingReviewQueueService,
     ReviewQueueRepositoryError,
@@ -43,8 +44,19 @@ def pricing_review_queue(
     _admin: None = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     try:
-        return AdminPricingReviewQueueService().list_queue(reason=reason, limit=limit)
+        payload = AdminPricingReviewQueueService().list_queue(reason=reason, limit=limit)
+        _record_audit(
+            action="pricing_review_queue.viewed",
+            status="success",
+            metadata={"filter": reason, "count": payload.get("count", 0)},
+        )
+        return payload
     except ReviewQueueRepositoryError as error:
+        _record_audit(
+            action="pricing_review_queue.viewed",
+            status="failure",
+            metadata={"filter": reason, "error": str(error)},
+        )
         raise _review_queue_error(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "review_queue_unavailable",
@@ -59,14 +71,32 @@ def mark_pricing_reviewed(
     _admin: None = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     try:
-        return AdminPricingReviewQueueService().mark_reviewed(item_id)
+        payload = AdminPricingReviewQueueService().mark_reviewed(item_id)
+        _record_audit(
+            action="pricing_review_queue.mark_reviewed",
+            status="success",
+            target_id=item_id,
+        )
+        return payload
     except ReviewQueueItemNotFoundError as error:
+        _record_audit(
+            action="pricing_review_queue.mark_reviewed",
+            status="failure",
+            target_id=item_id,
+            metadata={"error": str(error)},
+        )
         raise _review_queue_error(
             status.HTTP_404_NOT_FOUND,
             "review_item_not_found",
             str(error),
         ) from error
     except ReviewQueueRepositoryError as error:
+        _record_audit(
+            action="pricing_review_queue.mark_reviewed",
+            status="failure",
+            target_id=item_id,
+            metadata={"error": str(error)},
+        )
         raise _review_queue_error(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "review_queue_unavailable",
@@ -81,20 +111,48 @@ def retry_review_queue_pricing(
     _admin: None = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     try:
-        return AdminPricingReviewQueueService().retry_pricing(item_id)
+        payload = AdminPricingReviewQueueService().retry_pricing(item_id)
+        _record_audit(
+            action="pricing_review_queue.retry_pricing",
+            status="success",
+            target_id=item_id,
+            metadata={
+                "pricingStatus": payload.get("pricing", {}).get("status"),
+                "pricingConfidence": payload.get("pricing", {}).get("pricingConfidence"),
+            },
+        )
+        return payload
     except ReviewQueueItemNotFoundError as error:
+        _record_audit(
+            action="pricing_review_queue.retry_pricing",
+            status="failure",
+            target_id=item_id,
+            metadata={"error": str(error)},
+        )
         raise _review_queue_error(
             status.HTTP_404_NOT_FOUND,
             "review_item_not_found",
             str(error),
         ) from error
     except ReviewQueueItemNotPriceableError as error:
+        _record_audit(
+            action="pricing_review_queue.retry_pricing",
+            status="failure",
+            target_id=item_id,
+            metadata={"error": str(error)},
+        )
         raise _review_queue_error(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "review_item_not_priceable",
             str(error),
         ) from error
     except ReviewQueueRepositoryError as error:
+        _record_audit(
+            action="pricing_review_queue.retry_pricing",
+            status="failure",
+            target_id=item_id,
+            metadata={"error": str(error)},
+        )
         raise _review_queue_error(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "review_queue_unavailable",
@@ -118,3 +176,22 @@ def _review_queue_error(
             "retryable": retryable,
         },
     )
+
+
+def _record_audit(
+    *,
+    action: str,
+    status: str,
+    target_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    try:
+        AdminAuditService().record(
+            action=action,
+            status=status,
+            target_type="portfolio_item" if target_id else None,
+            target_id=target_id,
+            metadata=metadata,
+        )
+    except Exception:
+        return
