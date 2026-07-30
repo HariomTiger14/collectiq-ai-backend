@@ -5,10 +5,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Depends
 
 from app.core.config import settings
-from app.routers.admin_pricecharting import _require_admin_token
+from app.routers.admin_auth import require_admin_import_token
 from app.services.health.health_check_service import HealthCheckService
 from app.services.pricing.admin_health_service import PricingHealthError
 from app.services.pricing.admin_health_service import PricingHealthService
@@ -21,14 +21,8 @@ BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
 @router.get("/summary")
 def ops_summary(
-    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
-    authorization: str | None = Header(default=None),
+    _admin: None = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
-    _require_admin_token(
-        x_admin_token=x_admin_token,
-        authorization=authorization,
-    )
-
     generated_at = datetime.now(timezone.utc).isoformat()
     health_report = HealthCheckService().run()
     pricing = _pricing_health()

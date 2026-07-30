@@ -12,7 +12,7 @@ class AdminPriceChartingImportTest(unittest.TestCase):
         self.client = TestClient(app)
 
     def test_import_requires_configured_admin_token(self) -> None:
-        with patch("app.routers.admin_pricecharting.settings") as settings:
+        with patch("app.routers.admin_auth.settings") as settings:
             settings.admin_import_token = ""
 
             response = self.client.post("/admin/pricecharting/import?dryRun=true")
@@ -24,7 +24,7 @@ class AdminPriceChartingImportTest(unittest.TestCase):
         )
 
     def test_import_rejects_invalid_admin_token(self) -> None:
-        with patch("app.routers.admin_pricecharting.settings") as settings:
+        with patch("app.routers.admin_auth.settings") as settings:
             settings.admin_import_token = "secret-token"
 
             response = self.client.post(
@@ -61,7 +61,7 @@ class AdminPriceChartingImportTest(unittest.TestCase):
             ),
         ]
 
-        with patch("app.routers.admin_pricecharting.settings") as settings, patch(
+        with patch("app.routers.admin_auth.settings") as settings, patch(
             "app.routers.admin_pricecharting.download_env_sources",
             return_value=sources,
         ) as download_sources:
@@ -106,7 +106,7 @@ class AdminPriceChartingImportTest(unittest.TestCase):
             ),
         ]
 
-        with patch("app.routers.admin_pricecharting.settings") as settings, patch(
+        with patch("app.routers.admin_auth.settings") as settings, patch(
             "app.routers.admin_pricecharting.download_env_sources",
             return_value=sources,
         ) as download_sources:
@@ -130,7 +130,7 @@ class AdminPriceChartingImportTest(unittest.TestCase):
         )
 
     def test_dry_run_rejects_unsupported_source_filter(self) -> None:
-        with patch("app.routers.admin_pricecharting.settings") as settings:
+        with patch("app.routers.admin_auth.settings") as settings:
             settings.admin_import_token = "secret-token"
 
             response = self.client.post(

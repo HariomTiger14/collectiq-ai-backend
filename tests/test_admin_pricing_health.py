@@ -13,7 +13,7 @@ class AdminPricingHealthEndpointTest(unittest.TestCase):
         self.client = TestClient(app)
 
     def test_pricing_health_requires_admin_token(self) -> None:
-        with patch("app.routers.admin_pricecharting.settings") as settings:
+        with patch("app.routers.admin_auth.settings") as settings:
             settings.admin_import_token = "secret-token"
 
             response = self.client.get(
@@ -25,7 +25,7 @@ class AdminPricingHealthEndpointTest(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "unauthorized")
 
     def test_pricing_health_returns_admin_portal_payload(self) -> None:
-        with patch("app.routers.admin_pricecharting.settings") as auth_settings, patch(
+        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
             "app.routers.admin_pricing.PricingHealthService",
         ) as service_factory:
             auth_settings.admin_import_token = "secret-token"

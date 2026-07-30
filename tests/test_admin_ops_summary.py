@@ -12,7 +12,7 @@ class AdminOpsSummaryEndpointTest(unittest.TestCase):
         self.client = TestClient(app)
 
     def test_requires_admin_token(self) -> None:
-        with patch("app.routers.admin_pricecharting.settings") as settings:
+        with patch("app.routers.admin_auth.settings") as settings:
             settings.admin_import_token = "secret-token"
 
             response = self.client.get(
@@ -46,7 +46,7 @@ class AdminOpsSummaryEndpointTest(unittest.TestCase):
             "pricecharting": {"sources": []},
         }
 
-        with patch("app.routers.admin_pricecharting.settings") as auth_settings, patch(
+        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
             "app.routers.admin_ops.settings",
         ) as settings, patch(
             "app.routers.admin_ops.HealthCheckService",

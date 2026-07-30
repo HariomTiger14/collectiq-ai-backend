@@ -1,9 +1,10 @@
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.core.config import settings
+from app.routers.admin_auth import require_admin_import_token
 from scripts.import_pricecharting_catalog import PRICECHARTING_CSV_ENV_VARS
 from scripts.import_pricecharting_catalog import (
     SupabaseCatalogClient,
@@ -30,14 +31,8 @@ def import_pricecharting_catalog(
         le=600,
         description="Download/import timeout in seconds.",
     ),
-    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
-    authorization: str | None = Header(default=None),
+    _admin: None = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
-    _require_admin_token(
-        x_admin_token=x_admin_token,
-        authorization=authorization,
-    )
-
     source_filter = _normalized_source_filter(source)
     try:
         sources = download_env_sources(
@@ -155,34 +150,3 @@ def _admin_import_error(
             "retryable": status_code >= 500,
         },
     )
-
-
-def _require_admin_token(
-    *,
-    x_admin_token: str | None,
-    authorization: str | None,
-) -> None:
-    expected_token = settings.admin_import_token.strip()
-    if not expected_token:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "code": "admin_import_not_configured",
-                "message": "ADMIN_IMPORT_TOKEN is not configured.",
-                "retryable": False,
-            },
-        )
-
-    bearer_token = ""
-    if isinstance(authorization, str) and authorization.lower().startswith("bearer "):
-        bearer_token = authorization.split(" ", 1)[1].strip()
-    supplied_token = (x_admin_token or bearer_token or "").strip()
-    if supplied_token != expected_token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={
-                "code": "unauthorized",
-                "message": "Admin token is invalid.",
-                "retryable": False,
-            },
-        )
