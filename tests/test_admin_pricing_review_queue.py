@@ -167,6 +167,40 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
         self.assertEqual(data["reviewStatus"], "reviewed")
         self.assertTrue(data["reviewedAt"])
 
+    def test_override_price_updates_item_and_marks_reviewed(self) -> None:
+        portfolio_service.add_item(
+            PortfolioCreateRequest(
+                id="override-me",
+                data={
+                    "title": "Override Card",
+                    "category": "Trading Card",
+                    "needsReview": True,
+                    "pricing": {"estimatedMarketValue": 0, "pricingConfidence": 0},
+                },
+            )
+        )
+
+        with patch("app.routers.admin_auth.settings") as settings:
+            settings.admin_import_token = "secret-token"
+            response = self.client.post(
+                "/admin/pricing/review-queue/override-me/override",
+                headers={"Authorization": "Bearer secret-token"},
+                json={
+                    "estimatedValue": 144.5,
+                    "currency": "AUD",
+                    "note": "Manual comp from admin review.",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = portfolio_service.get_item("override-me").data
+        self.assertFalse(data["needsReview"])
+        self.assertEqual(data["reviewStatus"], "admin_override")
+        self.assertEqual(data["adminReviewNote"], "Manual comp from admin review.")
+        self.assertEqual(data["pricing"]["estimatedMarketValue"], 144.5)
+        self.assertEqual(data["pricing"]["currency"], "AUD")
+        self.assertEqual(data["pricing"]["pricingSource"], {"name": "admin_override"})
+
     def test_retry_pricing_updates_item_pricing(self) -> None:
         portfolio_service.add_item(
             PortfolioCreateRequest(
@@ -285,6 +319,61 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
         self.assertFalse(patch_request["json"]["needs_review"])
         self.assertEqual(patch_request["json"]["review_status"], "reviewed")
         self.assertEqual(patch_request["headers"]["Prefer"], "return=representation")
+
+    def test_supabase_override_price_patches_persistent_item(self) -> None:
+        client = _FakeSupabaseClient(
+            get_rows=[
+                {
+                    "id": "supabase-override",
+                    "data": {
+                        "title": "Override Me",
+                        "category": "Card",
+                        "needsReview": True,
+                    },
+                    "pricing": {"estimatedMarketValue": 0, "pricingConfidence": 0},
+                }
+            ],
+            patch_rows=[
+                {
+                    "id": "supabase-override",
+                    "data": {
+                        "title": "Override Me",
+                        "category": "Card",
+                        "needsReview": False,
+                        "reviewStatus": "admin_override",
+                    },
+                    "pricing": {
+                        "estimatedMarketValue": 88.0,
+                        "currency": "USD",
+                        "pricingConfidence": 100,
+                    },
+                    "review_status": "admin_override",
+                }
+            ],
+        )
+        service = AdminPricingReviewQueueService(
+            repository=SupabasePricingReviewQueueRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.override_price(
+            "supabase-override",
+            estimated_value=88,
+            currency="usd",
+            note="Admin override.",
+        )
+
+        self.assertTrue(payload["success"])
+        patch_request = client.requests[-1]
+        self.assertEqual(patch_request["method"], "PATCH")
+        self.assertEqual(patch_request["params"]["id"], "eq.supabase-override")
+        self.assertFalse(patch_request["json"]["needs_review"])
+        self.assertEqual(patch_request["json"]["review_status"], "admin_override")
+        self.assertEqual(patch_request["json"]["pricing"]["estimatedMarketValue"], 88.0)
+        self.assertEqual(patch_request["json"]["pricing"]["currency"], "USD")
 
 
 class _FakeSupabaseClient:

@@ -113,6 +113,53 @@ class AdminPricingReviewQueueService:
             "pricing": response.pricing.model_dump(mode="json"),
         }
 
+    def override_price(
+        self,
+        item_id: str,
+        *,
+        estimated_value: float,
+        currency: str = "USD",
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        item = (
+            self._repository.get_item(item_id)
+            if self._repository.is_configured
+            else portfolio_service.get_item(item_id)
+        )
+        if item is None:
+            raise ReviewQueueItemNotFoundError(f"Portfolio item {item_id} was not found.")
+        reviewed_at = _utc_now()
+        pricing = {
+            **_pricing_payload(item.data),
+            "status": "available",
+            "estimatedMarketValue": round(float(estimated_value), 2),
+            "currency": currency.strip().upper() or "USD",
+            "pricingConfidence": 100,
+            "confidenceScore": 1.0,
+            "pricingSource": {"name": "admin_override"},
+            "lastUpdated": reviewed_at,
+            "override": True,
+        }
+        update_data = {
+            "pricing": pricing,
+            "needsReview": False,
+            "requiresReview": False,
+            "reviewedAt": reviewed_at,
+            "reviewStatus": "admin_override",
+            "adminReviewNote": note.strip() if isinstance(note, str) and note.strip() else None,
+        }
+        if self._repository.is_configured:
+            self._repository.update_item_data(item_id, update_data)
+        else:
+            portfolio_service.update_item_data(item_id, update_data)
+        return {
+            "success": True,
+            "itemId": item_id,
+            "reviewStatus": "admin_override",
+            "pricing": pricing,
+            "note": update_data["adminReviewNote"],
+        }
+
 
 class SupabasePricingReviewQueueRepository:
     def __init__(
