@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from app.routers.admin_auth import require_admin_import_token
 from app.services.pricing.admin_review_queue_service import (
     AdminPricingReviewQueueService,
+    ReviewQueueRepositoryError,
     ReviewQueueItemNotFoundError,
     ReviewQueueItemNotPriceableError,
 )
@@ -41,7 +42,15 @@ def pricing_review_queue(
     limit: int = Query(50, ge=1, le=200),
     _admin: None = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
-    return AdminPricingReviewQueueService().list_queue(reason=reason, limit=limit)
+    try:
+        return AdminPricingReviewQueueService().list_queue(reason=reason, limit=limit)
+    except ReviewQueueRepositoryError as error:
+        raise _review_queue_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "review_queue_unavailable",
+            str(error),
+            retryable=True,
+        ) from error
 
 
 @router.post("/review-queue/{item_id}/reviewed")
@@ -56,6 +65,13 @@ def mark_pricing_reviewed(
             status.HTTP_404_NOT_FOUND,
             "review_item_not_found",
             str(error),
+        ) from error
+    except ReviewQueueRepositoryError as error:
+        raise _review_queue_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "review_queue_unavailable",
+            str(error),
+            retryable=True,
         ) from error
 
 
@@ -78,18 +94,27 @@ def retry_review_queue_pricing(
             "review_item_not_priceable",
             str(error),
         ) from error
+    except ReviewQueueRepositoryError as error:
+        raise _review_queue_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "review_queue_unavailable",
+            str(error),
+            retryable=True,
+        ) from error
 
 
 def _review_queue_error(
     status_code: int,
     code: str,
     message: str,
+    *,
+    retryable: bool = False,
 ) -> HTTPException:
     return HTTPException(
         status_code=status_code,
         detail={
             "code": code,
             "message": message,
-            "retryable": False,
+            "retryable": retryable,
         },
     )

@@ -3,6 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import httpx
+
+from app.core.config import settings
 from app.schemas.portfolio import PortfolioItem
 from app.schemas.pricing import RepriceIdentityRequest, RepriceRequest, RepriceResponse
 from app.services.portfolio_service import portfolio_service
@@ -21,11 +24,27 @@ class ReviewQueueItemNotPriceableError(Exception):
     """Raised when a portfolio item lacks the minimum fields needed to retry pricing."""
 
 
+class ReviewQueueRepositoryError(Exception):
+    """Raised when the persistent review queue cannot be read or written."""
+
+
 class AdminPricingReviewQueueService:
+    def __init__(
+        self,
+        *,
+        repository: "SupabasePricingReviewQueueRepository | None" = None,
+    ) -> None:
+        self._repository = repository or SupabasePricingReviewQueueRepository()
+
     def list_queue(self, *, reason: str = "all", limit: int = 50) -> dict[str, Any]:
+        items = (
+            self._repository.list_items(limit=max(limit, 200))
+            if self._repository.is_configured
+            else portfolio_service.list_items()
+        )
         queue_items = [
             review_item
-            for item in portfolio_service.list_items()
+            for item in items
             if (review_item := _review_item_from_portfolio(item)) is not None
         ]
         if reason != "all":
@@ -48,14 +67,17 @@ class AdminPricingReviewQueueService:
         }
 
     def mark_reviewed(self, item_id: str) -> dict[str, Any]:
-        item = portfolio_service.update_item_data(
-            item_id,
-            {
-                "needsReview": False,
-                "reviewedAt": _utc_now(),
-                "reviewStatus": "reviewed",
-            },
-        )
+        reviewed_at = _utc_now()
+        update_data = {
+            "needsReview": False,
+            "requiresReview": False,
+            "reviewedAt": reviewed_at,
+            "reviewStatus": "reviewed",
+        }
+        if self._repository.is_configured:
+            item = self._repository.update_item_data(item_id, update_data)
+        else:
+            item = portfolio_service.update_item_data(item_id, update_data)
         if item is None:
             raise ReviewQueueItemNotFoundError(f"Portfolio item {item_id} was not found.")
         return {
@@ -65,26 +87,148 @@ class AdminPricingReviewQueueService:
         }
 
     def retry_pricing(self, item_id: str) -> dict[str, Any]:
-        item = portfolio_service.get_item(item_id)
+        item = (
+            self._repository.get_item(item_id)
+            if self._repository.is_configured
+            else portfolio_service.get_item(item_id)
+        )
         if item is None:
             raise ReviewQueueItemNotFoundError(f"Portfolio item {item_id} was not found.")
         request = _reprice_request_from_item(item)
         response = RepriceService().reprice(request)
-        portfolio_service.update_item_data(
-            item_id,
-            {
-                "pricing": response.pricing.model_dump(mode="json"),
-                "needsReview": response.pricing.pricingConfidence < LOW_CONFIDENCE_THRESHOLD
-                or response.pricing.status != "available",
-                "lastPricingRetryAt": _utc_now(),
-                "reviewStatus": "pricing_retried",
-            },
-        )
+        update_data = {
+            "pricing": response.pricing.model_dump(mode="json"),
+            "needsReview": response.pricing.pricingConfidence < LOW_CONFIDENCE_THRESHOLD
+            or response.pricing.status != "available",
+            "lastPricingRetryAt": _utc_now(),
+            "reviewStatus": "pricing_retried",
+        }
+        if self._repository.is_configured:
+            self._repository.update_item_data(item_id, update_data)
+        else:
+            portfolio_service.update_item_data(item_id, update_data)
         return {
             "success": True,
             "itemId": item_id,
             "pricing": response.pricing.model_dump(mode="json"),
         }
+
+
+class SupabasePricingReviewQueueRepository:
+    def __init__(
+        self,
+        *,
+        supabase_url: str | None = None,
+        service_role_key: str | None = None,
+        table_name: str = "portfolio_items",
+        timeout_seconds: float = 5,
+        client: httpx.Client | None = None,
+    ) -> None:
+        self._supabase_url = (
+            supabase_url if supabase_url is not None else settings.supabase_url
+        ).strip().rstrip("/")
+        self._service_role_key = (
+            service_role_key
+            if service_role_key is not None
+            else settings.supabase_service_role_key
+        ).strip()
+        self._table_name = table_name.strip() or "portfolio_items"
+        self._timeout_seconds = timeout_seconds
+        self._client = client
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self._supabase_url and self._service_role_key)
+
+    def list_items(self, *, limit: int = 200) -> list[PortfolioItem]:
+        payload = self._request(
+            "GET",
+            f"/rest/v1/{self._table_name}",
+            params={
+                "select": "*",
+                "limit": str(limit),
+                "order": "updated_at.desc.nullslast,created_at.desc.nullslast",
+            },
+        )
+        if not isinstance(payload, list):
+            raise ReviewQueueRepositoryError("Supabase portfolio response shape was invalid.")
+        return [
+            item
+            for row in payload
+            if isinstance(row, dict) and (item := _portfolio_item_from_row(row)) is not None
+        ]
+
+    def get_item(self, item_id: str) -> PortfolioItem | None:
+        payload = self._request(
+            "GET",
+            f"/rest/v1/{self._table_name}",
+            params={
+                "id": f"eq.{item_id}",
+                "select": "*",
+                "limit": "1",
+            },
+        )
+        if not isinstance(payload, list):
+            raise ReviewQueueRepositoryError("Supabase portfolio response shape was invalid.")
+        if not payload:
+            return None
+        row = payload[0]
+        return _portfolio_item_from_row(row) if isinstance(row, dict) else None
+
+    def update_item_data(self, item_id: str, data: dict[str, Any]) -> PortfolioItem | None:
+        current = self.get_item(item_id)
+        if current is None:
+            return None
+        merged_data = {**current.data, **data}
+        payload = self._request(
+            "PATCH",
+            f"/rest/v1/{self._table_name}",
+            params={"id": f"eq.{item_id}", "select": "*"},
+            json_payload=_row_update_from_data(merged_data),
+            extra_headers={"Prefer": "return=representation"},
+        )
+        if isinstance(payload, list) and payload:
+            row = payload[0]
+            return _portfolio_item_from_row(row) if isinstance(row, dict) else current
+        return PortfolioItem(id=item_id, data=merged_data)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        json_payload: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
+    ):
+        headers = {
+            "apikey": self._service_role_key,
+            "Authorization": f"Bearer {self._service_role_key}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+
+        client = self._client or httpx.Client(timeout=self._timeout_seconds)
+        should_close = self._client is None
+        try:
+            response = client.request(
+                method,
+                f"{self._supabase_url}{path}",
+                headers=headers,
+                params=params,
+                json=json_payload,
+            )
+            response.raise_for_status()
+            if not response.content:
+                return None
+            return response.json()
+        except (httpx.HTTPError, ValueError) as error:
+            raise ReviewQueueRepositoryError("Supabase review queue request failed.") from error
+        finally:
+            if should_close:
+                client.close()
 
 
 def _review_item_from_portfolio(item: PortfolioItem) -> dict[str, Any] | None:
@@ -170,6 +314,54 @@ def _reprice_request_from_item(item: PortfolioItem) -> RepriceRequest:
 def _pricing_payload(data: dict[str, Any]) -> dict[str, Any]:
     pricing = data.get("pricing")
     return pricing if isinstance(pricing, dict) else {}
+
+
+def _portfolio_item_from_row(row: dict[str, Any]) -> PortfolioItem | None:
+    item_id = _first_text(row, "id", "item_id", "portfolio_item_id")
+    if not item_id:
+        return None
+    data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    pricing = row.get("pricing") if isinstance(row.get("pricing"), dict) else data.get("pricing")
+    merged = {
+        **data,
+        **{
+            key: value
+            for key, value in {
+                "title": _first_value(row, "title", "item_name", "name"),
+                "itemName": _first_value(row, "item_name"),
+                "category": _first_value(row, "category", "item_category"),
+                "condition": _first_value(row, "condition"),
+                "brand": _first_value(row, "brand"),
+                "setName": _first_value(row, "set_name"),
+                "series": _first_value(row, "series"),
+                "cardNumber": _first_value(row, "card_number"),
+                "year": _first_value(row, "year"),
+                "currency": _first_value(row, "currency", "display_currency"),
+                "displayCurrency": _first_value(row, "display_currency"),
+                "needsReview": _first_value(row, "needs_review"),
+                "requiresReview": _first_value(row, "requires_review"),
+                "reviewedAt": _first_value(row, "reviewed_at"),
+                "reviewStatus": _first_value(row, "review_status"),
+                "createdAt": _first_value(row, "created_at"),
+                "updatedAt": _first_value(row, "updated_at"),
+            }.items()
+            if value not in (None, "")
+        },
+    }
+    if isinstance(pricing, dict):
+        merged["pricing"] = pricing
+    return PortfolioItem(id=item_id, data=merged)
+
+
+def _row_update_from_data(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "data": data,
+        "pricing": data.get("pricing") if isinstance(data.get("pricing"), dict) else None,
+        "needs_review": bool(data.get("needsReview") or data.get("requiresReview")),
+        "reviewed_at": data.get("reviewedAt"),
+        "review_status": data.get("reviewStatus"),
+        "updated_at": _utc_now(),
+    }
 
 
 def _confidence(data: dict[str, Any], pricing: dict[str, Any]) -> int | None:

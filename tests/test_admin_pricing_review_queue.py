@@ -2,12 +2,17 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 from app.main import app
 from app.schemas.portfolio import PortfolioCreateRequest
 from app.schemas.pricing import RepricePricingResponse, RepriceResponse
 from app.services.portfolio_service import portfolio_service
+from app.services.pricing.admin_review_queue_service import (
+    AdminPricingReviewQueueService,
+    SupabasePricingReviewQueueRepository,
+)
 
 
 class AdminPricingReviewQueueTest(unittest.TestCase):
@@ -190,6 +195,124 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
         self.assertEqual(data["pricing"]["estimatedMarketValue"], 125.0)
         self.assertFalse(data["needsReview"])
         self.assertEqual(data["reviewStatus"], "pricing_retried")
+
+    def test_supabase_review_queue_lists_persistent_portfolio_items(self) -> None:
+        client = _FakeSupabaseClient(
+            get_rows=[
+                {
+                    "id": "supabase-low",
+                    "title": "Supabase Charizard",
+                    "category": "Pokemon Card",
+                    "condition": "Lightly Played",
+                    "pricing": {
+                        "estimatedMarketValue": 210,
+                        "currency": "USD",
+                        "pricingConfidence": 58,
+                        "pricingSource": {"name": "pricecharting_catalog"},
+                    },
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                {
+                    "id": "supabase-healthy",
+                    "title": "Healthy",
+                    "category": "Game",
+                    "pricing": {
+                        "estimatedMarketValue": 30,
+                        "pricingConfidence": 94,
+                    },
+                },
+            ]
+        )
+        service = AdminPricingReviewQueueService(
+            repository=SupabasePricingReviewQueueRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.list_queue()
+
+        self.assertEqual(payload["totalCount"], 1)
+        self.assertEqual(payload["items"][0]["id"], "supabase-low")
+        self.assertIn("low_confidence", payload["items"][0]["reasons"])
+        request = client.requests[0]
+        self.assertEqual(request["method"], "GET")
+        self.assertTrue(request["url"].endswith("/rest/v1/portfolio_items"))
+        self.assertEqual(request["headers"]["Authorization"], "Bearer service-role")
+
+    def test_supabase_mark_reviewed_patches_persistent_item(self) -> None:
+        client = _FakeSupabaseClient(
+            get_rows=[
+                {
+                    "id": "supabase-review",
+                    "data": {
+                        "title": "Review Me",
+                        "category": "Card",
+                        "needsReview": True,
+                    },
+                    "pricing": {"estimatedMarketValue": 20, "pricingConfidence": 85},
+                }
+            ],
+            patch_rows=[
+                {
+                    "id": "supabase-review",
+                    "data": {
+                        "title": "Review Me",
+                        "category": "Card",
+                        "needsReview": False,
+                        "reviewStatus": "reviewed",
+                    },
+                    "pricing": {"estimatedMarketValue": 20, "pricingConfidence": 85},
+                    "review_status": "reviewed",
+                }
+            ],
+        )
+        service = AdminPricingReviewQueueService(
+            repository=SupabasePricingReviewQueueRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.mark_reviewed("supabase-review")
+
+        self.assertTrue(payload["success"])
+        patch_request = client.requests[-1]
+        self.assertEqual(patch_request["method"], "PATCH")
+        self.assertEqual(patch_request["params"]["id"], "eq.supabase-review")
+        self.assertFalse(patch_request["json"]["needs_review"])
+        self.assertEqual(patch_request["json"]["review_status"], "reviewed")
+        self.assertEqual(patch_request["headers"]["Prefer"], "return=representation")
+
+
+class _FakeSupabaseClient:
+    def __init__(
+        self,
+        *,
+        get_rows: list[dict] | None = None,
+        patch_rows: list[dict] | None = None,
+    ) -> None:
+        self.get_rows = get_rows or []
+        self.patch_rows = patch_rows or []
+        self.requests: list[dict] = []
+
+    def request(self, method: str, url: str, **kwargs):
+        self.requests.append({"method": method, "url": url, **kwargs})
+        if method == "GET":
+            return _response(self.get_rows)
+        if method == "PATCH":
+            return _response(self.patch_rows)
+        raise AssertionError(f"Unexpected method: {method}")
+
+
+def _response(payload) -> httpx.Response:
+    return httpx.Response(
+        status_code=200,
+        json=payload,
+        request=httpx.Request("GET", "https://supabase.test"),
+    )
 
 
 def _reprice_response() -> RepriceResponse:
