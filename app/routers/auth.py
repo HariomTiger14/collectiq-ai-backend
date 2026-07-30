@@ -1,6 +1,7 @@
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from app.routers.admin_auth import require_admin_session
 from app.services.auth.signup_start_guard import (
     SignupStartGuardError,
     SignupStartRateLimitedError,
@@ -73,3 +74,8 @@ def signup_start(payload: SignupStartRequest, request: Request) -> SignupStartRe
         safeForAccountCreation=decision.safe_for_account_creation,
         cooldownSeconds=decision.cooldown_seconds,
     )
+
+
+@router.get("/admin/session")
+def admin_session(admin: dict[str, str] = Depends(require_admin_session)) -> dict[str, object]:
+    return {"success": True, "admin": admin}
