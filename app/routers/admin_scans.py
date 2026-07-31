@@ -20,6 +20,46 @@ class ScanFailureResolveRequest(BaseModel):
     note: str | None = Field(default=None, max_length=1000)
 
 
+@router.get("/failures/{scan_id}")
+def scan_failure_detail(
+    scan_id: str,
+    _admin: None = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    try:
+        payload = AdminScanFailureService().get_failure_detail(scan_id)
+        _record_audit(
+            action="scan_failure_queue.detail_viewed",
+            status="success",
+            target_id=scan_id,
+        )
+        return payload
+    except ScanFailureNotFoundError as error:
+        _record_audit(
+            action="scan_failure_queue.detail_viewed",
+            status="failure",
+            target_id=scan_id,
+            metadata={"error": str(error)},
+        )
+        raise _scan_queue_error(
+            status.HTTP_404_NOT_FOUND,
+            "scan_failure_not_found",
+            str(error),
+        ) from error
+    except ScanFailureQueueError as error:
+        _record_audit(
+            action="scan_failure_queue.detail_viewed",
+            status="failure",
+            target_id=scan_id,
+            metadata={"error": str(error)},
+        )
+        raise _scan_queue_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "scan_failure_queue_unavailable",
+            str(error),
+            retryable=True,
+        ) from error
+
+
 @router.get("/failures")
 def scan_failures(
     reason: str = Query(

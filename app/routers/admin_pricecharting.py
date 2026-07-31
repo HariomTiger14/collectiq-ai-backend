@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.core.config import settings
 from app.routers.admin_auth import require_admin_import_token
+from app.services.admin_import_job_service import AdminImportJobService
 from scripts.import_pricecharting_catalog import PRICECHARTING_CSV_ENV_VARS
 from scripts.import_pricecharting_catalog import (
     SupabaseCatalogClient,
@@ -34,30 +35,36 @@ def import_pricecharting_catalog(
     _admin: None = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     source_filter = _normalized_source_filter(source)
+    jobs = AdminImportJobService()
+    job = jobs.create_job(source=source_filter or "all", dry_run=dry_run)
     try:
         sources = download_env_sources(
             timeout_seconds=timeout_seconds,
             source_filter=source_filter,
         )
     except SystemExit as exc:
+        jobs.fail_job(job["id"], str(exc))
         raise _admin_import_error(
             status.HTTP_400_BAD_REQUEST,
             "invalid_import_source",
             str(exc),
         ) from exc
     except httpx.TimeoutException as exc:
+        jobs.fail_job(job["id"], "Timed out while downloading the PriceCharting CSV.")
         raise _admin_import_error(
             status.HTTP_504_GATEWAY_TIMEOUT,
             "pricecharting_csv_timeout",
             "Timed out while downloading the PriceCharting CSV.",
         ) from exc
     except httpx.HTTPStatusError as exc:
+        jobs.fail_job(job["id"], f"PriceCharting CSV download failed with HTTP {exc.response.status_code}.")
         raise _admin_import_error(
             status.HTTP_502_BAD_GATEWAY,
             "pricecharting_csv_download_failed",
             f"PriceCharting CSV download failed with HTTP {exc.response.status_code}.",
         ) from exc
     except httpx.HTTPError as exc:
+        jobs.fail_job(job["id"], "PriceCharting CSV download failed.")
         raise _admin_import_error(
             status.HTTP_502_BAD_GATEWAY,
             "pricecharting_csv_download_failed",
@@ -99,20 +106,23 @@ def import_pricecharting_catalog(
             history_count = client.sync_scd2_history_rows(imported_rows, batch_size=500)
             imported_count = client.upsert_rows(imported_rows, batch_size=500)
         except SystemExit as exc:
+            jobs.fail_job(job["id"], str(exc))
             raise _admin_import_error(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "supabase_import_not_configured",
                 str(exc),
             ) from exc
         except httpx.HTTPError as exc:
+            jobs.fail_job(job["id"], "Supabase catalog import failed.")
             raise _admin_import_error(
                 status.HTTP_502_BAD_GATEWAY,
                 "supabase_import_failed",
                 "Supabase catalog import failed.",
             ) from exc
 
-    return {
+    payload = {
         "success": True,
+        "jobId": job["id"],
         "dryRun": dry_run,
         "source": source_filter or "all",
         "sources": source_summaries,
@@ -121,6 +131,16 @@ def import_pricecharting_catalog(
         "importedRows": imported_count,
         "historyRows": history_count,
     }
+    jobs.complete_job(job["id"], payload)
+    return payload
+
+
+@router.get("/import-jobs")
+def list_pricecharting_import_jobs(
+    limit: int = Query(25, ge=1, le=100),
+    _admin: None = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    return AdminImportJobService().list_jobs(limit=limit)
 
 
 def _normalized_source_filter(source: str | None) -> str | None:

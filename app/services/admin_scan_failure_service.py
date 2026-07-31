@@ -52,6 +52,32 @@ class AdminScanFailureService:
             "items": limited,
         }
 
+    def get_failure_detail(self, scan_id: str) -> dict[str, Any]:
+        scan = (
+            self._repository.get_scan(scan_id)
+            if self._repository.is_configured
+            else _get_in_memory_scan(scan_id)
+        )
+        if scan is None:
+            raise ScanFailureNotFoundError(f"Scan failure {scan_id} was not found.")
+        failure = _failure_from_scan(scan) or {
+            "id": _first_text(scan, "id", "scanId", "scan_id") or scan_id,
+            "title": _first_text(scan, "title", "itemName", "item_name") or "Unknown scan",
+            "reasonLabel": "Reviewed",
+            "rawError": _safe_raw_error(scan),
+            "createdAt": _first_text(scan, "createdAt", "created_at"),
+            "updatedAt": _first_text(scan, "updatedAt", "updated_at"),
+        }
+        return {
+            "success": True,
+            "scanId": scan_id,
+            "scan": {
+                **failure,
+                "rawScan": scan,
+                "history": _scan_history(scan),
+            },
+        }
+
     def mark_reviewed(self, scan_id: str) -> dict[str, Any]:
         update = {
             "reviewStatus": "reviewed",
@@ -350,6 +376,21 @@ def _safe_raw_error(scan: dict[str, Any]) -> dict[str, Any]:
         }.items()
         if value
     }
+
+
+def _scan_history(scan: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates = [
+        ("retry_requested", _first_text(scan, "retryRequestedAt", "retry_requested_at")),
+        ("reviewed", _first_text(scan, "reviewedAt", "reviewed_at")),
+        ("resolved", _first_text(scan, "resolvedAt", "resolved_at")),
+        ("updated", _first_text(scan, "updatedAt", "updated_at")),
+        ("created", _first_text(scan, "createdAt", "created_at")),
+    ]
+    return [
+        {"event": event, "createdAt": created_at}
+        for event, created_at in candidates
+        if created_at
+    ]
 
 
 def _redact_sensitive(value: Any) -> Any:
