@@ -38,6 +38,42 @@ class AdminUserService:
             "user": self._repository.get_user_detail(user_id),
         }
 
+    def resend_confirmation(self, *, email: str) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminUserServiceError("Supabase admin configuration is missing.")
+        self._repository.resend_confirmation(email=email)
+        return {"success": True, "email": email, "status": "confirmation_requested"}
+
+    def force_logout(self, user_id: str) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminUserServiceError("Supabase admin configuration is missing.")
+        self._repository.force_logout(user_id)
+        return {"success": True, "userId": user_id, "status": "logout_requested"}
+
+    def disable_user(self, user_id: str) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminUserServiceError("Supabase admin configuration is missing.")
+        self._repository.update_auth_user(user_id, {"ban_duration": "876000h"})
+        return {"success": True, "userId": user_id, "status": "disabled"}
+
+    def enable_user(self, user_id: str) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminUserServiceError("Supabase admin configuration is missing.")
+        self._repository.update_auth_user(user_id, {"ban_duration": "none"})
+        return {"success": True, "userId": user_id, "status": "enabled"}
+
+    def update_admin_role(self, *, user_id: str, role: str, is_admin: bool) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminUserServiceError("Supabase admin configuration is missing.")
+        profile = self._repository.update_profile_role(user_id=user_id, role=role, is_admin=is_admin)
+        return {
+            "success": True,
+            "userId": user_id,
+            "role": profile.get("role") or role,
+            "isAdmin": bool(profile.get("is_admin", is_admin)),
+            "profile": profile,
+        }
+
 
 class SupabaseAdminUserRepository:
     def __init__(
@@ -135,6 +171,38 @@ class SupabaseAdminUserRepository:
             return payload
         return None
 
+    def resend_confirmation(self, *, email: str) -> None:
+        self._request(
+            "POST",
+            "/auth/v1/resend",
+            json_payload={"type": "signup", "email": email},
+        )
+
+    def force_logout(self, user_id: str) -> None:
+        self._request("POST", f"/auth/v1/admin/users/{user_id}/logout")
+
+    def update_auth_user(self, user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self._request(
+            "PUT",
+            f"/auth/v1/admin/users/{user_id}",
+            json_payload=payload,
+        )
+        if not isinstance(response, dict):
+            raise AdminUserServiceError("Supabase admin user update response shape was invalid.")
+        return response
+
+    def update_profile_role(self, *, user_id: str, role: str, is_admin: bool) -> dict[str, Any]:
+        payload = self._request(
+            "PATCH",
+            f"/rest/v1/{settings.admin_profile_table or 'profiles'}",
+            params={"id": f"eq.{user_id}", "select": "*"},
+            json_payload={"role": role, "is_admin": is_admin},
+            extra_headers={"Prefer": "return=representation"},
+        )
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            return payload[0]
+        raise AdminUserServiceError("Supabase admin profile update response shape was invalid.")
+
     def _optional_profile(self, user_id: str) -> dict[str, Any]:
         if not user_id:
             return {}
@@ -182,6 +250,8 @@ class SupabaseAdminUserRepository:
         path: str,
         *,
         params: dict[str, str] | None = None,
+        json_payload: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ):
         headers = {
             "apikey": self._service_role_key,
@@ -189,6 +259,8 @@ class SupabaseAdminUserRepository:
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
+        if extra_headers:
+            headers.update(extra_headers)
         client = self._client or httpx.Client(timeout=self._timeout_seconds)
         should_close = self._client is None
         try:
@@ -197,6 +269,7 @@ class SupabaseAdminUserRepository:
                 f"{self._supabase_url}{path}",
                 headers=headers,
                 params=params,
+                json=json_payload,
             )
             response.raise_for_status()
             if not response.content:

@@ -10,6 +10,7 @@ from app.routers import (
     admin_ops,
     admin_pricecharting,
     admin_scans,
+    admin_reports,
     admin_users,
     api_analyze,
     auth,
@@ -47,6 +48,7 @@ app.include_router(admin_audit.router)
 app.include_router(admin_ops.router)
 app.include_router(admin_pricecharting.router)
 app.include_router(admin_pricing.router)
+app.include_router(admin_reports.router)
 app.include_router(admin_scans.router)
 app.include_router(admin_users.router)
 app.include_router(push.router)
