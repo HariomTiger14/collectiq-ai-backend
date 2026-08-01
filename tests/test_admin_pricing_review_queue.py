@@ -197,6 +197,8 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
         self.assertFalse(data["needsReview"])
         self.assertEqual(data["reviewStatus"], "admin_override")
         self.assertEqual(data["adminReviewNote"], "Manual comp from admin review.")
+        self.assertEqual(data["estimatedValue"], 144.5)
+        self.assertEqual(data["valuationStatus"], "market_estimated")
         self.assertEqual(data["pricing"]["estimatedMarketValue"], 144.5)
         self.assertEqual(data["pricing"]["currency"], "AUD")
         self.assertEqual(data["pricing"]["pricingSource"], {"name": "admin_override"})
@@ -226,6 +228,8 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         data = portfolio_service.get_item("retry-me").data
+        self.assertEqual(data["estimatedValue"], 125.0)
+        self.assertEqual(data["valuationStatus"], "market_estimated")
         self.assertEqual(data["pricing"]["estimatedMarketValue"], 125.0)
         self.assertFalse(data["needsReview"])
         self.assertEqual(data["reviewStatus"], "pricing_retried")
@@ -372,8 +376,74 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
         self.assertEqual(patch_request["params"]["id"], "eq.supabase-override")
         self.assertFalse(patch_request["json"]["needs_review"])
         self.assertEqual(patch_request["json"]["review_status"], "admin_override")
+        self.assertEqual(patch_request["json"]["data"]["estimatedValue"], 88.0)
+        self.assertEqual(patch_request["json"]["data"]["valuationStatus"], "market_estimated")
+        self.assertEqual(patch_request["json"]["estimated_value_high"], 88.0)
+        self.assertIsNone(patch_request["json"]["estimated_value_low"])
         self.assertEqual(patch_request["json"]["pricing"]["estimatedMarketValue"], 88.0)
         self.assertEqual(patch_request["json"]["pricing"]["currency"], "USD")
+
+    def test_supabase_retry_pricing_patches_app_visible_value_fields(self) -> None:
+        client = _FakeSupabaseClient(
+            get_rows=[
+                {
+                    "id": "supabase-retry",
+                    "data": {
+                        "title": "Retry Me",
+                        "category": "Trading Card",
+                        "condition": "Near Mint",
+                        "estimatedValue": 10.0,
+                        "valuationStatus": "ai_estimated",
+                    },
+                    "pricing": {"estimatedMarketValue": 10.0, "pricingConfidence": 20},
+                }
+            ],
+            patch_rows=[
+                {
+                    "id": "supabase-retry",
+                    "data": {
+                        "title": "Retry Me",
+                        "category": "Trading Card",
+                        "estimatedValue": 125.0,
+                        "valuationStatus": "market_estimated",
+                        "reviewStatus": "pricing_retried",
+                    },
+                    "pricing": {
+                        "estimatedMarketValue": 125.0,
+                        "lowEstimate": 110.0,
+                        "highEstimate": 140.0,
+                        "currency": "USD",
+                        "pricingConfidence": 92,
+                    },
+                    "review_status": "pricing_retried",
+                    "estimated_value_low": 110.0,
+                    "estimated_value_high": 140.0,
+                }
+            ],
+        )
+        service = AdminPricingReviewQueueService(
+            repository=SupabasePricingReviewQueueRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        with patch(
+            "app.services.pricing.admin_review_queue_service.RepriceService",
+        ) as reprice_service:
+            reprice_service.return_value.reprice.return_value = _reprice_response()
+            payload = service.retry_pricing("supabase-retry")
+
+        self.assertTrue(payload["success"])
+        patch_request = client.requests[-1]
+        self.assertEqual(patch_request["method"], "PATCH")
+        self.assertEqual(patch_request["params"]["id"], "eq.supabase-retry")
+        self.assertEqual(patch_request["json"]["data"]["estimatedValue"], 125.0)
+        self.assertEqual(patch_request["json"]["data"]["valuationStatus"], "market_estimated")
+        self.assertEqual(patch_request["json"]["estimated_value_low"], 110.0)
+        self.assertEqual(patch_request["json"]["estimated_value_high"], 140.0)
+        self.assertEqual(patch_request["json"]["pricing"]["estimatedMarketValue"], 125.0)
 
 
 class _FakeSupabaseClient:

@@ -96,8 +96,13 @@ class AdminPricingReviewQueueService:
             raise ReviewQueueItemNotFoundError(f"Portfolio item {item_id} was not found.")
         request = _reprice_request_from_item(item)
         response = RepriceService().reprice(request)
+        pricing = response.pricing.model_dump(mode="json")
+        display_value = _price_value({}, pricing)
+        valuation_status = _valuation_status(pricing)
         update_data = {
-            "pricing": response.pricing.model_dump(mode="json"),
+            "pricing": pricing,
+            "estimatedValue": display_value,
+            "valuationStatus": valuation_status,
             "needsReview": response.pricing.pricingConfidence < LOW_CONFIDENCE_THRESHOLD
             or response.pricing.status != "available",
             "lastPricingRetryAt": _utc_now(),
@@ -110,7 +115,7 @@ class AdminPricingReviewQueueService:
         return {
             "success": True,
             "itemId": item_id,
-            "pricing": response.pricing.model_dump(mode="json"),
+            "pricing": pricing,
         }
 
     def override_price(
@@ -142,6 +147,8 @@ class AdminPricingReviewQueueService:
         }
         update_data = {
             "pricing": pricing,
+            "estimatedValue": pricing["estimatedMarketValue"],
+            "valuationStatus": "market_estimated",
             "needsReview": False,
             "requiresReview": False,
             "reviewedAt": reviewed_at,
@@ -407,9 +414,15 @@ def _portfolio_item_from_row(row: dict[str, Any]) -> PortfolioItem | None:
 
 
 def _row_update_from_data(data: dict[str, Any]) -> dict[str, Any]:
+    pricing = data.get("pricing") if isinstance(data.get("pricing"), dict) else {}
+    value = _price_value({}, pricing) or _estimated_value(data)
+    low_value = _estimate_value(pricing, "lowEstimate")
+    high_value = _estimate_value(pricing, "highEstimate") or value
     return {
         "data": data,
-        "pricing": data.get("pricing") if isinstance(data.get("pricing"), dict) else None,
+        "pricing": pricing or None,
+        "estimated_value_low": low_value,
+        "estimated_value_high": high_value,
         "needs_review": bool(data.get("needsReview") or data.get("requiresReview")),
         "reviewed_at": data.get("reviewedAt"),
         "review_status": data.get("reviewStatus"),
@@ -450,6 +463,42 @@ def _price_value(data: dict[str, Any], pricing: dict[str, Any]) -> float | None:
     except (TypeError, ValueError):
         return None
     return numeric
+
+
+def _estimated_value(data: dict[str, Any]) -> float | None:
+    try:
+        numeric = float(data.get("estimatedValue"))
+    except (TypeError, ValueError):
+        return None
+    return numeric
+
+
+def _estimate_value(pricing: dict[str, Any], key: str) -> float | None:
+    try:
+        numeric = float(pricing.get(key))
+    except (TypeError, ValueError):
+        return None
+    return numeric
+
+
+def _valuation_status(pricing: dict[str, Any]) -> str:
+    explicit_status = str(
+        pricing.get("valuationStatus") or pricing.get("valuationStrategy") or ""
+    ).strip()
+    allowed_statuses = {
+        "market_estimated",
+        "ai_estimated",
+        "no_market_match",
+        "lookup_failed",
+        "provider_not_configured",
+        "unavailable",
+    }
+    if explicit_status in allowed_statuses:
+        return explicit_status
+    value = _price_value({}, pricing)
+    if pricing.get("status") == "available" and value is not None and value > 0:
+        return "market_estimated"
+    return "unavailable"
 
 
 def _provider_name(pricing: dict[str, Any]) -> str:
