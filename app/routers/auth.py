@@ -78,4 +78,18 @@ def signup_start(payload: SignupStartRequest, request: Request) -> SignupStartRe
 
 @router.get("/admin/session")
 def admin_session(admin: dict[str, str] = Depends(require_admin_session)) -> dict[str, object]:
-    return {"success": True, "admin": admin}
+    permissions = set(admin.get("permissions") or [])
+    return {
+        "success": True,
+        "admin": admin,
+        "permissions": sorted(permissions),
+        "capabilities": {
+            "canRead": "admin:read" in permissions,
+            "canExportReports": "reports:export" in permissions,
+            "canManageCatalog": "catalog:write" in permissions,
+            "canRunImports": "imports:run" in permissions,
+            "canManagePricing": "pricing:write" in permissions,
+            "canManageScans": "scans:write" in permissions,
+            "canManageUsers": "users:write" in permissions,
+        },
+    }

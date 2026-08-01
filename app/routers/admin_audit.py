@@ -41,3 +41,31 @@ def list_admin_audit_events(
                 "retryable": True,
             },
         ) from error
+
+
+@router.get("/events/{event_id}")
+def get_admin_audit_event(
+    event_id: str,
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    try:
+        event = AdminAuditService().get_event(event_id)
+    except AdminAuditError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_audit_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+    if event is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "admin_audit_event_not_found",
+                "message": "Audit event was not found.",
+                "retryable": False,
+            },
+        )
+    return {"success": True, "event": event}

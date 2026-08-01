@@ -160,6 +160,12 @@ class AdminPricingReviewQueueService:
             "note": update_data["adminReviewNote"],
         }
 
+    def bulk_mark_reviewed(self, item_ids: list[str]) -> dict[str, Any]:
+        return _bulk_result(item_ids, self.mark_reviewed)
+
+    def bulk_retry_pricing(self, item_ids: list[str]) -> dict[str, Any]:
+        return _bulk_result(item_ids, self.retry_pricing)
+
 
 class SupabasePricingReviewQueueRepository:
     def __init__(
@@ -509,3 +515,21 @@ def _sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _bulk_result(item_ids: list[str], action) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    for item_id in list(dict.fromkeys([str(value).strip() for value in item_ids if str(value).strip()])):
+        try:
+            results.append(action(item_id))
+        except Exception as error:
+            failures.append({"id": item_id, "error": str(error)})
+    return {
+        "success": not failures,
+        "requested": len(item_ids),
+        "completed": len(results),
+        "failed": len(failures),
+        "results": results,
+        "failures": failures,
+    }

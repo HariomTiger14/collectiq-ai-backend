@@ -67,6 +67,16 @@ def ops_summary(
         "validation": validation,
         "readiness": readiness,
         "maintenance": {
+            "databaseMigrations": {
+                "latestAdminPortalMigration": "database/migrations/20260801_admin_portal_operations.sql",
+                "expectedTables": [
+                    "admin_import_jobs",
+                    "admin_notes",
+                    "admin_audit_events",
+                ],
+                "expectedCatalogColumns": ["admin_note", "active"],
+                "status": "apply_in_supabase_before_live_use",
+            },
             "catalogImport": {
                 "available": True,
                 "sources": _pricecharting_sources(),
@@ -80,9 +90,9 @@ def ops_summary(
                 "cacheTtlSeconds": settings.pricing_cache_ttl_seconds,
             },
             "auditLogs": {
-                "available": False,
-                "status": "not_exposed",
-                "message": "Audit log persistence has not been added yet.",
+                "available": True,
+                "status": "exposed",
+                "message": "Audit events are available through /admin/audit/events.",
             },
         },
     }

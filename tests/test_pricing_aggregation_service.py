@@ -136,7 +136,7 @@ def _sale(price: int) -> MarketComparableSale:
         title=f"Comparable sale {price}",
         soldPrice=price,
         currency="AUD",
-        soldDate="2026-06-30T00:00:00Z",
+        soldDate=utc_timestamp(),
         condition="Near Mint",
         url=None,
     )

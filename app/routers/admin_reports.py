@@ -20,9 +20,12 @@ router = APIRouter(prefix="/admin/reports", tags=["Admin Reports"])
 
 @router.get("/overview")
 def reports_overview(
-    _admin: None = Depends(require_admin_import_token),
+    days: int = Query(30, ge=1, le=365),
+    since: str | None = Query(default=None, min_length=1),
+    until: str | None = Query(default=None, min_length=1),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
-    payload = AdminReportsService().overview()
+    payload = AdminReportsService().overview(days=days, since=since, until=until)
     _record_audit("admin_reports.overview_viewed", "success", {"summary": payload.get("summary", {})})
     return payload
 
@@ -30,10 +33,32 @@ def reports_overview(
 @router.get("/export")
 def reports_export(
     dataset: str = Query(pattern="^(users|pricing|scans|audit)$"),
-    _admin: None = Depends(require_admin_import_token),
+    q: str | None = Query(default=None, min_length=1),
+    reason: str | None = Query(default=None, min_length=1),
+    action: str | None = Query(default=None, min_length=1),
+    status_filter: str | None = Query(default=None, alias="status", min_length=1),
+    target_type: str | None = Query(default=None, alias="targetType", min_length=1),
+    target_id: str | None = Query(default=None, alias="targetId", min_length=1),
+    actor: str | None = Query(default=None, min_length=1),
+    since: str | None = Query(default=None, min_length=1),
+    until: str | None = Query(default=None, min_length=1),
+    limit: int = Query(200, ge=1, le=1000),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> StreamingResponse:
     try:
-        rows = _export_rows(dataset)
+        rows = _export_rows(
+            dataset,
+            q=q,
+            reason=reason,
+            action=action,
+            status_filter=status_filter,
+            target_type=target_type,
+            target_id=target_id,
+            actor=actor,
+            since=since,
+            until=until,
+            limit=limit,
+        )
     except Exception as error:
         _record_audit("admin_reports.exported", "failure", {"dataset": dataset, "error": str(error)})
         raise HTTPException(
@@ -52,14 +77,42 @@ def reports_export(
     )
 
 
-def _export_rows(dataset: str) -> list[dict[str, Any]]:
+def _export_rows(
+    dataset: str,
+    *,
+    q: str | None,
+    reason: str | None,
+    action: str | None,
+    status_filter: str | None,
+    target_type: str | None,
+    target_id: str | None,
+    actor: str | None,
+    since: str | None,
+    until: str | None,
+    limit: int,
+) -> list[dict[str, Any]]:
     if dataset == "users":
-        return AdminUserService().list_users(limit=100).get("users", [])
+        return AdminUserService().list_users(query=q, limit=min(limit, 100)).get("users", [])
     if dataset == "pricing":
-        return AdminPricingReviewQueueService().list_queue(limit=200).get("items", [])
+        return AdminPricingReviewQueueService().list_queue(
+            reason=reason or "all",
+            limit=min(limit, 200),
+        ).get("items", [])
     if dataset == "scans":
-        return AdminScanFailureService().list_failures(limit=200).get("items", [])
-    return AdminAuditService().list_events(limit=200).get("events", [])
+        return AdminScanFailureService().list_failures(
+            reason=reason or "all",
+            limit=min(limit, 200),
+        ).get("items", [])
+    return AdminAuditService().list_events(
+        action=action,
+        status=status_filter,
+        target_type=target_type,
+        target_id=target_id,
+        actor=actor,
+        since=since,
+        until=until,
+        limit=min(limit, 1000),
+    ).get("events", [])
 
 
 def _csv_text(rows: list[dict[str, Any]]) -> str:

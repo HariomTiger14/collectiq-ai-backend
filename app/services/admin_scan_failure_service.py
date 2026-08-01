@@ -144,6 +144,21 @@ class AdminScanFailureService:
             "resolvedAt": resolved_at,
         }
 
+    def bulk_mark_reviewed(self, scan_ids: list[str]) -> dict[str, Any]:
+        return _bulk_result(scan_ids, self.mark_reviewed)
+
+    def bulk_resolve_failures(
+        self,
+        scan_ids: list[str],
+        *,
+        category: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        return _bulk_result(
+            scan_ids,
+            lambda scan_id: self.resolve_failure(scan_id, category=category, note=note),
+        )
+
 
 class SupabaseScanFailureRepository:
     def __init__(
@@ -469,3 +484,21 @@ def _utc_now() -> str:
 
 
 _IN_MEMORY_SCANS: list[dict[str, Any]] = []
+
+
+def _bulk_result(ids: list[str], action) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    for item_id in list(dict.fromkeys([str(value).strip() for value in ids if str(value).strip()])):
+        try:
+            results.append(action(item_id))
+        except Exception as error:
+            failures.append({"id": item_id, "error": str(error)})
+    return {
+        "success": not failures,
+        "requested": len(ids),
+        "completed": len(results),
+        "failed": len(failures),
+        "results": results,
+        "failures": failures,
+    }

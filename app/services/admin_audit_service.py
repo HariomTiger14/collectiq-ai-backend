@@ -90,6 +90,14 @@ class AdminAuditService:
             "events": events,
         }
 
+    def get_event(self, event_id: str) -> dict[str, Any] | None:
+        if self._repository.is_configured:
+            return self._repository.get_event(event_id)
+        return next(
+            (event for event in _IN_MEMORY_AUDIT_EVENTS if str(event.get("id")) == event_id),
+            None,
+        )
+
 
 class SupabaseAdminAuditRepository:
     def __init__(
@@ -172,6 +180,19 @@ class SupabaseAdminAuditRepository:
         if not isinstance(payload, list):
             raise AdminAuditError("Supabase audit response shape was invalid.")
         return [_event_from_row(row) for row in payload if isinstance(row, dict)]
+
+    def get_event(self, event_id: str) -> dict[str, Any] | None:
+        payload = self._request(
+            "GET",
+            f"/rest/v1/{self._table_name}",
+            params={"id": f"eq.{event_id}", "select": "*", "limit": "1"},
+        )
+        if not isinstance(payload, list):
+            raise AdminAuditError("Supabase audit response shape was invalid.")
+        if not payload:
+            return None
+        row = payload[0]
+        return _event_from_row(row) if isinstance(row, dict) else None
 
     def _request(
         self,

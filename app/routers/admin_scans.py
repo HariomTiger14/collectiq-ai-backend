@@ -20,6 +20,12 @@ class ScanFailureResolveRequest(BaseModel):
     note: str | None = Field(default=None, max_length=1000)
 
 
+class BulkScanFailureRequest(BaseModel):
+    scanIds: list[str] = Field(min_length=1, max_length=100)
+    category: str = Field(default="needs_review", pattern="^(provider_error|low_confidence|image_quality|unpriced|duplicate_invalid|needs_review)$")
+    note: str | None = Field(default=None, max_length=1000)
+
+
 @router.get("/failures/{scan_id}")
 def scan_failure_detail(
     scan_id: str,
@@ -116,6 +122,7 @@ def mark_scan_failure_reviewed(
             "scan_failure_not_found",
             str(error),
         ) from error
+
     except ScanFailureQueueError as error:
         _record_audit(
             action="scan_failure_queue.mark_reviewed",
@@ -162,6 +169,7 @@ def resolve_scan_failure(
             "scan_failure_not_found",
             str(error),
         ) from error
+
     except ScanFailureQueueError as error:
         _record_audit(
             action="scan_failure_queue.resolve",
@@ -215,6 +223,48 @@ def retry_scan_failure_analysis(
             str(error),
             retryable=True,
         ) from error
+
+
+@router.post("/failure-actions/reviewed")
+def bulk_mark_scan_failures_reviewed(
+    request: BulkScanFailureRequest,
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    payload = AdminScanFailureService().bulk_mark_reviewed(request.scanIds)
+    _record_audit(
+        action="scan_failure_queue.bulk_mark_reviewed",
+        status="success" if payload.get("success") else "failure",
+        metadata={
+            "requested": payload.get("requested"),
+            "completed": payload.get("completed"),
+            "failed": payload.get("failed"),
+        },
+    )
+    return payload
+
+
+@router.post("/failure-actions/resolved")
+def bulk_resolve_scan_failures(
+    request: BulkScanFailureRequest,
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    payload = AdminScanFailureService().bulk_resolve_failures(
+        request.scanIds,
+        category=request.category,
+        note=request.note,
+    )
+    _record_audit(
+        action="scan_failure_queue.bulk_resolve",
+        status="success" if payload.get("success") else "failure",
+        metadata={
+            "requested": payload.get("requested"),
+            "completed": payload.get("completed"),
+            "failed": payload.get("failed"),
+            "category": request.category,
+            "hasNote": bool(request.note),
+        },
+    )
+    return payload
 
 
 def _scan_queue_error(

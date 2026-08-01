@@ -209,7 +209,7 @@ class SupabaseAdminUserRepository:
         try:
             payload = self._request(
                 "GET",
-                "/rest/v1/profiles",
+                f"/rest/v1/{settings.admin_profile_table or 'profiles'}",
                 params={"id": f"eq.{user_id}", "select": "*", "limit": "1"},
             )
         except AdminUserServiceError:

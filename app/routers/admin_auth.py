@@ -1,14 +1,45 @@
+from collections.abc import Callable
+from typing import Any
+
 import httpx
 from fastapi import Header, HTTPException, status
 
 from app.core.config import settings
 
 
+FULL_ADMIN_PERMISSIONS = {
+    "admin:read",
+    "audit:read",
+    "catalog:write",
+    "imports:run",
+    "pricing:write",
+    "reports:export",
+    "scans:write",
+    "users:write",
+}
+
+ROLE_PERMISSIONS = {
+    "viewer": {"admin:read", "audit:read"},
+    "support": {"admin:read", "audit:read", "reports:export", "scans:write", "users:write"},
+    "pricing_reviewer": {
+        "admin:read",
+        "audit:read",
+        "catalog:write",
+        "imports:run",
+        "pricing:write",
+        "reports:export",
+    },
+    "admin": FULL_ADMIN_PERMISSIONS,
+    "owner": FULL_ADMIN_PERMISSIONS,
+    "super_admin": FULL_ADMIN_PERMISSIONS,
+}
+
+
 def require_admin_import_token(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
     authorization: str | None = Header(default=None),
-) -> None:
-    _require_admin_token(
+) -> dict[str, Any]:
+    return _require_admin_token(
         expected_token=settings.admin_import_token,
         not_configured_code="admin_import_not_configured",
         not_configured_message="ADMIN_IMPORT_TOKEN is not configured.",
@@ -20,8 +51,8 @@ def require_admin_import_token(
 def require_admin_job_token(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
     authorization: str | None = Header(default=None),
-) -> None:
-    _require_admin_token(
+) -> dict[str, Any]:
+    return _require_admin_token(
         expected_token=settings.admin_job_token,
         not_configured_code="admin_job_not_configured",
         not_configured_message="ADMIN_JOB_TOKEN is not configured.",
@@ -32,8 +63,31 @@ def require_admin_job_token(
 
 def require_admin_session(
     authorization: str | None = Header(default=None),
-) -> dict[str, str]:
+) -> dict[str, Any]:
     return _require_supabase_admin(_bearer_token(authorization))
+
+
+def require_admin_permission(permission: str) -> Callable[..., dict[str, Any]]:
+    def dependency(
+        x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        admin = require_admin_import_token(
+            x_admin_token=x_admin_token,
+            authorization=authorization,
+        )
+        if permission in set(admin.get("permissions") or []):
+            return admin
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "admin_permission_denied",
+                "message": "This admin role cannot perform that action.",
+                "retryable": False,
+            },
+        )
+
+    return dependency
 
 
 def _require_admin_token(
@@ -43,14 +97,15 @@ def _require_admin_token(
     not_configured_message: str,
     x_admin_token: str | None,
     authorization: str | None,
-) -> None:
+) -> dict[str, Any]:
     supplied_token = (x_admin_token or _bearer_token(authorization) or "").strip()
     expected = expected_token.strip()
     if expected and supplied_token == expected:
-        return
+        return _static_admin()
 
-    if _is_supabase_admin_token(supplied_token):
-        return
+    supabase_admin = _supabase_admin_token(supplied_token)
+    if supabase_admin:
+        return supabase_admin
 
     if not expected and not _supabase_admin_auth_configured():
         raise HTTPException(
@@ -72,15 +127,14 @@ def _require_admin_token(
     )
 
 
-def _is_supabase_admin_token(token: str) -> bool:
+def _supabase_admin_token(token: str) -> dict[str, Any] | None:
     try:
-        _require_supabase_admin(token)
+        return _require_supabase_admin(token)
     except HTTPException:
-        return False
-    return True
+        return None
 
 
-def _require_supabase_admin(token: str) -> dict[str, str]:
+def _require_supabase_admin(token: str) -> dict[str, Any]:
     token = token.strip()
     if not token:
         raise _unauthorized_admin_session()
@@ -101,10 +155,15 @@ def _require_supabase_admin(token: str) -> dict[str, str]:
     if not _profile_has_admin_role(profile):
         raise _unauthorized_admin_session()
 
+    role = str(profile.get("role") or profile.get("admin_role") or "admin").strip().lower()
+    permissions = sorted(_permissions_for_role(role))
     return {
         "id": user_id,
         "email": email,
-        "role": str(profile.get("role") or profile.get("admin_role") or "admin"),
+        "role": role,
+        "isAdmin": True,
+        "permissions": permissions,
+        "canWrite": bool(set(permissions) - {"admin:read", "audit:read"}),
     }
 
 
@@ -178,7 +237,24 @@ def _profile_has_admin_role(profile: dict) -> bool:
     if profile.get("is_admin") is True:
         return True
     role = str(profile.get("role") or profile.get("admin_role") or "").strip().lower()
-    return role in {"admin", "owner", "super_admin"}
+    return role in ROLE_PERMISSIONS and role != "user"
+
+
+def _permissions_for_role(role: str) -> set[str]:
+    normalized = (role or "viewer").strip().lower()
+    return set(ROLE_PERMISSIONS.get(normalized, ROLE_PERMISSIONS["viewer"]))
+
+
+def _static_admin() -> dict[str, Any]:
+    return {
+        "id": "admin_token",
+        "email": "",
+        "role": "admin",
+        "isAdmin": True,
+        "permissions": sorted(FULL_ADMIN_PERMISSIONS),
+        "canWrite": True,
+        "authMode": "admin_token",
+    }
 
 
 def _supabase_admin_auth_configured() -> bool:

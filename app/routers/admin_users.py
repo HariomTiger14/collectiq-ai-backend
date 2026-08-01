@@ -3,7 +3,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from app.routers.admin_auth import require_admin_import_token
+from app.routers.admin_auth import require_admin_import_token, require_admin_permission
 from app.services.admin_audit_service import AdminAuditService
 from app.services.admin_user_service import AdminUserService, AdminUserServiceError
 
@@ -23,7 +23,7 @@ class AdminRoleUpdateRequest(BaseModel):
 @router.get("/{user_id}")
 def get_admin_user_detail(
     user_id: str,
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     try:
         payload = AdminUserService().get_user_detail(user_id)
@@ -54,7 +54,7 @@ def run_user_support_action(
     user_id: str,
     action: str,
     request: UserSupportActionRequest | None = None,
-    _admin: None = Depends(require_admin_import_token),
+    admin: dict[str, Any] = Depends(require_admin_permission("users:write")),
 ) -> dict[str, Any]:
     if action not in {"resend_confirmation", "force_logout", "disable", "enable"}:
         raise HTTPException(
@@ -66,6 +66,15 @@ def run_user_support_action(
             },
         )
     try:
+        if action in {"disable", "force_logout"} and _is_self_target(admin, user_id):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "unsafe_self_admin_action",
+                    "message": "You cannot disable or force logout your own admin session.",
+                    "retryable": False,
+                },
+            )
         service = AdminUserService()
         if action == "resend_confirmation":
             email = str(request.email if request else "").strip().lower()
@@ -106,9 +115,18 @@ def run_user_support_action(
 def update_admin_user_role(
     user_id: str,
     request: AdminRoleUpdateRequest,
-    _admin: None = Depends(require_admin_import_token),
+    admin: dict[str, Any] = Depends(require_admin_permission("users:write")),
 ) -> dict[str, Any]:
     try:
+        if _is_self_target(admin, user_id) and not request.isAdmin:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "unsafe_self_admin_action",
+                    "message": "You cannot remove admin access from your own active session.",
+                    "retryable": False,
+                },
+            )
         payload = AdminUserService().update_admin_role(
             user_id=user_id,
             role=request.role,
@@ -142,7 +160,7 @@ def update_admin_user_role(
 def list_admin_users(
     q: str | None = Query(default=None, min_length=1),
     limit: int = Query(50, ge=1, le=100),
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     action = "admin_users.searched" if q else "admin_users.viewed"
     try:
@@ -186,3 +204,8 @@ def _record_audit(
         )
     except Exception:
         return
+
+
+def _is_self_target(admin: dict[str, Any], user_id: str) -> bool:
+    admin_id = str(admin.get("id") or "").strip()
+    return bool(admin_id and admin_id == user_id)

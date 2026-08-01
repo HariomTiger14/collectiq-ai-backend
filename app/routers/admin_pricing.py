@@ -24,6 +24,10 @@ class PricingOverrideRequest(BaseModel):
     note: str | None = Field(default=None, max_length=1000)
 
 
+class BulkPricingActionRequest(BaseModel):
+    itemIds: list[str] = Field(min_length=1, max_length=100)
+
+
 @router.get("/health")
 def pricing_health(
     _admin: None = Depends(require_admin_import_token),
@@ -97,6 +101,7 @@ def mark_pricing_reviewed(
             "review_item_not_found",
             str(error),
         ) from error
+
     except ReviewQueueRepositoryError as error:
         _record_audit(
             action="pricing_review_queue.mark_reviewed",
@@ -192,6 +197,7 @@ def retry_review_queue_pricing(
             "review_item_not_found",
             str(error),
         ) from error
+
     except ReviewQueueItemNotPriceableError as error:
         _record_audit(
             action="pricing_review_queue.retry_pricing",
@@ -217,6 +223,42 @@ def retry_review_queue_pricing(
             str(error),
             retryable=True,
         ) from error
+
+
+@router.post("/review-queue-actions/reviewed")
+def bulk_mark_pricing_reviewed(
+    request: BulkPricingActionRequest,
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    payload = AdminPricingReviewQueueService().bulk_mark_reviewed(request.itemIds)
+    _record_audit(
+        action="pricing_review_queue.bulk_mark_reviewed",
+        status="success" if payload.get("success") else "failure",
+        metadata={
+            "requested": payload.get("requested"),
+            "completed": payload.get("completed"),
+            "failed": payload.get("failed"),
+        },
+    )
+    return payload
+
+
+@router.post("/review-queue-actions/retry")
+def bulk_retry_review_queue_pricing(
+    request: BulkPricingActionRequest,
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    payload = AdminPricingReviewQueueService().bulk_retry_pricing(request.itemIds)
+    _record_audit(
+        action="pricing_review_queue.bulk_retry_pricing",
+        status="success" if payload.get("success") else "failure",
+        metadata={
+            "requested": payload.get("requested"),
+            "completed": payload.get("completed"),
+            "failed": payload.get("failed"),
+        },
+    )
+    return payload
 
 
 def _review_queue_error(
