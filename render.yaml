@@ -99,3 +99,27 @@ services:
         sync: false
       - key: PRICECHARTING_CSV_ONE_PIECE_URL
         sync: false
+
+  # App-facing: evaluate saved price alerts (flip -> triggered) + dispatch pushes.
+  - type: cron
+    name: collectiq-price-alerts-sit
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    schedule: "0 */6 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m scripts.run_price_alert_pipeline --limit 1000 --push-limit 200
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ENVIRONMENT
+        value: sit
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
