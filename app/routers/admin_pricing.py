@@ -24,6 +24,11 @@ class PricingOverrideRequest(BaseModel):
     note: str | None = Field(default=None, max_length=1000)
 
 
+class PricingAssignmentRequest(BaseModel):
+    assignee: str | None = Field(default=None, max_length=120)
+    status: str = Field(default="open", pattern="^(open|in_review|done)$")
+
+
 class BulkPricingActionRequest(BaseModel):
     itemIds: list[str] = Field(min_length=1, max_length=100)
 
@@ -156,6 +161,55 @@ def override_review_queue_price(
     except ReviewQueueRepositoryError as error:
         _record_audit(
             action="pricing_review_queue.override_price",
+            status="failure",
+            target_id=item_id,
+            metadata={"error": str(error)},
+        )
+        raise _review_queue_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "review_queue_unavailable",
+            str(error),
+            retryable=True,
+        ) from error
+
+
+@router.patch("/review-queue/{item_id}/assignment")
+def assign_pricing_review_item(
+    item_id: str,
+    request: PricingAssignmentRequest,
+    _admin: None = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    try:
+        payload = AdminPricingReviewQueueService().assign_item(
+            item_id,
+            assignee=request.assignee,
+            status=request.status,
+        )
+        _record_audit(
+            action="pricing_review_queue.assign",
+            status="success",
+            target_id=item_id,
+            metadata={
+                "assignee": request.assignee,
+                "assignmentStatus": request.status,
+            },
+        )
+        return payload
+    except ReviewQueueItemNotFoundError as error:
+        _record_audit(
+            action="pricing_review_queue.assign",
+            status="failure",
+            target_id=item_id,
+            metadata={"error": str(error)},
+        )
+        raise _review_queue_error(
+            status.HTTP_404_NOT_FOUND,
+            "review_item_not_found",
+            str(error),
+        ) from error
+    except ReviewQueueRepositoryError as error:
+        _record_audit(
+            action="pricing_review_queue.assign",
             status="failure",
             target_id=item_id,
             metadata={"error": str(error)},

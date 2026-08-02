@@ -234,6 +234,37 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
         self.assertFalse(data["needsReview"])
         self.assertEqual(data["reviewStatus"], "pricing_retried")
 
+    def test_assign_pricing_review_item_persists_assignment(self) -> None:
+        portfolio_service.add_item(
+            PortfolioCreateRequest(
+                id="assign-me",
+                data={
+                    "title": "Assign Card",
+                    "category": "Trading Card",
+                    "needsReview": True,
+                    "pricing": {"estimatedMarketValue": 0, "pricingConfidence": 0},
+                },
+            )
+        )
+
+        with patch("app.routers.admin_auth.settings") as settings:
+            settings.admin_import_token = "secret-token"
+            response = self.client.patch(
+                "/admin/pricing/review-queue/assign-me/assignment",
+                headers={"Authorization": "Bearer secret-token"},
+                json={"assignee": "pricing@packlox.com", "status": "in_review"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["assignment"]["assignee"], "pricing@packlox.com")
+        self.assertEqual(payload["assignment"]["status"], "in_review")
+        data = portfolio_service.get_item("assign-me").data
+        self.assertEqual(data["pricingAssignee"], "pricing@packlox.com")
+        self.assertEqual(data["pricingAssignmentStatus"], "in_review")
+        self.assertEqual(data["pricingAssignment"]["assignee"], "pricing@packlox.com")
+
     def test_supabase_review_queue_lists_persistent_portfolio_items(self) -> None:
         client = _FakeSupabaseClient(
             get_rows=[
@@ -444,6 +475,54 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
         self.assertEqual(patch_request["json"]["estimated_value_low"], 110.0)
         self.assertEqual(patch_request["json"]["estimated_value_high"], 140.0)
         self.assertEqual(patch_request["json"]["pricing"]["estimatedMarketValue"], 125.0)
+
+    def test_supabase_assign_pricing_review_item_patches_persistent_item(self) -> None:
+        client = _FakeSupabaseClient(
+            get_rows=[
+                {
+                    "id": "supabase-assign",
+                    "data": {
+                        "title": "Assign Me",
+                        "category": "Trading Card",
+                        "needsReview": True,
+                    },
+                    "pricing": {"estimatedMarketValue": 0, "pricingConfidence": 0},
+                }
+            ],
+            patch_rows=[
+                {
+                    "id": "supabase-assign",
+                    "data": {
+                        "title": "Assign Me",
+                        "category": "Trading Card",
+                        "needsReview": True,
+                        "pricingAssignee": "ops@packlox.com",
+                        "pricingAssignmentStatus": "in_review",
+                    },
+                    "pricing": {"estimatedMarketValue": 0, "pricingConfidence": 0},
+                }
+            ],
+        )
+        service = AdminPricingReviewQueueService(
+            repository=SupabasePricingReviewQueueRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.assign_item(
+            "supabase-assign",
+            assignee="ops@packlox.com",
+            status="in_review",
+        )
+
+        self.assertTrue(payload["success"])
+        patch_request = client.requests[-1]
+        self.assertEqual(patch_request["method"], "PATCH")
+        self.assertEqual(patch_request["params"]["id"], "eq.supabase-assign")
+        self.assertEqual(patch_request["json"]["data"]["pricingAssignee"], "ops@packlox.com")
+        self.assertEqual(patch_request["json"]["data"]["pricingAssignmentStatus"], "in_review")
 
 
 class _FakeSupabaseClient:

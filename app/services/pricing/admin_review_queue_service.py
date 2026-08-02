@@ -167,6 +167,46 @@ class AdminPricingReviewQueueService:
             "note": update_data["adminReviewNote"],
         }
 
+    def assign_item(
+        self,
+        item_id: str,
+        *,
+        assignee: str | None = None,
+        status: str = "open",
+    ) -> dict[str, Any]:
+        item = (
+            self._repository.get_item(item_id)
+            if self._repository.is_configured
+            else portfolio_service.get_item(item_id)
+        )
+        if item is None:
+            raise ReviewQueueItemNotFoundError(f"Portfolio item {item_id} was not found.")
+        normalized_status = status.strip().lower() if isinstance(status, str) else "open"
+        if normalized_status not in {"open", "in_review", "done"}:
+            normalized_status = "open"
+        normalized_assignee = assignee.strip() if isinstance(assignee, str) and assignee.strip() else None
+        updated_at = _utc_now()
+        assignment = {
+            "assignee": normalized_assignee,
+            "status": normalized_status,
+            "updatedAt": updated_at,
+        }
+        update_data = {
+            "pricingAssignment": assignment,
+            "pricingAssignee": normalized_assignee,
+            "pricingAssignmentStatus": normalized_status,
+            "pricingAssignmentUpdatedAt": updated_at,
+        }
+        if self._repository.is_configured:
+            self._repository.update_item_data(item_id, update_data)
+        else:
+            portfolio_service.update_item_data(item_id, update_data)
+        return {
+            "success": True,
+            "itemId": item_id,
+            "assignment": assignment,
+        }
+
     def bulk_mark_reviewed(self, item_ids: list[str]) -> dict[str, Any]:
         return _bulk_result(item_ids, self.mark_reviewed)
 
@@ -333,6 +373,22 @@ def _review_item_from_portfolio(item: PortfolioItem) -> dict[str, Any] | None:
         "lastPricedAt": last_priced_at,
         "createdAt": _first_text(data, "createdAt", "created_at"),
         "updatedAt": _first_text(data, "updatedAt", "updated_at"),
+        "assignment": _assignment_payload(data),
+    }
+
+
+def _assignment_payload(data: dict[str, Any]) -> dict[str, Any]:
+    assignment = data.get("pricingAssignment")
+    if isinstance(assignment, dict):
+        return {
+            "assignee": _first_text(assignment, "assignee"),
+            "status": _first_text(assignment, "status") or "open",
+            "updatedAt": _first_text(assignment, "updatedAt", "updated_at"),
+        }
+    return {
+        "assignee": _first_text(data, "pricingAssignee"),
+        "status": _first_text(data, "pricingAssignmentStatus") or "open",
+        "updatedAt": _first_text(data, "pricingAssignmentUpdatedAt"),
     }
 
 
