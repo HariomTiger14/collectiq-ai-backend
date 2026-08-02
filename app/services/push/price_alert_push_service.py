@@ -224,6 +224,8 @@ class PriceAlertPushService:
         }
 
     def _normalize_delivery(self, row: dict[str, Any]) -> dict[str, Any]:
+        raw_json = row.get("raw_json") if isinstance(row.get("raw_json"), dict) else {}
+        device = raw_json.get("device") if isinstance(raw_json.get("device"), dict) else {}
         return {
             "id": row.get("id"),
             "kind": "Price-alert delivery",
@@ -239,6 +241,37 @@ class PriceAlertPushService:
             "body": row.get("body"),
             "errorMessage": row.get("error_message"),
             "providerMessageId": row.get("provider_message_id"),
+            "deviceId": row.get("device_id") or device.get("id"),
+            "deviceTokenId": row.get("device_id") or device.get("id"),
+        }
+
+    def disable_device_registration(self, device_id: str) -> dict[str, Any]:
+        self._ensure_configured(require_firebase=False)
+        device_id = device_id.strip()
+        if not device_id:
+            raise PushNotificationError("Device registration id is required.")
+        response = self._supabase_request(
+            "PATCH",
+            "/rest/v1/push_device_registrations",
+            params={"id": f"eq.{device_id}"},
+            headers={"Prefer": "return=representation"},
+            json={
+                "enabled": False,
+                "status": "disabled_by_admin",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        rows = response.json()
+        if isinstance(rows, list) and rows:
+            return {
+                "deviceId": device_id,
+                "disabled": True,
+                "device": rows[0],
+            }
+        return {
+            "deviceId": device_id,
+            "disabled": False,
+            "message": "No matching device registration was updated.",
         }
 
     def _ensure_configured(self, *, require_firebase: bool) -> None:

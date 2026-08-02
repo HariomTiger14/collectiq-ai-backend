@@ -104,3 +104,21 @@ async def list_push_delivery_history(
                 "retryable": True,
             },
         ) from error
+
+
+@router.post("/devices/{device_id}/disable")
+async def disable_push_device_registration(
+    device_id: str,
+    _admin: None = Depends(require_admin_job_token),
+) -> dict:
+    try:
+        return PriceAlertPushService().disable_device_registration(device_id)
+    except PushNotificationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "push_device_cleanup_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error

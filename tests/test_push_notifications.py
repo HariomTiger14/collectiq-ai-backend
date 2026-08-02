@@ -123,6 +123,29 @@ class PushNotificationServiceTest(unittest.TestCase):
         self.assertEqual(history["sent"], 1)
         self.assertEqual(history["failed"], 1)
         self.assertEqual(history["deliveries"][0]["portfolioItemId"], "item-1")
+        self.assertEqual(history["deliveries"][1]["deviceId"], "device-2")
+
+    def test_disable_device_registration_marks_token_disabled(self) -> None:
+        client = _FakePushHttpClient()
+        service = PriceAlertPushService(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            firebase_project_id="packlox-test",
+            firebase_access_token="",
+            client=client,
+        )
+
+        result = service.disable_device_registration("device-2")
+
+        self.assertTrue(result["disabled"])
+        patch_request = [
+            request
+            for request in client.requests
+            if request["method"] == "PATCH" and "push_device_registrations" in request["url"]
+        ][0]
+        self.assertEqual(patch_request["params"]["id"], "eq.device-2")
+        self.assertFalse(patch_request["json"]["enabled"])
+        self.assertEqual(patch_request["json"]["status"], "disabled_by_admin")
 
 
 class _FakePushHttpClient:
@@ -144,10 +167,21 @@ class _FakePushHttpClient:
                     }
                 ]
             )
+        if "push_device_registrations" in url and method == "PATCH":
+            return _response(
+                [
+                    {
+                        "id": kwargs["params"]["id"].removeprefix("eq."),
+                        "enabled": False,
+                        "status": "disabled_by_admin",
+                    }
+                ]
+            )
         if "push_device_registrations" in url:
             return _response(
                 [
                     {
+                        "id": "device-1",
                         "user_id": "user-1",
                         "device_token": "device-token-1",
                         "provider": "fcm",
@@ -184,6 +218,7 @@ class _FakePushHttpClient:
                         "status": "failed",
                         "error_message": "FCM rejected token.",
                         "created_at": "2026-08-02T01:05:00Z",
+                        "raw_json": {"device": {"id": "device-2"}},
                     },
                 ]
             )
