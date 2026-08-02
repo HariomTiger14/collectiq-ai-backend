@@ -1,6 +1,25 @@
+# ⚠️ DOCUMENTATION MIRROR — NOT the source of truth.
+# This Render project is managed manually in the Render dashboard (project
+# "PackLox"), NOT provisioned from this file. Service names, the web service's
+# Docker runtime, and the full secret set live in the dashboard. Keep this file
+# in sync by hand as a readable spec; editing it does NOT change Render.
+#
+# Live services (dashboard):
+#   packlox-api-sit                     web  (Docker)   — FastAPI app
+#   collectiq-pricecharting-refresh-sit cron (Python 3) — daily catalog refresh
+#   packlox-batch-reprice-sit           cron (Python 3) — daily batch re-pricing
+#   packlox-price-alerts-sit            cron (Python 3) — 6-hourly alert pipeline
+#
+# The two app-facing crons call the deployed web service over HTTP (so all the
+# pricing / Supabase / Firebase secrets live only on packlox-api-sit and are not
+# duplicated per-cron). Each cron therefore needs just PUBLIC_API_URL +
+# ADMIN_JOB_TOKEN.
+
 services:
   - type: web
-    name: collectiq-ai-backend-sit
+    name: packlox-api-sit
+    # Live runtime is Docker (has a Dockerfile); shown as python here only for
+    # the env reference below.
     runtime: python
     plan: starter
     region: oregon
@@ -38,8 +57,10 @@ services:
         value: "true"
       - key: AI_PROVIDER
         value: auto
+      # Set to "auto" (with a real pricing key below) for live market values;
+      # "mock" makes every valuation come back unavailable.
       - key: PRICING_PROVIDER
-        value: mock
+        value: auto
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL
@@ -56,7 +77,40 @@ services:
         value: "900"
       - key: PRICING_PROVIDER_MIN_INTERVAL_MS
         value: "250"
+      # Real pricing providers (auto routes by category → tcgplayer/pricecharting
+      # /ebay for cards, kicksdb for sneakers). TCGPLAYER_* is not configured;
+      # cards fall back to PriceCharting + eBay.
+      - key: PRICECHARTING_API_KEY
+        sync: false
+      - key: EBAY_ACCESS_TOKEN
+        sync: false
+      - key: EBAY_CLIENT_ID
+        sync: false
+      - key: EBAY_CLIENT_SECRET
+        sync: false
+      - key: EBAY_OAUTH_TOKEN_URL
+        sync: false
+      - key: EBAY_BROWSE_API_URL
+        sync: false
+      - key: EBAY_MARKETPLACE_ID
+        sync: false
+      - key: EBAY_TIMEOUT_SECONDS
+        sync: false
+      - key: KICKSDB_API_KEY
+        sync: false
+      - key: KICKSDB_API_BASE
+        sync: false
+      - key: KICKSDB_PROVIDER_ENABLED
+        sync: false
+      # Push (price-alert dispatch runs here when the alerts cron calls the API).
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      # Admin auth: crons authenticate to the /admin endpoints with this token.
       - key: ADMIN_IMPORT_TOKEN
+        sync: false
+      - key: ADMIN_JOB_TOKEN
         sync: false
       - key: ADMIN_PROFILE_TABLE
         value: profiles
@@ -101,63 +155,46 @@ services:
         sync: false
 
   # App-facing: batch re-price every portfolio item (persist refreshed values).
-  # Runs after the PriceCharting catalog refresh (14:30) so it prices against
-  # fresh data. No-op while PRICING_PROVIDER=mock — never zeroes existing values.
+  # Calls the deployed web service, which owns all the pricing env; the endpoint
+  # no-ops safely while PRICING_PROVIDER=mock (never zeroes existing values).
+  # Runs after the PriceCharting catalog refresh (14:30) so it prices fresh data.
+  #
+  # NOTE: if this cron instead runs the standalone script
+  #   python -m scripts.run_batch_repricing --limit 5000 --page-size 200
+  # then it needs the FULL pricing env (SUPABASE_*, PRICING_PROVIDER=auto,
+  # PRICECHARTING_API_KEY, EBAY_*, KICKSDB_*) on the cron itself.
   - type: cron
-    name: collectiq-batch-reprice-sit
+    name: packlox-batch-reprice-sit
     runtime: python
     plan: starter
     region: oregon
     branch: main
     schedule: "0 16 * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m scripts.run_batch_repricing --limit 5000 --page-size 200
+    startCommand: curl -fsS -X POST "$PUBLIC_API_URL/admin/pricing/reprice-all?limit=5000" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.8
-      - key: ENVIRONMENT
-        value: sit
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false
-      - key: PRICING_PROVIDER
-        value: mock
-      - key: PRICING_CACHE_TTL_SECONDS
-        value: "900"
-      - key: PRICING_PROVIDER_MIN_INTERVAL_MS
-        value: "250"
-      - key: PRICECHARTING_CSV_VIDEO_GAMES_URL
-        sync: false
-      - key: PRICECHARTING_CSV_POKEMON_URL
-        sync: false
-      - key: PRICECHARTING_CSV_MAGIC_URL
-        sync: false
-      - key: PRICECHARTING_CSV_YUGIOH_URL
-        sync: false
-      - key: PRICECHARTING_CSV_ONE_PIECE_URL
+      - key: PUBLIC_API_URL
+        value: https://api-sit.packlox.com
+      - key: ADMIN_JOB_TOKEN
         sync: false
 
   # App-facing: evaluate saved price alerts (flip -> triggered) + dispatch pushes.
+  # /admin/push/price-alerts/run does evaluate + dispatch in one call.
+  #
+  # NOTE: standalone-script alternative
+  #   python -m scripts.run_price_alert_pipeline --limit 1000 --push-limit 200
+  # needs SUPABASE_* + FIREBASE_* on the cron itself.
   - type: cron
-    name: collectiq-price-alerts-sit
+    name: packlox-price-alerts-sit
     runtime: python
     plan: starter
     region: oregon
     branch: main
     schedule: "0 */6 * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m scripts.run_price_alert_pipeline --limit 1000 --push-limit 200
+    startCommand: curl -fsS -X POST "$PUBLIC_API_URL/admin/push/price-alerts/run?limit=200" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.8
-      - key: ENVIRONMENT
-        value: sit
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false
-      - key: FIREBASE_PROJECT_ID
-        sync: false
-      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+      - key: PUBLIC_API_URL
+        value: https://api-sit.packlox.com
+      - key: ADMIN_JOB_TOKEN
         sync: false
