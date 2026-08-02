@@ -122,3 +122,42 @@ def test_dry_run_reports_but_does_not_patch():
     assert summary.triggered == 1
     assert summary.dry_run is True
     assert patched == []
+
+
+def test_notified_alert_rearms_when_condition_clears():
+    service, patched = _service(
+        alerts=[
+            _alert(
+                status="notified",
+                rule_type="priceRisesAboveAmount",
+                target_amount=100,
+            )
+        ],
+        items=[_item(50)],  # no longer above 100 -> re-arm
+    )
+    summary = service.evaluate_and_flag()
+
+    assert summary.triggered == 0
+    assert summary.rearmed == 1
+    assert len(patched) == 1
+    assert patched[0]["body"]["status"] == "active"
+    assert patched[0]["body"]["triggered_at"] is None
+    assert patched[0]["body"]["notified_at"] is None
+
+
+def test_notified_alert_stays_when_still_met():
+    service, patched = _service(
+        alerts=[
+            _alert(
+                status="notified",
+                rule_type="priceRisesAboveAmount",
+                target_amount=100,
+            )
+        ],
+        items=[_item(150)],  # still above 100 -> stay notified, no re-push
+    )
+    summary = service.evaluate_and_flag()
+
+    assert summary.triggered == 0
+    assert summary.rearmed == 0
+    assert patched == []

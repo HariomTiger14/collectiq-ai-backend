@@ -95,6 +95,7 @@ class PriceAlertPushService:
                     )
                 continue
 
+            alert_sent = False
             for device in devices:
                 attempted += 1
                 if dry_run:
@@ -103,6 +104,7 @@ class PriceAlertPushService:
                 status, provider_message_id, error_message = self._send_fcm(alert, device)
                 if status == "sent":
                     sent += 1
+                    alert_sent = True
                 else:
                     failed += 1
                 self._log_delivery(
@@ -112,6 +114,12 @@ class PriceAlertPushService:
                     provider_message_id=provider_message_id,
                     error_message=error_message,
                 )
+
+            # Notify-once: once a push has gone out for this trigger, move the
+            # alert out of `triggered` so the next scheduled run does not re-push
+            # it. The evaluator re-arms it to `active` when the condition clears.
+            if alert_sent and not dry_run:
+                self._mark_notified(alert)
 
         return PushDeliverySummary(
             success=failed == 0,
@@ -285,6 +293,24 @@ class PriceAlertPushService:
             )
         ):
             raise PushNotificationError("Firebase push configuration is missing.")
+
+    def _mark_notified(self, alert: dict[str, Any]) -> None:
+        """Flip a just-pushed alert triggered -> notified so it is not re-pushed."""
+        iso = datetime.now(timezone.utc).isoformat()
+        self._supabase_request(
+            "PATCH",
+            "/rest/v1/price_alerts",
+            params={
+                "id": f"eq.{alert['id']}",
+                "user_id": f"eq.{alert['user_id']}",
+            },
+            headers={"Prefer": "return=minimal"},
+            json={
+                "status": "notified",
+                "notified_at": iso,
+                "updated_at": iso,
+            },
+        )
 
     def _fetch_triggered_alerts(self, *, limit: int) -> list[dict[str, Any]]:
         response = self._supabase_request(

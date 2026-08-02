@@ -171,10 +171,10 @@ services:
     branch: main
     schedule: "0 16 * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: curl -fsS -X POST "$PUBLIC_API_URL/admin/pricing/reprice-all?limit=5000" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"
+    # URL hardcoded (not $PUBLIC_API_URL) — the env var wasn't reliably present
+    # on the cron, so curl got an empty host and failed with "(3) bad/illegal URL".
+    startCommand: curl -fsS -X POST "https://api-sit.packlox.com/admin/pricing/reprice-all?limit=5000" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"
     envVars:
-      - key: PUBLIC_API_URL
-        value: https://api-sit.packlox.com
       - key: ADMIN_JOB_TOKEN
         sync: false
 
@@ -192,9 +192,7 @@ services:
     branch: main
     schedule: "0 */6 * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: curl -fsS -X POST "$PUBLIC_API_URL/admin/push/price-alerts/run?limit=200" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"
+    startCommand: curl -fsS -X POST "https://api-sit.packlox.com/admin/push/price-alerts/run?limit=200" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"
     envVars:
-      - key: PUBLIC_API_URL
-        value: https://api-sit.packlox.com
       - key: ADMIN_JOB_TOKEN
         sync: false

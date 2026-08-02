@@ -47,6 +47,46 @@ class PushNotificationServiceTest(unittest.TestCase):
         self.assertEqual(len(delivery_logs), 1)
         self.assertEqual(delivery_logs[0]["json"][0]["status"], "sent")
 
+    def test_sent_alert_is_marked_notified(self) -> None:
+        client = _FakePushHttpClient()
+        service = PriceAlertPushService(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            firebase_project_id="packlox-test",
+            firebase_access_token="firebase-access",
+            client=client,
+        )
+
+        service.dispatch_triggered_alerts(dry_run=False)
+
+        notified = [
+            request
+            for request in client.requests
+            if request["method"] == "PATCH" and "price_alerts" in request["url"]
+        ]
+        self.assertEqual(len(notified), 1)
+        self.assertEqual(notified[0]["json"]["status"], "notified")
+        self.assertIn("notified_at", notified[0]["json"])
+
+    def test_dry_run_does_not_mark_notified(self) -> None:
+        client = _FakePushHttpClient()
+        service = PriceAlertPushService(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            firebase_project_id="packlox-test",
+            firebase_access_token="",
+            client=client,
+        )
+
+        service.dispatch_triggered_alerts(dry_run=True)
+
+        notified = [
+            request
+            for request in client.requests
+            if request["method"] == "PATCH" and "price_alerts" in request["url"]
+        ]
+        self.assertEqual(notified, [])
+
     def test_test_notification_sends_to_registered_devices(self) -> None:
         client = _FakePushHttpClient()
         service = PriceAlertPushService(

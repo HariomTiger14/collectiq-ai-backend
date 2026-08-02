@@ -23,6 +23,7 @@ from app.core.config import settings
 class EvaluationSummary:
     evaluated: int = 0
     triggered: int = 0
+    rearmed: int = 0
     triggered_alerts: list[dict[str, Any]] = field(default_factory=list)
     dry_run: bool = False
 
@@ -30,6 +31,7 @@ class EvaluationSummary:
         return {
             "evaluated": self.evaluated,
             "triggered": self.triggered,
+            "rearmed": self.rearmed,
             "triggeredAlerts": self.triggered_alerts,
             "dryRun": self.dry_run,
         }
@@ -79,6 +81,16 @@ class PriceAlertEvaluationService:
             if item is None:
                 continue
             message = self._evaluate(alert, item, current_time)
+            status = alert.get("status")
+            if status == "notified":
+                # Already pushed. Re-arm to `active` once the condition clears so
+                # it can trigger (and push) again later; otherwise leave it.
+                if not message:
+                    summary.rearmed += 1
+                    if not dry_run:
+                        self._rearm(alert, current_time)
+                continue
+            # status == "active"
             if not message:
                 continue
             summary.triggered += 1
@@ -102,7 +114,9 @@ class PriceAlertEvaluationService:
             params={
                 "select": "*",
                 "enabled": "eq.true",
-                "status": "eq.active",
+                # `active` alerts may promote to triggered; `notified` alerts may
+                # re-arm to active once their condition clears.
+                "status": "in.(active,notified)",
                 "limit": str(limit),
             },
         )
@@ -144,6 +158,27 @@ class PriceAlertEvaluationService:
                 "status": "triggered",
                 "triggered_at": alert.get("triggered_at") or iso,
                 "message": message,
+                "updated_at": iso,
+            },
+        )
+
+    def _rearm(self, alert: dict[str, Any], now: datetime) -> None:
+        """Reset a notified alert back to active once its condition clears, so a
+        future crossing can trigger (and push) again."""
+        iso = now.isoformat()
+        self._supabase_request(
+            "PATCH",
+            "/rest/v1/price_alerts",
+            params={
+                "id": f"eq.{alert['id']}",
+                "user_id": f"eq.{alert['user_id']}",
+            },
+            headers={"Prefer": "return=minimal"},
+            json={
+                "status": "active",
+                "triggered_at": None,
+                "notified_at": None,
+                "message": None,
                 "updated_at": iso,
             },
         )
