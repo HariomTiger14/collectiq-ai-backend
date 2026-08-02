@@ -195,6 +195,52 @@ class PriceAlertPushService:
             skipped_deliveries=skipped,
         )
 
+    def delivery_history(self, *, limit: int = 25) -> dict[str, Any]:
+        self._ensure_configured(require_firebase=False)
+        response = self._supabase_request(
+            "GET",
+            "/rest/v1/push_notification_deliveries",
+            params={
+                "select": "*",
+                "order": "created_at.desc.nullslast,sent_at.desc.nullslast",
+                "limit": str(limit),
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise PushNotificationError("Push delivery history response was invalid.")
+
+        deliveries = [self._normalize_delivery(row) for row in rows]
+        sent = sum(1 for row in deliveries if row["status"] == "sent")
+        failed = sum(1 for row in deliveries if row["status"] == "failed")
+        skipped = sum(1 for row in deliveries if row["status"] == "skipped")
+        return {
+            "source": "push_notification_deliveries",
+            "count": len(deliveries),
+            "sent": sent,
+            "failed": failed,
+            "skipped": skipped,
+            "deliveries": deliveries,
+        }
+
+    def _normalize_delivery(self, row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": row.get("id"),
+            "kind": "Price-alert delivery",
+            "status": row.get("status") or "unknown",
+            "createdAt": row.get("created_at") or row.get("sent_at"),
+            "sentAt": row.get("sent_at"),
+            "userId": row.get("user_id"),
+            "priceAlertId": row.get("price_alert_id"),
+            "portfolioItemId": row.get("portfolio_item_id"),
+            "provider": row.get("provider") or "fcm",
+            "platform": row.get("platform"),
+            "title": row.get("title"),
+            "body": row.get("body"),
+            "errorMessage": row.get("error_message"),
+            "providerMessageId": row.get("provider_message_id"),
+        }
+
     def _ensure_configured(self, *, require_firebase: bool) -> None:
         if not self._supabase_url or not self._service_role_key:
             raise PushNotificationError("Supabase service role configuration is missing.")

@@ -86,3 +86,21 @@ async def send_test_price_alert_push_notification(
         ) from error
 
     return {**summary.to_dict(), "dryRun": dry_run}
+
+
+@router.get("/history")
+async def list_push_delivery_history(
+    limit: int = Query(25, ge=1, le=100),
+    _admin: None = Depends(require_admin_job_token),
+) -> dict:
+    try:
+        return PriceAlertPushService().delivery_history(limit=limit)
+    except PushNotificationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "push_history_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error

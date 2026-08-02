@@ -106,6 +106,24 @@ class PushNotificationServiceTest(unittest.TestCase):
             },
         )
 
+    def test_delivery_history_reads_recent_delivery_rows(self) -> None:
+        client = _FakePushHttpClient()
+        service = PriceAlertPushService(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            firebase_project_id="packlox-test",
+            firebase_access_token="",
+            client=client,
+        )
+
+        history = service.delivery_history(limit=10)
+
+        self.assertEqual(history["source"], "push_notification_deliveries")
+        self.assertEqual(history["count"], 2)
+        self.assertEqual(history["sent"], 1)
+        self.assertEqual(history["failed"], 1)
+        self.assertEqual(history["deliveries"][0]["portfolioItemId"], "item-1")
+
 
 class _FakePushHttpClient:
     def __init__(self) -> None:
@@ -135,6 +153,38 @@ class _FakePushHttpClient:
                         "provider": "fcm",
                         "platform": "ios",
                     }
+                ]
+            )
+        if "push_notification_deliveries" in url and method == "GET":
+            return _response(
+                [
+                    {
+                        "id": "delivery-1",
+                        "user_id": "user-1",
+                        "price_alert_id": "alert-1",
+                        "portfolio_item_id": "item-1",
+                        "provider": "fcm",
+                        "platform": "ios",
+                        "title": "Price alert triggered",
+                        "body": "Charizard rose above USD 200.",
+                        "status": "sent",
+                        "provider_message_id": "message-1",
+                        "sent_at": "2026-08-02T01:00:00Z",
+                        "created_at": "2026-08-02T01:00:00Z",
+                    },
+                    {
+                        "id": "delivery-2",
+                        "user_id": "user-2",
+                        "price_alert_id": "alert-2",
+                        "portfolio_item_id": "item-2",
+                        "provider": "fcm",
+                        "platform": "android",
+                        "title": "Price alert triggered",
+                        "body": "Delivery failed.",
+                        "status": "failed",
+                        "error_message": "FCM rejected token.",
+                        "created_at": "2026-08-02T01:05:00Z",
+                    },
                 ]
             )
         if "push_notification_deliveries" in url:
