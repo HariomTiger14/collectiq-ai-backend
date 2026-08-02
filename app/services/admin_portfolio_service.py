@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from app.schemas.portfolio import PortfolioItem
@@ -52,6 +53,38 @@ class AdminPortfolioService:
             "item": _compact_portfolio_item(item, include_raw=True),
         }
 
+    def update_item(self, item_id: str, updates: dict[str, Any], *, actor: str = "admin") -> dict[str, Any]:
+        current = (
+            self._repository.get_item(item_id)
+            if self._repository.is_configured
+            else portfolio_service.get_item(item_id)
+        )
+        if current is None:
+            raise KeyError(f"Portfolio item {item_id} was not found.")
+
+        update_data = _editable_portfolio_updates(updates)
+        if not update_data:
+            return {
+                "success": True,
+                "item": _compact_portfolio_item(current, include_raw=True),
+                "updated": False,
+                "message": "No editable fields were supplied.",
+            }
+        update_data["adminLastEditedAt"] = datetime.now(timezone.utc).isoformat()
+        update_data["adminLastEditedBy"] = actor
+        item = (
+            self._repository.update_item_data(item_id, update_data)
+            if self._repository.is_configured
+            else portfolio_service.update_item_data(item_id, update_data)
+        )
+        if item is None:
+            raise KeyError(f"Portfolio item {item_id} was not found.")
+        return {
+            "success": True,
+            "updated": True,
+            "item": _compact_portfolio_item(item, include_raw=True),
+        }
+
 
 def _portfolio_search_text(item: PortfolioItem) -> str:
     data = item.data
@@ -86,6 +119,7 @@ def _compact_portfolio_item(item: PortfolioItem, *, include_raw: bool = False) -
         "provider": _provider_name(pricing),
         "confidence": _first_value(data, pricing, "pricingConfidence", "confidence", "confidenceScore"),
         "valuationStatus": _first_text(data, "valuationStatus", "reviewStatus") or "unknown",
+        "adminNotes": _first_text(data, "adminNotes", "adminNote"),
         "needsReview": bool(data.get("needsReview") or data.get("requiresReview")),
         "updatedAt": _first_text(data, "updatedAt", "updated_at", "lastUpdated"),
         "createdAt": _first_text(data, "createdAt", "created_at"),
@@ -99,6 +133,46 @@ def _compact_portfolio_item(item: PortfolioItem, *, include_raw: bool = False) -
         payload["raw"] = data
         payload["pricing"] = pricing
     return payload
+
+
+def _editable_portfolio_updates(updates: dict[str, Any]) -> dict[str, Any]:
+    cleaned: dict[str, Any] = {}
+    text_fields = {
+        "category": "category",
+        "condition": "condition",
+        "adminNotes": "adminNotes",
+        "valuationStatus": "valuationStatus",
+        "reviewStatus": "reviewStatus",
+        "pricingProvider": "pricingProvider",
+        "currency": "currency",
+    }
+    for source_key, target_key in text_fields.items():
+        value = updates.get(source_key)
+        if value is not None:
+            cleaned[target_key] = str(value).strip()
+    if "confidence" in updates and updates["confidence"] not in (None, ""):
+        cleaned["pricingConfidence"] = _bounded_number(updates["confidence"], minimum=0, maximum=100)
+    if "price" in updates and updates["price"] not in (None, ""):
+        price = _bounded_number(updates["price"], minimum=0)
+        cleaned["estimatedMarketValue"] = price
+        pricing = updates.get("pricing") if isinstance(updates.get("pricing"), dict) else {}
+        cleaned["pricing"] = {
+            **pricing,
+            "estimatedMarketValue": price,
+            "currency": cleaned.get("currency") or pricing.get("currency") or "USD",
+            "pricingConfidence": cleaned.get("pricingConfidence"),
+            "pricingSource": {"name": cleaned.get("pricingProvider") or pricing.get("pricingProvider") or "admin_override"},
+        }
+    return {key: value for key, value in cleaned.items() if value not in (None, "")}
+
+
+def _bounded_number(value: Any, *, minimum: float = 0, maximum: float | None = None) -> float:
+    number = float(value)
+    if number < minimum:
+        number = minimum
+    if maximum is not None and number > maximum:
+        number = maximum
+    return number
 
 
 def _provider_name(pricing: dict[str, Any]) -> str:

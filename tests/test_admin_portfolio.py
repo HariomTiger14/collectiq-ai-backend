@@ -87,6 +87,48 @@ class AdminPortfolioTest(unittest.TestCase):
         self.assertEqual(item["assignment"]["assignee"], "pricing@packlox.com")
         self.assertIn("raw", item)
 
+    def test_admin_portfolio_update_writes_editable_fields(self) -> None:
+        portfolio_service.add_item(
+            PortfolioCreateRequest(
+                id="item-update",
+                data={
+                    "title": "Editable Item",
+                    "category": "Unknown",
+                    "condition": "Unknown",
+                    "userId": "collector-1",
+                },
+            )
+        )
+
+        with patch("app.routers.admin_auth.settings") as settings:
+            settings.admin_import_token = "secret-token"
+            response = self.client.patch(
+                "/admin/portfolio/items/item-update",
+                headers={"Authorization": "Bearer secret-token"},
+                json={
+                    "category": "Sneakers",
+                    "condition": "Near Mint",
+                    "adminNotes": "Verified from admin portal.",
+                    "valuationStatus": "reviewed",
+                    "price": 212.5,
+                    "currency": "AUD",
+                    "confidence": 88,
+                    "pricingProvider": "admin_override",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["updated"])
+        item = payload["item"]
+        self.assertEqual(item["category"], "Sneakers")
+        self.assertEqual(item["condition"], "Near Mint")
+        self.assertEqual(item["price"], 212.5)
+        self.assertEqual(item["currency"], "AUD")
+        self.assertEqual(item["confidence"], 88)
+        self.assertEqual(item["valuationStatus"], "reviewed")
+        self.assertEqual(item["adminNotes"], "Verified from admin portal.")
+
 
 if __name__ == "__main__":
     unittest.main()
