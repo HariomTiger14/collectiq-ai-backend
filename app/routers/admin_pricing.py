@@ -3,8 +3,12 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from app.routers.admin_auth import require_admin_import_token
+from app.routers.admin_auth import (
+    require_admin_import_token,
+    require_admin_job_token,
+)
 from app.services.admin_audit_service import AdminAuditService
+from app.services.pricing.batch_repricing_service import BatchRepricingService
 from app.services.pricing.admin_review_queue_service import (
     AdminPricingReviewQueueService,
     ReviewQueueRepositoryError,
@@ -48,6 +52,30 @@ def pricing_health(
                 "retryable": True,
             },
         ) from error
+
+
+@router.post("/reprice-all")
+def reprice_all_portfolio_items(
+    dry_run: bool = Query(False, alias="dryRun"),
+    limit: int = Query(1000, ge=1, le=10000),
+    _admin: None = Depends(require_admin_job_token),
+) -> dict[str, Any]:
+    """Scheduled batch re-pricing: re-value every portfolio item and persist
+    refreshed values. Unavailable results are a no-op (never zero out a value).
+    """
+    summary = BatchRepricingService().reprice_all(limit=limit, dry_run=dry_run)
+    payload = summary.to_dict()
+    _record_audit(
+        action="pricing.reprice_all",
+        status="success",
+        metadata={
+            "scanned": payload["scanned"],
+            "repriced": payload["repriced"],
+            "unavailable": payload["unavailable"],
+            "dryRun": dry_run,
+        },
+    )
+    return payload
 
 
 @router.get("/review-queue")

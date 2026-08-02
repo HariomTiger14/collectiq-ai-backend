@@ -99,3 +99,65 @@ services:
         sync: false
       - key: PRICECHARTING_CSV_ONE_PIECE_URL
         sync: false
+
+  # App-facing: batch re-price every portfolio item (persist refreshed values).
+  # Runs after the PriceCharting catalog refresh (14:30) so it prices against
+  # fresh data. No-op while PRICING_PROVIDER=mock — never zeroes existing values.
+  - type: cron
+    name: collectiq-batch-reprice-sit
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    schedule: "0 16 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m scripts.run_batch_repricing --limit 5000 --page-size 200
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ENVIRONMENT
+        value: sit
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: PRICING_PROVIDER
+        value: mock
+      - key: PRICING_CACHE_TTL_SECONDS
+        value: "900"
+      - key: PRICING_PROVIDER_MIN_INTERVAL_MS
+        value: "250"
+      - key: PRICECHARTING_CSV_VIDEO_GAMES_URL
+        sync: false
+      - key: PRICECHARTING_CSV_POKEMON_URL
+        sync: false
+      - key: PRICECHARTING_CSV_MAGIC_URL
+        sync: false
+      - key: PRICECHARTING_CSV_YUGIOH_URL
+        sync: false
+      - key: PRICECHARTING_CSV_ONE_PIECE_URL
+        sync: false
+
+  # App-facing: evaluate saved price alerts (flip -> triggered) + dispatch pushes.
+  - type: cron
+    name: collectiq-price-alerts-sit
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    schedule: "0 */6 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m scripts.run_price_alert_pipeline --limit 1000 --push-limit 200
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ENVIRONMENT
+        value: sit
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
