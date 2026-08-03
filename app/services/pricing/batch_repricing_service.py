@@ -20,14 +20,19 @@ value. Only a real ``market_estimated`` result with a positive value is written.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
 from app.core.config import settings
 from app.schemas.pricing import RepriceIdentityRequest, RepriceRequest
+from app.services.pricing.base_pricing_provider import (
+    PricingProviderRateLimitError,
+    PricingProviderTimeoutError,
+)
 from app.services.pricing.reprice_service import (
     RepriceService,
     RepriceValidationError,
@@ -40,6 +45,7 @@ class RepricingSummary:
     repriced: int = 0
     unavailable: int = 0
     skipped: int = 0
+    rate_limited: int = 0
     dry_run: bool = False
     errors: list[dict[str, Any]] = field(default_factory=list)
 
@@ -49,6 +55,7 @@ class RepricingSummary:
             "repriced": self.repriced,
             "unavailable": self.unavailable,
             "skipped": self.skipped,
+            "rateLimited": self.rate_limited,
             "dryRun": self.dry_run,
             "errors": self.errors,
         }
@@ -62,6 +69,9 @@ class BatchRepricingService:
         service_role_key: str | None = None,
         client: httpx.Client | None = None,
         reprice_service: RepriceService | None = None,
+        max_rate_limit_retries: int = 3,
+        retry_backoff_seconds: float = 1.1,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._supabase_url = (
             supabase_url if supabase_url is not None else settings.supabase_url
@@ -73,6 +83,14 @@ class BatchRepricingService:
         )
         self._client = client or httpx.Client(timeout=30.0)
         self._reprice = reprice_service or RepriceService()
+        # The provider throttle REJECTS (raises) rather than waiting when calls
+        # arrive faster than its min interval (PriceCharting: 1s, shared across
+        # processes). Sweeping many same-provider items back-to-back therefore
+        # loses some to rate-limit errors. Retry those with a short backoff —
+        # slightly above the strictest interval — instead of dropping them.
+        self._max_rate_limit_retries = max(0, max_rate_limit_retries)
+        self._retry_backoff_seconds = max(0.0, retry_backoff_seconds)
+        self._sleep = sleep
 
     def reprice_all(
         self,
@@ -113,13 +131,8 @@ class BatchRepricingService:
         if request is None:
             summary.skipped += 1
             return
-        try:
-            response = self._reprice.reprice(request)
-        except RepriceValidationError:
-            summary.skipped += 1
-            return
-        except Exception as error:  # noqa: BLE001 - one bad row must not stop the sweep
-            summary.errors.append({"id": row.get("id"), "error": str(error)})
+        response = self._reprice_with_retry(request, row, summary)
+        if response is None:
             return
 
         pricing = response.pricing
@@ -135,6 +148,38 @@ class BatchRepricingService:
             except Exception as error:  # noqa: BLE001
                 summary.repriced -= 1
                 summary.errors.append({"id": row.get("id"), "error": str(error)})
+
+    def _reprice_with_retry(
+        self,
+        request: RepriceRequest,
+        row: dict[str, Any],
+        summary: RepricingSummary,
+    ):
+        """Price one item, retrying on throttle rejection (rate-limit/timeout)
+        with a backoff. Returns the RepriceResponse, or None if the row was
+        skipped or errored (counters already updated)."""
+        attempt = 0
+        while True:
+            try:
+                return self._reprice.reprice(request)
+            except RepriceValidationError:
+                summary.skipped += 1
+                return None
+            except (
+                PricingProviderRateLimitError,
+                PricingProviderTimeoutError,
+            ) as error:
+                if attempt < self._max_rate_limit_retries:
+                    attempt += 1
+                    summary.rate_limited += 1
+                    if self._retry_backoff_seconds > 0:
+                        self._sleep(self._retry_backoff_seconds)
+                    continue
+                summary.errors.append({"id": row.get("id"), "error": str(error)})
+                return None
+            except Exception as error:  # noqa: BLE001 - one bad row can't stop the sweep
+                summary.errors.append({"id": row.get("id"), "error": str(error)})
+                return None
 
     def _persist(self, row: dict[str, Any], pricing: Any, now: datetime) -> None:
         iso = now.isoformat()

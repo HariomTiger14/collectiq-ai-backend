@@ -13,7 +13,27 @@ from app.schemas.pricing import (
     RepriceRequest,
     RepriceResponse,
 )
+from app.services.pricing.base_pricing_provider import (
+    PricingProviderRateLimitError,
+)
 from app.services.pricing.batch_repricing_service import BatchRepricingService
+
+
+class _RateLimitedReprice:
+    """Raises a throttle rate-limit for the first `fails` calls, then delegates
+    to a wrapped fake (simulating PriceCharting's reject-if-too-fast throttle)."""
+
+    def __init__(self, *, fails: int, inner: _FakeReprice):
+        self._remaining_fails = fails
+        self._inner = inner
+        self.calls = 0
+
+    def reprice(self, request: RepriceRequest) -> RepriceResponse:
+        self.calls += 1
+        if self._remaining_fails > 0:
+            self._remaining_fails -= 1
+            raise PricingProviderRateLimitError("throttled locally; retry")
+        return self._inner.reprice(request)
 
 
 class _FakeReprice:
@@ -77,6 +97,7 @@ def _service(
         service_role_key="service-role-key",
         client=httpx.Client(transport=httpx.MockTransport(handler)),
         reprice_service=reprice,
+        sleep=lambda _seconds: None,  # don't actually wait in tests
     )
     return service, patched
 
@@ -200,3 +221,30 @@ def test_identity_built_from_raw_json_fields():
     assert identity.setName == "Base Set"
     assert identity.year == "1999"
     assert reprice.requests[0].correctionSource == "scheduled_reprice"
+
+
+def test_rate_limited_then_succeeds_is_repriced():
+    inner = _FakeReprice(status="available", value=250.0, low=200.0, high=300.0)
+    reprice = _RateLimitedReprice(fails=2, inner=inner)  # throttled twice, then ok
+    service, patched = _service(items_pages=[[_item()]], reprice=reprice)
+
+    summary = service.reprice_all()
+
+    assert summary.repriced == 1
+    assert summary.rate_limited == 2
+    assert reprice.calls == 3  # 2 rejections + 1 success
+    assert len(patched) == 1
+
+
+def test_rate_limited_beyond_retries_records_error_not_repriced():
+    inner = _FakeReprice(status="available", value=250.0)
+    reprice = _RateLimitedReprice(fails=99, inner=inner)  # always throttled
+    service, patched = _service(items_pages=[[_item()]], reprice=reprice)
+
+    summary = service.reprice_all()
+
+    assert summary.repriced == 0
+    assert summary.unavailable == 0
+    assert summary.rate_limited == 3  # default max_rate_limit_retries
+    assert len(summary.errors) == 1
+    assert patched == []

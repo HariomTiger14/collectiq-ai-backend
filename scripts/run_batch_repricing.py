@@ -32,7 +32,8 @@ def main() -> None:
     print(
         f"[reprice] scanned={payload['scanned']} repriced={payload['repriced']} "
         f"unavailable={payload['unavailable']} skipped={payload['skipped']} "
-        f"errors={len(payload['errors'])} dry_run={args.dry_run}"
+        f"rateLimited={payload['rateLimited']} errors={len(payload['errors'])} "
+        f"dry_run={args.dry_run}"
     )
 
 
