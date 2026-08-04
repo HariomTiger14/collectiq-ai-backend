@@ -5,6 +5,7 @@ import time
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request, status
+from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
 from app.services.subscription.subscription_service import SubscriptionService
@@ -121,7 +122,9 @@ async def analyze_collectible(payload: ApiAnalyzeRequest) -> ApiAnalyzeResponse:
 async def quote_collectible_pricing(
     payload: ApiPricingQuoteRequest,
 ) -> ApiPricingQuoteResponse:
-    return _quote_collectible_pricing(payload)
+    # Pricing lookups are blocking network I/O; run off the event loop so
+    # concurrent requests are not serialized behind one another.
+    return await run_in_threadpool(_quote_collectible_pricing, payload)
 
 
 @root_router.post(
@@ -130,7 +133,8 @@ async def quote_collectible_pricing(
     summary="Analyze a collectible image from the production Analyzer API contract",
 )
 async def analyze_collectible_root(request: Request) -> ApiAnalyzeResponse:
-    _enforce_scan_quota(request)
+    # The quota check makes blocking Supabase calls; keep it off the event loop.
+    await run_in_threadpool(_enforce_scan_quota, request)
     payload = await _payload_from_request(request)
     return await _analyze_collectible(
         payload,
@@ -158,11 +162,18 @@ async def _analyze_collectible(
     )
 
     try:
-        pipeline_result = BackendAnalyzerService().analyze(payload)
+        # Recognition (AI vision) and pricing are blocking, network-bound calls.
+        # Run them in the threadpool so a slow scan does not block the event loop
+        # and stall every other in-flight request (which serialized them before).
+        pipeline_result = await run_in_threadpool(
+            BackendAnalyzerService().analyze,
+            payload,
+        )
         provider = pipeline_result.provider
         recognition = pipeline_result.recognition
         display_currency = _target_display_currency(payload)
-        pricing = _price_recognition(
+        pricing = await run_in_threadpool(
+            _price_recognition,
             recognition,
             trace_id=trace_id,
             display_currency=display_currency,
