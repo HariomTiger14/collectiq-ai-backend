@@ -16,6 +16,7 @@ from app.routers import (
     admin_scans,
     admin_users,
     api_analyze,
+    api_subscription,
     auth,
     health,
     metadata,
@@ -60,6 +61,7 @@ app.include_router(admin_users.router)
 app.include_router(push.router)
 app.include_router(api_analyze.root_router)
 app.include_router(api_analyze.router)
+app.include_router(api_subscription.router)
 app.include_router(scanner.router)
 app.include_router(portfolio.router)
 app.include_router(pricing.router)
