@@ -84,6 +84,44 @@ class SubscriptionService:
             raise SubscriptionUnauthorizedError("Could not resolve user.")
         return str(user_id)
 
+    def check_scan_allowed(
+        self,
+        access_token: str,
+        *,
+        free_daily_limit: int,
+    ) -> dict[str, Any]:
+        """Whether this scan is allowed for the caller.
+
+        Pro/premium are unlimited. Free is metered by an atomic daily
+        check-and-bump. Raises on config/auth/store errors so the caller can
+        fail open (a scan must never break because of this check).
+        Returns {'allowed': bool, 'plan': str, 'used': int}.
+        """
+        self._require_config()
+        user_id = self.user_id_from_token(access_token)
+        plan = self.get_entitlement(user_id).get("plan", "free")
+        if plan != "free":
+            return {"allowed": True, "plan": plan, "used": 0}
+        rows = self._rpc(
+            "check_and_bump_scan_usage",
+            {"p_user_id": user_id, "p_limit": free_daily_limit},
+        )
+        if isinstance(rows, list) and rows:
+            row = rows[0]
+            return {
+                "allowed": bool(row.get("allowed")),
+                "plan": plan,
+                "used": int(row.get("used") or 0),
+            }
+        # RPC returned nothing unexpected — fail open.
+        return {"allowed": True, "plan": plan, "used": 0}
+
+    def _rpc(self, fn: str, params: dict[str, Any]) -> Any:
+        response = self._supabase_request(
+            "POST", f"/rest/v1/rpc/{fn}", json=params
+        )
+        return response.json()
+
     def get_entitlement(self, user_id: str) -> dict[str, Any]:
         """Return the user's current entitlement (defaults to free)."""
         self._require_config()

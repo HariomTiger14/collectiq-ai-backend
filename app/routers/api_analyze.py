@@ -7,6 +7,8 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Request, status
 from starlette.datastructures import UploadFile
 
+from app.services.subscription.subscription_service import SubscriptionService
+
 from app.schemas.api_analysis import (
     ApiAlternativeMatchResponse,
     ApiAnalyzeDiagnosticsResponse,
@@ -51,6 +53,34 @@ from app.services.pricing.shared_cache_repository import (
 router = APIRouter(prefix="/api", tags=["Analyze API"])
 root_router = APIRouter(tags=["Analyzer API"])
 logger = logging.getLogger("collectiq.api.analyze")
+
+_subscription_service = SubscriptionService()
+
+
+def _enforce_scan_quota(request: Request) -> None:
+    """Server-side daily scan cap for FREE users (anti-abuse).
+
+    Fail-open: only blocks when a signed-in free user is positively over the
+    limit. A missing/invalid token or any error lets the scan proceed, so
+    scanning never breaks because of this check. Pro/premium are unlimited.
+    """
+    authorization = request.headers.get("authorization")
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        result = _subscription_service.check_scan_allowed(
+            token,
+            free_daily_limit=settings.subscription_free_daily_scan_limit,
+        )
+    except Exception as error:  # noqa: BLE001 — fail open on any error
+        logger.warning("scan quota check skipped (fail-open): %s", error)
+        return
+    if not result.get("allowed", True):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Daily scan limit reached for the free plan.",
+        )
 _shared_pricing_cache = SharedPricingCacheRepository()
 
 SUPPORTED_CATEGORIES = {
@@ -100,6 +130,7 @@ async def quote_collectible_pricing(
     summary="Analyze a collectible image from the production Analyzer API contract",
 )
 async def analyze_collectible_root(request: Request) -> ApiAnalyzeResponse:
+    _enforce_scan_quota(request)
     payload = await _payload_from_request(request)
     return await _analyze_collectible(
         payload,
