@@ -263,14 +263,44 @@ actual usage instead of staying capped at 5 manually-imported CSVs.
      than the non-determinism bug it was meant to fix (that was
      random-but-fair; this would be consistent-and-biased). Not shipped.
 
-     **Still open.** Neither single-column order tried so far is safe:
-     `product_name.asc` risks an unindexed sort; `pricecharting_id.asc`
-     systematically disadvantages scan-derived rows. A real fix needs
-     genuine relevance-based DB-side ranking — e.g. the existing
-     `pricecharting_catalog_search_idx` GIN/tsvector index through an RPC —
-     not a single arbitrary sort column. That's a separate, larger,
-     unscoped change. Do not add an `order` clause to `_fetch_rows()`
-     without working through both failure modes above first.
+     ✅ **Resolved 2026-08-06**, properly this time — verified against real
+     data at every step before shipping, not assumed:
+     - `search_pricecharting_catalog()` (`20260806_create_search_pricecharting_catalog_rpc.sql`)
+       — a Postgres function doing filter + relevance scoring (mirrors
+       `_match_score()` exactly, as SQL `CASE`) + sort + limit in one
+       query. Same match semantics as the old `ilike` OR-filter (doesn't
+       change what can match, only how it's ranked) — but now ranks the
+       true full matching set, not an arbitrary fetch-window subset, so
+       there's no id/name column that can systematically bias results the
+       way the two rejected attempts did.
+     - The RPC alone wasn't enough — first `EXPLAIN ANALYZE` (against real
+       SIT data, ~433K rows) showed 9.5-15.7s regardless of the ranking
+       logic: `ilike('%text%')` (leading wildcard) can't use any existing
+       index, forcing a full sequential scan on every search. This was
+       true before any of today's changes and likely explains a lot of
+       the pre-existing `catalog_search_unavailable` flakiness on broad
+       queries. Fixed with `pg_trgm` GIN indexes on every filtered column
+       (`20260806_add_trigram_indexes_for_catalog_search.sql`) — the
+       standard Postgres fix for fast `ILIKE '%text%'`, no semantic
+       change. First pass missed the `upc` column (confirmed via
+       `EXPLAIN ANALYZE`: the query fell back to a weak partial-index
+       substitute and stayed slow); added and reverified.
+     - **Verified result**: `'pikachu v'` went from **15.7s → 83ms**
+       (~190x). Confirmed the ranking itself was never the bottleneck —
+       even in the 15.7s version, `Sort Method: top-N heapsort` completed
+       in milliseconds; the seq scan was 100% of the cost.
+     - **Known remaining gap, deliberately not fixed**: an extremely broad
+       single-word query matching a large fraction of the table (tested:
+       `'pokemon'` alone, ~21% of ~433K rows) is still slow (~15s) — no
+       index helps once a filter is that unselective; Postgres's own
+       planner correctly prefers a seq scan at that point over any index.
+       This is very likely pre-existing, not a regression from today. A
+       real fix needs genuine full-text relevance ranking (the existing
+       `pricecharting_catalog_search_idx` GIN/tsvector index, `ts_rank`),
+       ranking mechanics not selectivity — separate, larger, unscoped.
+     - Two single-column `order` attempts were tried and rejected before
+       landing on the RPC — kept below as a record of what doesn't work,
+       so neither gets retried blind:
 4. ✅ **Scheduling** — `packlox-catalog-promote-scan-derived-sit` Render
    cron added to `render.yaml` (daily, 17:00 UTC, `minHitCount=1`,
    `dryRun=false`). Remember: `render.yaml` is a documentation mirror, not

@@ -90,39 +90,40 @@ class CatalogSearchService:
         return value.strip()
 
     def _fetch_rows(self, query: str, limit: int) -> list[dict[str, Any]]:
-        pattern = _postgrest_ilike_pattern(query)
-        params = {
-            "select": (
-                "pricecharting_id,product_name,console_name,category,upc,"
-                "loose_price_cents,cib_price_cents,new_price_cents,"
-                "graded_price_cents,currency,product_url,source_file,"
-                "source_downloaded_at,updated_at,normalized_identity,"
-                "source_provider,market_value_cents,low_estimate_cents,"
-                "high_estimate_cents"
-            ),
-            "or": (
-                f"(product_name.ilike.{pattern},"
-                f"console_name.ilike.{pattern},"
-                f"category.ilike.{pattern},"
-                f"upc.ilike.{pattern},"
-                f"normalized_identity.ilike.{pattern})"
-            ),
-            # REVERTED 2026-08-05: an explicit "order": "product_name.asc"
-            # was added here to make the DB-level fetch deterministic
-            # (without it, PostgreSQL doesn't guarantee row order for an
-            # unordered query, and a promoted row could be present in one
-            # call's results and absent from the next identical call).
-            # Shipped, then found live: pricecharting_catalog only indexes
-            # lower(product_name) (for case-insensitive lookups), not plain
-            # product_name — ordering by the unindexed column very likely
-            # forced an unindexed sort over every matching row, and search
-            # went from "occasionally flaky" to consistently timing out
-            # (5s client timeout) immediately after deploy. Reverted without
-            # a supporting index in place; determinism problem still open,
-            # see docs/GLOBAL_CATALOG_ARCHITECTURE.md.
-            "limit": str(min(max(limit * 3, limit), 100)),
-        }
-        payload = self._request("GET", "/rest/v1/pricecharting_catalog", params=params)
+        # Calls search_pricecharting_catalog(), a Postgres function
+        # (20260806_create_search_pricecharting_catalog_rpc.sql) that does
+        # the filter + relevance scoring + sort + limit entirely in SQL.
+        #
+        # Two single-column ORDER BY attempts on the plain REST table query
+        # were tried and reverted before this: product_name.asc forced an
+        # unindexed sort and broke production; pricecharting_id.asc would
+        # have been fast but systematically hidden every scan-derived row
+        # from popular queries (their ids sort after all-digit PriceCharting
+        # ids). Neither was safe. This RPC avoids both failure modes: it
+        # ranks over the true full matching set (not an arbitrary fetch-
+        # window subset), the ilike filter itself is now backed by pg_trgm
+        # GIN indexes on every filtered column
+        # (20260806_add_trigram_indexes_for_catalog_search.sql — confirmed
+        # via EXPLAIN ANALYZE: 'pikachu v' went from 15.7s to 83ms), and the
+        # ranking score has nothing to do with row identity, so it can't
+        # systematically favor one id format over another. Verified against
+        # real SIT data before shipping, not assumed — see
+        # docs/GLOBAL_CATALOG_ARCHITECTURE.md.
+        #
+        # Known remaining gap, not fixed by this: an extremely broad
+        # single-word query matching a large fraction of the whole table
+        # (e.g. "pokemon" alone, ~21% of rows) is still slow — no index
+        # helps once a filter is that unselective; Postgres's planner
+        # correctly prefers a sequential scan at that point. A real fix
+        # needs full-text relevance ranking (the existing
+        # pricecharting_catalog_search_idx GIN/tsvector index), a separate,
+        # larger, unscoped change. This was very likely already slow before
+        # today, unrelated to anything changed here.
+        payload = self._request(
+            "POST",
+            "/rest/v1/rpc/search_pricecharting_catalog",
+            json_payload={"search_query": query, "result_limit": limit},
+        )
         if not isinstance(payload, list):
             return []
         return [row for row in payload if isinstance(row, dict)]
@@ -174,6 +175,7 @@ class CatalogSearchService:
         path: str,
         *,
         params: dict[str, str] | None = None,
+        json_payload: dict[str, Any] | None = None,
     ) -> Any:
         headers = {
             "apikey": self._service_role_key,
@@ -189,6 +191,7 @@ class CatalogSearchService:
                 f"{self._supabase_url}{path}",
                 headers=headers,
                 params=params,
+                json=json_payload,
             )
             response.raise_for_status()
             if not response.content:
@@ -313,12 +316,6 @@ def _match_score(row: dict[str, Any], query: str) -> int:
 
 def _normalize_query(query: str) -> str:
     return " ".join(query.strip().lower().split())
-
-
-def _postgrest_ilike_pattern(query: str) -> str:
-    safe = query.replace(",", " ").replace("(", " ").replace(")", " ").strip()
-    safe = " ".join(safe.split())
-    return f"*{safe}*"
 
 
 def _cents_to_units(value: Any) -> float | None:

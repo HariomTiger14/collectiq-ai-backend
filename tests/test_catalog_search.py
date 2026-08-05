@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 
@@ -66,19 +67,26 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertEqual(response.results[0].pricing.currency, "USD")
         self.assertEqual(response.results[0].imageUrl, None)
         self.assertEqual(response.results[0].source, "PriceCharting")
+        self.assertEqual(requests[0].method, "POST")
         self.assertIn(
-            "product_name.ilike.*charizard*",
-            requests[0].url.params.get("or"),
+            "/rest/v1/rpc/search_pricecharting_catalog", str(requests[0].url)
         )
+        body = json.loads(requests[0].content)
+        self.assertEqual(body["search_query"], "charizard")
+        self.assertEqual(body["result_limit"], 10)
 
-    def test_search_does_not_request_an_unindexed_sort_order(self) -> None:
-        # An explicit "order": "product_name.asc" was tried and reverted —
-        # pricecharting_catalog only indexes lower(product_name), not plain
-        # product_name, so ordering by the unindexed column forced an
-        # unindexed sort that took search from occasionally flaky to
-        # consistently timing out in production. This test exists so that
-        # regressing back to an unindexed order param fails loudly, not
-        # silently, next time. See docs/GLOBAL_CATALOG_ARCHITECTURE.md.
+    def test_search_calls_the_db_side_ranking_rpc(self) -> None:
+        # Two single-column ORDER BY attempts on the plain REST table query
+        # were tried and reverted: product_name.asc forced an unindexed
+        # sort and broke production; pricecharting_id.asc would have been
+        # fast but systematically hidden every scan-derived row from
+        # popular queries (their ids sort after all-digit PriceCharting
+        # ids). This test pins search() to the RPC-based fix instead —
+        # search_pricecharting_catalog() ranks the true full matching set
+        # in SQL (backed by pg_trgm indexes, verified via EXPLAIN ANALYZE:
+        # 'pikachu v' went from 15.7s to 83ms), so there's no arbitrary
+        # fetch-window subset to guess at, and no single id/name column
+        # driving the sort. See docs/GLOBAL_CATALOG_ARCHITECTURE.md.
         requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -93,8 +101,10 @@ class CatalogSearchServiceTest(unittest.TestCase):
 
         service.search("pikachu", limit=20)
 
-        self.assertNotIn("order", requests[0].url.params)
-        self.assertEqual(requests[0].url.params.get("limit"), "60")
+        self.assertEqual(requests[0].method, "POST")
+        self.assertIn(
+            "/rest/v1/rpc/search_pricecharting_catalog", str(requests[0].url)
+        )
 
     def test_search_falls_back_to_generic_price_for_scan_derived_rows(self) -> None:
         # Scan-derived rows (source_kind='scan_derived', promoted from
