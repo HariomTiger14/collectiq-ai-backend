@@ -220,21 +220,45 @@ actual usage instead of staying capped at 5 manually-imported CSVs.
 
 ## Rollout phases
 
-1. **Schema**: run the additive migration above; add the missing
-   `pricing_cache_entries` migration file (documenting what's already live).
-2. **Promotion job**: `promote_scan_derived_catalog.py` service +
-   `POST /admin/catalog/promote-scan-derived` endpoint, dry-run first against
-   real SIT data to sanity-check candidate quality before writing anything.
-3. **Search ranking + staleness**: update `_rank_rows`/result filtering in
-   `catalog_search_service.py`.
-4. **Scheduling**: a Render cron (same pattern as
-   `collectiq-pricecharting-refresh-sit`) to run the promotion job daily.
+1. ✅ **Schema** — additive migration + the missing `pricing_cache_entries`
+   migration file, done 2026-08-05.
+2. ✅ **Promotion job** — `promote_scan_derived_catalog.py` +
+   `POST /admin/catalog/promote-scan-derived`. Verified end-to-end against
+   real SIT data 2026-08-05: scanned a real card twice, `hit_count` went
+   0→1, dry-run found it, live run promoted it, confirmed searchable in
+   Discover with a correct price.
+3. ✅ **Search fixes found via that verification, not planned upfront**:
+   - `_fetch_rows()`/`_fetch_catalog_row()`/`_pricing_from_row()` never read
+     `market_value_cents`/`low_estimate_cents`/`high_estimate_cents` —
+     promoted rows searched fine but showed `marketValue: null`. Fixed.
+   - `source`/`attribution` were hardcoded to `"PriceCharting"` regardless
+     of the row's real provider. Fixed via `source_provider` with a
+     graceful fallback to `"PriceCharting"` for unrecognized/multi-provider
+     strings.
+   - Separate, pre-existing bug also found here (not scan-derived-specific
+     — affects all catalog search): `_fetch_rows()` had no `order`, so
+     PostgreSQL didn't guarantee which rows landed in the fetch window
+     before Python-side ranking ran — a query matching many rows (e.g.
+     "Pikachu V", 60+ real variants) could non-deterministically omit the
+     true best match. Mitigated with `order=product_name.asc` (deterministic
+     fetch, and as a side effect tends to surface short/exact titles before
+     longer variants sharing their prefix) plus a wider over-fetch window
+     (`limit*5` capped at 200, up from `limit*3` capped at 100). This does
+     **not** fully solve relevance ranking for very large result sets — a
+     real fix needs DB-side ranking (e.g. the existing
+     `pricecharting_catalog_search_idx` GIN/tsvector index via an RPC),
+     which is a separate, larger, not-yet-scoped change.
+4. ✅ **Scheduling** — `packlox-catalog-promote-scan-derived-sit` Render
+   cron added to `render.yaml` (daily, 17:00 UTC, `minHitCount=1`,
+   `dryRun=false`). Remember: `render.yaml` is a documentation mirror, not
+   the source of truth — this still needs creating by hand in the Render
+   dashboard to actually take effect.
 5. **Optional later**: admin portal screen listing recent promotions /
-   pending-but-below-threshold candidates, only if phase 2's automatic
-   threshold turns out to need human oversight in practice.
+   pending-but-below-threshold candidates, only if the automatic
+   `minHitCount=1` threshold turns out to need human oversight in practice.
 
-Each phase ships independent value — phase 2 alone (even run manually via
-curl, no cron yet) already starts filling in Sneakers/Comics/Coins/etc.
+All of phases 1-4 are done and verified against real SIT data as of
+2026-08-05 — this is no longer just a design proposal.
 
 ## Open questions before implementation
 
