@@ -263,44 +263,94 @@ actual usage instead of staying capped at 5 manually-imported CSVs.
      than the non-determinism bug it was meant to fix (that was
      random-but-fair; this would be consistent-and-biased). Not shipped.
 
-     ✅ **Resolved 2026-08-06**, properly this time — verified against real
-     data at every step before shipping, not assumed:
-     - `search_pricecharting_catalog()` (`20260806_create_search_pricecharting_catalog_rpc.sql`)
-       — a Postgres function doing filter + relevance scoring (mirrors
-       `_match_score()` exactly, as SQL `CASE`) + sort + limit in one
-       query. Same match semantics as the old `ilike` OR-filter (doesn't
-       change what can match, only how it's ranked) — but now ranks the
-       true full matching set, not an arbitrary fetch-window subset, so
-       there's no id/name column that can systematically bias results the
-       way the two rejected attempts did.
-     - The RPC alone wasn't enough — first `EXPLAIN ANALYZE` (against real
-       SIT data, ~433K rows) showed 9.5-15.7s regardless of the ranking
-       logic: `ilike('%text%')` (leading wildcard) can't use any existing
-       index, forcing a full sequential scan on every search. This was
-       true before any of today's changes and likely explains a lot of
-       the pre-existing `catalog_search_unavailable` flakiness on broad
-       queries. Fixed with `pg_trgm` GIN indexes on every filtered column
-       (`20260806_add_trigram_indexes_for_catalog_search.sql`) — the
-       standard Postgres fix for fast `ILIKE '%text%'`, no semantic
-       change. First pass missed the `upc` column (confirmed via
-       `EXPLAIN ANALYZE`: the query fell back to a weak partial-index
-       substitute and stayed slow); added and reverified.
-     - **Verified result**: `'pikachu v'` went from **15.7s → 83ms**
-       (~190x). Confirmed the ranking itself was never the bottleneck —
-       even in the 15.7s version, `Sort Method: top-N heapsort` completed
-       in milliseconds; the seq scan was 100% of the cost.
-     - **Known remaining gap, deliberately not fixed**: an extremely broad
-       single-word query matching a large fraction of the table (tested:
-       `'pokemon'` alone, ~21% of ~433K rows) is still slow (~15s) — no
-       index helps once a filter is that unselective; Postgres's own
-       planner correctly prefers a seq scan at that point over any index.
-       This is very likely pre-existing, not a regression from today. A
-       real fix needs genuine full-text relevance ranking (the existing
-       `pricecharting_catalog_search_idx` GIN/tsvector index, `ts_rank`),
-       ranking mechanics not selectivity — separate, larger, unscoped.
-     - Two single-column `order` attempts were tried and rejected before
-       landing on the RPC — kept below as a record of what doesn't work,
-       so neither gets retried blind:
+     Third attempt: `search_pricecharting_catalog()`
+     (`20260806_create_search_pricecharting_catalog_rpc.sql`), a Postgres
+     RPC doing filter + relevance scoring (mirrors `_match_score()`
+     exactly, as SQL `CASE`) + sort + limit in one query — same match
+     semantics as the old `ilike` OR-filter, but ranking the true full
+     matching set instead of an arbitrary fetch-window subset, so no
+     id/name column can systematically bias results the way the two
+     `order`-clause attempts above did.
+
+     Verified with real `EXPLAIN ANALYZE` before wiring up any app code
+     (learned that lesson from the first attempt): the RPC alone wasn't
+     enough — 9.5-15.7s regardless of ranking logic, because
+     `ilike('%text%')` can't use any existing index and forces a full
+     sequential scan. Added `pg_trgm` GIN indexes on every filtered
+     column (`20260806_add_trigram_indexes_for_catalog_search.sql`,
+     including a second pass after the first missed the `upc` column —
+     caught via `EXPLAIN ANALYZE` again before declaring done). Result
+     for a specific-item query: `'pikachu v'` went from **15.7s → 83ms**
+     (~190x) — the sort itself was always cheap (`top-N heapsort` in
+     milliseconds); the seq scan was 100% of the original cost.
+
+     **Not shipped as-is** — one more check caught a real regression the
+     `EXPLAIN ANALYZE` numbers alone didn't reveal. Tested the *currently
+     deployed* (pre-fix) endpoint live against a broad single-word query
+     (`'pokemon'`, ~21% of ~433K rows) before pushing: **~0.5-1s**, not
+     slow at all — the existing unordered fetch can early-exit a scan
+     once it's found enough matches, since nothing forces it to consider
+     every matching row. The RPC's `ORDER BY` removes that early-exit
+     entirely (a correct ranking needs the true best of the *whole*
+     matching set, not just the first N found) — measured ~15s for the
+     same query through the plain ranked RPC. Shipping that as-is would
+     have traded a real regression (broad queries: fast → ~15s, likely
+     timing out) for a real improvement (specific queries: broken/flaky
+     → 83ms) — not an acceptable trade blind, with no usage data on how
+     often real queries are broad vs. specific.
+
+     ✅ **Fourth attempt, shipped**: made `search_pricecharting_catalog()`
+     adaptive instead of unconditionally ranking
+     (`20260806_make_search_pricecharting_catalog_adaptive.sql`). It
+     estimates how many rows a query would match *before* deciding how to
+     answer it — via Postgres's own planner estimate (`EXPLAIN`), not a
+     real `COUNT`, since counting a broad `ilike` match costs as much as
+     the problem being avoided. Below `broad_query_row_threshold` (default
+     5000, a judgment call — wide margin below the ~92K "pokemon" case and
+     wide margin above realistic specific-item match counts, but the cost
+     curve in between was checked, not assumed): full relevance-ranked
+     query. At/above it: the original cheap, early-exit-capable, same
+     non-determinism-it-always-had unordered query — unregressed.
+
+     Two Postgres gotchas hit and fixed while shipping this, both worth
+     knowing if this function is touched again: (1) `CREATE OR REPLACE`
+     only replaces a function with the *exact same* parameter signature —
+     adding `broad_query_row_threshold` created a second overload instead
+     of replacing the first, and any 2-argument call became ambiguous
+     (error 42725) until the old signature was explicitly dropped; (2)
+     `EXPLAIN` cannot run inside a `STABLE`/`IMMUTABLE` function (error
+     0A000) — this function is `VOLATILE`, which is also the semantically
+     correct marking, since it does dynamic plan introspection rather than
+     a plain cacheable read.
+
+     **Verified across three query breadths on real SIT data before
+     shipping**: `'pikachu v'` (~109 matches, ranked branch) 24ms;
+     `'pokemon'` (~92,347 matches, ~21% of the table, cheap branch)
+     43.6ms; `'charizard'` (medium breadth, sanity-checking the threshold
+     isn't picking a bad middle case) 21.9ms. All three fast, correct
+     branch taken in both known extremes.
+
+     App wiring: `catalog_search_service.py`'s `_fetch_rows()` calls this
+     RPC via `POST /rest/v1/rpc/search_pricecharting_catalog` with
+     `{search_query, result_limit}` — no Python change needed between the
+     third and fourth attempts, since the adaptive version kept the same
+     first two parameters; `_postgrest_ilike_pattern()` and the old
+     `or=(...)` REST-filter construction were removed as dead code.
+
+     **Known remaining gap, deliberately not fixed**: for a query broad
+     enough to hit the cheap fallback branch, ranking is still whatever
+     Postgres's unordered scan happens to return first — the original
+     non-determinism, just no longer regressed to a timeout. Fixing that
+     too needs genuine full-text relevance ranking (the existing
+     `pricecharting_catalog_search_idx` GIN/tsvector index, `ts_rank`) —
+     ranking mechanics, not selectivity — a separate, larger, unscoped
+     change. Given this trade-off (rare broad queries keep their existing
+     imperfect-but-fast behavior; the vastly more common specific-item
+     queries are now both fast and correctly ranked), it was judged worth
+     shipping without also solving that.
+
+     Three single-shot attempts on record before landing on the adaptive
+     one — kept below so none get retried blind:
 4. ✅ **Scheduling** — `packlox-catalog-promote-scan-derived-sit` Render
    cron added to `render.yaml` (daily, 17:00 UTC, `minHitCount=1`,
    `dryRun=false`). Remember: `render.yaml` is a documentation mirror, not
