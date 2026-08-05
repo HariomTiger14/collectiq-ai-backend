@@ -16,6 +16,14 @@ from app.services.ai.base_recognition_service import (
 
 logger = logging.getLogger("collectiq.ai.openai")
 
+# Shared across requests: a fresh BackendAnalyzerService (and provider) is
+# constructed per /analyze call, so defaulting to a per-instance httpx.Client
+# meant every scan paid a new TCP+TLS handshake. httpx.Client's connection
+# pool is thread-safe, so one long-lived client (reused the same way
+# subscription_service.py already does) avoids that cost under concurrent
+# load. Per-call timeouts are still set explicitly on each request.
+_shared_client = httpx.Client(timeout=60)
+
 
 class AIProviderNotConfiguredError(RuntimeError):
     """Raised when a selected AI provider is not ready for recognition."""
@@ -52,7 +60,7 @@ class OpenAIRecognitionProvider(AIRecognitionProvider):
             if timeout_seconds is None
             else timeout_seconds
         )
-        self._client = client or httpx.Client(timeout=self._timeout_seconds)
+        self._client = client or _shared_client
 
     def recognize(self, image_path: Path) -> RecognitionResult:
         if not self._api_key.strip():
