@@ -235,19 +235,25 @@ actual usage instead of staying capped at 5 manually-imported CSVs.
      of the row's real provider. Fixed via `source_provider` with a
      graceful fallback to `"PriceCharting"` for unrecognized/multi-provider
      strings.
-   - Separate, pre-existing bug also found here (not scan-derived-specific
-     — affects all catalog search): `_fetch_rows()` had no `order`, so
-     PostgreSQL didn't guarantee which rows landed in the fetch window
-     before Python-side ranking ran — a query matching many rows (e.g.
-     "Pikachu V", 60+ real variants) could non-deterministically omit the
-     true best match. Mitigated with `order=product_name.asc` (deterministic
-     fetch, and as a side effect tends to surface short/exact titles before
-     longer variants sharing their prefix) plus a wider over-fetch window
-     (`limit*5` capped at 200, up from `limit*3` capped at 100). This does
-     **not** fully solve relevance ranking for very large result sets — a
-     real fix needs DB-side ranking (e.g. the existing
-     `pricecharting_catalog_search_idx` GIN/tsvector index via an RPC),
-     which is a separate, larger, not-yet-scoped change.
+   - ⚠️ **Separate, pre-existing bug found here, attempted fix reverted**
+     (not scan-derived-specific — affects all catalog search):
+     `_fetch_rows()` had no `order`, so PostgreSQL didn't guarantee which
+     rows landed in the fetch window before Python-side ranking ran — a
+     query matching many rows (e.g. "Pikachu V", 60+ real variants) could
+     non-deterministically omit the true best match. Tried
+     `order=product_name.asc` to fix it (deploy 656583c) — broke production
+     within minutes: `pricecharting_catalog` only indexes
+     `lower(product_name)` (case-insensitive lookups), not plain
+     `product_name`, so ordering by the unindexed column forced an
+     unindexed sort over every matching row, and search went from
+     occasionally-flaky to consistently timing out (5s client timeout).
+     Reverted same day. **Still open** — a real fix needs either (a) a
+     plain btree index on `product_name` before trying `order` again, or
+     (b) DB-side relevance ranking via the existing
+     `pricecharting_catalog_search_idx` GIN/tsvector index through an RPC
+     (bigger, more correct, but a separate unscoped change). Do not re-add
+     an `order` clause without a supporting index — verified live that this
+     exact mistake takes search down within minutes on this table's size.
 4. ✅ **Scheduling** — `packlox-catalog-promote-scan-derived-sit` Render
    cron added to `render.yaml` (daily, 17:00 UTC, `minHitCount=1`,
    `dryRun=false`). Remember: `render.yaml` is a documentation mirror, not
