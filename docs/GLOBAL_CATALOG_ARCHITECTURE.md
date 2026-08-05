@@ -57,14 +57,39 @@ rows out of `pricing_cache_entries` into `pricecharting_catalog`."** No
 changes to `/analyze` or the scan path are needed — it already logs
 everything we need, today.
 
-One gap: `pricing_cache_entries` and `increment_pricing_cache_hit` have no
-tracked migration in `database/migrations/` — they exist directly in
-Supabase. Before implementing, confirm the live column names/types match
-what `shared_cache_repository.py` assumes (`cache_key`, `category`,
-`normalized_identity`, `value_aud`, `low_estimate_aud`, `high_estimate_aud`,
-`pricing_provider`, `confidence_score`, `valuation_status`, `checked_at`,
-`expires_at`, `evidence_json`, and a hit-count column) and add a migration
-file for it so it's no longer undocumented infrastructure.
+**Verified 2026-08-05** against the live SIT schema (no tracked migration
+existed for this table before now — added in
+`20260805_document_pricing_cache_entries.sql`). Confirmed: `cache_key` is
+the primary key (required — the app upserts with `on_conflict=cache_key`),
+`hit_count integer not null default 0` (increments only on a cache **hit**,
+i.e. a second-or-later scan matching the same `normalized_identity` — the
+row that creates the entry never touches it, so `hit_count >= 1` already
+means at least one independent corroborating scan beyond the original, not
+`>= 2` as an earlier draft of this doc assumed), `expires_at timestamptz not
+null` (always explicitly set, no default).
+
+### Currency: promote from `original_price`/`original_currency`, not `value_aud`
+
+`pricing_cache_entries.value_aud`/`low_estimate_aud`/`high_estimate_aud` are
+**display-currency-converted** — normalized to AUD (or whatever
+`display_currency` was for that request) via `convert_pricing_result()`,
+frozen at whatever FX rate applied on the day of that scan. Meanwhile
+`pricecharting_catalog` stores **native provider currency** per row today
+(PriceCharting rows are hardcoded `currency: "USD"` in
+`to_catalog_row()`, no conversion) — Discover's UI displays that currency
+directly (e.g. "USD $161").
+
+Promoting `value_aud` would make every scan-derived row a currency
+conversion frozen at scan time, inconsistent with existing native-currency
+rows and drifting from real market price as FX rates move. The fix: promote
+from `original_price`/`original_currency` instead. Verified this is safe —
+traced `api_analyze.py:978`, `convert_pricing_result()` always runs
+**before** `_shared_pricing_cache.set()` (line 980), and it unconditionally
+captures `originalMarketValue`/`originalCurrency` as the pre-conversion,
+native-provider values (`currency_conversion.py:30,39`) before doing any FX
+math. So `original_price`/`original_currency` on every cache row is
+reliably genuine native currency, not an AUD fallback — safe to promote
+directly into `market_value_cents`/`currency`.
 
 ## Proposed schema changes
 
@@ -91,8 +116,23 @@ create index if not exists pricecharting_catalog_source_kind_idx
 - `source_kind`: `bulk_import` (existing rows) / `scan_derived` (new).
 - `market_value_cents` / `low_estimate_cents` / `high_estimate_cents`:
   provider-neutral price fields every source can populate. PriceCharting's
-  existing `loose/cib/new/graded_price_cents` stay as-is for its own rows;
-  scan-derived rows populate only the generic three.
+  existing `loose/cib/new/graded_price_cents` stay as-is for its own rows.
+  For scan-derived rows: **only `market_value_cents` has a real native-currency
+  source today** — `pricing_cache_entries.original_price` (paired with
+  `original_currency` → `currency`). `low_estimate_cents`/`high_estimate_cents`
+  have **no native-currency equivalent stored anywhere currently** —
+  `_row_from_pricing()` in `shared_cache_repository.py` only ever persists
+  `original_price`, never an original low/high (even though the
+  `PricingResult` dataclass itself already has `originalLowEstimate`/
+  `originalHighEstimate` fields, populated by `convert_pricing_result()` —
+  they're just dropped on the floor before the cache write). So: leave
+  `low_estimate_cents`/`high_estimate_cents` **null** for scan-derived rows
+  at first (not unprecedented — PriceCharting rows already leave tiers like
+  `box_only_price_cents` null when unavailable). A follow-up enhancement
+  could add `original_low_estimate`/`original_high_estimate` columns to
+  `pricing_cache_entries` and start capturing them, to give scan-derived
+  Discover results the same Low/High range PriceCharting-backed ones show —
+  worth doing, but a separate, smaller change from this proposal.
 - `pricecharting_id` (the primary key) stays required — for scan-derived rows,
   synthesize it as `{provider}:{cache_key}` so it can't collide with a real
   PriceCharting product id.
@@ -115,7 +155,7 @@ New service, same shape as `scripts/import_pricecharting_catalog.py` /
 ```python
 # app/services/pricing/promote_scan_derived_catalog.py (proposed)
 
-def find_promotion_candidates(min_hit_count: int = 2) -> list[dict]:
+def find_promotion_candidates(min_hit_count: int = 1) -> list[dict]:
     # SELECT * FROM pricing_cache_entries
     # WHERE hit_count >= :min_hit_count
     #   AND valuation_status = 'market_estimated'
@@ -133,7 +173,7 @@ def to_promoted_catalog_row(cache_row: dict) -> dict:
 Exposed the same way the existing import is:
 
 ```
-POST /admin/catalog/promote-scan-derived?dryRun=true&minHitCount=2
+POST /admin/catalog/promote-scan-derived?dryRun=true&minHitCount=1
 ```
 
 mirroring `POST /admin/pricecharting/import` — dry-run first, same
@@ -144,8 +184,10 @@ it is safe/idempotent: a cache row already promoted is excluded via
 naturally picks that up as an update, not a duplicate.
 
 **On auto-promote vs. manual review:** I'd start with an automatic threshold
-(`min_hit_count >= 2`, i.e. at least one independent corroborating scan
-beyond the first) rather than a manual admin-review queue. Reasoning: the
+(`min_hit_count >= 1`, i.e. at least one independent corroborating scan
+beyond the first — `hit_count` starts at 0 and only increments on a repeat
+hit, confirmed against the live schema) rather than a manual admin-review
+queue. Reasoning: the
 corroboration signal is already fairly strong (two independent AI
 recognitions + live provider prices agreeing on the same normalized
 identity), and a manual-approve-every-item queue won't scale once scan
@@ -196,11 +238,14 @@ curl, no cron yet) already starts filling in Sneakers/Comics/Coins/etc.
 
 ## Open questions before implementation
 
-- Confirm `pricing_cache_entries`' actual live column names/types in
-  Supabase (no tracked migration exists — verify against what
-  `shared_cache_repository.py` assumes, especially the hit-count column
-  name).
-- Decide the `min_hit_count` starting threshold (proposed: 2).
+- ~~Confirm `pricing_cache_entries`' actual live column names/types~~ —
+  done 2026-08-05, captured in `20260805_document_pricing_cache_entries.sql`.
+- Decide the `min_hit_count` starting threshold (proposed: 1).
+- Decide whether to extend `pricing_cache_entries` with
+  `original_low_estimate`/`original_high_estimate` columns (capturing
+  fields the `PricingResult` dataclass already carries but the cache write
+  currently drops) so promoted rows can show a real Low/High range instead
+  of leaving it null.
 - Decide whether scan-derived rows should ever get their own
   `pricecharting_catalog_history` SCD2 tracking, or whether that's overkill
   for data that's inherently more volatile than a bulk import (leaning
