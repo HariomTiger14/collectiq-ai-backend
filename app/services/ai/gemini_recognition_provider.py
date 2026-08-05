@@ -20,6 +20,10 @@ from app.services.analyzer.errors import AnalyzerPipelineError
 
 logger = logging.getLogger("collectiq.ai.gemini")
 
+# Shared across requests — see the matching comment in
+# openai_recognition_provider.py for why this isn't built per-instance.
+_shared_client = httpx.Client(timeout=60)
+
 
 class GeminiProviderError(OpenAIProviderError):
     """Raised when Gemini recognition cannot complete."""
@@ -51,7 +55,7 @@ class GeminiRecognitionProvider(OpenAIRecognitionProvider):
             if timeout_seconds is None
             else timeout_seconds
         )
-        self._client = client or httpx.Client(timeout=self._timeout_seconds)
+        self._client = client or _shared_client
 
     def recognize(self, image_path: Path):
         if not self._api_key.strip():

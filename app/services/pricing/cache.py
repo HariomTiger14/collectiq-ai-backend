@@ -74,6 +74,9 @@ class ProviderThrottle:
             self._last_request_at = 0.0
 
 
+_shared_client = httpx.Client(timeout=5)
+
+
 class SharedProviderThrottle:
     """Database-backed provider gate shared by every backend worker."""
 
@@ -96,7 +99,9 @@ class SharedProviderThrottle:
             else settings.supabase_service_role_key
         ).strip()
         self._timeout_seconds = timeout_seconds
-        self._client = client
+        # Shared across requests — see shared_cache_repository.py for why this
+        # isn't built fresh per instance.
+        self._client = client or _shared_client
 
     @property
     def is_configured(self) -> bool:

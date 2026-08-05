@@ -23,6 +23,14 @@ class SharedPricingCacheError(Exception):
     """Raised when the shared pricing cache cannot be read or written."""
 
 
+# Shared across requests: the app constructs one SharedPricingCacheRepository
+# singleton (api_analyze.py) that every scan calls at least once (get) and
+# often twice more (set, hit-count increment). Defaulting the client to None
+# meant each of those calls opened and closed its own httpx.Client — a fresh
+# TCP+TLS handshake to Supabase every time. Reuse one pooled client instead.
+_shared_client = httpx.Client(timeout=5)
+
+
 class SharedPricingCacheRepository:
     def __init__(
         self,
@@ -41,7 +49,7 @@ class SharedPricingCacheRepository:
             else settings.supabase_service_role_key
         ).strip()
         self._timeout_seconds = timeout_seconds
-        self._client = client
+        self._client = client or _shared_client
 
     @property
     def is_configured(self) -> bool:
