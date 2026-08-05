@@ -247,13 +247,30 @@ actual usage instead of staying capped at 5 manually-imported CSVs.
      `product_name`, so ordering by the unindexed column forced an
      unindexed sort over every matching row, and search went from
      occasionally-flaky to consistently timing out (5s client timeout).
-     Reverted same day. **Still open** — a real fix needs either (a) a
-     plain btree index on `product_name` before trying `order` again, or
-     (b) DB-side relevance ranking via the existing
-     `pricecharting_catalog_search_idx` GIN/tsvector index through an RPC
-     (bigger, more correct, but a separate unscoped change). Do not re-add
-     an `order` clause without a supporting index — verified live that this
-     exact mistake takes search down within minutes on this table's size.
+     Reverted same day.
+
+     Second attempt, caught before shipping this time: ordering by
+     `pricecharting_id` (the primary key — always has an automatic unique
+     index, so no unindexed-sort risk) looked like the safe fix. It isn't.
+     Checked the actual sort order first: every real PriceCharting row has
+     a plain-digit id ("999", "3404679", ...); every promoted scan-derived
+     row has an id prefixed `scan:` (digits sort before letters
+     lexicographically). Ascending PK order would **deterministically push
+     every scan-derived row to the end of results, and out of the fetch
+     window entirely for any query matching more PriceCharting rows than
+     that window** — permanently hiding exactly the data this whole
+     initiative exists to surface, for popular queries specifically. Worse
+     than the non-determinism bug it was meant to fix (that was
+     random-but-fair; this would be consistent-and-biased). Not shipped.
+
+     **Still open.** Neither single-column order tried so far is safe:
+     `product_name.asc` risks an unindexed sort; `pricecharting_id.asc`
+     systematically disadvantages scan-derived rows. A real fix needs
+     genuine relevance-based DB-side ranking — e.g. the existing
+     `pricecharting_catalog_search_idx` GIN/tsvector index through an RPC —
+     not a single arbitrary sort column. That's a separate, larger,
+     unscoped change. Do not add an `order` clause to `_fetch_rows()`
+     without working through both failure modes above first.
 4. ✅ **Scheduling** — `packlox-catalog-promote-scan-derived-sit` Render
    cron added to `render.yaml` (daily, 17:00 UTC, `minHitCount=1`,
    `dryRun=false`). Remember: `render.yaml` is a documentation mirror, not
