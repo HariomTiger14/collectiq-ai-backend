@@ -5,15 +5,19 @@
 # in sync by hand as a readable spec; editing it does NOT change Render.
 #
 # Live services (dashboard):
-#   packlox-api-sit                     web  (Docker)   — FastAPI app
-#   collectiq-pricecharting-refresh-sit cron (Python 3) — daily catalog refresh
-#   packlox-batch-reprice-sit           cron (Python 3) — daily batch re-pricing
-#   packlox-price-alerts-sit            cron (Python 3) — 6-hourly alert pipeline
+#   packlox-api-sit                          web  (Docker)   — FastAPI app
+#   collectiq-pricecharting-refresh-sit      cron (Python 3) — daily catalog refresh
+#   packlox-batch-reprice-sit                cron (Python 3) — daily batch re-pricing
+#   packlox-price-alerts-sit                 cron (Python 3) — 6-hourly alert pipeline
+#   packlox-catalog-promote-scan-derived-sit cron (Python 3) — daily scan-derived catalog promotion
 #
-# The two app-facing crons call the deployed web service over HTTP (so all the
-# pricing / Supabase / Firebase secrets live only on packlox-api-sit and are not
-# duplicated per-cron). Each cron therefore needs just PUBLIC_API_URL +
-# ADMIN_JOB_TOKEN.
+# The three app-facing crons call the deployed web service over HTTP (so all
+# the pricing / Supabase / Firebase secrets live only on packlox-api-sit and
+# are not duplicated per-cron). packlox-batch-reprice-sit and
+# packlox-price-alerts-sit need ADMIN_JOB_TOKEN;
+# packlox-catalog-promote-scan-derived-sit needs ADMIN_IMPORT_TOKEN instead —
+# its endpoint reuses the same auth dependency as /admin/pricecharting/import,
+# not the job-token one the other two use.
 
 services:
   - type: web
@@ -195,4 +199,30 @@ services:
     startCommand: curl -fsS -X POST "https://api-sit.packlox.com/admin/push/price-alerts/run?limit=200" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"
     envVars:
       - key: ADMIN_JOB_TOKEN
+        sync: false
+
+  # App-facing: promote corroborated scan-derived pricing_cache_entries rows
+  # (KicksDB/TCGPlayer/eBay results from real scans) into pricecharting_catalog,
+  # so Discover's search can surface categories no CSV import covers (Sneakers,
+  # Comics, Coins, etc.) — see docs/GLOBAL_CATALOG_ARCHITECTURE.md. minHitCount=1
+  # requires at least one independent corroborating scan beyond the original
+  # before anything is promoted. dryRun=false — a no-op cron would defeat the
+  # point; the corroboration threshold is the safety gate, not dry-run mode.
+  # Uses ADMIN_IMPORT_TOKEN (not ADMIN_JOB_TOKEN) — this endpoint reuses the
+  # same auth dependency as /admin/pricecharting/import.
+  #
+  # NOTE: standalone-script alternative would call
+  #   promote_scan_derived_rows() directly and needs SUPABASE_* on the cron
+  #   itself instead of ADMIN_IMPORT_TOKEN.
+  - type: cron
+    name: packlox-catalog-promote-scan-derived-sit
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    schedule: "0 17 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: curl -fsS -X POST "https://api-sit.packlox.com/admin/catalog/promote-scan-derived?dryRun=false&minHitCount=1" -H "X-Admin-Token: $ADMIN_IMPORT_TOKEN"
+    envVars:
+      - key: ADMIN_IMPORT_TOKEN
         sync: false

@@ -71,6 +71,27 @@ class CatalogSearchServiceTest(unittest.TestCase):
             requests[0].url.params.get("or"),
         )
 
+    def test_search_requests_deterministic_order_and_wider_fetch_window(self) -> None:
+        # Without an explicit order, PostgreSQL doesn't guarantee row order
+        # for an unordered query — seen live as a promoted row present in
+        # the results on one call and absent on the next, identical call.
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        service.search("pikachu", limit=20)
+
+        self.assertEqual(requests[0].url.params.get("order"), "product_name.asc")
+        self.assertEqual(requests[0].url.params.get("limit"), "100")
+
     def test_search_falls_back_to_generic_price_for_scan_derived_rows(self) -> None:
         # Scan-derived rows (source_kind='scan_derived', promoted from
         # pricing_cache_entries) never populate the PriceCharting-specific

@@ -107,7 +107,22 @@ class CatalogSearchService:
                 f"upc.ilike.{pattern},"
                 f"normalized_identity.ilike.{pattern})"
             ),
-            "limit": str(min(max(limit * 3, limit), 100)),
+            # Ranking happens in Python (_rank_rows) over whatever subset this
+            # request returns — without an explicit order, PostgreSQL doesn't
+            # guarantee any particular row order, so identical repeated
+            # queries could return a different subset each time (seen live:
+            # a promoted row present in one call's top results, absent from
+            # the next). product_name.asc makes the DB-level fetch
+            # deterministic call to call, and as a side effect tends to sort
+            # a short exact-ish title ("Pikachu V") ahead of longer variants
+            # sharing its prefix ("Pikachu V #1", "Pikachu V #10", ...).
+            # This does NOT guarantee the true best match is always inside
+            # the fetch window for a query matching hundreds of rows — a real
+            # fix needs DB-side relevance ranking (e.g. the existing
+            # pricecharting_catalog_search_idx GIN/tsvector index via an RPC),
+            # which is a separate, larger change, not done here.
+            "order": "product_name.asc",
+            "limit": str(min(max(limit * 5, limit), 200)),
         }
         payload = self._request("GET", "/rest/v1/pricecharting_catalog", params=params)
         if not isinstance(payload, list):
