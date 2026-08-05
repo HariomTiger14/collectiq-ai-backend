@@ -71,10 +71,14 @@ class CatalogSearchServiceTest(unittest.TestCase):
             requests[0].url.params.get("or"),
         )
 
-    def test_search_requests_deterministic_order_and_wider_fetch_window(self) -> None:
-        # Without an explicit order, PostgreSQL doesn't guarantee row order
-        # for an unordered query — seen live as a promoted row present in
-        # the results on one call and absent on the next, identical call.
+    def test_search_does_not_request_an_unindexed_sort_order(self) -> None:
+        # An explicit "order": "product_name.asc" was tried and reverted —
+        # pricecharting_catalog only indexes lower(product_name), not plain
+        # product_name, so ordering by the unindexed column forced an
+        # unindexed sort that took search from occasionally flaky to
+        # consistently timing out in production. This test exists so that
+        # regressing back to an unindexed order param fails loudly, not
+        # silently, next time. See docs/GLOBAL_CATALOG_ARCHITECTURE.md.
         requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -89,8 +93,8 @@ class CatalogSearchServiceTest(unittest.TestCase):
 
         service.search("pikachu", limit=20)
 
-        self.assertEqual(requests[0].url.params.get("order"), "product_name.asc")
-        self.assertEqual(requests[0].url.params.get("limit"), "100")
+        self.assertNotIn("order", requests[0].url.params)
+        self.assertEqual(requests[0].url.params.get("limit"), "60")
 
     def test_search_falls_back_to_generic_price_for_scan_derived_rows(self) -> None:
         # Scan-derived rows (source_kind='scan_derived', promoted from
