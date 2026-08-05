@@ -96,7 +96,9 @@ class CatalogSearchService:
                 "pricecharting_id,product_name,console_name,category,upc,"
                 "loose_price_cents,cib_price_cents,new_price_cents,"
                 "graded_price_cents,currency,product_url,source_file,"
-                "source_downloaded_at,updated_at,normalized_identity"
+                "source_downloaded_at,updated_at,normalized_identity,"
+                "source_provider,market_value_cents,low_estimate_cents,"
+                "high_estimate_cents"
             ),
             "or": (
                 f"(product_name.ilike.{pattern},"
@@ -119,7 +121,9 @@ class CatalogSearchService:
                 "loose_price_cents,cib_price_cents,new_price_cents,"
                 "graded_price_cents,box_only_price_cents,manual_only_price_cents,"
                 "currency,product_url,source_file,source_downloaded_at,"
-                "updated_at,normalized_identity"
+                "updated_at,normalized_identity,"
+                "source_provider,market_value_cents,low_estimate_cents,"
+                "high_estimate_cents"
             ),
             "pricecharting_id": f"eq.{catalog_id}",
             "limit": "1",
@@ -184,19 +188,34 @@ class CatalogSearchService:
                 client.close()
 
 
+_PROVIDER_DISPLAY_NAMES = {
+    "pricecharting_import": "PriceCharting",
+    "pricecharting": "PriceCharting",
+    "kicksdb": "KicksDB",
+    "tcgplayer": "TCGPlayer",
+    "ebay": "eBay",
+}
+
+
+def _source_display_name(row: dict[str, Any]) -> str:
+    provider = str(row.get("source_provider") or "").strip().lower()
+    return _PROVIDER_DISPLAY_NAMES.get(provider, "PriceCharting")
+
+
 def _row_to_result(row: dict[str, Any], query: str) -> CatalogSearchResult:
     pricing = _pricing_from_row(row)
+    source = _source_display_name(row)
     return CatalogSearchResult(
         id=str(row.get("pricecharting_id") or ""),
         title=str(row.get("product_name") or "Catalog item"),
         category=str(row.get("category") or row.get("console_name") or "Catalog"),
-        source="PriceCharting",
+        source=source,
         setName=_clean(row.get("console_name")),
         identifier=_clean(row.get("upc")),
         productUrl=_clean(row.get("product_url")),
         sourceFile=_clean(row.get("source_file")),
         confidence=_match_confidence(row, query),
-        attribution="Pricing data by PriceCharting",
+        attribution=f"Pricing data by {source}",
         lastUpdated=_latest_timestamp(row),
         imageUrl=None,
         pricing=pricing,
@@ -212,6 +231,16 @@ def _pricing_from_row(row: dict[str, Any]) -> CatalogSearchPricing:
     market_value = loose or cib or new or graded
     low = min(prices) if prices else None
     high = max(prices) if prices else None
+
+    if market_value is None:
+        # Scan-derived rows (source_kind='scan_derived') don't populate the
+        # PriceCharting-specific price tiers above — fall back to the
+        # provider-neutral market_value_cents/low/high_estimate_cents columns
+        # instead (see docs/GLOBAL_CATALOG_ARCHITECTURE.md).
+        market_value = _cents_to_units(row.get("market_value_cents"))
+        low = _cents_to_units(row.get("low_estimate_cents"))
+        high = _cents_to_units(row.get("high_estimate_cents"))
+
     return CatalogSearchPricing(
         currency=str(row.get("currency") or "USD").upper(),
         marketValue=market_value,
