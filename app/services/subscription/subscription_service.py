@@ -88,11 +88,11 @@ class SubscriptionService:
         self,
         access_token: str,
         *,
-        free_daily_limit: int,
+        free_monthly_limit: int,
     ) -> dict[str, Any]:
         """Whether this scan is allowed for the caller.
 
-        Pro/premium are unlimited. Free is metered by an atomic daily
+        Pro/premium are unlimited. Free is metered by an atomic monthly
         check-and-bump. Raises on config/auth/store errors so the caller can
         fail open (a scan must never break because of this check).
         Returns {'allowed': bool, 'plan': str, 'used': int}.
@@ -104,7 +104,7 @@ class SubscriptionService:
             return {"allowed": True, "plan": plan, "used": 0}
         rows = self._rpc(
             "check_and_bump_scan_usage",
-            {"p_user_id": user_id, "p_limit": free_daily_limit},
+            {"p_user_id": user_id, "p_limit": free_monthly_limit},
         )
         if isinstance(rows, list) and rows:
             row = rows[0]

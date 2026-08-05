@@ -99,10 +99,11 @@ class Settings:
     supabase_url: str = os.getenv("SUPABASE_URL", "")
     supabase_service_role_key: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     supabase_anon_key: str = os.getenv("SUPABASE_ANON_KEY", "")
-    # Free-plan daily /analyze cap enforced server-side (anti-abuse). Matches the
-    # app's client-side ceiling. Enforcement is fail-open.
-    subscription_free_daily_scan_limit: int = int(
-        os.getenv("SUBSCRIPTION_FREE_DAILY_SCAN_LIMIT", "20")
+    # Free-plan monthly /analyze cap enforced server-side (anti-abuse), giving a
+    # hard, predictable cost ceiling. Matches the app's client-side limit.
+    # Enforcement is fail-open.
+    subscription_free_monthly_scan_limit: int = int(
+        os.getenv("SUBSCRIPTION_FREE_MONTHLY_SCAN_LIMIT", "30")
     )
     supabase_health_required: bool = os.getenv(
         "SUPABASE_HEALTH_REQUIRED",

@@ -59,11 +59,11 @@ _subscription_service = SubscriptionService()
 
 
 def _enforce_scan_quota(request: Request) -> None:
-    """Server-side daily scan cap for FREE users (anti-abuse).
+    """Server-side monthly scan cap for FREE users (anti-abuse).
 
     Fail-open: only blocks when a signed-in free user is positively over the
-    limit. A missing/invalid token or any error lets the scan proceed, so
-    scanning never breaks because of this check. Pro/premium are unlimited.
+    monthly limit. A missing/invalid token or any error lets the scan proceed,
+    so scanning never breaks because of this check. Pro/premium are unlimited.
     """
     authorization = request.headers.get("authorization")
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -72,7 +72,7 @@ def _enforce_scan_quota(request: Request) -> None:
     try:
         result = _subscription_service.check_scan_allowed(
             token,
-            free_daily_limit=settings.subscription_free_daily_scan_limit,
+            free_monthly_limit=settings.subscription_free_monthly_scan_limit,
         )
     except Exception as error:  # noqa: BLE001 — fail open on any error
         logger.warning("scan quota check skipped (fail-open): %s", error)
@@ -80,7 +80,7 @@ def _enforce_scan_quota(request: Request) -> None:
     if not result.get("allowed", True):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Daily scan limit reached for the free plan.",
+            detail="Monthly scan limit reached for the free plan.",
         )
 _shared_pricing_cache = SharedPricingCacheRepository()
 
