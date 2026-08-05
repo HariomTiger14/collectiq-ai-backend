@@ -46,6 +46,7 @@ class GeminiRecognitionProvider(OpenAIRecognitionProvider):
         api_key: str | None = None,
         model: str | None = None,
         timeout_seconds: float | None = None,
+        rescue_timeout_seconds: float | None = None,
         client: httpx.Client | None = None,
     ) -> None:
         self._api_key = settings.gemini_api_key if api_key is None else api_key
@@ -54,6 +55,11 @@ class GeminiRecognitionProvider(OpenAIRecognitionProvider):
             settings.gemini_timeout_seconds
             if timeout_seconds is None
             else timeout_seconds
+        )
+        self._rescue_timeout_seconds = (
+            settings.gemini_rescue_timeout_seconds
+            if rescue_timeout_seconds is None
+            else rescue_timeout_seconds
         )
         self._client = client or _shared_client
 
@@ -232,11 +238,15 @@ class GeminiRecognitionProvider(OpenAIRecognitionProvider):
 
         rescue_payload = _gemini_title_rescue_payload(original_payload)
         try:
+            # Bounded independently of the primary call: this pass is a
+            # best-effort upgrade with an existing result to fall back to
+            # (below and in the except clause), so a slow attempt should
+            # give up well before it doubles the scan's total latency.
             response = self._client.post(
                 self._generate_content_url(),
                 headers={"Content-Type": "application/json"},
                 json=rescue_payload,
-                timeout=self._timeout_seconds,
+                timeout=self._rescue_timeout_seconds,
             )
             if response.status_code >= 400:
                 return result_payload
