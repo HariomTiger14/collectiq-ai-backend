@@ -123,6 +123,14 @@ class Settings:
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
     gemini_timeout_seconds: float = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "60"))
+    # The title-rescue pass (a second Gemini call attempted only when the
+    # first pass returns an unrecognized item) is optional and already
+    # fails open to the original result on any error. Giving it the full
+    # primary-call budget let a slow rescue attempt roughly double a scan's
+    # worst-case latency; bound it independently so it can't compound.
+    gemini_rescue_timeout_seconds: float = float(
+        os.getenv("GEMINI_RESCUE_TIMEOUT_SECONDS", "25")
+    )
     ai_fallback_provider: str = os.getenv("AI_FALLBACK_PROVIDER", "openai")
     ai_fallback_confidence_threshold: int = int(
         os.getenv("AI_FALLBACK_CONFIDENCE_THRESHOLD", "70")
