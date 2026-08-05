@@ -208,6 +208,7 @@ def _row_from_pricing(
     diagnostics = pricing.providerDiagnostics
     return {
         "cache_key": cache_key,
+        "title": recognition.title or None,
         "category": recognition.category or "Collectible",
         "normalized_identity": _normalized_identity(recognition),
         "condition_label": recognition.condition or None,
