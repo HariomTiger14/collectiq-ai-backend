@@ -71,6 +71,49 @@ class CatalogSearchServiceTest(unittest.TestCase):
             requests[0].url.params.get("or"),
         )
 
+    def test_search_falls_back_to_generic_price_for_scan_derived_rows(self) -> None:
+        # Scan-derived rows (source_kind='scan_derived', promoted from
+        # pricing_cache_entries) never populate the PriceCharting-specific
+        # loose/cib/new/graded tiers — only market_value_cents/low/high_
+        # estimate_cents. A result must still surface a real price and the
+        # correct provider name, not silently show null/"PriceCharting".
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "pricecharting_id": "scan:abc123",
+                        "product_name": "Nike Air Force 1 '07",
+                        "console_name": None,
+                        "category": "Sneakers",
+                        "loose_price_cents": None,
+                        "cib_price_cents": None,
+                        "new_price_cents": None,
+                        "graded_price_cents": None,
+                        "currency": "USD",
+                        "source_file": None,
+                        "normalized_identity": "sneakers nike air force 1 07",
+                        "source_provider": "kicksdb",
+                        "market_value_cents": 10000,
+                        "low_estimate_cents": None,
+                        "high_estimate_cents": None,
+                    },
+                ],
+            )
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.search("nike air force 1", limit=10)
+
+        self.assertEqual(response.results[0].pricing.marketValue, 100)
+        self.assertEqual(response.results[0].pricing.currency, "USD")
+        self.assertEqual(response.results[0].source, "KicksDB")
+        self.assertEqual(response.results[0].attribution, "Pricing data by KicksDB")
+
     def test_short_query_returns_empty_without_supabase(self) -> None:
         service = CatalogSearchService(
             supabase_url="",
