@@ -1,12 +1,39 @@
+import json
 import unittest
 
 import httpx
 
 from app.services.ai.base_recognition_service import RecognitionResult
+from app.services.pricing.base_pricing_provider import PricingResult
 from app.services.pricing.shared_cache_repository import SharedPricingCacheRepository
 
 
 class SharedPricingCacheRepositoryTest(unittest.TestCase):
+    def test_set_writes_the_recognized_title(self) -> None:
+        # pricecharting_catalog.product_name is NOT NULL, so a scan-derived
+        # catalog promotion has nothing usable to promote unless the cache
+        # row carries the recognized title, not just normalized_identity
+        # (a lowercased matching key) or display_string (a formatted price).
+        captured_bodies: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                captured_bodies.append(json.loads(request.content))
+                return httpx.Response(201, json=[])
+            return httpx.Response(204)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SharedPricingCacheRepository(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.set(_recognition(title="Charizard Base Set"), _pricing())
+
+        self.assertEqual(len(captured_bodies), 1)
+        self.assertEqual(captured_bodies[0]["title"], "Charizard Base Set")
+
     def test_cache_key_is_stable_for_same_collectible_identity(self) -> None:
         repository = SharedPricingCacheRepository(
             supabase_url="https://example.supabase.co",
@@ -114,6 +141,20 @@ def _recognition(title: str = "Charizard Base Set") -> RecognitionResult:
         confidenceExplanation="Matched known card identifiers.",
         detectionQuality="Good",
         aiReasoning="Test fixture.",
+    )
+
+
+def _pricing() -> PricingResult:
+    return PricingResult(
+        estimatedMarketValue=638,
+        lowEstimate=593,
+        highEstimate=684,
+        currency="AUD",
+        pricingSource="PriceCharting",
+        pricingConfidence=86,
+        lastUpdated="2026-07-24T22:06:00Z",
+        valuationStatus="market_estimated",
+        valuationSource="PriceCharting",
     )
 
 
