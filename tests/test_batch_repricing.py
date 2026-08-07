@@ -92,7 +92,10 @@ class _FakeCatalogSearch:
         market_value: float | None = 250.0,
         low: float | None = 200.0,
         high: float | None = 300.0,
-        currency: str = "USD",
+        # AUD by default so tests that don't care about currency conversion
+        # get a same-currency (rate=1.0) pass-through -- see the dedicated
+        # currency-conversion tests below for the USD->AUD conversion path.
+        currency: str = "AUD",
         confidence: float = 0.96,
         source: str = "PriceCharting",
         error: Exception | None = None,
@@ -413,7 +416,10 @@ def test_rate_limited_beyond_retries_records_error_not_repriced():
 
 
 def test_catalog_matched_item_prices_from_catalog_not_live_api():
-    catalog = _FakeCatalogSearch(market_value=250.0, low=200.0, high=300.0, currency="USD")
+    # AUD catalog currency + AUD item display currency (the _item() default)
+    # -> same-currency, rate=1.0, values pass through unchanged. See the
+    # dedicated currency-conversion tests below for the USD->AUD case.
+    catalog = _FakeCatalogSearch(market_value=250.0, low=200.0, high=300.0, currency="AUD")
     item = _item(pricecharting_id="12345")
     service, patched, _snap = _service(
         items_pages=[[item]],
@@ -430,6 +436,33 @@ def test_catalog_matched_item_prices_from_catalog_not_live_api():
     assert body["estimated_value_low"] == 200.0
     assert body["estimated_value_high"] == 300.0
     assert body["raw_json"]["pricing"]["estimatedMarketValue"] == 250.0
+
+
+def test_catalog_matched_item_converts_catalog_currency_to_item_display_currency():
+    # Real bug hit in review: the catalog stores native provider currency
+    # (USD), but the live-API path always converts to the item's own display
+    # currency before persisting -- the catalog path skipped that entirely,
+    # so a USD catalog value would get stored as if it were already AUD
+    # (understating it by the FX rate). Uses the real _exchange_rate() for
+    # the expected value rather than a hardcoded number, so this doesn't
+    # drift if the configured FX rate ever changes.
+    from app.services.pricing.currency_conversion import _exchange_rate
+
+    catalog = _FakeCatalogSearch(market_value=100.0, low=80.0, high=120.0, currency="USD")
+    item = _item(pricecharting_id="12345")  # raw_json has no currency -> AUD display
+    service, patched, _snap = _service(
+        items_pages=[[item]], reprice=_ExplodingReprice(), catalog_search=catalog
+    )
+
+    service.reprice_all()
+
+    rate = _exchange_rate("USD", "AUD")
+    assert rate != 1.0, "test is meaningless if USD/AUD happen to be configured 1:1"
+    body = patched[0]["body"]
+    assert body["raw_json"]["pricing"]["estimatedMarketValue"] == 100.0 * rate
+    assert body["estimated_value_low"] == 80.0 * rate
+    assert body["estimated_value_high"] == 120.0 * rate
+    assert body["raw_json"]["pricing"]["currency"] == "AUD"
 
 
 def test_catalog_matched_item_uses_catalog_lookup_valuation_strategy():

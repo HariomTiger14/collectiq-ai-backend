@@ -42,6 +42,7 @@ from app.services.pricing.catalog_search_service import (
     CatalogSearchError,
     CatalogSearchService,
 )
+from app.services.pricing.currency_conversion import _exchange_rate
 from app.services.pricing.reprice_service import (
     RepriceService,
     RepriceValidationError,
@@ -197,15 +198,26 @@ class BatchRepricingService:
 
         result = detail.result
         pricing = result.pricing
-        value = pricing.marketValue
-        available = value is not None and value > 0
+        available = pricing.marketValue is not None and pricing.marketValue > 0
+
+        # The catalog stores native provider currency (e.g. USD); the live-API
+        # path always converts to the item's own display currency before
+        # persisting (RepriceService -> convert_pricing_result()) -- this must
+        # match, or a catalog-matched item's value gets stored as if its raw
+        # USD amount were AUD (understating it by the FX rate, ~35% for USD).
+        display_currency = _display_currency_from_row(row)
+        rate = _exchange_rate(pricing.currency, display_currency)
+        value = _to_float(pricing.marketValue * rate) if available else None
+        low = _to_float(pricing.lowEstimate * rate) if pricing.lowEstimate else None
+        high = _to_float(pricing.highEstimate * rate) if pricing.highEstimate else None
+
         return RepricePricingResponse(
             status="available" if available else "unavailable",
             estimatedMarketValue=value,
-            lowEstimate=pricing.lowEstimate,
-            highEstimate=pricing.highEstimate,
-            currency=pricing.currency,
-            displayString=f"{pricing.currency} {value}" if available else None,
+            lowEstimate=low,
+            highEstimate=high,
+            currency=display_currency,
+            displayString=f"{display_currency} {value}" if available else None,
             confidenceScore=result.confidence,
             pricingConfidence=round(result.confidence * 100),
             valuationStrategy="catalog_lookup",
@@ -399,11 +411,7 @@ def _request_from_row(row: dict[str, Any]) -> RepriceRequest | None:
     category = _clean(raw.get("category")) or _clean(row.get("category"))
     if not title or len(title) < 2 or not category or len(category) < 2:
         return None
-    currency = (
-        _clean(raw.get("currency"))
-        or _clean((raw.get("pricing") or {}).get("currency"))
-        or "AUD"
-    )
+    currency = _display_currency_from_row(row)
     identity = RepriceIdentityRequest(
         title=title,
         category=category,
@@ -438,6 +446,15 @@ def _source_name(pricing: Any) -> str | None:
         name = source.get("name")
         return name if isinstance(name, str) and name.strip() else None
     return None
+
+
+def _display_currency_from_row(row: dict[str, Any]) -> str:
+    raw = row.get("raw_json") or {}
+    return (
+        _clean(raw.get("currency"))
+        or _clean((raw.get("pricing") or {}).get("currency"))
+        or "AUD"
+    )
 
 
 def _year_text(value: Any) -> str | None:
