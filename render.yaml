@@ -12,6 +12,7 @@
 #   packlox-catalog-promote-scan-derived-sit cron (Python 3) — daily scan-derived catalog promotion
 #   packlox-discover-pricecharting-sets-sit  cron (Python 3) — weekly comics/coins/sports-cards set discovery
 #   packlox-backfill-pricecharting-sets-sit  cron (Python 3) — comics/coins/sports-cards catalog backfill
+#   packlox-match-portfolio-catalog-sit      cron (Python 3) — hourly portfolio-item-to-catalog linking
 #
 # The three app-facing crons call the deployed web service over HTTP (so all
 # the pricing / Supabase / Firebase secrets live only on packlox-api-sit and
@@ -283,4 +284,26 @@ services:
     startCommand: curl -fsS -X POST "https://api-sit.packlox.com/admin/catalog/promote-scan-derived?dryRun=false&minHitCount=1" -H "X-Admin-Token: $ADMIN_IMPORT_TOKEN"
     envVars:
       - key: ADMIN_IMPORT_TOKEN
+        sync: false
+
+  # App-facing: links portfolio_items to their matched pricecharting_catalog
+  # row (via the existing search_pricecharting_catalog RPC, confidence>=0.90
+  # only -- prefix/exact/product-name-substring matches, never a loose
+  # console/category-only guess) so the reprice cron can read a price
+  # straight from the catalog instead of always calling a live pricing
+  # provider API. Covers both new items (queue ordered so never-attempted
+  # items go first) and a retroactive backfill of already-owned items with
+  # the same job. Cheap (internal Supabase reads/writes only, no external
+  # rate limits), so it runs hourly rather than daily.
+  - type: cron
+    name: packlox-match-portfolio-catalog-sit
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    schedule: "0 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: curl -fsS -X POST "https://api-sit.packlox.com/admin/portfolio/match-catalog?dryRun=false&limit=500" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"
+    envVars:
+      - key: ADMIN_JOB_TOKEN
         sync: false
