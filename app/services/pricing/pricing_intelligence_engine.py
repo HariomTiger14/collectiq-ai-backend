@@ -31,6 +31,10 @@ class PricingConfidenceResult:
     provider_agreement_percent: int
 
 
+def _pluralize(count: int, singular: str) -> str:
+    return f"{count} {singular}" if count == 1 else f"{count} {singular}s"
+
+
 @dataclass(frozen=True)
 class PricingIntelligenceResult:
     comparable_sales: list[MarketComparableSale]
@@ -163,7 +167,8 @@ class PricingConfidenceEngine:
         )
 
         reason = (
-            f"{comparable_count} comparable sales, {max(1, provider_count)} providers, "
+            f"{_pluralize(comparable_count, 'comparable sale')}, "
+            f"{_pluralize(max(1, provider_count), 'provider')}, "
             f"{variance_percent}% price variance, {agreement}% provider agreement, "
             f"{self._freshness_label(comparable_sales)} market data"
         )
@@ -273,8 +278,10 @@ class PricingConfidenceEngine:
         sources = sorted({sale.source for sale in comparable_sales})
         source_label = " + ".join(sources) if sources else "provider data"
         return (
-            f"Estimated value is based on {comparable_count} comparable sales, "
-            f"{max(1, provider_count)} providers, {self._freshness_label(comparable_sales)} "
+            f"Estimated value is based on "
+            f"{_pluralize(comparable_count, 'comparable sale')}, "
+            f"{_pluralize(max(1, provider_count), 'provider')}, "
+            f"{self._freshness_label(comparable_sales)} "
             f"market data, {confidence.confidence}% confidence, and {source_label} "
             f"agreement at {confidence.provider_agreement_percent}%."
         )

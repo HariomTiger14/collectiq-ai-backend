@@ -55,6 +55,26 @@ class PricingIntelligenceEngineTest(unittest.TestCase):
         self.assertIn("2 providers", strong.confidence.reason)
         self.assertGreaterEqual(strong.confidence.provider_agreement_percent, 90)
 
+    def test_reason_and_explanation_use_singular_for_one(self) -> None:
+        # "1 providers"/"1 comparable sales" was live in the app's Market
+        # check pricing note — user-reported grammar bug.
+        result = self.engine.analyze(
+            recognition=self.recognition,
+            comparable_sales=[
+                _sale(1000, source="eBay", title="1999 Pokemon Charizard 4/102"),
+            ],
+            provider_count=1,
+        )
+
+        self.assertIn("1 comparable sale,", result.confidence.reason)
+        self.assertIn("1 provider,", result.confidence.reason)
+        self.assertNotIn("1 comparable sales", result.confidence.reason)
+        self.assertNotIn("1 providers", result.confidence.reason)
+        self.assertIn("1 comparable sale,", result.price_explanation)
+        self.assertIn("1 provider,", result.price_explanation)
+        self.assertNotIn("1 comparable sales", result.price_explanation)
+        self.assertNotIn("1 providers", result.price_explanation)
+
     def test_outlier_detection_removes_extreme_and_broken_listings(self) -> None:
         result = self.engine.detect_outliers(
             [
