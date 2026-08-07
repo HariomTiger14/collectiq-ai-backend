@@ -10,6 +10,8 @@
 #   packlox-batch-reprice-sit                cron (Python 3) — daily batch re-pricing
 #   packlox-price-alerts-sit                 cron (Python 3) — 6-hourly alert pipeline
 #   packlox-catalog-promote-scan-derived-sit cron (Python 3) — daily scan-derived catalog promotion
+#   packlox-discover-pricecharting-sets-sit  cron (Python 3) — monthly comics/coins/sports-cards set discovery
+#   packlox-backfill-pricecharting-sets-sit  cron (Python 3) — comics/coins/sports-cards catalog backfill
 #
 # The three app-facing crons call the deployed web service over HTTP (so all
 # the pricing / Supabase / Firebase secrets live only on packlox-api-sit and
@@ -156,6 +158,60 @@ services:
       - key: PRICECHARTING_CSV_YUGIOH_URL
         sync: false
       - key: PRICECHARTING_CSV_ONE_PIECE_URL
+        sync: false
+
+  # Discovers Comics/Coins/Sports-Cards set pages (categories the bulk CSV
+  # pipeline above doesn't cover) and registers new ones in
+  # pricecharting_set_registry for the priority-ordered backfill worker to
+  # pick up. Cheap plain-HTML crawl (not the rate-limited CSV/API endpoints),
+  # so it only needs to run monthly to catch newly published sets.
+  - type: cron
+    name: packlox-discover-pricecharting-sets-sit
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    schedule: "0 3 1 * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m scripts.discover_pricecharting_sets
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ENVIRONMENT
+        value: sit
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+
+  # Backfills Comics/Coins/Sports-Cards catalog data: claims priority-ordered
+  # rows from pricecharting_set_registry, resolves each set's console_uid,
+  # batches many sets into one undocumented-but-confirmed-working
+  # /price-guide/download-custom request, and writes straight into the same
+  # pricecharting_catalog / pricecharting_catalog_history tables the existing
+  # 5 bulk categories use (via the same SCD2 upsert code) -- so backfilled
+  # items are immediately usable by search/matching/pricing, not just landed
+  # as raw files. Runs frequently since each run is self-paced (2s between
+  # requests) and only processes a bounded --limit of registry rows.
+  - type: cron
+    name: packlox-backfill-pricecharting-sets-sit
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    schedule: "*/15 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m scripts.backfill_pricecharting_sets --limit 300 --batch-size 150 --catalog-batch-size 100 --sleep-between-requests-seconds 2
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ENVIRONMENT
+        value: sit
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: PRICECHARTING_API_TOKEN
         sync: false
 
   # App-facing: batch re-price every portfolio item (persist refreshed values).
