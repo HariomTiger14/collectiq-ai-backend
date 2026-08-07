@@ -113,8 +113,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if not args.dry_run and catalog_rows:
                     assert catalog_client is not None
-                    catalog_client.sync_scd2_history_rows(catalog_rows, batch_size=args.catalog_batch_size)
-                    catalog_client.upsert_rows(catalog_rows, batch_size=args.catalog_batch_size)
+                    if not write_catalog_rows(
+                        catalog_client,
+                        catalog_rows,
+                        batch_size=args.catalog_batch_size,
+                    ):
+                        failed_rows.extend(chunk)
+                        continue
 
                 succeeded_ids.extend(row["registry_id"] for row in chunk)
 
@@ -193,6 +198,26 @@ def chunked(items: list[Any], size: int) -> list[list[Any]]:
     if size <= 0:
         raise ValueError("size must be greater than zero")
     return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def write_catalog_rows(
+    catalog_client: SupabaseCatalogClient,
+    catalog_rows: list[dict[str, Any]],
+    *,
+    batch_size: int,
+) -> bool:
+    # A single slow/failing catalog write (e.g. a Postgres statement timeout
+    # on a large table) must not crash the whole run and cost every other
+    # already-processed chunk its mark_success. Whatever landed before the
+    # failure is already committed (idempotent upserts), so the only cost of
+    # treating this chunk as failed is a retry next cycle, not lost data.
+    try:
+        catalog_client.sync_scd2_history_rows(catalog_rows, batch_size=batch_size)
+        catalog_client.upsert_rows(catalog_rows, batch_size=batch_size)
+    except (SystemExit, Exception) as exc:
+        print(f"  Catalog write failed for this batch, will retry next cycle: {exc}", flush=True)
+        return False
+    return True
 
 
 def fetch_batch_csv(

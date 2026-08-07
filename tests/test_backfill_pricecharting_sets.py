@@ -10,6 +10,7 @@ from scripts.backfill_pricecharting_sets import (
     fetch_batch_csv,
     group_by_site,
     resolve_console_uids,
+    write_catalog_rows,
 )
 
 
@@ -133,6 +134,28 @@ class FetchBatchCsvTest(unittest.TestCase):
         self.assertIsNone(text)
 
 
+class WriteCatalogRowsTest(unittest.TestCase):
+    def test_returns_true_when_both_writes_succeed(self) -> None:
+        client = _FakeCatalogClient()
+        result = write_catalog_rows(client, [{"pricecharting_id": "1"}], batch_size=50)
+
+        self.assertTrue(result)
+        self.assertEqual(client.history_calls, 1)
+        self.assertEqual(client.upsert_calls, 1)
+
+    def test_a_systemexit_from_the_catalog_write_does_not_propagate(self) -> None:
+        client = _FakeCatalogClient(raise_on="upsert", error=SystemExit("statement timeout"))
+        result = write_catalog_rows(client, [{"pricecharting_id": "1"}], batch_size=50)
+
+        self.assertFalse(result)
+
+    def test_a_regular_exception_from_the_catalog_write_does_not_propagate(self) -> None:
+        client = _FakeCatalogClient(raise_on="history", error=RuntimeError("boom"))
+        result = write_catalog_rows(client, [{"pricecharting_id": "1"}], batch_size=50)
+
+        self.assertFalse(result)
+
+
 class SupabaseRegistryOpsClientTest(unittest.TestCase):
     def test_claim_rows_queries_unclaimed_or_expired_leases_and_marks_them_claimed(self) -> None:
         transport = _FakeRegistryOpsTransport(
@@ -222,6 +245,26 @@ class SupabaseRegistryOpsClientTest(unittest.TestCase):
         self.assertEqual(transport.patch_calls[0]["json"], {"console_uid": "G1"})
         self.assertEqual(transport.patch_calls[0]["params"]["registry_id"], "eq.1")
         self.assertEqual(transport.patch_calls[1]["json"], {"console_uid": "G2"})
+
+
+class _FakeCatalogClient:
+    def __init__(self, *, raise_on: str | None = None, error: Exception | None = None) -> None:
+        self.raise_on = raise_on
+        self.error = error
+        self.history_calls = 0
+        self.upsert_calls = 0
+
+    def sync_scd2_history_rows(self, rows, *, batch_size):
+        self.history_calls += 1
+        if self.raise_on == "history":
+            raise self.error
+        return len(rows)
+
+    def upsert_rows(self, rows, *, batch_size):
+        self.upsert_calls += 1
+        if self.raise_on == "upsert":
+            raise self.error
+        return len(rows)
 
 
 class _ExplodingRegistryClient:
