@@ -5,7 +5,9 @@ from unittest.mock import patch
 import httpx
 
 from scripts.backfill_pricecharting_sets import (
+    CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD,
     SupabaseRegistryOpsClient,
+    _RateLimitCircuitBreaker,
     chunked,
     fetch_batch_csv,
     group_by_site,
@@ -148,6 +150,83 @@ class ResolveConsoleUidsTest(unittest.TestCase):
         self.assertEqual(len(registry_client.updated_batches), 1)
         self.assertEqual(len(registry_client.updated_batches[0]), 9)
 
+    def test_circuit_breaker_stops_after_consecutive_429s_without_attempting_the_rest(
+        self,
+    ) -> None:
+        rows = [
+            {"registry_id": str(i), "url": f"https://example.test/{i}", "console_uid": None}
+            for i in range(6)
+        ]
+        request_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal request_count
+            request_count += 1
+            return httpx.Response(429)
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        registry_client = _ExplodingRegistryClient()
+
+        resolved, failed = resolve_console_uids(
+            rows, http=http, registry_client=registry_client, sleep_seconds=0, dry_run=True
+        )
+
+        self.assertEqual(resolved, [])
+        self.assertEqual(len(failed), 6)
+        # Only the threshold's worth of rows should ever have hit the
+        # network -- the rest must be skipped once the breaker trips,
+        # not attempted and then marked failed.
+        self.assertEqual(request_count, CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD)
+
+    def test_circuit_breaker_does_not_trip_on_a_non_429_error(self) -> None:
+        rows = [
+            {"registry_id": str(i), "url": f"https://example.test/{i}", "console_uid": None}
+            for i in range(6)
+        ]
+        request_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal request_count
+            request_count += 1
+            return httpx.Response(404)
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        registry_client = _ExplodingRegistryClient()
+
+        resolved, failed = resolve_console_uids(
+            rows, http=http, registry_client=registry_client, sleep_seconds=0, dry_run=True
+        )
+
+        self.assertEqual(len(failed), 6)
+        # A run of non-429 errors is not a "block" signal -- every row is
+        # still attempted, the breaker never trips.
+        self.assertEqual(request_count, 6)
+
+    def test_circuit_breaker_resets_after_a_success_in_between(self) -> None:
+        rows = [
+            {"registry_id": str(i), "url": f"https://example.test/{i}", "console_uid": None}
+            for i in range(5)
+        ]
+        # 429, 429, success, 429, 429 -- never 3 in a row, so the breaker
+        # should never trip and every row gets attempted.
+        statuses = iter([429, 429, 200, 429, 429])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            status = next(statuses)
+            if status == 200:
+                return httpx.Response(200, text=SET_PAGE_HTML)
+            return httpx.Response(status)
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        registry_client = _RecordingRegistryClient()
+
+        resolved, failed = resolve_console_uids(
+            rows, http=http, registry_client=registry_client, sleep_seconds=0, dry_run=False
+        )
+
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(len(failed), 4)
+
     def test_concurrency_with_a_single_row_does_not_spawn_a_thread_pool(self) -> None:
         rows = [{"registry_id": "1", "url": "https://example.test/x", "console_uid": None}]
         http = httpx.Client(
@@ -166,6 +245,30 @@ class ResolveConsoleUidsTest(unittest.TestCase):
 
         self.assertEqual(failed, [])
         self.assertEqual(resolved[0]["console_uid"], "G58495")
+
+
+class RateLimitCircuitBreakerTest(unittest.TestCase):
+    def test_not_tripped_before_the_threshold(self) -> None:
+        breaker = _RateLimitCircuitBreaker(threshold=3)
+        breaker.record_rate_limited()
+        breaker.record_rate_limited()
+        self.assertFalse(breaker.tripped)
+
+    def test_trips_at_the_threshold(self) -> None:
+        breaker = _RateLimitCircuitBreaker(threshold=3)
+        breaker.record_rate_limited()
+        breaker.record_rate_limited()
+        breaker.record_rate_limited()
+        self.assertTrue(breaker.tripped)
+
+    def test_success_resets_the_count(self) -> None:
+        breaker = _RateLimitCircuitBreaker(threshold=3)
+        breaker.record_rate_limited()
+        breaker.record_rate_limited()
+        breaker.record_success()
+        breaker.record_rate_limited()
+        breaker.record_rate_limited()
+        self.assertFalse(breaker.tripped)
 
 
 class FetchBatchCsvTest(unittest.TestCase):
