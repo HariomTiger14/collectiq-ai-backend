@@ -232,6 +232,59 @@ class BatchRepricingService:
                 "updated_at": iso,
             },
         )
+        self._persist_valuation_snapshot(row, pricing, value, low, high, iso, source)
+
+    def _persist_valuation_snapshot(
+        self,
+        row: dict[str, Any],
+        pricing: Any,
+        value: float,
+        low: float | None,
+        high: float | None,
+        iso: str,
+        source: str,
+    ) -> None:
+        """Writes a permanent daily price point for this item, mirroring the
+        mobile app's own cloud row shape (``supabaseValuationSnapshotRowForItem``)
+        so rows written by the scheduled sweep and rows written by a user's
+        manual "refresh valuation" tap are indistinguishable in storage. This
+        is what powers the value-history chart with real daily data instead
+        of only updating on a manual refresh.
+        """
+        raw = row.get("raw_json") or {}
+        try:
+            self._supabase_request(
+                "POST",
+                "/rest/v1/portfolio_valuation_snapshots",
+                headers={"Prefer": "return=minimal"},
+                json={
+                    "user_id": row["user_id"],
+                    "portfolio_item_id": row["id"],
+                    "value_aud": value,
+                    "low_estimate_aud": low if low is not None else value,
+                    "high_estimate_aud": high if high is not None else value,
+                    "display_string": pricing.displayString,
+                    "valuation_status": "market_estimated",
+                    "reason_code": "market_estimated",
+                    "valuation_strategy": pricing.valuationStrategy,
+                    "pricing_provider": source,
+                    "attribution_text": source,
+                    "confidence_score": pricing.confidenceScore,
+                    "condition_label": _clean(raw.get("condition")),
+                    "priced_at": iso,
+                    "evidence_json": {
+                        "title": _clean(raw.get("title")) or _clean(row.get("title")),
+                        "category": _clean(raw.get("category"))
+                        or _clean(row.get("category")),
+                        "brand": _clean(raw.get("brand"))
+                        or _clean(row.get("manufacturer")),
+                        "condition": _clean(raw.get("condition")),
+                        "source": "scheduled_reprice",
+                    },
+                },
+            )
+        except Exception:  # noqa: BLE001 - a missed history point can't block the sweep
+            pass
 
     # --- Supabase access -----------------------------------------------------
 
