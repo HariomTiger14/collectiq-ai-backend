@@ -112,6 +112,61 @@ class ResolveConsoleUidsTest(unittest.TestCase):
         self.assertEqual(resolved, [])
         self.assertEqual(len(failed), 1)
 
+    def test_concurrency_resolves_every_row_exactly_once(self) -> None:
+        rows = [
+            {"registry_id": str(i), "url": f"https://example.test/{i}", "console_uid": None}
+            for i in range(9)
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            uid = request.url.path.strip("/")
+            return httpx.Response(200, text=f'<script>VGPC.console_uid = "G{uid}";</script>')
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        registry_client = _RecordingRegistryClient()
+
+        resolved, failed = resolve_console_uids(
+            rows,
+            http=http,
+            registry_client=registry_client,
+            sleep_seconds=0,
+            dry_run=False,
+            max_concurrency=4,
+        )
+
+        self.assertEqual(failed, [])
+        self.assertEqual(len(resolved), 9)
+        self.assertEqual(
+            {row["registry_id"] for row in resolved},
+            {row["registry_id"] for row in rows},
+        )
+        self.assertEqual(
+            {row["console_uid"] for row in resolved},
+            {f"G{i}" for i in range(9)},
+        )
+        # One registry update call aggregating every lane's newly-resolved rows.
+        self.assertEqual(len(registry_client.updated_batches), 1)
+        self.assertEqual(len(registry_client.updated_batches[0]), 9)
+
+    def test_concurrency_with_a_single_row_does_not_spawn_a_thread_pool(self) -> None:
+        rows = [{"registry_id": "1", "url": "https://example.test/x", "console_uid": None}]
+        http = httpx.Client(
+            transport=httpx.MockTransport(lambda r: httpx.Response(200, text=SET_PAGE_HTML))
+        )
+        registry_client = _RecordingRegistryClient()
+
+        resolved, failed = resolve_console_uids(
+            rows,
+            http=http,
+            registry_client=registry_client,
+            sleep_seconds=0,
+            dry_run=False,
+            max_concurrency=5,
+        )
+
+        self.assertEqual(failed, [])
+        self.assertEqual(resolved[0]["console_uid"], "G58495")
+
 
 class FetchBatchCsvTest(unittest.TestCase):
     def test_builds_comma_separated_console_uids_param(self) -> None:

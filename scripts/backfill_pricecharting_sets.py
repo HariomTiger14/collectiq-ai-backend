@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -78,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
             registry_client=registry_client,
             sleep_seconds=args.sleep_between_requests_seconds,
             dry_run=args.dry_run,
+            max_concurrency=args.console_resolve_concurrency,
         )
         failed_rows.extend(resolve_failed)
 
@@ -154,7 +156,50 @@ def resolve_console_uids(
     registry_client: "SupabaseRegistryOpsClient",
     sleep_seconds: float,
     dry_run: bool,
+    max_concurrency: int = 1,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    # This resolve phase (one plain page fetch per unresolved set, looking
+    # for the VGPC.console_uid script tag) dominates a backfill run's wall
+    # clock -- confirmed live, ~5min of pure sleep()/request time for 150
+    # sets at the default 2s serial pace, before any CSV download or catalog
+    # write happens. max_concurrency>1 shards rows round-robin across N
+    # independent lanes run in a thread pool; each lane keeps the exact same
+    # per-request sleep_seconds pacing as before, so this scales wall-clock
+    # throughput without changing how "gentle" any single lane looks to
+    # PriceCharting/SportsCardsPro -- N lanes each requesting at the old
+    # pace, not one lane requesting N times faster. max_concurrency=1 (the
+    # default) runs the exact original single-lane loop, unchanged.
+    if max_concurrency <= 1 or len(rows) <= 1:
+        resolved, failed, newly_resolved = _resolve_console_uids_lane(
+            rows, http=http, sleep_seconds=sleep_seconds
+        )
+    else:
+        lanes = _shard_round_robin(rows, max_concurrency)
+        resolved, failed, newly_resolved = [], [], []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(lanes)) as pool:
+            lane_results = pool.map(
+                lambda lane: _resolve_console_uids_lane(
+                    lane, http=http, sleep_seconds=sleep_seconds
+                ),
+                lanes,
+            )
+            for lane_resolved, lane_failed, lane_newly_resolved in lane_results:
+                resolved.extend(lane_resolved)
+                failed.extend(lane_failed)
+                newly_resolved.extend(lane_newly_resolved)
+
+    if newly_resolved and not dry_run:
+        registry_client.update_console_uids(newly_resolved)
+
+    return resolved, failed
+
+
+def _resolve_console_uids_lane(
+    rows: list[dict[str, Any]],
+    *,
+    http: httpx.Client,
+    sleep_seconds: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     resolved: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     newly_resolved: list[dict[str, Any]] = []
@@ -181,10 +226,14 @@ def resolve_console_uids(
         resolved.append(row)
         newly_resolved.append(row)
 
-    if newly_resolved and not dry_run:
-        registry_client.update_console_uids(newly_resolved)
+    return resolved, failed, newly_resolved
 
-    return resolved, failed
+
+def _shard_round_robin(items: list[Any], shard_count: int) -> list[list[Any]]:
+    shards: list[list[Any]] = [[] for _ in range(shard_count)]
+    for index, item in enumerate(items):
+        shards[index % shard_count].append(item)
+    return [shard for shard in shards if shard]
 
 
 def group_by_site(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -267,6 +316,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=2.0,
         help="Self-imposed pace between set-page resolves and batch CSV requests.",
+    )
+    parser.add_argument(
+        "--console-resolve-concurrency",
+        type=int,
+        default=1,
+        help=(
+            "Number of parallel lanes resolving console_uids. Each lane keeps "
+            "the same --sleep-between-requests-seconds pacing independently, "
+            "so this multiplies wall-clock throughput without any single lane "
+            "requesting faster than before. Default 1 preserves the original "
+            "fully-serial behavior."
+        ),
     )
     parser.add_argument("--api-token", default="", help="Defaults to PRICECHARTING_API_TOKEN.")
     parser.add_argument("--supabase-url", default="", help="Defaults to SUPABASE_URL.")

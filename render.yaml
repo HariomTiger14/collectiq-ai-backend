@@ -196,6 +196,18 @@ services:
   # items are immediately usable by search/matching/pricing, not just landed
   # as raw files. Runs frequently since each run is self-paced (2s between
   # requests) and only processes a bounded --limit of registry rows.
+  #
+  # --console-resolve-concurrency 4: the console_uid resolve phase (one
+  # plain page fetch per unresolved set) dominates a run's wall clock --
+  # confirmed live at ~5min of pure pacing for 150 sets serially. 4 shards
+  # the claimed rows round-robin across 4 threads, each still pacing at
+  # --sleep-between-requests-seconds independently -- same per-lane request
+  # rate as before, ~4x less wall clock. Chosen as a moderate first step
+  # (not higher) since --sleep-between-requests-seconds's value was itself
+  # a conservative, never-fully-confirmed guess against an inconclusive
+  # single incident (see packlox-pricecharting-permission-and-expansion
+  # memory) -- worth monitoring a few real runs before considering either
+  # value more aggressive.
   - type: cron
     name: packlox-backfill-pricecharting-sets-sit
     runtime: python
@@ -204,7 +216,7 @@ services:
     branch: main
     schedule: "*/15 * * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m scripts.backfill_pricecharting_sets --limit 150 --batch-size 150 --catalog-batch-size 50 --sleep-between-requests-seconds 2
+    startCommand: python -m scripts.backfill_pricecharting_sets --limit 150 --batch-size 150 --catalog-batch-size 50 --sleep-between-requests-seconds 2 --console-resolve-concurrency 4
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
