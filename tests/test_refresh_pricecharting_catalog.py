@@ -69,6 +69,33 @@ class RefreshPriceChartingCatalogTest(unittest.TestCase):
         self.assertEqual([len(batch) for batch in client.history_batches], [2, 1])
         self.assertEqual(client.batches[0][0]["product_name"], "Charizard")
 
+    def test_import_source_file_survives_a_failing_batch(self) -> None:
+        path = _write_csv(
+            "id,product-name,console-name,loose-price\n"
+            "1,Charizard,Pokemon Cards,79000\n"
+            "2,Pikachu,Pokemon Cards,1200\n"
+            "3,Blastoise,Pokemon Cards,3300\n"
+        )
+        self.addCleanup(path.unlink, missing_ok=True)
+        client = _FailFirstBatchCatalogClient()
+
+        summary = import_source_file(
+            source_name="pokemon.csv",
+            path=path,
+            source_downloaded_at="2026-07-25T00:00:00Z",
+            batch_size=2,
+            dry_run=False,
+            client=client,
+        )
+
+        # First batch (2 rows) fails with a simulated statement timeout;
+        # the run must continue and still import the second batch (1 row)
+        # instead of raising and losing the whole source.
+        self.assertEqual(summary["inputRows"], 3)
+        self.assertEqual(summary["importedRows"], 1)
+        self.assertEqual(summary["historyRows"], 1)
+        self.assertEqual(len(client.upsert_calls), 2)
+
     def test_archive_source_file_copies_raw_csv_with_checksum(self) -> None:
         path = _write_csv(
             "id,product-name,console-name,loose-price\n"
@@ -120,6 +147,23 @@ class _RecordingCatalogClient:
 
     def upsert_rows(self, rows, *, batch_size):
         self.batches.append(list(rows))
+        return len(rows)
+
+
+class _FailFirstBatchCatalogClient:
+    def __init__(self) -> None:
+        self.upsert_calls = []
+
+    def sync_scd2_history_rows(self, rows, *, batch_size):
+        return len(rows)
+
+    def upsert_rows(self, rows, *, batch_size):
+        self.upsert_calls.append(list(rows))
+        if len(self.upsert_calls) == 1:
+            raise SystemExit(
+                "Supabase catalog import failed at rows 1-2 with HTTP 500: "
+                '{"code":"57014","message":"canceling statement due to statement timeout"}'
+            )
         return len(rows)
 
 

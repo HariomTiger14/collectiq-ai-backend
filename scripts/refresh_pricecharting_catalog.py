@@ -225,8 +225,17 @@ def import_batch(
         return {"importedRows": 0, "historyRows": 0}
     if client is None:
         raise SystemExit("Supabase client is required for non-dry-run refresh.")
-    history_total = client.sync_scd2_history_rows(batch, batch_size=batch_size)
-    total = client.upsert_rows(batch, batch_size=batch_size)
+    # A single slow/failing write (e.g. a Postgres statement timeout on the
+    # growing catalog table) must not crash the whole 5-source refresh and
+    # cost every other already-processed source its import. Whatever landed
+    # before the failure is already committed (idempotent upserts), so the
+    # only cost of treating this batch as failed is a retry next cycle.
+    try:
+        history_total = client.sync_scd2_history_rows(batch, batch_size=batch_size)
+        total = client.upsert_rows(batch, batch_size=batch_size)
+    except (SystemExit, Exception) as exc:
+        print(f"  Batch write failed, will retry next cycle: {exc}", flush=True)
+        return {"importedRows": 0, "historyRows": 0}
     print(f"Imported {imported_rows + total} rows for current source...", flush=True)
     return {"importedRows": total, "historyRows": history_total}
 
