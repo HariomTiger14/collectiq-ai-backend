@@ -10,7 +10,7 @@
 #   packlox-batch-reprice-sit                cron (Python 3) — daily batch re-pricing
 #   packlox-price-alerts-sit                 cron (Python 3) — 6-hourly alert pipeline
 #   packlox-catalog-promote-scan-derived-sit cron (Python 3) — daily scan-derived catalog promotion
-#   packlox-discover-pricecharting-sets-sit  cron (Python 3) — monthly comics/coins/sports-cards set discovery
+#   packlox-discover-pricecharting-sets-sit  cron (Python 3) — weekly comics/coins/sports-cards set discovery
 #   packlox-backfill-pricecharting-sets-sit  cron (Python 3) — comics/coins/sports-cards catalog backfill
 #
 # The three app-facing crons call the deployed web service over HTTP (so all
@@ -164,14 +164,16 @@ services:
   # pipeline above doesn't cover) and registers new ones in
   # pricecharting_set_registry for the priority-ordered backfill worker to
   # pick up. Cheap plain-HTML crawl (not the rate-limited CSV/API endpoints),
-  # so it only needs to run monthly to catch newly published sets.
+  # existing rows are never touched on re-run. Weekly, not monthly: sports
+  # cards get new product releases fairly often through the year, and a
+  # missed set just sits unpriced until the next crawl finds it.
   - type: cron
     name: packlox-discover-pricecharting-sets-sit
     runtime: python
     plan: starter
     region: oregon
     branch: main
-    schedule: "0 3 1 * *"
+    schedule: "0 3 * * 0"
     buildCommand: pip install -r requirements.txt
     startCommand: python -m scripts.discover_pricecharting_sets
     envVars:
