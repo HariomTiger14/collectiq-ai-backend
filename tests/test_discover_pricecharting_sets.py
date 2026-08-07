@@ -6,6 +6,8 @@ from unittest.mock import patch
 import httpx
 
 from scripts.discover_pricecharting_sets import (
+    DEFAULT_PRIORITY_TIER,
+    PRIORITY_TIER_BY_CATEGORY,
     SITE_CONFIGS,
     SupabaseRegistryClient,
     _selected_sites,
@@ -97,6 +99,35 @@ class BuildRegistryRowTest(unittest.TestCase):
             row["url"], "https://www.pricecharting.com/console/comic-books-x-men"
         )
         self.assertEqual(row["source_site"], "pricecharting")
+
+    def test_assigns_priority_tier_by_category(self) -> None:
+        coins_row = build_registry_row(
+            source_site="pricecharting",
+            category="coins",
+            brand="penny",
+            slug="coins-lincoln-wheat-penny",
+            set_name="Lincoln Wheat Penny",
+            base_url="https://www.pricecharting.com",
+        )
+        comics_row = build_registry_row(
+            source_site="pricecharting",
+            category="comic-books",
+            brand="marvel",
+            slug="comic-books-x-men",
+            set_name="X-Men",
+            base_url="https://www.pricecharting.com",
+        )
+        sports_row = build_registry_row(
+            source_site="sportscardspro",
+            category="baseball-cards",
+            brand="topps",
+            slug="baseball-cards-2025-topps",
+            set_name="2025 Topps",
+            base_url="https://www.sportscardspro.com",
+        )
+        self.assertEqual(coins_row["priority_tier"], PRIORITY_TIER_BY_CATEGORY["coins"])
+        self.assertEqual(comics_row["priority_tier"], PRIORITY_TIER_BY_CATEGORY["comic-books"])
+        self.assertEqual(sports_row["priority_tier"], DEFAULT_PRIORITY_TIER)
 
 
 class SelectedSitesTest(unittest.TestCase):

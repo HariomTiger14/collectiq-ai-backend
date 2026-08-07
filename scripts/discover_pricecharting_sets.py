@@ -33,6 +33,16 @@ SITE_CONFIGS = {
     },
 }
 
+# Coins (~68 sets) finishes almost immediately; comics (~6,200) is still
+# manageable; sports cards (~36,000, 85% of the whole backlog across dozens
+# of dynamically-discovered sport categories) stays at the column default (3)
+# so it doesn't delay the smaller categories from getting full coverage.
+PRIORITY_TIER_BY_CATEGORY = {
+    "coins": 1,
+    "comic-books": 2,
+}
+DEFAULT_PRIORITY_TIER = 3
+
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
@@ -193,6 +203,7 @@ def build_registry_row(
         "slug": slug,
         "set_name": set_name,
         "url": f"{base_url}/console/{slug}",
+        "priority_tier": PRIORITY_TIER_BY_CATEGORY.get(category, DEFAULT_PRIORITY_TIER),
     }
 
 
