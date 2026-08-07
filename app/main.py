@@ -12,6 +12,7 @@ from app.routers import (
     admin_ops,
     admin_pricecharting,
     admin_portfolio,
+    admin_portfolio_matching,
     admin_pricing,
     admin_reports,
     admin_scans,
@@ -56,6 +57,7 @@ app.include_router(admin_notes.router)
 app.include_router(admin_ops.router)
 app.include_router(admin_pricecharting.router)
 app.include_router(admin_portfolio.router)
+app.include_router(admin_portfolio_matching.router)
 app.include_router(admin_pricing.router)
 app.include_router(admin_reports.router)
 app.include_router(admin_scans.router)

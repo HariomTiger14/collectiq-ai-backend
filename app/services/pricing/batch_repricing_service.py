@@ -28,10 +28,19 @@ from typing import Any, Callable
 import httpx
 
 from app.core.config import settings
-from app.schemas.pricing import RepriceIdentityRequest, RepriceRequest
+from app.schemas.pricing import (
+    RepriceIdentityRequest,
+    RepricePricingResponse,
+    RepriceRequest,
+)
 from app.services.pricing.base_pricing_provider import (
     PricingProviderRateLimitError,
     PricingProviderTimeoutError,
+)
+from app.services.pricing.catalog_search_service import (
+    CatalogItemNotFoundError,
+    CatalogSearchError,
+    CatalogSearchService,
 )
 from app.services.pricing.reprice_service import (
     RepriceService,
@@ -69,6 +78,7 @@ class BatchRepricingService:
         service_role_key: str | None = None,
         client: httpx.Client | None = None,
         reprice_service: RepriceService | None = None,
+        catalog_search: CatalogSearchService | None = None,
         max_rate_limit_retries: int = 3,
         retry_backoff_seconds: float = 1.1,
         sleep: Callable[[float], None] = time.sleep,
@@ -83,6 +93,14 @@ class BatchRepricingService:
         )
         self._client = client or httpx.Client(timeout=30.0)
         self._reprice = reprice_service or RepriceService()
+        # Items linked to a pricecharting_catalog row (see
+        # portfolio_catalog_matching_service.py) get priced from the catalog
+        # directly instead of a live provider call -- same data, no external
+        # API hit. Unmatched items keep the live-API path below unchanged.
+        self._catalog_search = catalog_search or CatalogSearchService(
+            supabase_url=self._supabase_url,
+            service_role_key=self._service_role_key,
+        )
         # The provider throttle REJECTS (raises) rather than waiting when calls
         # arrive faster than its min interval (PriceCharting: 1s, shared across
         # processes). Sweeping many same-provider items back-to-back therefore
@@ -127,15 +145,21 @@ class BatchRepricingService:
         now: datetime,
         dry_run: bool,
     ) -> None:
-        request = _request_from_row(row)
-        if request is None:
-            summary.skipped += 1
-            return
-        response = self._reprice_with_retry(request, row, summary)
-        if response is None:
-            return
+        catalog_id = row.get("pricecharting_id")
+        if catalog_id:
+            pricing = self._price_from_catalog(catalog_id, row, summary)
+            if pricing is None:
+                return
+        else:
+            request = _request_from_row(row)
+            if request is None:
+                summary.skipped += 1
+                return
+            response = self._reprice_with_retry(request, row, summary)
+            if response is None:
+                return
+            pricing = response.pricing
 
-        pricing = response.pricing
         value = pricing.estimatedMarketValue
         if pricing.status != "available" or value is None or value <= 0:
             summary.unavailable += 1
@@ -148,6 +172,45 @@ class BatchRepricingService:
             except Exception as error:  # noqa: BLE001
                 summary.repriced -= 1
                 summary.errors.append({"id": row.get("id"), "error": str(error)})
+
+    def _price_from_catalog(
+        self,
+        catalog_id: str,
+        row: dict[str, Any],
+        summary: RepricingSummary,
+    ) -> RepricePricingResponse | None:
+        """Reads a price straight from pricecharting_catalog for an item
+        already linked by portfolio_catalog_matching_service, instead of
+        calling a live pricing provider. Returns None (counters already
+        updated) when the catalog row is gone or the request itself fails;
+        an unpriced/zero catalog entry still returns a response with
+        status="unavailable" so it's handled the same safe no-op way as a
+        live-API "unavailable" result (never zeroes an existing value)."""
+        try:
+            detail = self._catalog_search.detail(catalog_id)
+        except CatalogItemNotFoundError:
+            summary.unavailable += 1
+            return None
+        except CatalogSearchError as error:
+            summary.errors.append({"id": row.get("id"), "error": str(error)})
+            return None
+
+        result = detail.result
+        pricing = result.pricing
+        value = pricing.marketValue
+        available = value is not None and value > 0
+        return RepricePricingResponse(
+            status="available" if available else "unavailable",
+            estimatedMarketValue=value,
+            lowEstimate=pricing.lowEstimate,
+            highEstimate=pricing.highEstimate,
+            currency=pricing.currency,
+            displayString=f"{pricing.currency} {value}" if available else None,
+            confidenceScore=result.confidence,
+            pricingConfidence=round(result.confidence * 100),
+            valuationStrategy="catalog_lookup",
+            pricingSource={"name": result.source, "kind": "catalog"},
+        )
 
     def _reprice_with_retry(
         self,
@@ -296,7 +359,7 @@ class BatchRepricingService:
             "/rest/v1/portfolio_items",
             params={
                 "select": "id,user_id,category,title,manufacturer,series,year,"
-                "raw_json,estimated_value_high,estimated_value_low",
+                "raw_json,estimated_value_high,estimated_value_low,pricecharting_id",
                 "order": "id.asc",
                 "limit": str(page_size),
                 "offset": str(offset),

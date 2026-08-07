@@ -13,10 +13,15 @@ from app.schemas.pricing import (
     RepriceRequest,
     RepriceResponse,
 )
+from app.schemas.search import CatalogDetailResponse, CatalogSearchPricing, CatalogSearchResult
 from app.services.pricing.base_pricing_provider import (
     PricingProviderRateLimitError,
 )
 from app.services.pricing.batch_repricing_service import BatchRepricingService
+from app.services.pricing.catalog_search_service import (
+    CatalogItemNotFoundError,
+    CatalogSearchError,
+)
 
 
 class _RateLimitedReprice:
@@ -69,8 +74,82 @@ class _FakeReprice:
         )
 
 
+class _ExplodingReprice:
+    """Fails the test if the live-API path is ever reached -- used to prove a
+    catalog-matched item never falls through to it."""
+
+    def reprice(self, request: RepriceRequest) -> RepriceResponse:
+        raise AssertionError("live pricing provider must not be called for a catalog-matched item")
+
+
+class _FakeCatalogSearch:
+    """Stand-in for CatalogSearchService.detail(), used to test the
+    catalog-lookup repricing path without hitting Supabase."""
+
+    def __init__(
+        self,
+        *,
+        market_value: float | None = 250.0,
+        low: float | None = 200.0,
+        high: float | None = 300.0,
+        currency: str = "USD",
+        confidence: float = 0.96,
+        source: str = "PriceCharting",
+        error: Exception | None = None,
+    ) -> None:
+        self._market_value = market_value
+        self._low = low
+        self._high = high
+        self._currency = currency
+        self._confidence = confidence
+        self._source = source
+        self._error = error
+        self.detail_calls: list[str] = []
+
+    def detail(self, catalog_id: str, history_limit: int = 30) -> CatalogDetailResponse:
+        self.detail_calls.append(catalog_id)
+        if self._error is not None:
+            raise self._error
+        result = CatalogSearchResult(
+            id=catalog_id,
+            title="Amazing Spider-Man #300",
+            category="Comic Books",
+            source=self._source,
+            setName=None,
+            identifier=None,
+            productUrl=None,
+            sourceFile=None,
+            confidence=self._confidence,
+            attribution=f"Pricing data by {self._source}",
+            lastUpdated=None,
+            imageUrl=None,
+            pricing=CatalogSearchPricing(
+                currency=self._currency,
+                marketValue=self._market_value,
+                lowEstimate=self._low,
+                highEstimate=self._high,
+                loosePrice=self._market_value,
+                cibPrice=None,
+                newPrice=None,
+                gradedPrice=None,
+            ),
+        )
+        return CatalogDetailResponse(result=result, history=[])
+
+
+class _ExplodingCatalogSearch:
+    """Fails the test if the catalog-lookup path is ever reached -- used to
+    prove an unmatched item still falls through to the live-API path."""
+
+    def detail(self, catalog_id: str, history_limit: int = 30) -> CatalogDetailResponse:
+        raise AssertionError("catalog search must not be called for an unmatched item")
+
+
 def _service(
-    *, items_pages: list[list[dict[str, Any]]], reprice: _FakeReprice
+    *,
+    items_pages: list[list[dict[str, Any]]],
+    reprice: _FakeReprice,
+    catalog_search: Any = None,
 ) -> tuple[BatchRepricingService, list[dict[str, Any]], list[dict[str, Any]]]:
     patched: list[dict[str, Any]] = []
     snapshots: list[dict[str, Any]] = []
@@ -101,6 +180,10 @@ def _service(
         service_role_key="service-role-key",
         client=httpx.Client(transport=httpx.MockTransport(handler)),
         reprice_service=reprice,
+        # Defaults to a fake that fails the test if reached -- every existing
+        # test's items are unmatched (no pricecharting_id), so this also
+        # proves the catalog path is never touched for them.
+        catalog_search=catalog_search if catalog_search is not None else _ExplodingCatalogSearch(),
         sleep=lambda _seconds: None,  # don't actually wait in tests
     )
     return service, patched, snapshots
@@ -327,3 +410,96 @@ def test_rate_limited_beyond_retries_records_error_not_repriced():
     assert summary.rate_limited == 3  # default max_rate_limit_retries
     assert len(summary.errors) == 1
     assert patched == []
+
+
+def test_catalog_matched_item_prices_from_catalog_not_live_api():
+    catalog = _FakeCatalogSearch(market_value=250.0, low=200.0, high=300.0, currency="USD")
+    item = _item(pricecharting_id="12345")
+    service, patched, _snap = _service(
+        items_pages=[[item]],
+        reprice=_ExplodingReprice(),  # proves the live-API path is skipped
+        catalog_search=catalog,
+    )
+
+    summary = service.reprice_all()
+
+    assert catalog.detail_calls == ["12345"]
+    assert summary.repriced == 1
+    assert len(patched) == 1
+    body = patched[0]["body"]
+    assert body["estimated_value_low"] == 200.0
+    assert body["estimated_value_high"] == 300.0
+    assert body["raw_json"]["pricing"]["estimatedMarketValue"] == 250.0
+
+
+def test_catalog_matched_item_uses_catalog_lookup_valuation_strategy():
+    # "catalog_lookup" is the exact string the mobile app's
+    # _catalogIdFromNotes/isCatalogSnapshot check already looks for on the
+    # per-item value-history panel -- using it here means that existing UI
+    # badge recognizes catalog-sourced reprice snapshots too, no mobile change.
+    catalog = _FakeCatalogSearch(market_value=250.0)
+    item = _item(pricecharting_id="12345")
+    service, _patched, snapshots = _service(
+        items_pages=[[item]], reprice=_ExplodingReprice(), catalog_search=catalog
+    )
+
+    service.reprice_all()
+
+    assert snapshots[0]["valuation_strategy"] == "catalog_lookup"
+
+
+def test_catalog_item_with_no_price_is_a_noop():
+    catalog = _FakeCatalogSearch(market_value=None)
+    item = _item(pricecharting_id="12345")
+    service, patched, _snap = _service(
+        items_pages=[[item]], reprice=_ExplodingReprice(), catalog_search=catalog
+    )
+
+    summary = service.reprice_all()
+
+    assert summary.repriced == 0
+    assert summary.unavailable == 1
+    assert patched == []
+
+
+def test_catalog_item_not_found_is_treated_as_unavailable():
+    catalog = _FakeCatalogSearch(error=CatalogItemNotFoundError("gone"))
+    item = _item(pricecharting_id="12345")
+    service, patched, _snap = _service(
+        items_pages=[[item]], reprice=_ExplodingReprice(), catalog_search=catalog
+    )
+
+    summary = service.reprice_all()
+
+    assert summary.unavailable == 1
+    assert summary.repriced == 0
+    assert patched == []
+
+
+def test_catalog_search_error_records_error_not_repriced():
+    catalog = _FakeCatalogSearch(error=CatalogSearchError("boom"))
+    item = _item(pricecharting_id="12345")
+    service, patched, _snap = _service(
+        items_pages=[[item]], reprice=_ExplodingReprice(), catalog_search=catalog
+    )
+
+    summary = service.reprice_all()
+
+    assert summary.repriced == 0
+    assert summary.unavailable == 0
+    assert len(summary.errors) == 1
+    assert patched == []
+
+
+def test_unmatched_item_still_uses_live_api_not_catalog():
+    # No pricecharting_id on the item -- _service()'s default catalog_search
+    # fake fails the test if it's ever called, proving this regresses to
+    # exactly today's live-API behavior for unmatched items.
+    reprice = _FakeReprice(status="available", value=250.0, low=200.0, high=300.0)
+    service, patched, _snap = _service(items_pages=[[_item()]], reprice=reprice)
+
+    summary = service.reprice_all()
+
+    assert summary.repriced == 1
+    assert len(reprice.requests) == 1
+    assert len(patched) == 1
