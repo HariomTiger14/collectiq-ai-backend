@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 
@@ -67,6 +68,20 @@ class FindBestMatchTest(unittest.TestCase):
 
         assert match is not None
         self.assertEqual(match["id"], "first")
+
+    def test_score_is_an_integer_percentage_not_a_raw_float(self) -> None:
+        # pricecharting_match_score is an integer column -- writing the raw
+        # 0.0-1.0 confidence float crashed with a real Postgres 22P02 error
+        # on a live run. Must always come back as a rounded int 0-100.
+        catalog = _StubCatalog(
+            CatalogSearchResponse(query="q", count=1, results=[_result(id="x", confidence=0.96)])
+        )
+
+        match = find_best_match(catalog, "q")
+
+        assert match is not None
+        self.assertEqual(match["score"], 96)
+        self.assertIsInstance(match["score"], int)
 
     def test_skips_low_confidence_and_takes_the_next_qualifying_result(self) -> None:
         catalog = _StubCatalog(
@@ -144,12 +159,14 @@ class MatchUnlinkedPortfolioItemsTest(unittest.TestCase):
             settings.supabase_service_role_key = "service-role"
             reader = reader_cls.return_value
             reader.fetch_unlinked_items.return_value = items
-            find_best_match_fn.side_effect = [{"id": "123", "score": 0.96}, None]
+            reader.apply_updates.return_value = 0
+            find_best_match_fn.side_effect = [{"id": "123", "score": 96}, None]
 
             result = match_unlinked_portfolio_items(limit=200, dry_run=False)
 
         self.assertEqual(result.matchedCount, 1)
         self.assertEqual(result.unmatchedCount, 1)
+        self.assertEqual(result.updateFailures, 0)
         reader.apply_updates.assert_called_once()
         updates = reader.apply_updates.call_args[0][0]
         self.assertEqual(updates[0]["pricecharting_id"], "123")
@@ -202,6 +219,44 @@ class PortfolioItemReaderTest(unittest.TestCase):
         self.assertEqual(patch_calls[0]["id"], "eq.1")
         self.assertEqual(patch_calls[0]["user_id"], "eq.u1")
         self.assertEqual(patch_calls[1]["id"], "eq.2")
+
+    def test_apply_updates_continues_past_a_failing_row_and_counts_failures(self) -> None:
+        # Hit for real: one row's bad value 400'd and, before this fix,
+        # aborted every other row's update in the same batch. A failure must
+        # be logged and skipped, not stop the loop.
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            if "bad" in body.values():
+                return httpx.Response(400, json={"message": "invalid input syntax"})
+            return httpx.Response(200)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        reader = PortfolioItemReader(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        failures = reader.apply_updates(
+            [
+                {"id": "1", "user_id": "u1", "pricecharting_id": "bad"},
+                {"id": "2", "user_id": "u2", "pricecharting_id": "123"},
+            ]
+        )
+
+        self.assertEqual(failures, 1)
+
+    def test_apply_updates_returns_zero_when_everything_succeeds(self) -> None:
+        client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+        reader = PortfolioItemReader(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        failures = reader.apply_updates([{"id": "1", "user_id": "u1", "pricecharting_id": "123"}])
+
+        self.assertEqual(failures, 0)
 
     def test_raises_without_configuration(self) -> None:
         with self.assertRaises(PortfolioCatalogMatchingError):
