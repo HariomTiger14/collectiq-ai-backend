@@ -57,6 +57,7 @@ class AdminPortfolioMatchingTest(unittest.TestCase):
         self.assertEqual(payload["matchedCount"], 4)
         self.assertEqual(payload["unmatchedCount"], 5)
         self.assertEqual(payload["skippedMissingTitle"], 1)
+        self.assertEqual(payload["updateFailures"], 0)
         match_fn.assert_called_once_with(limit=50, dry_run=True, timeout_seconds=30)
 
 

@@ -33,6 +33,7 @@ class MatchResult:
     matchedCount: int
     unmatchedCount: int
     skippedMissingTitle: int
+    updateFailures: int = 0
 
 
 def match_unlinked_portfolio_items(
@@ -87,14 +88,16 @@ def match_unlinked_portfolio_items(
                 }
             )
 
+    update_failures = 0
     if not dry_run and updates:
-        reader.apply_updates(updates)
+        update_failures = reader.apply_updates(updates)
 
     return MatchResult(
         candidateCount=len(items),
         matchedCount=matched,
         unmatchedCount=unmatched,
         skippedMissingTitle=skipped_missing_title,
+        updateFailures=update_failures,
     )
 
 
@@ -113,7 +116,12 @@ def find_best_match(catalog: CatalogSearchService, query: str) -> dict[str, Any]
         return None
     for result in response.results:
         if result.confidence >= MIN_AUTO_LINK_CONFIDENCE:
-            return {"id": result.id, "score": result.confidence}
+            # pricecharting_match_score is an integer column -- store as a
+            # 0-100 percentage (matches RepricePricingResponse.pricingConfidence's
+            # existing int convention elsewhere in this codebase), not the raw
+            # 0.0-1.0 float confidence (writing that raw crashed with Postgres
+            # 22P02 "invalid input syntax for type integer" on a live run).
+            return {"id": result.id, "score": round(result.confidence * 100)}
     return None
 
 
@@ -151,12 +159,20 @@ class PortfolioItemReader:
             return []
         return [row for row in payload if isinstance(row, dict)]
 
-    def apply_updates(self, updates: list[dict[str, Any]]) -> None:
+    def apply_updates(self, updates: list[dict[str, Any]]) -> int:
         # PATCH per row (not a batched upsert): portfolio_items' primary key
         # is composite (id, user_id), and each row needs its own values
         # (different pricecharting_id/score/timestamps), which a single
         # shared-payload PATCH can't express. Same reasoning as the set
         # registry's per-row PATCH in backfill_pricecharting_sets.py.
+        #
+        # A single bad row must not abort every other row's update in this
+        # batch (hit for real: one row's stale float score 400'd and the
+        # remaining ~19 updates in that run never happened). Log and keep
+        # going instead of raising -- the failed row's pricecharting_id
+        # stays null and pricecharting_match_attempted_at stays unset, so
+        # it's naturally retried next cycle rather than silently stuck.
+        failures = 0
         client = self._client or httpx.Client(timeout=self._timeout_seconds)
         should_close = self._client is None
         try:
@@ -177,13 +193,15 @@ class PortfolioItemReader:
                 try:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as exc:
-                    raise PortfolioCatalogMatchingError(
-                        f"Portfolio item update failed for {item_id} "
-                        f"with HTTP {response.status_code}: {response.text}"
-                    ) from exc
+                    failures += 1
+                    print(
+                        f"Portfolio item update failed for {item_id}, will retry "
+                        f"next cycle: HTTP {response.status_code}: {response.text}"
+                    )
         finally:
             if should_close:
                 client.close()
+        return failures
 
     def _request(self, method: str, path: str, *, params: dict[str, str]) -> Any:
         headers = self._headers()
