@@ -82,7 +82,18 @@ def promote_scan_derived_rows(
             service_role_key=settings.supabase_service_role_key,
             timeout_seconds=timeout_seconds,
         )
-        promoted_count = client.upsert_rows(rows, batch_size=200)
+        # A single slow/failing chunk (e.g. a Postgres statement timeout)
+        # must not abandon every other already-committed chunk in this run
+        # -- same resilience pattern as write_catalog_rows() in
+        # scripts/backfill_pricecharting_sets.py and import_batch() in
+        # scripts/refresh_pricecharting_catalog.py. Idempotent upserts mean
+        # nothing already written is lost; the only cost is this candidate
+        # set being re-attempted on tomorrow's run.
+        try:
+            promoted_count = client.upsert_rows(rows, batch_size=200)
+        except (SystemExit, Exception) as exc:
+            print(f"Catalog promotion write failed, will retry next cycle: {exc}", flush=True)
+            promoted_count = 0
 
     return PromotionResult(
         candidateCount=len(candidates),
