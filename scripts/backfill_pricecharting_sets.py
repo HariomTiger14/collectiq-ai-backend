@@ -3,11 +3,52 @@ import concurrent.futures
 import json
 import os
 import re
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
+
+
+# A sustained run of 429s means the remote site is actively throttling this
+# connection right now -- continuing to send more requests after that point
+# only digs the hole deeper (and risks the relationship with the data
+# provider, not just wasting this run). This was an explicit design
+# requirement from day one ("don't build the backfill worker to hammer at
+# zero delay... with automatic backoff/circuit-breaker if any response ever
+# looks like a block") that was never actually implemented -- a live run
+# hit 20+ consecutive 429s before this existed. 3 is deliberately low: a
+# single 429 could be a transient blip, but 3 in a row is a real signal.
+CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD = 3
+
+
+class _RateLimitCircuitBreaker:
+    """Shared across every concurrent resolve lane so one lane detecting a
+    sustained block stops every lane immediately, instead of each lane
+    independently burning through its own quota of wasted requests before
+    noticing the same block."""
+
+    def __init__(self, threshold: int) -> None:
+        self._threshold = threshold
+        self._lock = threading.Lock()
+        self._consecutive_failures = 0
+        self._tripped = False
+
+    @property
+    def tripped(self) -> bool:
+        with self._lock:
+            return self._tripped
+
+    def record_rate_limited(self) -> None:
+        with self._lock:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._threshold:
+                self._tripped = True
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._consecutive_failures = 0
 
 from scripts.import_pricecharting_catalog import (
     SupabaseCatalogClient,
@@ -169,9 +210,10 @@ def resolve_console_uids(
     # PriceCharting/SportsCardsPro -- N lanes each requesting at the old
     # pace, not one lane requesting N times faster. max_concurrency=1 (the
     # default) runs the exact original single-lane loop, unchanged.
+    breaker = _RateLimitCircuitBreaker(CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD)
     if max_concurrency <= 1 or len(rows) <= 1:
         resolved, failed, newly_resolved = _resolve_console_uids_lane(
-            rows, http=http, sleep_seconds=sleep_seconds
+            rows, http=http, sleep_seconds=sleep_seconds, breaker=breaker
         )
     else:
         lanes = _shard_round_robin(rows, max_concurrency)
@@ -179,7 +221,7 @@ def resolve_console_uids(
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(lanes)) as pool:
             lane_results = pool.map(
                 lambda lane: _resolve_console_uids_lane(
-                    lane, http=http, sleep_seconds=sleep_seconds
+                    lane, http=http, sleep_seconds=sleep_seconds, breaker=breaker
                 ),
                 lanes,
             )
@@ -199,6 +241,7 @@ def _resolve_console_uids_lane(
     *,
     http: httpx.Client,
     sleep_seconds: float,
+    breaker: "_RateLimitCircuitBreaker",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     resolved: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
@@ -208,11 +251,25 @@ def _resolve_console_uids_lane(
         if row.get("console_uid"):
             resolved.append(row)
             continue
+        if breaker.tripped:
+            print(
+                f"  Circuit breaker tripped (repeated 429s) -- skipping "
+                f"{row['url']} without attempting.",
+                flush=True,
+            )
+            failed.append(row)
+            continue
         if index > 0 and sleep_seconds > 0:
             time.sleep(sleep_seconds)
         try:
             response = http.get(row["url"])
             response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            print(f"  Failed to resolve console_uid for {row['url']}: {exc}", flush=True)
+            failed.append(row)
+            if exc.response.status_code == 429:
+                breaker.record_rate_limited()
+            continue
         except httpx.HTTPError as exc:
             print(f"  Failed to resolve console_uid for {row['url']}: {exc}", flush=True)
             failed.append(row)
@@ -221,10 +278,12 @@ def _resolve_console_uids_lane(
         if not match:
             print(f"  No console_uid found on {row['url']}.", flush=True)
             failed.append(row)
+            breaker.record_success()
             continue
         row["console_uid"] = match.group(1)
         resolved.append(row)
         newly_resolved.append(row)
+        breaker.record_success()
 
     return resolved, failed, newly_resolved
 
