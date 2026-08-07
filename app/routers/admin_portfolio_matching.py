@@ -43,4 +43,5 @@ def match_portfolio_items_to_catalog(
         "unmatchedCount": result.unmatchedCount,
         "skippedMissingTitle": result.skippedMissingTitle,
         "updateFailures": result.updateFailures,
+        "historyRowsBackfilled": result.historyRowsBackfilled,
     }
