@@ -203,7 +203,7 @@ services:
     branch: main
     schedule: "*/15 * * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m scripts.backfill_pricecharting_sets --limit 150 --batch-size 150 --catalog-batch-size 100 --sleep-between-requests-seconds 2
+    startCommand: python -m scripts.backfill_pricecharting_sets --limit 150 --batch-size 150 --catalog-batch-size 50 --sleep-between-requests-seconds 2
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
