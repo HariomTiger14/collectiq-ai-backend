@@ -197,6 +197,35 @@ class PromoteScanDerivedRowsTest(unittest.TestCase):
         promoted_rows = client_cls.return_value.upsert_rows.call_args[0][0]
         self.assertEqual(promoted_rows[0]["pricecharting_id"], "scan:a")
 
+    def test_survives_a_failing_write_instead_of_raising(self) -> None:
+        candidates = [
+            {"cache_key": "a", "title": "Charizard #4", "category": "Cards"},
+        ]
+
+        with patch(
+            "app.services.pricing.promote_scan_derived_catalog.PricingCacheReader"
+        ) as reader_cls, patch(
+            "app.services.pricing.promote_scan_derived_catalog.SupabaseCatalogClient"
+        ) as client_cls, patch(
+            "app.services.pricing.promote_scan_derived_catalog.settings"
+        ) as settings:
+            settings.supabase_url = "https://example.supabase.co"
+            settings.supabase_service_role_key = "service-role"
+            reader = reader_cls.return_value
+            reader.fetch_candidates.return_value = candidates
+            reader.fetch_already_promoted_cache_keys.return_value = set()
+            client_cls.return_value.upsert_rows.side_effect = SystemExit(
+                "Supabase catalog import failed at rows 1-1 with HTTP 500: "
+                '{"code":"57014","message":"canceling statement due to statement timeout"}'
+            )
+
+            # Must not raise -- a failed write is caught, logged, and
+            # reported as zero promoted rather than crashing the request.
+            result = promote_scan_derived_rows(min_hit_count=1, dry_run=False)
+
+        self.assertEqual(result.promotedCount, 0)
+        self.assertEqual(result.candidateCount, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
