@@ -387,6 +387,14 @@ def parse_date(value: str) -> str | None:
     return None
 
 
+# Generous upper bound for a single collectible's price ($1,000,000). Real
+# source rows never approach this; it exists to catch malformed CSV values
+# (e.g. a UPC or id sitting in a price column) before they reach the
+# database, where they would overflow the `integer` price_cents columns
+# and fail the whole write batch.
+MAX_PLAUSIBLE_PRICE_CENTS = 100_000_000
+
+
 def parse_price_cents(value: str) -> int | None:
     if not value:
         return None
@@ -396,14 +404,17 @@ def parse_price_cents(value: str) -> int | None:
     if cleaned.startswith("$") or "." in cleaned:
         cleaned = cleaned.replace("$", "")
         try:
-            return max(0, round(float(cleaned) * 100))
+            cents = max(0, round(float(cleaned) * 100))
         except ValueError:
             return None
-    try:
-        cents = int(float(cleaned))
-    except ValueError:
+    else:
+        try:
+            cents = int(float(cleaned))
+        except ValueError:
+            return None
+    if cents <= 0 or cents > MAX_PLAUSIBLE_PRICE_CENTS:
         return None
-    return cents if cents > 0 else None
+    return cents
 
 
 class SupabaseCatalogClient:
