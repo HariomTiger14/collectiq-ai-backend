@@ -410,7 +410,20 @@ class SupabaseRegistryOpsClient:
                 f"{self.supabase_url}/rest/v1/pricecharting_set_registry",
                 params={
                     "select": "registry_id,source_site,url,console_uid,failure_count",
-                    "or": f"(claimed_at.is.null,claimed_at.lt.{lease_cutoff})",
+                    # Both conditions matter: the claimed_at OR-group picks
+                    # never-claimed/lease-expired rows; the last_fetch_status
+                    # OR-group excludes rows already marked "success" so they
+                    # stop re-entering the batch forever (mark_success() nulls
+                    # claimed_at on completion, which otherwise makes a done
+                    # row indistinguishable from a never-attempted one -- with
+                    # priority_tier ordering, that let coins/comics rows
+                    # perpetually re-fill every batch and starve every lower
+                    # -tier category of a single run). Failed ("error") and
+                    # never-attempted (null) rows still pass through to retry.
+                    "and": (
+                        f"(or(claimed_at.is.null,claimed_at.lt.{lease_cutoff}),"
+                        "or(last_fetch_status.is.null,last_fetch_status.neq.success))"
+                    ),
                     "order": "priority_tier.asc,last_fetched_at.asc.nullsfirst",
                     "limit": str(limit),
                 },
