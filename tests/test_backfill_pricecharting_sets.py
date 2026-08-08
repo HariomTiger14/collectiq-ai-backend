@@ -5,13 +5,17 @@ from unittest.mock import patch
 import httpx
 
 from scripts.backfill_pricecharting_sets import (
+    API_SEARCH_RESULT_CAP,
     CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD,
     SupabaseRegistryOpsClient,
     _RateLimitCircuitBreaker,
+    _search_products,
     chunked,
     fetch_batch_csv,
+    fetch_batch_csv_with_retry,
     group_by_site,
     resolve_console_uids,
+    resolve_via_api_for_small_sets,
     write_catalog_rows,
 )
 
@@ -292,6 +296,200 @@ class FetchBatchCsvTest(unittest.TestCase):
         self.assertIsNone(text)
 
 
+def _product(product_id: str, name: str, console: str = "Baseball Cards 1962 Bazooka") -> dict:
+    return {
+        "id": product_id,
+        "product-name": name,
+        "console-name": console,
+        "loose-price": 1000,
+    }
+
+
+class SearchProductsTest(unittest.TestCase):
+    def test_returns_products_on_success(self) -> None:
+        products = [_product("1", "Card A"), _product("2", "Card B")]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": "success", "products": products})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        result = _search_products(http, base_url="https://example.test", token="tok", query="1962 bazooka")
+
+        self.assertEqual(result, products)
+
+    def test_returns_none_for_empty_query(self) -> None:
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+        result = _search_products(http, base_url="https://example.test", token="tok", query="")
+        self.assertIsNone(result)
+
+    def test_returns_none_on_error_status(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": "error", "error-message": "bad token"})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        result = _search_products(http, base_url="https://example.test", token="tok", query="x")
+        self.assertIsNone(result)
+
+    def test_returns_none_on_http_error(self) -> None:
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(403)))
+        result = _search_products(http, base_url="https://example.test", token="tok", query="x")
+        self.assertIsNone(result)
+
+
+class ResolveViaApiForSmallSetsTest(unittest.TestCase):
+    def test_a_small_set_succeeds_and_is_removed_from_remaining(self) -> None:
+        rows = [{"registry_id": "1", "set_name": "1962 Bazooka", "source_site": "sportscardspro"}]
+        products = [_product("1", "Card A"), _product("2", "Card B")]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": "success", "products": products})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        succeeded, remaining = resolve_via_api_for_small_sets(
+            rows, http=http, token="tok", sleep_seconds=0, source_downloaded_at="2026-01-01T00:00:00Z"
+        )
+
+        self.assertEqual(remaining, [])
+        self.assertEqual(len(succeeded), 1)
+        row, catalog_rows = succeeded[0]
+        self.assertEqual(row["registry_id"], "1")
+        self.assertEqual(len(catalog_rows), 2)
+        self.assertEqual(catalog_rows[0]["pricecharting_id"], "1")
+
+    def test_a_set_at_the_cap_falls_back_to_remaining(self) -> None:
+        rows = [{"registry_id": "1", "set_name": "2023 Panini Prizm", "source_site": "sportscardspro"}]
+        products = [_product(str(i), f"Card {i}") for i in range(API_SEARCH_RESULT_CAP)]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": "success", "products": products})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        succeeded, remaining = resolve_via_api_for_small_sets(
+            rows, http=http, token="tok", sleep_seconds=0, source_downloaded_at="2026-01-01T00:00:00Z"
+        )
+
+        # Hitting the cap is ambiguous/truncated -- must fall back to CSV,
+        # not be trusted as a complete result.
+        self.assertEqual(succeeded, [])
+        self.assertEqual(remaining, rows)
+
+    def test_an_empty_result_falls_back_to_remaining(self) -> None:
+        rows = [{"registry_id": "1", "set_name": "nonexistent set", "source_site": "sportscardspro"}]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": "success", "products": []})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        succeeded, remaining = resolve_via_api_for_small_sets(
+            rows, http=http, token="tok", sleep_seconds=0, source_downloaded_at="2026-01-01T00:00:00Z"
+        )
+
+        self.assertEqual(succeeded, [])
+        self.assertEqual(remaining, rows)
+
+    def test_a_fetch_error_falls_back_to_remaining(self) -> None:
+        rows = [{"registry_id": "1", "set_name": "1962 Bazooka", "source_site": "sportscardspro"}]
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(403)))
+
+        succeeded, remaining = resolve_via_api_for_small_sets(
+            rows, http=http, token="tok", sleep_seconds=0, source_downloaded_at="2026-01-01T00:00:00Z"
+        )
+
+        self.assertEqual(succeeded, [])
+        self.assertEqual(remaining, rows)
+
+    def test_multiple_rows_are_each_evaluated_independently(self) -> None:
+        rows = [
+            {"registry_id": "1", "set_name": "small set", "source_site": "sportscardspro"},
+            {"registry_id": "2", "set_name": "big set", "source_site": "sportscardspro"},
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            query = request.url.params.get("q")
+            count = 5 if query == "small set" else API_SEARCH_RESULT_CAP
+            products = [_product(str(i), f"Card {i}") for i in range(count)]
+            return httpx.Response(200, json={"status": "success", "products": products})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        succeeded, remaining = resolve_via_api_for_small_sets(
+            rows, http=http, token="tok", sleep_seconds=0, source_downloaded_at="2026-01-01T00:00:00Z"
+        )
+
+        self.assertEqual(len(succeeded), 1)
+        self.assertEqual(succeeded[0][0]["registry_id"], "1")
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["registry_id"], "2")
+
+
+class FetchBatchCsvWithRetryTest(unittest.TestCase):
+    def test_returns_on_first_success_without_retrying(self) -> None:
+        request_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal request_count
+            request_count += 1
+            return httpx.Response(200, text="id,console-name\n1,Foo\n")
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        text = fetch_batch_csv_with_retry(
+            http,
+            base_url="https://example.test",
+            token="tok",
+            console_uids=["G1"],
+            max_attempts=3,
+            retry_sleep_seconds=0,
+        )
+
+        self.assertEqual(text, "id,console-name\n1,Foo\n")
+        self.assertEqual(request_count, 1)
+
+    def test_retries_after_a_failure_and_succeeds(self) -> None:
+        statuses = iter([429, 200])
+        request_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal request_count
+            request_count += 1
+            status = next(statuses)
+            if status == 200:
+                return httpx.Response(200, text="id,console-name\n1,Foo\n")
+            return httpx.Response(status)
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        text = fetch_batch_csv_with_retry(
+            http,
+            base_url="https://example.test",
+            token="tok",
+            console_uids=["G1"],
+            max_attempts=3,
+            retry_sleep_seconds=0,
+        )
+
+        self.assertEqual(text, "id,console-name\n1,Foo\n")
+        self.assertEqual(request_count, 2)
+
+    def test_gives_up_after_max_attempts(self) -> None:
+        request_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal request_count
+            request_count += 1
+            return httpx.Response(429)
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        text = fetch_batch_csv_with_retry(
+            http,
+            base_url="https://example.test",
+            token="tok",
+            console_uids=["G1"],
+            max_attempts=3,
+            retry_sleep_seconds=0,
+        )
+
+        self.assertIsNone(text)
+        self.assertEqual(request_count, 3)
+
+
 class WriteCatalogRowsTest(unittest.TestCase):
     def test_returns_true_when_both_writes_succeed(self) -> None:
         client = _FakeCatalogClient()
@@ -333,6 +531,9 @@ class SupabaseRegistryOpsClientTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(transport.patched_claim["claimed_by"], "worker-1")
         self.assertIn("registry_id", transport.get_params["select"])
+        # set_name is required by the API-search hybrid path, which queries
+        # /api/products?q=<set_name> before falling back to console_uid+CSV.
+        self.assertIn("set_name", transport.get_params["select"])
 
     def test_claim_rows_excludes_already_successful_rows(self) -> None:
         # Regression test: mark_success() nulls claimed_at on completion, so

@@ -68,6 +68,28 @@ SOURCE_SITE_BASE_URLS = {
     "sportscardspro": "https://www.sportscardspro.com",
 }
 
+# /api/products (search) is confirmed NOT blocked by sportscardspro.com's
+# Cloudflare protection (unlike /console/* pages and the CSV download), and
+# with a real subscriber token it returns full price data per item -- same
+# column names as the CSV (see TEXT_FIELDS/PRICE_FIELDS in
+# import_pricecharting_catalog.py), so results can feed straight into
+# to_catalog_row() unchanged. But it's a ranked full-text search with a hard
+# cap, confirmed live at exactly 100 results regardless of page/offset/
+# cursor/limit params (all silently ignored, no pagination exists). A set
+# under this cap is reliably complete (verified against a real set's known
+# checklist size); a set at or over the cap is truncated/ambiguous and must
+# fall back to the console_uid+CSV path instead.
+API_SEARCH_RESULT_CAP = 100
+
+# sportscardspro.com's console_uid pages and CSV download return a
+# Cloudflare "Managed Challenge" (429) unpredictably at fast pacing, but
+# this is rate-based throttling, not a hard bot-fingerprint block -- live
+# testing found ~13% success at 2s spacing, 80% at 15s, and 100% (10/10) at
+# 30s. pricecharting.com has no such throttle and stays on the caller's
+# normal --sleep-between-requests-seconds pacing.
+SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS = 30.0
+SPORTSCARDSPRO_DEFAULT_MAX_ATTEMPTS = 3
+
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
@@ -108,37 +130,103 @@ def main(argv: list[str] | None = None) -> int:
     succeeded_ids: list[str] = []
     failed_rows: list[dict[str, Any]] = []
     total_catalog_rows = 0
+    api_search_succeeded = 0
 
     with httpx.Client(
         timeout=args.timeout_seconds,
         follow_redirects=True,
         headers=REQUEST_HEADERS,
     ) as http:
-        resolved, resolve_failed = resolve_console_uids(
-            claimed_rows,
+        # Try the cheap, non-blocked /api/products search first for
+        # sportscardspro sets -- complete for anything under the 100-result
+        # cap, which skips console_uid resolution and the CSV download
+        # entirely for those rows. Only sets that come back empty or
+        # truncated fall through to the console_uid+CSV path below.
+        sportscardspro_rows = [
+            row for row in claimed_rows if row["source_site"] == "sportscardspro"
+        ]
+        remaining_rows = [
+            row for row in claimed_rows if row["source_site"] != "sportscardspro"
+        ]
+        if sportscardspro_rows:
+            api_succeeded, api_remaining = resolve_via_api_for_small_sets(
+                sportscardspro_rows,
+                http=http,
+                token=token,
+                sleep_seconds=args.sleep_between_requests_seconds,
+                source_downloaded_at=source_downloaded_at,
+            )
+            for row, catalog_rows in api_succeeded:
+                total_catalog_rows += len(catalog_rows)
+                if not args.dry_run and catalog_rows:
+                    assert catalog_client is not None
+                    if not write_catalog_rows(
+                        catalog_client, catalog_rows, batch_size=args.catalog_batch_size
+                    ):
+                        failed_rows.append(row)
+                        continue
+                succeeded_ids.append(row["registry_id"])
+                api_search_succeeded += 1
+        # remaining_rows stays pricecharting-only; api_remaining (the
+        # sportscardspro rows that didn't clear via API search) is handled
+        # as its own group below, with its own pacing.
+
+        # console_uid resolution and CSV download run with SEPARATE pacing
+        # per site: pricecharting.com is unthrottled and keeps the caller's
+        # normal pace; sportscardspro.com's large sets (whatever didn't
+        # clear via the API search above) need the much slower, empirically
+        # -confirmed-reliable pace to avoid the Cloudflare throttle. Each
+        # call gets its own circuit breaker instance too, so a sportscardspro
+        # anomaly never affects pricecharting processing or vice versa.
+        resolved_pricecharting, resolve_failed_pricecharting = resolve_console_uids(
+            remaining_rows,
             http=http,
             registry_client=registry_client,
             sleep_seconds=args.sleep_between_requests_seconds,
             dry_run=args.dry_run,
             max_concurrency=args.console_resolve_concurrency,
         )
-        failed_rows.extend(resolve_failed)
+        resolved_sportscardspro, resolve_failed_sportscardspro = resolve_console_uids(
+            api_remaining if sportscardspro_rows else [],
+            http=http,
+            registry_client=registry_client,
+            sleep_seconds=args.sportscardspro_sleep_seconds,
+            dry_run=args.dry_run,
+            max_concurrency=1,
+        )
+        resolved = resolved_pricecharting + resolved_sportscardspro
+        failed_rows.extend(resolve_failed_pricecharting)
+        failed_rows.extend(resolve_failed_sportscardspro)
 
         for source_site, rows in group_by_site(resolved).items():
             base_url = SOURCE_SITE_BASE_URLS[source_site]
+            is_sportscardspro = source_site == "sportscardspro"
+            site_sleep_seconds = (
+                args.sportscardspro_sleep_seconds
+                if is_sportscardspro
+                else args.sleep_between_requests_seconds
+            )
             for index, chunk in enumerate(chunked(rows, args.batch_size)):
-                if index > 0 and args.sleep_between_requests_seconds > 0:
-                    time.sleep(args.sleep_between_requests_seconds)
+                if index > 0 and site_sleep_seconds > 0:
+                    time.sleep(site_sleep_seconds)
                 console_uids = [row["console_uid"] for row in chunk]
                 print(
                     f"Fetching {source_site} batch of {len(chunk)} sets...",
                     flush=True,
                 )
-                csv_text = fetch_batch_csv(
-                    http,
-                    base_url=base_url,
-                    token=token,
-                    console_uids=console_uids,
+                csv_text = (
+                    fetch_batch_csv_with_retry(
+                        http,
+                        base_url=base_url,
+                        token=token,
+                        console_uids=console_uids,
+                        max_attempts=args.sportscardspro_max_attempts,
+                        retry_sleep_seconds=args.sportscardspro_sleep_seconds,
+                    )
+                    if is_sportscardspro
+                    else fetch_batch_csv(
+                        http, base_url=base_url, token=token, console_uids=console_uids
+                    )
                 )
                 if csv_text is None:
                     failed_rows.extend(chunk)
@@ -179,6 +267,7 @@ def main(argv: list[str] | None = None) -> int:
                 "dryRun": args.dry_run,
                 "claimed": len(claimed_rows),
                 "succeeded": len(succeeded_ids),
+                "succeededViaApiSearch": api_search_succeeded,
                 "failed": len(failed_rows),
                 "catalogRowsWritten": 0 if args.dry_run else total_catalog_rows,
                 "catalogRowsParsed": total_catalog_rows,
@@ -188,6 +277,79 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
     return 0
+
+
+def resolve_via_api_for_small_sets(
+    rows: list[dict[str, Any]],
+    *,
+    http: httpx.Client,
+    token: str,
+    sleep_seconds: float,
+    source_downloaded_at: str,
+) -> tuple[list[tuple[dict[str, Any], list[dict[str, Any]]]], list[dict[str, Any]]]:
+    """Try the sanctioned /api/products search for each row's set name --
+    cheap, not Cloudflare-blocked, and a complete result for any set with
+    fewer than API_SEARCH_RESULT_CAP cards. Sets that come back empty or hit
+    the cap are ambiguous/incomplete and are returned in `remaining` for the
+    caller to fall back to the console_uid+CSV path instead.
+
+    Only meaningful for sportscardspro.com rows -- pricecharting.com's CSV
+    path already works directly via plain HTTP, so there's no reason to
+    spend extra per-set API calls there.
+    """
+    succeeded: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    remaining: list[dict[str, Any]] = []
+    base_url = SOURCE_SITE_BASE_URLS["sportscardspro"]
+
+    for index, row in enumerate(rows):
+        if index > 0 and sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+        products = _search_products(
+            http, base_url=base_url, token=token, query=row.get("set_name") or ""
+        )
+        if products is None or not (0 < len(products) < API_SEARCH_RESULT_CAP):
+            remaining.append(row)
+            continue
+        catalog_rows = [
+            to_catalog_row(product, "sportscardspro-api-search", source_downloaded_at)
+            for product in products
+        ]
+        catalog_rows = [catalog_row for catalog_row in catalog_rows if catalog_row is not None]
+        if not catalog_rows:
+            remaining.append(row)
+            continue
+        print(
+            f"  API search complete for {row.get('set_name')!r}: "
+            f"{len(catalog_rows)} cards.",
+            flush=True,
+        )
+        succeeded.append((row, catalog_rows))
+
+    return succeeded, remaining
+
+
+def _search_products(
+    http: httpx.Client,
+    *,
+    base_url: str,
+    token: str,
+    query: str,
+) -> list[dict[str, Any]] | None:
+    if not query:
+        return None
+    try:
+        response = http.get(
+            f"{base_url}/api/products",
+            params={"t": token, "q": query},
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        print(f"  API search failed for {query!r}: {exc}", flush=True)
+        return None
+    if payload.get("status") != "success":
+        return None
+    return payload.get("products") or []
 
 
 def resolve_console_uids(
@@ -347,6 +509,35 @@ def fetch_batch_csv(
     return response.text
 
 
+def fetch_batch_csv_with_retry(
+    http: httpx.Client,
+    *,
+    base_url: str,
+    token: str,
+    console_uids: list[str],
+    max_attempts: int,
+    retry_sleep_seconds: float,
+) -> str | None:
+    # A single 30s-paced request already succeeds ~100% of the time
+    # (confirmed live), so this retry exists purely as a safety margin for
+    # occasional misses -- recovering within the same run instead of
+    # waiting a full 15-minute cron cycle for the next attempt.
+    for attempt in range(1, max_attempts + 1):
+        csv_text = fetch_batch_csv(
+            http, base_url=base_url, token=token, console_uids=console_uids
+        )
+        if csv_text is not None:
+            return csv_text
+        if attempt < max_attempts:
+            print(
+                f"  Retrying batch download (attempt {attempt + 1}/{max_attempts}) "
+                f"after {retry_sleep_seconds:.0f}s...",
+                flush=True,
+            )
+            time.sleep(retry_sleep_seconds)
+    return None
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -388,6 +579,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "fully-serial behavior."
         ),
     )
+    parser.add_argument(
+        "--sportscardspro-sleep-seconds",
+        type=float,
+        default=SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS,
+        help=(
+            "Pace for sportscardspro.com console_uid resolution and CSV "
+            "requests -- separate from --sleep-between-requests-seconds "
+            "since sportscardspro.com throttles much more aggressively "
+            "(confirmed live: ~13%% success at 2s, 80%% at 15s, 100%% at 30s). "
+            "pricecharting.com is unaffected and keeps the normal pace."
+        ),
+    )
+    parser.add_argument(
+        "--sportscardspro-max-attempts",
+        type=int,
+        default=SPORTSCARDSPRO_DEFAULT_MAX_ATTEMPTS,
+        help="In-run retry attempts for a sportscardspro CSV batch before giving up.",
+    )
     parser.add_argument("--api-token", default="", help="Defaults to PRICECHARTING_API_TOKEN.")
     parser.add_argument("--supabase-url", default="", help="Defaults to SUPABASE_URL.")
     parser.add_argument("--service-role-key", default="", help="Defaults to SUPABASE_SERVICE_ROLE_KEY.")
@@ -409,7 +618,7 @@ class SupabaseRegistryOpsClient:
             response = client.get(
                 f"{self.supabase_url}/rest/v1/pricecharting_set_registry",
                 params={
-                    "select": "registry_id,source_site,url,console_uid,failure_count",
+                    "select": "registry_id,source_site,url,console_uid,failure_count,set_name",
                     # Both conditions matter: the claimed_at OR-group picks
                     # never-claimed/lease-expired rows; the last_fetch_status
                     # OR-group excludes rows already marked "success" so they
