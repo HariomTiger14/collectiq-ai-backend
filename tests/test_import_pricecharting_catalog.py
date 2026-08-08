@@ -27,6 +27,13 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
         self.assertEqual(parse_price_cents("33.25"), 3325)
         self.assertEqual(parse_price_cents("1,234"), 1234)
 
+    def test_parse_price_cents_rejects_implausibly_large_values(self) -> None:
+        # A malformed source field (e.g. a UPC/id landing in a price
+        # column) must not be trusted as-is: it would overflow the
+        # `integer` price_cents columns and fail the whole write batch.
+        self.assertIsNone(parse_price_cents("4009902121"))
+        self.assertIsNone(parse_price_cents("$4009902121.00"))
+
     def test_to_catalog_row_maps_pricecharting_csv_fields(self) -> None:
         row = to_catalog_row(
             {
