@@ -334,6 +334,29 @@ class SupabaseRegistryOpsClientTest(unittest.TestCase):
         self.assertEqual(transport.patched_claim["claimed_by"], "worker-1")
         self.assertIn("registry_id", transport.get_params["select"])
 
+    def test_claim_rows_excludes_already_successful_rows(self) -> None:
+        # Regression test: mark_success() nulls claimed_at on completion, so
+        # without this exclusion a successfully-processed row looks
+        # identical to a never-attempted one on the next claim query --
+        # with priority_tier ordering, that let a handful of high-priority
+        # categories perpetually re-fill every batch and starve every lower
+        # -tier category (all sports-cards categories) of a single run.
+        transport = _FakeRegistryOpsTransport(claimable_rows=[])
+        with patch("scripts.backfill_pricecharting_sets.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseRegistryOpsClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key="key",
+                timeout_seconds=1,
+            )
+            client.claim_rows(limit=10, lease_minutes=30, worker_id="worker-1")
+
+        and_filter = transport.get_params["and"]
+        self.assertIn("last_fetch_status.is.null", and_filter)
+        self.assertIn("last_fetch_status.neq.success", and_filter)
+        self.assertIn("claimed_at.is.null", and_filter)
+        self.assertNotIn("or", transport.get_params)
+
     def test_claim_rows_returns_empty_without_patching_when_nothing_available(self) -> None:
         transport = _FakeRegistryOpsTransport(claimable_rows=[])
         with patch("scripts.backfill_pricecharting_sets.httpx.Client") as client_class:
