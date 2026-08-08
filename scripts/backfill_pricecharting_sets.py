@@ -90,6 +90,19 @@ API_SEARCH_RESULT_CAP = 100
 SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS = 30.0
 SPORTSCARDSPRO_DEFAULT_MAX_ATTEMPTS = 3
 
+# The console_uid resolve step is fully serial at SPORTSCARDSPRO_DEFAULT_SLEEP_
+# SECONDS per row (deliberately not concurrent -- parallel lanes would send
+# requests faster in aggregate and risk re-triggering the throttle this
+# pacing exists to avoid). Left unbounded, a claimed batch where every row
+# needs this slow path (worst case) would take limit x 30s -- at the cron's
+# default --limit 150 that's 75 minutes, far past the 15-minute schedule
+# and risking two runs claiming overlapping rows once a lease expires
+# mid-run. Capping how many rows take the slow path per run bounds a
+# single run's worst-case wall-clock time regardless of --limit; any
+# excess rows are simply left claimed and age out their lease for a later
+# run to pick up -- not touched, no failure_count penalty.
+SPORTSCARDSPRO_DEFAULT_SLOW_PATH_LIMIT = 20
+
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
@@ -148,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
         remaining_rows = [
             row for row in claimed_rows if row["source_site"] != "sportscardspro"
         ]
+        api_remaining: list[dict[str, Any]] = []
         if sportscardspro_rows:
             api_succeeded, api_remaining = resolve_via_api_for_small_sets(
                 sportscardspro_rows,
@@ -178,6 +192,21 @@ def main(argv: list[str] | None = None) -> int:
         # -confirmed-reliable pace to avoid the Cloudflare throttle. Each
         # call gets its own circuit breaker instance too, so a sportscardspro
         # anomaly never affects pricecharting processing or vice versa.
+        #
+        # Only the first --sportscardspro-slow-path-limit of api_remaining
+        # actually go through this run's slow resolve step, bounding this
+        # run's worst-case wall-clock time -- any beyond that are simply
+        # left claimed (not touched, no failure_count penalty) to age out
+        # their lease and get picked up by a later run instead.
+        sportscardspro_slow_path_rows, deferred_count = cap_slow_path_rows(
+            api_remaining, limit=args.sportscardspro_slow_path_limit
+        )
+        if deferred_count:
+            print(
+                f"  Deferring {deferred_count} sportscardspro set(s) to a later run "
+                f"(slow-path cap {args.sportscardspro_slow_path_limit} reached).",
+                flush=True,
+            )
         resolved_pricecharting, resolve_failed_pricecharting = resolve_console_uids(
             remaining_rows,
             http=http,
@@ -187,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
             max_concurrency=args.console_resolve_concurrency,
         )
         resolved_sportscardspro, resolve_failed_sportscardspro = resolve_console_uids(
-            api_remaining if sportscardspro_rows else [],
+            sportscardspro_slow_path_rows,
             http=http,
             registry_client=registry_client,
             sleep_seconds=args.sportscardspro_sleep_seconds,
@@ -268,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
                 "claimed": len(claimed_rows),
                 "succeeded": len(succeeded_ids),
                 "succeededViaApiSearch": api_search_succeeded,
+                "deferredToLaterRun": deferred_count,
                 "failed": len(failed_rows),
                 "catalogRowsWritten": 0 if args.dry_run else total_catalog_rows,
                 "catalogRowsParsed": total_catalog_rows,
@@ -457,6 +487,19 @@ def _shard_round_robin(items: list[Any], shard_count: int) -> list[list[Any]]:
     return [shard for shard in shards if shard]
 
 
+def cap_slow_path_rows(
+    rows: list[dict[str, Any]], *, limit: int
+) -> tuple[list[dict[str, Any]], int]:
+    """Bounds how many rows enter the slow (30s/row) resolve path in a
+    single run. Returns (rows_to_process, deferred_count) -- rows beyond
+    the limit are simply not included; they stay claimed and age out their
+    lease for a later run to pick up, no other action needed here."""
+    if limit <= 0:
+        return [], len(rows)
+    capped = rows[:limit]
+    return capped, max(0, len(rows) - len(capped))
+
+
 def group_by_site(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -596,6 +639,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=SPORTSCARDSPRO_DEFAULT_MAX_ATTEMPTS,
         help="In-run retry attempts for a sportscardspro CSV batch before giving up.",
+    )
+    parser.add_argument(
+        "--sportscardspro-slow-path-limit",
+        type=int,
+        default=SPORTSCARDSPRO_DEFAULT_SLOW_PATH_LIMIT,
+        help=(
+            "Max sportscardspro rows resolved via the slow (30s/row) "
+            "console_uid+CSV path per run, bounding worst-case wall-clock "
+            "time regardless of --limit. Excess rows are left claimed and "
+            "picked up by a later run once their lease expires."
+        ),
     )
     parser.add_argument("--api-token", default="", help="Defaults to PRICECHARTING_API_TOKEN.")
     parser.add_argument("--supabase-url", default="", help="Defaults to SUPABASE_URL.")

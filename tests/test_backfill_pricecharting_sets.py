@@ -10,6 +10,7 @@ from scripts.backfill_pricecharting_sets import (
     SupabaseRegistryOpsClient,
     _RateLimitCircuitBreaker,
     _search_products,
+    cap_slow_path_rows,
     chunked,
     fetch_batch_csv,
     fetch_batch_csv_with_retry,
@@ -34,6 +35,32 @@ class ChunkedTest(unittest.TestCase):
     def test_rejects_non_positive_size(self) -> None:
         with self.assertRaises(ValueError):
             chunked([1], 0)
+
+
+class CapSlowPathRowsTest(unittest.TestCase):
+    def test_returns_everything_uncapped_when_under_the_limit(self) -> None:
+        rows = [{"registry_id": str(i)} for i in range(5)]
+        capped, deferred = cap_slow_path_rows(rows, limit=20)
+        self.assertEqual(capped, rows)
+        self.assertEqual(deferred, 0)
+
+    def test_caps_at_the_limit_and_reports_the_remainder_as_deferred(self) -> None:
+        rows = [{"registry_id": str(i)} for i in range(50)]
+        capped, deferred = cap_slow_path_rows(rows, limit=20)
+        self.assertEqual(len(capped), 20)
+        self.assertEqual(capped, rows[:20])
+        self.assertEqual(deferred, 30)
+
+    def test_a_zero_or_negative_limit_defers_everything(self) -> None:
+        rows = [{"registry_id": str(i)} for i in range(5)]
+        capped, deferred = cap_slow_path_rows(rows, limit=0)
+        self.assertEqual(capped, [])
+        self.assertEqual(deferred, 5)
+
+    def test_empty_input_is_a_no_op(self) -> None:
+        capped, deferred = cap_slow_path_rows([], limit=20)
+        self.assertEqual(capped, [])
+        self.assertEqual(deferred, 0)
 
 
 class GroupBySiteTest(unittest.TestCase):
