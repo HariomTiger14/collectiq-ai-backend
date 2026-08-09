@@ -333,6 +333,38 @@ services:
       - key: KICKSDB_API_KEY
         sync: false
 
+  # Daily refresh for the 5 pricecharting.com registry categories that are
+  # already 100% backfilled (coins, comic-books, funko-pops, lego-sets,
+  # lorcana-cards -- ~6,600 sets total) but permanently excluded from
+  # backfill-pricecharting-sets-sit's claim_rows() once successful. Unlike
+  # sportscardspro.com's categories (still mid first-pass, heavily
+  # throttled), these are small and completely unthrottled, so rather than
+  # complicate the shared claim/priority-tier logic sportscardspro depends
+  # on, this is a standalone script: unconditionally re-downloads every set
+  # in these categories daily via its saved console_uid. ~44 download-custom
+  # requests/run (6,600 sets / 150 per batch) -- a couple minutes, not the
+  # multi-day sportscardspro backfill problem.
+  - type: cron
+    name: packlox-refresh-completed-pricecharting-categories-sit
+    runtime: python
+    plan: starter
+    region: ohio
+    branch: main
+    schedule: "45 4 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m scripts.refresh_completed_pricecharting_categories --batch-size 150 --catalog-batch-size 500 --sleep-between-requests-seconds 2
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ENVIRONMENT
+        value: sit
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: PRICECHARTING_API_TOKEN
+        sync: false
+
   # TEMPORARY / diagnostic only: exists purely to get Shell access to a
   # different Render region (Ohio, vs. the Oregon used everywhere else) so
   # we can test whether sportscardspro.com's Cloudflare block is scoped to
