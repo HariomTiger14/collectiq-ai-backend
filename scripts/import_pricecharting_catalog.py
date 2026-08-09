@@ -417,6 +417,22 @@ def parse_price_cents(value: str) -> int | None:
     return cents
 
 
+class PartialCatalogWriteError(Exception):
+    """Raised by upsert_rows()/sync_scd2_history_rows() when at least one
+    sub-batch failed but every sub-batch was still attempted (unlike a bare
+    exception escaping mid-loop, which would abort every later sub-batch
+    too -- live-confirmed: a single 50-row Postgres statement timeout
+    aborted a run with thousands of still-unwritten rows that would
+    otherwise have succeeded). Callers that only care about full success
+    can let this propagate like any other exception; callers that want to
+    know how much actually landed can inspect succeeded_count/failed_ids."""
+
+    def __init__(self, message: str, *, succeeded_count: int, failed_ids: list[str]) -> None:
+        super().__init__(message)
+        self.succeeded_count = succeeded_count
+        self.failed_ids = failed_ids
+
+
 class SupabaseCatalogClient:
     def __init__(self, *, supabase_url: str, service_role_key: str, timeout_seconds: float) -> None:
         self.supabase_url = supabase_url.strip().rstrip("/")
@@ -436,30 +452,53 @@ class SupabaseCatalogClient:
             raise ValueError("batch_size must be greater than zero")
         total = 0
         skipped = 0
+        failed_ids: list[str] = []
         with httpx.Client(timeout=self.timeout_seconds) as client:
             for index in range(0, len(rows), batch_size):
                 batch = rows[index : index + batch_size]
-                current_by_id = self._fetch_current_catalog_hashes(client, batch)
-                changed_rows = []
-                for row in batch:
-                    product_id = str(row.get("pricecharting_id") or "").strip()
-                    current = current_by_id.get(product_id)
-                    if current and current.get("content_hash") == row.get("content_hash"):
-                        skipped += 1
-                        continue
-                    changed_rows.append(row)
-                if changed_rows:
-                    total += self._upsert(
-                        table="pricecharting_catalog",
-                        rows=changed_rows,
-                        batch_size=batch_size,
-                        on_conflict="pricecharting_id",
-                        label="catalog",
+                try:
+                    current_by_id = self._fetch_current_catalog_hashes(client, batch)
+                    changed_rows = []
+                    for row in batch:
+                        product_id = str(row.get("pricecharting_id") or "").strip()
+                        current = current_by_id.get(product_id)
+                        if current and current.get("content_hash") == row.get("content_hash"):
+                            skipped += 1
+                            continue
+                        changed_rows.append(row)
+                    if changed_rows:
+                        total += self._upsert(
+                            table="pricecharting_catalog",
+                            rows=changed_rows,
+                            batch_size=batch_size,
+                            on_conflict="pricecharting_id",
+                            label="catalog",
+                        )
+                except (SystemExit, Exception) as exc:
+                    # This sub-batch failed (e.g. a statement timeout on a
+                    # large/loaded table) -- log and move on to the next
+                    # sub-batch rather than letting the exception abort the
+                    # whole call. Every row in a failed sub-batch is treated
+                    # as failed, even if some would have been skipped as
+                    # unchanged, since _fetch_current_catalog_hashes may be
+                    # what failed.
+                    print(f"  Catalog upsert sub-batch failed, continuing: {exc}", flush=True)
+                    failed_ids.extend(
+                        str(row.get("pricecharting_id") or "").strip()
+                        for row in batch
+                        if row.get("pricecharting_id")
                     )
+                    continue
                 print(
                     f"Skipped {skipped} unchanged catalog rows; upserted {total} changed/new rows...",
                     flush=True,
                 )
+        if failed_ids:
+            raise PartialCatalogWriteError(
+                f"{len(failed_ids)} catalog row(s) failed to upsert; {total} succeeded.",
+                succeeded_count=total,
+                failed_ids=failed_ids,
+            )
         return total
 
     def _fetch_current_catalog_hashes(
@@ -507,40 +546,58 @@ class SupabaseCatalogClient:
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
         inserted = 0
+        failed_ids: list[str] = []
         with httpx.Client(timeout=self.timeout_seconds) as client:
             for index in range(0, len(rows), batch_size):
                 batch = rows[index : index + batch_size]
-                current_by_id = self._fetch_current_history_rows(client, batch)
-                rows_to_insert = []
-                changed_ids = []
-                for row in batch:
-                    product_id = str(row.get("pricecharting_id") or "").strip()
-                    if not product_id:
-                        continue
-                    history_row = to_catalog_history_row(row)
-                    current = current_by_id.get(product_id)
-                    if current and current.get("change_hash") == history_row["change_hash"]:
-                        continue
-                    if current:
-                        changed_ids.append(product_id)
-                    rows_to_insert.append(history_row)
+                try:
+                    current_by_id = self._fetch_current_history_rows(client, batch)
+                    rows_to_insert = []
+                    changed_ids = []
+                    for row in batch:
+                        product_id = str(row.get("pricecharting_id") or "").strip()
+                        if not product_id:
+                            continue
+                        history_row = to_catalog_history_row(row)
+                        current = current_by_id.get(product_id)
+                        if current and current.get("change_hash") == history_row["change_hash"]:
+                            continue
+                        if current:
+                            changed_ids.append(product_id)
+                        rows_to_insert.append(history_row)
 
-                if changed_ids:
-                    self._close_current_history_rows(
-                        client,
-                        pricecharting_ids=changed_ids,
-                        valid_to=source_timestamp(batch[0].get("source_downloaded_at")),
+                    if changed_ids:
+                        self._close_current_history_rows(
+                            client,
+                            pricecharting_ids=changed_ids,
+                            valid_to=source_timestamp(batch[0].get("source_downloaded_at")),
+                        )
+                    if rows_to_insert:
+                        inserted += self._insert_history_rows(
+                            client,
+                            rows_to_insert,
+                            batch_offset=index,
+                        )
+                except (SystemExit, Exception) as exc:
+                    # Same reasoning as upsert_rows(): don't let one
+                    # sub-batch's failure abort every later sub-batch.
+                    print(f"  Catalog history sub-batch failed, continuing: {exc}", flush=True)
+                    failed_ids.extend(
+                        str(row.get("pricecharting_id") or "").strip()
+                        for row in batch
+                        if row.get("pricecharting_id")
                     )
-                if rows_to_insert:
-                    inserted += self._insert_history_rows(
-                        client,
-                        rows_to_insert,
-                        batch_offset=index,
-                    )
+                    continue
                 print(
                     f"Recorded {inserted} / {len(rows)} SCD2 history versions...",
                     flush=True,
                 )
+        if failed_ids:
+            raise PartialCatalogWriteError(
+                f"{len(failed_ids)} catalog history row(s) failed to sync; {inserted} succeeded.",
+                succeeded_count=inserted,
+                failed_ids=failed_ids,
+            )
         return inserted
 
     def _fetch_current_history_rows(
