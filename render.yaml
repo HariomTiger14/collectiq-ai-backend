@@ -236,6 +236,38 @@ services:
       - key: PRICECHARTING_API_TOKEN
         sync: false
 
+  # Refreshes individually-tracked comics/coins/sports-cards/lorcana/funko/
+  # lego catalog items via /api/product?id=X (one call per item), the piece
+  # the backfill cron above doesn't cover -- claim_rows() there permanently
+  # excludes already-succeeded sets, so a tracked item's price otherwise
+  # never updates again after its one-time backfill, and its SCD2 history /
+  # portfolio detail chart never accumulates new points. The 5 bulk
+  # categories (video games, Pokemon, Magic, YuGiOh, One Piece) don't need
+  # this -- their full catalog already refreshes daily via CSV -- so this
+  # script explicitly excludes those source_files. Hourly, not every 15min
+  # like backfill: refresh only matters for items someone actually tracks,
+  # a much smaller and slower-moving population than full-set backfill.
+  - type: cron
+    name: packlox-refresh-tracked-catalog-items-sit
+    runtime: python
+    plan: starter
+    region: ohio
+    branch: main
+    schedule: "20 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m scripts.refresh_tracked_catalog_items --limit 200 --stale-after-hours 24 --sleep-between-requests-seconds 1.5
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ENVIRONMENT
+        value: sit
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: PRICECHARTING_API_TOKEN
+        sync: false
+
   # TEMPORARY / diagnostic only: exists purely to get Shell access to a
   # different Render region (Ohio, vs. the Oregon used everywhere else) so
   # we can test whether sportscardspro.com's Cloudflare block is scoped to
