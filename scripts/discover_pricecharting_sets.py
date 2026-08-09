@@ -50,20 +50,35 @@ SITE_CONFIGS = {
 }
 
 # Coins (~68 sets) finishes almost immediately; comics (~6,200) is still
-# manageable; sports cards (~36,000, 85% of the whole backlog across dozens
-# of dynamically-discovered sport categories) stays at the column default (3)
-# so it doesn't delay the smaller categories from getting full coverage.
-# Lorcana/Funko Pops/LEGO Sets are all small (dozens to low hundreds of
-# sets) and skip the console_uid resolve step entirely, so they clear fast
-# regardless of tier -- tier 1 just keeps them ahead of the sports-cards tail.
+# manageable; Lorcana/Funko Pops/LEGO Sets are all small (dozens to low
+# hundreds of sets) and skip the console_uid resolve step entirely, so they
+# clear fast regardless of tier -- tier 1 just keeps them ahead of everything
+# else.
+#
+# Sports cards (sportscardspro.com, ~36,000 sets across 8 dynamically-
+# discovered categories) used to all share one flat default tier, which let
+# whichever category happened to be inserted first (baseball) dominate every
+# claim batch via tie-break order, starving the other 7 almost entirely --
+# smallest-set-count-first avoids that: small categories clear fast and stop
+# competing for cron slots, instead of the biggest category holding up
+# everyone else indefinitely. Tiers below are ordered strictly by each
+# category's real set count (confirmed live via pricecharting_set_registry).
 PRIORITY_TIER_BY_CATEGORY = {
     "coins": 1,
-    "comic-books": 2,
     "lorcana-cards": 1,
     "funko-pops": 1,
     "lego-sets": 1,
+    "comic-books": 2,
+    "ufc-cards": 3,  # ~724 sets
+    "wrestling-cards": 3,  # ~979 sets
+    "racing-cards": 3,  # ~962 sets
+    "soccer-cards": 4,  # ~2,982 sets
+    "hockey-cards": 4,  # ~4,108 sets
+    "basketball-cards": 5,  # ~6,990 sets
+    "football-cards": 5,  # ~8,700 sets
+    "baseball-cards": 5,  # ~10,995 sets, the largest category
 }
-DEFAULT_PRIORITY_TIER = 3
+DEFAULT_PRIORITY_TIER = 5
 
 _SLUG_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
