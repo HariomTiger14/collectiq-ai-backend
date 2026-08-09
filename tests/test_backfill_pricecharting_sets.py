@@ -362,6 +362,31 @@ class SearchProductsTest(unittest.TestCase):
         result = _search_products(http, base_url="https://example.test", token="tok", query="x")
         self.assertIsNone(result)
 
+    def test_records_rate_limit_on_the_given_breaker_on_429(self) -> None:
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(429)))
+        breaker = _RateLimitCircuitBreaker(threshold=3)
+
+        _search_products(http, base_url="https://example.test", token="tok", query="x", breaker=breaker)
+        _search_products(http, base_url="https://example.test", token="tok", query="x", breaker=breaker)
+        self.assertFalse(breaker.tripped)
+        _search_products(http, base_url="https://example.test", token="tok", query="x", breaker=breaker)
+
+        self.assertTrue(breaker.tripped)
+
+    def test_does_not_record_rate_limit_on_a_non_429_error(self) -> None:
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(404)))
+        breaker = _RateLimitCircuitBreaker(threshold=3)
+
+        for _ in range(6):
+            _search_products(http, base_url="https://example.test", token="tok", query="x", breaker=breaker)
+
+        self.assertFalse(breaker.tripped)
+
+    def test_works_without_a_breaker(self) -> None:
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(429)))
+        result = _search_products(http, base_url="https://example.test", token="tok", query="x")
+        self.assertIsNone(result)
+
 
 class ResolveViaApiForSmallSetsTest(unittest.TestCase):
     def test_a_small_set_succeeds_and_is_removed_from_remaining(self) -> None:
@@ -446,6 +471,74 @@ class ResolveViaApiForSmallSetsTest(unittest.TestCase):
         self.assertEqual(succeeded[0][0]["registry_id"], "1")
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0]["registry_id"], "2")
+
+    def test_concurrency_resolves_every_row_exactly_once(self) -> None:
+        rows = [
+            {"registry_id": str(i), "set_name": f"set {i}", "source_site": "sportscardspro"}
+            for i in range(9)
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            products = [_product("1", "Card A")]
+            return httpx.Response(200, json={"status": "success", "products": products})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        succeeded, remaining = resolve_via_api_for_small_sets(
+            rows,
+            http=http,
+            token="tok",
+            sleep_seconds=0,
+            source_downloaded_at="2026-01-01T00:00:00Z",
+            max_concurrency=4,
+        )
+
+        self.assertEqual(remaining, [])
+        self.assertEqual(len(succeeded), 9)
+        self.assertEqual(
+            {row["registry_id"] for row, _ in succeeded},
+            {row["registry_id"] for row in rows},
+        )
+
+    def test_circuit_breaker_stops_after_consecutive_429s_without_attempting_the_rest(self) -> None:
+        rows = [
+            {"registry_id": str(i), "set_name": f"set {i}", "source_site": "sportscardspro"}
+            for i in range(6)
+        ]
+        request_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal request_count
+            request_count += 1
+            return httpx.Response(429)
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        succeeded, remaining = resolve_via_api_for_small_sets(
+            rows, http=http, token="tok", sleep_seconds=0, source_downloaded_at="2026-01-01T00:00:00Z"
+        )
+
+        self.assertEqual(succeeded, [])
+        self.assertEqual(len(remaining), 6)
+        self.assertEqual(request_count, CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD)
+
+    def test_concurrency_with_a_single_row_does_not_spawn_a_thread_pool(self) -> None:
+        rows = [{"registry_id": "1", "set_name": "1962 Bazooka", "source_site": "sportscardspro"}]
+        products = [_product("1", "Card A")]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": "success", "products": products})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        succeeded, remaining = resolve_via_api_for_small_sets(
+            rows,
+            http=http,
+            token="tok",
+            sleep_seconds=0,
+            source_downloaded_at="2026-01-01T00:00:00Z",
+            max_concurrency=5,
+        )
+
+        self.assertEqual(remaining, [])
+        self.assertEqual(len(succeeded), 1)
 
 
 class FetchBatchCsvWithRetryTest(unittest.TestCase):

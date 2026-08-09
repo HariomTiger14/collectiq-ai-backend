@@ -185,8 +185,9 @@ def main(argv: list[str] | None = None) -> int:
                 sportscardspro_rows,
                 http=http,
                 token=token,
-                sleep_seconds=args.sleep_between_requests_seconds,
+                sleep_seconds=args.sportscardspro_api_search_sleep_seconds,
                 source_downloaded_at=source_downloaded_at,
+                max_concurrency=args.sportscardspro_api_search_concurrency,
             )
             for row, catalog_rows in api_succeeded:
                 total_catalog_rows += len(catalog_rows)
@@ -337,6 +338,7 @@ def resolve_via_api_for_small_sets(
     token: str,
     sleep_seconds: float,
     source_downloaded_at: str,
+    max_concurrency: int = 1,
 ) -> tuple[list[tuple[dict[str, Any], list[dict[str, Any]]]], list[dict[str, Any]]]:
     """Try the sanctioned /api/products search for each row's set name --
     cheap, not Cloudflare-blocked, and a complete result for any set with
@@ -347,16 +349,76 @@ def resolve_via_api_for_small_sets(
     Only meaningful for sportscardspro.com rows -- pricecharting.com's CSV
     path already works directly via plain HTTP, so there's no reason to
     spend extra per-set API calls there.
+
+    Individual searches vary a lot in latency -- live-confirmed some broad
+    /ambiguous queries take several seconds server-side even though the
+    endpoint itself isn't Cloudflare-throttled -- so this step benefits from
+    the same round-robin thread-sharded concurrency as resolve_console_uids
+    (max_concurrency>1 overlaps those slow searches instead of serializing
+    them; each lane keeps the same per-request sleep_seconds pacing, so
+    total request rate scales with lane count, not per-lane speed).
+    max_concurrency=1 (the default) runs the exact original single-lane
+    loop, unchanged. A dedicated circuit breaker (independent from any other
+    phase's) still aborts every lane on repeated 429s.
     """
+    breaker = _RateLimitCircuitBreaker(CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD)
+    if max_concurrency <= 1 or len(rows) <= 1:
+        return _resolve_via_api_for_small_sets_lane(
+            rows,
+            http=http,
+            token=token,
+            sleep_seconds=sleep_seconds,
+            source_downloaded_at=source_downloaded_at,
+            breaker=breaker,
+        )
+
+    lanes = _shard_round_robin(rows, max_concurrency)
+    succeeded: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    remaining: list[dict[str, Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(lanes)) as pool:
+        lane_results = pool.map(
+            lambda lane: _resolve_via_api_for_small_sets_lane(
+                lane,
+                http=http,
+                token=token,
+                sleep_seconds=sleep_seconds,
+                source_downloaded_at=source_downloaded_at,
+                breaker=breaker,
+            ),
+            lanes,
+        )
+        for lane_succeeded, lane_remaining in lane_results:
+            succeeded.extend(lane_succeeded)
+            remaining.extend(lane_remaining)
+    return succeeded, remaining
+
+
+def _resolve_via_api_for_small_sets_lane(
+    rows: list[dict[str, Any]],
+    *,
+    http: httpx.Client,
+    token: str,
+    sleep_seconds: float,
+    source_downloaded_at: str,
+    breaker: "_RateLimitCircuitBreaker",
+) -> tuple[list[tuple[dict[str, Any], list[dict[str, Any]]]], list[dict[str, Any]]]:
     succeeded: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
     remaining: list[dict[str, Any]] = []
     base_url = SOURCE_SITE_BASE_URLS["sportscardspro"]
 
     for index, row in enumerate(rows):
+        if breaker.tripped:
+            print(
+                f"  Circuit breaker tripped (repeated 429s) -- skipping "
+                f"{row.get('set_name')!r} without attempting.",
+                flush=True,
+            )
+            remaining.append(row)
+            continue
         if index > 0 and sleep_seconds > 0:
             time.sleep(sleep_seconds)
         products = _search_products(
-            http, base_url=base_url, token=token, query=row.get("set_name") or ""
+            http, base_url=base_url, token=token, query=row.get("set_name") or "", breaker=breaker
         )
         if products is None or not (0 < len(products) < API_SEARCH_RESULT_CAP):
             remaining.append(row)
@@ -385,6 +447,7 @@ def _search_products(
     base_url: str,
     token: str,
     query: str,
+    breaker: "_RateLimitCircuitBreaker | None" = None,
 ) -> list[dict[str, Any]] | None:
     if not query:
         return None
@@ -395,9 +458,16 @@ def _search_products(
         )
         response.raise_for_status()
         payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        print(f"  API search failed for {query!r}: {exc}", flush=True)
+        if breaker is not None and exc.response.status_code == 429:
+            breaker.record_rate_limited()
+        return None
     except (httpx.HTTPError, ValueError) as exc:
         print(f"  API search failed for {query!r}: {exc}", flush=True)
         return None
+    if breaker is not None:
+        breaker.record_success()
     if payload.get("status") != "success":
         return None
     return payload.get("products") or []
@@ -698,6 +768,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "console_uid+CSV path per run, bounding worst-case wall-clock "
             "time regardless of --limit. Excess rows are left claimed and "
             "picked up by a later run once their lease expires."
+        ),
+    )
+    parser.add_argument(
+        "--sportscardspro-api-search-sleep-seconds",
+        type=float,
+        default=0.5,
+        help=(
+            "Pace for the /api/products search pre-pass over sportscardspro "
+            "rows -- separate from --sleep-between-requests-seconds since "
+            "this endpoint is confirmed NOT Cloudflare-throttled (unlike "
+            "console_uid pages/CSV downloads), live-confirmed reliable at "
+            "0.5s from Render's own outbound IP."
+        ),
+    )
+    parser.add_argument(
+        "--sportscardspro-api-search-concurrency",
+        type=int,
+        default=1,
+        help=(
+            "Parallel lanes for the /api/products search pre-pass. Individual "
+            "searches vary widely in latency (some broad/ambiguous queries "
+            "take several seconds server-side even though the endpoint isn't "
+            "throttled), so concurrency overlaps those slow searches instead "
+            "of serializing them -- same round-robin-lane design as "
+            "--console-resolve-concurrency. Default 1 preserves the original "
+            "fully-serial behavior."
         ),
     )
     parser.add_argument("--api-token", default="", help="Defaults to PRICECHARTING_API_TOKEN.")
