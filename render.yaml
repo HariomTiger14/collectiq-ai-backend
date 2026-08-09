@@ -227,6 +227,17 @@ services:
   # run -- not pushed all the way to the naive 3x ceiling (~72) yet. Worth
   # raising further once a few real runs confirm no 429s/circuit-breaker
   # trips at this pace.
+  #
+  # --sportscardspro-api-search-sleep-seconds 0.5 / --sportscardspro-api-
+  # search-concurrency 4: the /api/products search pre-pass (tries every
+  # sportscardspro row via cheap full-text search before falling back to
+  # the slow path) was inheriting the general --sleep-between-requests-
+  # seconds pacing even though this endpoint is confirmed NOT Cloudflare
+  # -throttled -- live-confirmed reliable at 0.5s from this same Ohio
+  # region. Some individual searches still take several seconds server
+  # -side for broad/ambiguous queries regardless of pacing, so concurrency
+  # (same round-robin-lane design as --console-resolve-concurrency) lets
+  # those overlap instead of serializing.
   - type: cron
     name: packlox-backfill-pricecharting-sets-sit
     runtime: python
@@ -235,7 +246,7 @@ services:
     branch: main
     schedule: "*/15 * * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m scripts.backfill_pricecharting_sets --limit 150 --batch-size 150 --catalog-batch-size 50 --sleep-between-requests-seconds 2 --console-resolve-concurrency 4 --sportscardspro-slow-path-limit 45
+    startCommand: python -m scripts.backfill_pricecharting_sets --limit 150 --batch-size 150 --catalog-batch-size 50 --sleep-between-requests-seconds 2 --console-resolve-concurrency 4 --sportscardspro-slow-path-limit 45 --sportscardspro-api-search-sleep-seconds 0.5 --sportscardspro-api-search-concurrency 4
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
