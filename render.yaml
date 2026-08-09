@@ -204,17 +204,21 @@ services:
   # as raw files. Runs frequently since each run is self-paced (2s between
   # requests) and only processes a bounded --limit of registry rows.
   #
-  # --console-resolve-concurrency 4: the console_uid resolve phase (one
-  # plain page fetch per unresolved set) dominates a run's wall clock --
-  # confirmed live at ~5min of pure pacing for 150 sets serially. 4 shards
-  # the claimed rows round-robin across 4 threads, each still pacing at
-  # --sleep-between-requests-seconds independently -- same per-lane request
-  # rate as before, ~4x less wall clock. Chosen as a moderate first step
-  # (not higher) since --sleep-between-requests-seconds's value was itself
-  # a conservative, never-fully-confirmed guess against an inconclusive
-  # single incident (see packlox-pricecharting-permission-and-expansion
-  # memory) -- worth monitoring a few real runs before considering either
-  # value more aggressive.
+  # --console-resolve-concurrency 8 (up from 4 on 2026-08-09): the
+  # console_uid resolve phase (one plain page fetch per unresolved set)
+  # dominates a run's wall clock -- confirmed live at ~5min of pure pacing
+  # for 150 sets serially. N shards the claimed rows round-robin across N
+  # threads, each still pacing at --sleep-between-requests-seconds
+  # independently -- same per-lane request rate as before, ~Nx less wall
+  # clock. This only affects pricecharting.com rows (comics/coins here --
+  # sportscardspro.com console_uid resolution has its own separate,
+  # much-more-cautious pacing/concurrency, see below), and
+  # pricecharting.com is confirmed to have NO Cloudflare throttle at all
+  # (unlike sportscardspro.com) -- months of runs at 4 with zero issues,
+  # so raising this specific lever carries none of the burst-rate risk
+  # that broke sportscardspro's API-search concurrency (see below). Not
+  # pushed higher than 8 yet purely out of caution about Postgres/Supabase
+  # write-side load (see --catalog-batch-size), not about the fetch side.
   #
   # --sportscardspro-slow-path-limit 45: sportscardspro's per-set pacing
   # (SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS in backfill_pricecharting_sets.py)
@@ -248,6 +252,17 @@ services:
   # sportscardspro.com's throttle isn't perfectly isolated per-function
   # once tripped. Reverted to 1 (serial, unchanged from original behavior)
   # -- do not raise this again without a much more cautious, gradual test.
+  #
+  # --catalog-batch-size 25 (down from 50 on 2026-08-09): the pacing/limit
+  # increases above roughly tripled how much data a single run can fetch,
+  # which pushed the catalog UPSERT step (a hash lookup plus a conflict
+  # -resolving write per row -- already known to hit Postgres's statement
+  # timeout at a much lower row count than a plain insert) into hitting
+  # that timeout on some sub-batches, live-confirmed in production logs
+  # ("canceling statement due to statement timeout", HTTP 500). Already
+  # handled safely either way (PartialCatalogWriteError catches it and
+  # retries the failed rows next cycle, no data loss) -- this just reduces
+  # how often it happens by keeping each write sub-batch smaller.
   - type: cron
     name: packlox-backfill-pricecharting-sets-sit
     runtime: python
@@ -256,7 +271,7 @@ services:
     branch: main
     schedule: "*/15 * * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m scripts.backfill_pricecharting_sets --limit 150 --batch-size 150 --catalog-batch-size 50 --sleep-between-requests-seconds 2 --console-resolve-concurrency 4 --sportscardspro-slow-path-limit 45 --sportscardspro-api-search-sleep-seconds 0.5 --sportscardspro-api-search-concurrency 1
+    startCommand: python -m scripts.backfill_pricecharting_sets --limit 150 --batch-size 150 --catalog-batch-size 25 --sleep-between-requests-seconds 2 --console-resolve-concurrency 8 --sportscardspro-slow-path-limit 45 --sportscardspro-api-search-sleep-seconds 0.5 --sportscardspro-api-search-concurrency 1
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
