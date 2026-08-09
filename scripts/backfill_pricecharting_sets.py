@@ -84,11 +84,19 @@ API_SEARCH_RESULT_CAP = 100
 
 # sportscardspro.com's console_uid pages and CSV download return a
 # Cloudflare "Managed Challenge" (429) unpredictably at fast pacing, but
-# this is rate-based throttling, not a hard bot-fingerprint block -- live
-# testing found ~13% success at 2s spacing, 80% at 15s, and 100% (10/10) at
-# 30s. pricecharting.com has no such throttle and stays on the caller's
-# normal --sleep-between-requests-seconds pacing.
-SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS = 30.0
+# this is rate-based throttling, not a hard bot-fingerprint block -- an
+# early test (from a non-Render IP) found ~13% success at 2s spacing, 80%
+# at 15s, 100% (10/10) at 30s, which is where this was originally set.
+# Re-tested 2026-08-09 from Render's actual Ohio outbound IP (the IP that
+# actually matters -- Cloudflare's blocking here is IP/ASN-aware, not just
+# rate-based; see the Oregon->Ohio migration elsewhere in this repo) at
+# 10s spacing: 8/8 console_uid resolves succeeded, plus a real
+# download-custom CSV batch succeeded too. Small sample, so keep watching
+# real cron runs for 429s/circuit-breaker trips, but strong enough to move
+# off the original, more conservative 30s. pricecharting.com has no such
+# throttle and stays on the caller's normal --sleep-between-requests-seconds
+# pacing.
+SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS = 10.0
 SPORTSCARDSPRO_DEFAULT_MAX_ATTEMPTS = 3
 
 # The console_uid resolve step is fully serial at SPORTSCARDSPRO_DEFAULT_SLEEP_

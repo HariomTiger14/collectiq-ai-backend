@@ -215,6 +215,18 @@ services:
   # single incident (see packlox-pricecharting-permission-and-expansion
   # memory) -- worth monitoring a few real runs before considering either
   # value more aggressive.
+  #
+  # --sportscardspro-slow-path-limit 45: sportscardspro's per-set pacing
+  # (SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS in backfill_pricecharting_sets.py)
+  # dropped from 30s to 10s on 2026-08-09 after re-testing from this cron's
+  # own Ohio region (not just a generic IP -- Cloudflare's blocking here is
+  # IP/ASN-aware) confirmed 8/8 console_uid resolves and a real CSV download
+  # all succeeding at 10s. 45 (up from 24) reflects that 3x pacing speedup
+  # while still leaving real buffer in the 15-min window for the CSV
+  # downloads/writes that scale up with however many more sets clear per
+  # run -- not pushed all the way to the naive 3x ceiling (~72) yet. Worth
+  # raising further once a few real runs confirm no 429s/circuit-breaker
+  # trips at this pace.
   - type: cron
     name: packlox-backfill-pricecharting-sets-sit
     runtime: python
@@ -223,7 +235,7 @@ services:
     branch: main
     schedule: "*/15 * * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m scripts.backfill_pricecharting_sets --limit 150 --batch-size 150 --catalog-batch-size 50 --sleep-between-requests-seconds 2 --console-resolve-concurrency 4 --sportscardspro-slow-path-limit 24
+    startCommand: python -m scripts.backfill_pricecharting_sets --limit 150 --batch-size 150 --catalog-batch-size 50 --sleep-between-requests-seconds 2 --console-resolve-concurrency 4 --sportscardspro-slow-path-limit 45
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
