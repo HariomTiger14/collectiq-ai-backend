@@ -175,8 +175,11 @@ class FetchSegmentTest(unittest.TestCase):
 class LoadSegmentsTest(unittest.TestCase):
     def test_returns_default_when_no_json_given(self) -> None:
         segments = load_segments(None)
-        self.assertEqual(len(segments), 1)
+        self.assertEqual(len(segments), 10)
         self.assertEqual(segments[0]["label"], "sneakers-by-rank")
+        labels = {segment["label"] for segment in segments}
+        self.assertIn("nike-by-rank", labels)
+        self.assertIn("vans-by-rank", labels)
 
     def test_parses_custom_segments_json(self) -> None:
         segments = load_segments(json.dumps([{"label": "nike", "filters": 'brand="Nike"'}]))
