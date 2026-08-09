@@ -143,17 +143,39 @@ class BuildRegistryRowTest(unittest.TestCase):
             set_name="X-Men",
             base_url="https://www.pricecharting.com",
         )
-        sports_row = build_registry_row(
+        unknown_sport_row = build_registry_row(
             source_site="sportscardspro",
-            category="baseball-cards",
+            category="cricket-cards",
             brand="topps",
-            slug="baseball-cards-2025-topps",
+            slug="cricket-cards-2025-topps",
             set_name="2025 Topps",
             base_url="https://www.sportscardspro.com",
         )
         self.assertEqual(coins_row["priority_tier"], PRIORITY_TIER_BY_CATEGORY["coins"])
         self.assertEqual(comics_row["priority_tier"], PRIORITY_TIER_BY_CATEGORY["comic-books"])
-        self.assertEqual(sports_row["priority_tier"], DEFAULT_PRIORITY_TIER)
+        # A sport category sportscardspro.com hasn't shown us yet (its
+        # brand-page categories are discovered dynamically, not a fixed
+        # list) falls back to the default rather than accidentally jumping
+        # the queue ahead of already-sized categories.
+        self.assertEqual(unknown_sport_row["priority_tier"], DEFAULT_PRIORITY_TIER)
+
+    def test_assigns_priority_tiers_to_sports_categories_by_set_count(self) -> None:
+        # Smallest sports categories clear first so they stop competing for
+        # cron slots with the much larger ones -- see PRIORITY_TIER_BY_
+        # CATEGORY's comment for why this matters (baseball was previously
+        # starving the other 7 sports almost entirely via tie-break order).
+        small = ["ufc-cards", "wrestling-cards", "racing-cards"]
+        medium = ["soccer-cards", "hockey-cards"]
+        large = ["basketball-cards", "football-cards", "baseball-cards"]
+        for category in small:
+            self.assertEqual(PRIORITY_TIER_BY_CATEGORY[category], 3, category)
+        for category in medium:
+            self.assertEqual(PRIORITY_TIER_BY_CATEGORY[category], 4, category)
+        for category in large:
+            self.assertEqual(PRIORITY_TIER_BY_CATEGORY[category], 5, category)
+        smallest_tier = min(PRIORITY_TIER_BY_CATEGORY[c] for c in small)
+        largest_tier = max(PRIORITY_TIER_BY_CATEGORY[c] for c in large)
+        self.assertLess(smallest_tier, largest_tier)
 
 
 class SlugifyTest(unittest.TestCase):
