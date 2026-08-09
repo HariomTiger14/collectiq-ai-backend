@@ -34,7 +34,11 @@ from scripts.backfill_pricecharting_sets import (
     _search_products,
     write_catalog_rows,
 )
-from scripts.import_pricecharting_catalog import SupabaseCatalogClient, to_catalog_row
+from scripts.import_pricecharting_catalog import (
+    SupabaseCatalogClient,
+    dedupe_catalog_rows,
+    to_catalog_row,
+)
 
 
 DEFAULT_STALE_AFTER_HOURS = 24.0
@@ -160,6 +164,18 @@ def refresh_small_sets(
             continue
         catalog_rows.extend(set_catalog_rows)
         refreshed_ids.append(row["registry_id"])
+    # Unlike backfill's per-set CSV (scoped to exactly one set), tier 1
+    # searches by text -- PriceCharting's fuzzy /api/products?q= match can
+    # return an item that actually belongs to a DIFFERENT set (e.g.
+    # searching "Creepshow" surfaced a "Stray Dogs: Dog Days [Creepshow]"
+    # crossover item). If that other set is also a candidate in this same
+    # run, the same pricecharting_id lands in catalog_rows twice, and the
+    # SCD2 history table's one-current-row-per-item unique constraint
+    # rejects the second insert (live-confirmed: 23505 duplicate key).
+    # Dedupe by pricecharting_id before returning -- both occurrences
+    # describe the same real item fetched moments apart, so either is fine
+    # to keep.
+    catalog_rows = dedupe_catalog_rows(catalog_rows)
     return catalog_rows, refreshed_ids, checked_ids, skipped
 
 
