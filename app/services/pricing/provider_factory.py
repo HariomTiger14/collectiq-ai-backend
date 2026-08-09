@@ -11,6 +11,7 @@ from app.services.pricing.cache import (
     SharedProviderThrottle,
 )
 from app.services.pricing.ebay_pricing_provider import EbayPricingProvider
+from app.services.pricing.kicksdb_catalog_matcher import KicksDBCatalogMatcher
 from app.services.pricing.kicksdb_pricing_provider import KicksDBPricingProvider
 from app.services.pricing.mock_pricing_provider import MockPricingProvider
 from app.services.pricing.pricecharting_pricing_provider import (
@@ -42,12 +43,18 @@ _tcgplayer_provider = TCGPlayerPricingProvider(
     cache_ttl_seconds=settings.pricing_cache_ttl_seconds,
     min_interval_ms=settings.pricing_provider_min_interval_ms,
 )
+_kicksdb_catalog_matcher = KicksDBCatalogMatcher(
+    supabase_url=settings.supabase_url,
+    service_role_key=settings.supabase_service_role_key,
+    timeout_seconds=settings.kicksdb_timeout_seconds,
+)
 _kicksdb_provider = KicksDBPricingProvider(
     api_key=settings.kicksdb_api_key,
     api_base=settings.kicksdb_api_base,
     timeout_seconds=settings.kicksdb_timeout_seconds,
     cache_ttl_seconds=settings.pricing_cache_ttl_seconds,
     min_interval_ms=settings.pricing_provider_min_interval_ms,
+    catalog_matcher=_kicksdb_catalog_matcher,
 )
 _pricecharting_provider = PriceChartingPricingProvider(
     api_key=settings.pricecharting_api_key,
