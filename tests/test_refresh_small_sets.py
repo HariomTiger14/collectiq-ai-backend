@@ -85,6 +85,34 @@ class RefreshSmallSetsTest(unittest.TestCase):
         self.assertEqual(checked_ids, ["1"])
         self.assertEqual(skipped, 1)
 
+    def test_the_same_item_returned_by_two_different_sets_searches_is_deduped(self) -> None:
+        # Live-confirmed bug: fuzzy text search can return an item that
+        # actually belongs to a DIFFERENT set (searching "Creepshow"
+        # surfaced a "Stray Dogs: Dog Days [Creepshow]" crossover item). If
+        # both sets are candidates in the same run, the same
+        # pricecharting_id would land in the write batch twice and violate
+        # the SCD2 history table's one-current-row-per-item constraint.
+        candidates = [
+            {"registry_id": "1", "source_site": "pricecharting", "set_name": "Creepshow"},
+            {"registry_id": "2", "source_site": "pricecharting", "set_name": "Stray Dogs"},
+        ]
+        shared_item = _product("999", "Stray Dogs: Dog Days [Creepshow] #1", console="Comic Books Stray Dogs")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            query = request.url.params["q"]
+            products = [_product("1", "Card A"), shared_item] if query == "Creepshow" else [shared_item]
+            return httpx.Response(200, json={"status": "success", "products": products})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        catalog_rows, refreshed_ids, checked_ids, skipped = refresh_small_sets(
+            http, candidates, token="tok", sleep_seconds=0, source_downloaded_at="2026-08-09T00:00:00Z"
+        )
+
+        self.assertEqual(refreshed_ids, ["1", "2"])
+        pricecharting_ids = [row["pricecharting_id"] for row in catalog_rows]
+        self.assertEqual(len(pricecharting_ids), len(set(pricecharting_ids)))
+        self.assertEqual(sorted(pricecharting_ids), ["1", "999"])
+
     def test_routes_each_candidate_to_the_right_domain(self) -> None:
         candidates = [
             {"registry_id": "1", "source_site": "pricecharting", "set_name": "Comic Books X-Men"},
