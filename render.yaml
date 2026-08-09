@@ -204,6 +204,18 @@ services:
   # as raw files. Runs frequently since each run is self-paced (2s between
   # requests) and only processes a bounded --limit of registry rows.
   #
+  # --batch-size 300 (up from 150 on 2026-08-09): sets per download-custom
+  # request for pricecharting.com (comics/coins) -- unlike sportscardspro's
+  # --sportscardspro-batch-size (deliberately tiny, see below, due to a
+  # real OOM crash from oversized vintage sports-card sets), comics/coins
+  # sets average far fewer items each (~41/set for comics, vs. 1,300+/set
+  # for the sportscardspro sets that caused that crash), so there's real
+  # headroom here. Catalog writes are chunked independently at
+  # --catalog-batch-size regardless of this value, so raising it doesn't
+  # reintroduce the Postgres statement-timeout issue either. Not pushed
+  # further than 2x yet since this hasn't been live-tested at a higher
+  # value -- same pacing philosophy as everything else changed today.
+  #
   # --console-resolve-concurrency 8 (up from 4 on 2026-08-09): the
   # console_uid resolve phase (one plain page fetch per unresolved set)
   # dominates a run's wall clock -- confirmed live at ~5min of pure pacing
@@ -273,7 +285,7 @@ services:
     branch: main
     schedule: "*/15 * * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m scripts.backfill_pricecharting_sets --limit 150 --batch-size 150 --catalog-batch-size 25 --sleep-between-requests-seconds 2 --console-resolve-concurrency 8 --sportscardspro-slow-path-limit 40 --sportscardspro-api-search-sleep-seconds 1.0 --sportscardspro-api-search-concurrency 1
+    startCommand: python -m scripts.backfill_pricecharting_sets --limit 150 --batch-size 300 --catalog-batch-size 25 --sleep-between-requests-seconds 2 --console-resolve-concurrency 8 --sportscardspro-slow-path-limit 40 --sportscardspro-api-search-sleep-seconds 1.0 --sportscardspro-api-search-concurrency 1
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
