@@ -158,12 +158,71 @@ class KicksDBPricingProviderTest(unittest.TestCase):
         with self.assertRaises(EmptyMarketDataError):
             provider.price(_sneaker_recognition())
 
+    def test_catalog_match_skips_the_live_api_entirely(self) -> None:
+        client = _FakeHttpClient(response=_FakeResponse(body=_stockx_payload()))
+        matcher = _FakeCatalogMatcher([_catalog_row()])
+        provider = _provider(client=client, catalog_matcher=matcher)
+
+        pricing = provider.price(_sneaker_recognition())
+
+        self.assertEqual(client.call_count, 0)
+        self.assertEqual(matcher.call_count, 1)
+        self.assertEqual(pricing.pricingSource, "KicksDB Catalog (StockX)")
+        self.assertEqual(pricing.pricingAge, "cached")
+        self.assertEqual(pricing.lowEstimate, 220)
+        self.assertEqual(pricing.highEstimate, 310)
+        self.assertEqual(pricing.estimatedMarketValue, 268)
+        self.assertEqual(pricing.providerDiagnostics["matchedProductSku"], "DN3707-160")
+
+    def test_catalog_result_is_cached_like_a_live_result(self) -> None:
+        client = _FakeHttpClient(response=_FakeResponse(body=_stockx_payload()))
+        matcher = _FakeCatalogMatcher([_catalog_row()])
+        provider = _provider(client=client, catalog_matcher=matcher, cache_ttl_seconds=60)
+
+        first = provider.price(_sneaker_recognition())
+        second = provider.price(_sneaker_recognition())
+
+        self.assertEqual(client.call_count, 0)
+        self.assertEqual(first.cacheStatus, "miss")
+        self.assertEqual(second.cacheStatus, "hit")
+
+    def test_no_catalog_candidates_falls_back_to_live_search(self) -> None:
+        client = _FakeHttpClient(response=_FakeResponse(body=_stockx_payload()))
+        matcher = _FakeCatalogMatcher([])
+        provider = _provider(client=client, catalog_matcher=matcher)
+
+        pricing = provider.price(_sneaker_recognition())
+
+        self.assertEqual(client.call_count, 1)
+        self.assertEqual(pricing.pricingSource, "KicksDB StockX API")
+
+    def test_weak_catalog_match_falls_back_to_live_search(self) -> None:
+        client = _FakeHttpClient(response=_FakeResponse(body=_stockx_payload()))
+        unrelated_row = {**_catalog_row(), "title": "Adidas Samba OG", "brand": "Adidas", "sku": "B75807"}
+        matcher = _FakeCatalogMatcher([unrelated_row])
+        provider = _provider(client=client, catalog_matcher=matcher)
+
+        pricing = provider.price(_sneaker_recognition())
+
+        self.assertEqual(client.call_count, 1)
+        self.assertEqual(pricing.pricingSource, "KicksDB StockX API")
+
+    def test_no_catalog_matcher_configured_behaves_like_before(self) -> None:
+        client = _FakeHttpClient(response=_FakeResponse(body=_stockx_payload()))
+        provider = _provider(client=client, catalog_matcher=None)
+
+        pricing = provider.price(_sneaker_recognition())
+
+        self.assertEqual(client.call_count, 1)
+        self.assertEqual(pricing.pricingSource, "KicksDB StockX API")
+
 
 def _provider(
     *,
     api_key: str = "kicks-key",
     client=None,
     cache_ttl_seconds: int = 0,
+    catalog_matcher=None,
 ) -> KicksDBPricingProvider:
     return KicksDBPricingProvider(
         api_key=api_key,
@@ -172,6 +231,7 @@ def _provider(
         cache_ttl_seconds=cache_ttl_seconds,
         min_interval_ms=0,
         client=client,
+        catalog_matcher=catalog_matcher,
     )
 
 
@@ -341,6 +401,33 @@ def _weak_payload() -> dict:
             }
         ]
     }
+
+
+def _catalog_row() -> dict:
+    return {
+        "kicksdb_id": "abc-123",
+        "sku": "DN3707-160",
+        "slug": "air-jordan-4-military-black",
+        "title": "Nike Air Jordan 4 Retro Military Black",
+        "brand": "Nike",
+        "model": "Air Jordan 4",
+        "product_url": "https://stockx.com/air-jordan-4-retro-military-black",
+        "currency": "USD",
+        "min_price_cents": 22000,
+        "max_price_cents": 31000,
+        "avg_price_cents": 27500,
+        "variants": [],
+    }
+
+
+class _FakeCatalogMatcher:
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
+        self.call_count = 0
+
+    def candidates(self) -> list[dict]:
+        self.call_count += 1
+        return self._rows
 
 
 class _FakeHttpClient:

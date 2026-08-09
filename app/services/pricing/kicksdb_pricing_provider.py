@@ -18,6 +18,7 @@ from app.services.pricing.base_pricing_provider import (
     utc_timestamp,
 )
 from app.services.pricing.cache import InMemoryPricingCache, ProviderThrottle
+from app.services.pricing.kicksdb_catalog_matcher import KicksDBCatalogMatcher
 
 
 class KicksDBPricingProvider(PricingProvider):
@@ -34,6 +35,7 @@ class KicksDBPricingProvider(PricingProvider):
         client=None,
         cache: InMemoryPricingCache | None = None,
         throttle: ProviderThrottle | None = None,
+        catalog_matcher: KicksDBCatalogMatcher | None = None,
     ) -> None:
         self._api_key = api_key.strip()
         self._api_base = api_base.strip().rstrip("/") + "/"
@@ -41,6 +43,7 @@ class KicksDBPricingProvider(PricingProvider):
         self._client = client
         self._cache = cache or InMemoryPricingCache(cache_ttl_seconds)
         self._throttle = throttle or ProviderThrottle(min_interval_ms)
+        self._catalog_matcher = catalog_matcher
 
     def price(self, recognition: RecognitionResult) -> PricingResult:
         self._validate_configuration()
@@ -58,6 +61,16 @@ class KicksDBPricingProvider(PricingProvider):
                     "provider": self.provider_name,
                 },
             )
+
+        # Check the locally-backfilled catalog before spending a live
+        # KicksDB request -- today, every scan (not just saves) calls this
+        # method, so a free catalog hit here directly cuts request volume
+        # for anything already backfilled, at the same precision the live
+        # search path already returns (see kicksdb_catalog_matcher.py).
+        catalog_result = self._catalog_price(recognition, query)
+        if catalog_result is not None:
+            self._cache.set(cache_key, catalog_result)
+            return catalog_result
 
         self._throttle.acquire(self.provider_name)
         started_at = time.perf_counter()
@@ -89,6 +102,52 @@ class KicksDBPricingProvider(PricingProvider):
         )
         self._cache.set(cache_key, result)
         return result
+
+    def _catalog_price(self, recognition: RecognitionResult, query: str) -> PricingResult | None:
+        if self._catalog_matcher is None:
+            return None
+        candidates = self._catalog_matcher.candidates()
+        if not candidates:
+            return None
+
+        products = [self._catalog_row_to_product(row) for row in candidates]
+        try:
+            product = self._best_product(products, recognition)
+        except EmptyMarketDataError:
+            return None
+
+        comparable_sales = self._sales_from_product(product, recognition)
+        if not comparable_sales:
+            return None
+
+        return self._pricing_result(
+            recognition=recognition,
+            query=query,
+            product=product,
+            comparable_sales=comparable_sales,
+            latency_ms=0,
+            pricing_source="KicksDB Catalog (StockX)",
+            pricing_age="cached",
+        )
+
+    def _catalog_row_to_product(self, row: dict) -> dict:
+        # Reshaped to match the live /v3/stockx/products response shape so
+        # the existing _best_product()/_sales_from_product() scoring and
+        # sale-extraction logic can be reused unchanged.
+        return {
+            "id": row.get("kicksdb_id"),
+            "title": row.get("title"),
+            "brand": row.get("brand"),
+            "model": row.get("model"),
+            "sku": row.get("sku"),
+            "slug": row.get("slug"),
+            "link": row.get("product_url"),
+            "currency": row.get("currency") or "USD",
+            "min_price": _cents_to_dollars(row.get("min_price_cents")),
+            "max_price": _cents_to_dollars(row.get("max_price_cents")),
+            "avg_price": _cents_to_dollars(row.get("avg_price_cents")),
+            "variants": row.get("variants") if isinstance(row.get("variants"), list) else [],
+        }
 
     def _validate_configuration(self) -> None:
         if not self._api_key:
@@ -447,6 +506,8 @@ class KicksDBPricingProvider(PricingProvider):
         product: dict,
         comparable_sales: list[MarketComparableSale],
         latency_ms: int,
+        pricing_source: str = "KicksDB StockX API",
+        pricing_age: str = "live",
     ) -> PricingResult:
         prices = [sale.soldPrice for sale in comparable_sales]
         estimated_value = round(sum(prices) / len(prices))
@@ -457,19 +518,19 @@ class KicksDBPricingProvider(PricingProvider):
             lowEstimate=max(1, min(prices)),
             highEstimate=max(1, max(prices)),
             currency=comparable_sales[0].currency,
-            pricingSource="KicksDB StockX API",
+            pricingSource=pricing_source,
             pricingConfidence=confidence,
             lastUpdated=utc_timestamp(),
             marketTrend=self._trend(comparable_sales),
             sourceCount=1,
-            pricingAge="live",
+            pricingAge=pricing_age,
             comparableSales=comparable_sales,
             cacheStatus="miss",
             providerDiagnostics={
                 "provider": self.provider_name,
                 "cacheStatus": "miss",
                 "responseLatencyMs": str(latency_ms),
-                "pricingFreshness": "live",
+                "pricingFreshness": pricing_age,
                 "fallbackReason": "",
                 "sourceConfidence": str(confidence),
                 "resultCount": str(len(comparable_sales)),
@@ -636,3 +697,9 @@ class KicksDBPricingProvider(PricingProvider):
     def _is_valid_url(self, value: str) -> bool:
         parsed = urlparse(value)
         return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _cents_to_dollars(value: object) -> float | None:
+    if isinstance(value, int) and value > 0:
+        return value / 100
+    return None
