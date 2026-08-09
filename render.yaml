@@ -168,11 +168,18 @@ services:
   # existing rows are never touched on re-run. Weekly, not monthly: sports
   # cards get new product releases fairly often through the year, and a
   # missed set just sits unpriced until the next crawl finds it.
+  # region: ohio -- sportscardspro.com's Cloudflare protection blocks even
+  # plain page views (not just the CSV/console_uid endpoints) from Render's
+  # Oregon outbound IP with a 403, live-confirmed 2026-08-09. The backfill
+  # cron below was already migrated Oregon->Ohio for the same reason (see
+  # its own comment); this discovery cron needs the identical migration --
+  # Render has no in-place region change, a new service must be created in
+  # Ohio and the old Oregon one retired, same as was done for backfill.
   - type: cron
     name: packlox-discover-pricecharting-sets-sit
     runtime: python
     plan: starter
-    region: oregon
+    region: ohio
     branch: main
     schedule: "0 3 * * 0"
     buildCommand: pip install -r requirements.txt
