@@ -103,6 +103,15 @@ SPORTSCARDSPRO_DEFAULT_MAX_ATTEMPTS = 3
 # run to pick up -- not touched, no failure_count penalty.
 SPORTSCARDSPRO_DEFAULT_SLOW_PATH_LIMIT = 20
 
+# Live-confirmed: a single CSV batch of 20 sportscardspro sets returned
+# 26,450+ rows and OOM-killed a starter (512Mi) instance -- some sports-card
+# sets run far larger than any pricecharting.com category ever has. Keep
+# sportscardspro's CSV batches much smaller than pricecharting.com's
+# (--batch-size, default 150) regardless of instance size, so no single
+# batch's parsed rows (each held in memory, plus a duplicated raw_payload
+# per row) can blow past the memory limit.
+SPORTSCARDSPRO_DEFAULT_BATCH_SIZE = 3
+
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
@@ -235,7 +244,10 @@ def main(argv: list[str] | None = None) -> int:
                 if is_sportscardspro
                 else args.sleep_between_requests_seconds
             )
-            for index, chunk in enumerate(chunked(rows, args.batch_size)):
+            site_batch_size = (
+                args.sportscardspro_batch_size if is_sportscardspro else args.batch_size
+            )
+            for index, chunk in enumerate(chunked(rows, site_batch_size)):
                 if index > 0 and site_sleep_seconds > 0:
                     time.sleep(site_sleep_seconds)
                 console_uids = [row["console_uid"] for row in chunk]
@@ -639,6 +651,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=SPORTSCARDSPRO_DEFAULT_MAX_ATTEMPTS,
         help="In-run retry attempts for a sportscardspro CSV batch before giving up.",
+    )
+    parser.add_argument(
+        "--sportscardspro-batch-size",
+        type=int,
+        default=SPORTSCARDSPRO_DEFAULT_BATCH_SIZE,
+        help=(
+            "Sets per sportscardspro.com download-custom request -- kept far "
+            "smaller than --batch-size (150, used for pricecharting.com) "
+            "since some sports-card sets are large enough that a batch of "
+            "20 produced 26,450+ rows and OOM-killed a 512Mi instance."
+        ),
     )
     parser.add_argument(
         "--sportscardspro-slow-path-limit",
