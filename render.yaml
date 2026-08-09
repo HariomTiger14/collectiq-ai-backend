@@ -268,6 +268,37 @@ services:
       - key: PRICECHARTING_API_TOKEN
         sync: false
 
+  # Refreshes small (<100-item) sets via /api/products search, regardless of
+  # tracking status -- the other half of the tiered refresh design, tier 1.
+  # A backfilled set never gets touched again by the backfill cron above
+  # (claim_rows() permanently excludes success rows), so without this an
+  # untracked item just sits frozen at its one-time backfill snapshot
+  # forever. This only refreshes sets that fit under PriceCharting's 100-
+  # result search cap in one call -- large sets stay on the slow CSV/
+  # console_uid path, untouched by this script. Hourly at :40 (offset from
+  # backfill's */15 and tracked-item-refresh's :20) to spread load in time,
+  # not because it needs to be that frequent.
+  - type: cron
+    name: packlox-refresh-small-sets-sit
+    runtime: python
+    plan: starter
+    region: ohio
+    branch: main
+    schedule: "40 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m scripts.refresh_small_sets --limit 300 --stale-after-hours 24 --sleep-between-requests-seconds 1.2
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ENVIRONMENT
+        value: sit
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: PRICECHARTING_API_TOKEN
+        sync: false
+
   # TEMPORARY / diagnostic only: exists purely to get Shell access to a
   # different Render region (Ohio, vs. the Oregon used everywhere else) so
   # we can test whether sportscardspro.com's Cloudflare block is scoped to
