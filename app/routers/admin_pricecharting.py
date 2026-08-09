@@ -8,6 +8,7 @@ from app.routers.admin_auth import require_admin_import_token
 from app.services.admin_import_job_service import AdminImportJobService
 from scripts.import_pricecharting_catalog import PRICECHARTING_CSV_ENV_VARS
 from scripts.import_pricecharting_catalog import (
+    PartialCatalogWriteError,
     SupabaseCatalogClient,
     dedupe_catalog_rows,
     download_env_sources,
@@ -110,6 +111,18 @@ def import_pricecharting_catalog(
             raise _admin_import_error(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "supabase_import_not_configured",
+                str(exc),
+            ) from exc
+        except PartialCatalogWriteError as exc:
+            # sync_scd2_history_rows()/upsert_rows() now attempt every
+            # sub-batch before reporting failure (see PartialCatalogWriteError)
+            # instead of raising SystemExit on the first failing sub-batch --
+            # still a real failure for this endpoint's contract (some rows
+            # didn't write), just with more of the work already done.
+            jobs.fail_job(job["id"], str(exc))
+            raise _admin_import_error(
+                status.HTTP_502_BAD_GATEWAY,
+                "supabase_import_failed",
                 str(exc),
             ) from exc
         except httpx.HTTPError as exc:

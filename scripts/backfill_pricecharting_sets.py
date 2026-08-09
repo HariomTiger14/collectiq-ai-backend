@@ -51,6 +51,7 @@ class _RateLimitCircuitBreaker:
             self._consecutive_failures = 0
 
 from scripts.import_pricecharting_catalog import (
+    PartialCatalogWriteError,
     SupabaseCatalogClient,
     load_rows_from_text,
     to_catalog_row,
@@ -536,9 +537,26 @@ def write_catalog_rows(
     # already-processed chunk its mark_success. Whatever landed before the
     # failure is already committed (idempotent upserts), so the only cost of
     # treating this chunk as failed is a retry next cycle, not lost data.
+    #
+    # sync_scd2_history_rows()/upsert_rows() each attempt every sub-batch
+    # regardless of earlier sub-batch failures (see PartialCatalogWriteError)
+    # -- so even on a partial failure here, only the genuinely-failed rows'
+    # worth of work is left to redo next cycle, not the whole chunk from
+    # scratch. This whole registry-row chunk still gets marked failed either
+    # way (there's no cheap way to know which specific registry rows/sets a
+    # failed catalog row belonged to once batched into one CSV parse), but
+    # the retry converges fast since almost everything already landed.
     try:
         catalog_client.sync_scd2_history_rows(catalog_rows, batch_size=batch_size)
         catalog_client.upsert_rows(catalog_rows, batch_size=batch_size)
+    except PartialCatalogWriteError as exc:
+        print(
+            f"  Catalog write partially failed for this batch "
+            f"({exc.succeeded_count} succeeded, {len(exc.failed_ids)} failed) "
+            f"-- will retry next cycle: {exc}",
+            flush=True,
+        )
+        return False
     except (SystemExit, Exception) as exc:
         print(f"  Catalog write failed for this batch, will retry next cycle: {exc}", flush=True)
         return False

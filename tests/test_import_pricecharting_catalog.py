@@ -3,7 +3,10 @@ import base64
 import json
 from unittest.mock import patch
 
+import httpx
+
 from scripts.import_pricecharting_catalog import (
+    PartialCatalogWriteError,
     SupabaseCatalogClient,
     catalog_history_change_hash,
     dedupe_catalog_rows,
@@ -354,6 +357,80 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
             ["2", "3"],
         )
 
+    def test_upsert_rows_continues_past_a_failing_subbatch(self) -> None:
+        # Live-confirmed bug: a single sub-batch's Postgres statement timeout
+        # used to abort the whole call, leaving every later sub-batch
+        # unattempted even though it would have succeeded. batch_size=1 puts
+        # each row in its own sub-batch so failing the 2nd POST call proves
+        # the 3rd row still gets attempted afterward.
+        rows = [
+            _catalog_row("1", "First"),
+            _catalog_row("2", "Second"),
+            _catalog_row("3", "Third"),
+        ]
+        transport = _FakeSupabaseTransport(current_rows=[], fail_on_post_call_index=1)
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+
+            with self.assertRaises(PartialCatalogWriteError) as context:
+                client.upsert_rows(rows, batch_size=1)
+
+        exc = context.exception
+        self.assertEqual(exc.succeeded_count, 2)
+        self.assertEqual(exc.failed_ids, ["2"])
+        # Row 3's sub-batch ran after row 2's failed sub-batch -- proves the
+        # loop didn't abort.
+        self.assertEqual(
+            [row["pricecharting_id"] for row in transport.upserted_rows],
+            ["1", "3"],
+        )
+
+    def test_sync_scd2_history_rows_continues_past_a_failing_subbatch(self) -> None:
+        rows = [
+            _catalog_row("1", "First"),
+            _catalog_row("2", "Second"),
+            _catalog_row("3", "Third"),
+        ]
+        transport = _FakeSupabaseTransport(current_rows=[], fail_on_post_call_index=1)
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+
+            with self.assertRaises(PartialCatalogWriteError) as context:
+                client.sync_scd2_history_rows(rows, batch_size=1)
+
+        exc = context.exception
+        self.assertEqual(exc.succeeded_count, 2)
+        self.assertEqual(exc.failed_ids, ["2"])
+        self.assertEqual(
+            [row["pricecharting_id"] for row in transport.inserted_rows],
+            ["1", "3"],
+        )
+
+
+def _catalog_row(pricecharting_id: str, name: str) -> dict:
+    row = to_catalog_row(
+        {
+            "id": pricecharting_id,
+            "product-name": name,
+            "console-name": "Pokemon Cards",
+            "loose-price": "1000",
+        },
+        source_file="pokemon.csv",
+        source_downloaded_at="2026-07-25T00:00:00Z",
+    )
+    assert row is not None
+    return row
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -389,11 +466,18 @@ class _FakeSupabaseResponse:
 
 
 class _FakeSupabaseTransport:
-    def __init__(self, *, current_rows: list[dict[str, str]]) -> None:
+    def __init__(
+        self,
+        *,
+        current_rows: list[dict[str, str]],
+        fail_on_post_call_index: int | None = None,
+    ) -> None:
         self.current_rows = current_rows
         self.closed_ids: list[str] = []
         self.inserted_rows: list[dict[str, object]] = []
         self.upserted_rows: list[dict[str, object]] = []
+        self._fail_on_post_call_index = fail_on_post_call_index
+        self._post_call_count = 0
 
     def get(self, url: str, **kwargs):
         return _FakeSupabaseResponse(self.current_rows)
@@ -405,12 +489,25 @@ class _FakeSupabaseTransport:
         return _FakeSupabaseResponse()
 
     def post(self, url: str, **kwargs):
+        call_index = self._post_call_count
+        self._post_call_count += 1
+        if call_index == self._fail_on_post_call_index:
+            return _FailingSupabaseResponse()
         rows = kwargs.get("json", [])
         if url.endswith("/pricecharting_catalog_history"):
             self.inserted_rows.extend(rows)
         else:
             self.upserted_rows.extend(rows)
         return _FakeSupabaseResponse()
+
+
+class _FailingSupabaseResponse:
+    def __init__(self) -> None:
+        self.status_code = 500
+        self.text = '{"code":"57014","message":"canceling statement due to statement timeout"}'
+
+    def raise_for_status(self) -> None:
+        raise httpx.HTTPStatusError("timeout", request=None, response=self)
 
 
 def _fake_supabase_jwt(role: str) -> str:
