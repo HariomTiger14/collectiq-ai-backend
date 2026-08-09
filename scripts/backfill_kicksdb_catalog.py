@@ -37,19 +37,43 @@ import httpx
 
 DEFAULT_API_BASE = "https://api.kicks.dev"
 DEFAULT_PAGE_SIZE = 100
-DEFAULT_MAX_REQUESTS = 20
+# 10 segments x 10 requests/segment (1,000 results / 100 page size) = 100
+# requests per full run, plus headroom for a slow/retried segment.
+DEFAULT_MAX_REQUESTS = 120
 # Meilisearch's default cap on total results for a single filtered query --
 # confirmed live (a broad product_type="sneakers" query reported
 # meta.total=1000 regardless of how many pages were requested).
 API_RESULT_CAP = 1000
 
-# One segment per query worth running. Kept intentionally small for the
-# first backfill -- top 1,000 by rank alone costs ~10 requests, comfortably
-# inside even the free tier's 1,000/month. Add more (e.g. per-brand
-# filters) once real usage against the free tier's shared quota is
-# understood.
+# The general "sneakers-by-rank" segment plus the 9 brands confirmed live to
+# each independently hit the 1,000-result cap on their own (i.e. each has
+# 1,000+ sneakers in KicksDB's catalog) -- this is the real, full segment
+# list the initial 9,062-item catalog was built from (live-run once as a
+# one-off `--segments-json` override; persisted here so both manual re-runs
+# and the daily refresh cron use the same list by default, instead of
+# silently shrinking back to just the general segment). This script is
+# idempotent either way (write_catalog_rows only touches rows whose
+# content_hash actually changed), so running it daily against this same
+# list is exactly what keeps the catalog and its price history current.
 DEFAULT_SEGMENTS = [
     {"label": "sneakers-by-rank", "filters": 'product_type="sneakers"', "sort": "rank"},
+    {"label": "nike-by-rank", "filters": 'product_type="sneakers" AND brand="Nike"', "sort": "rank"},
+    {"label": "jordan-by-rank", "filters": 'product_type="sneakers" AND brand="Jordan"', "sort": "rank"},
+    {"label": "adidas-by-rank", "filters": 'product_type="sneakers" AND brand="Adidas"', "sort": "rank"},
+    {
+        "label": "new-balance-by-rank",
+        "filters": 'product_type="sneakers" AND brand="New Balance"',
+        "sort": "rank",
+    },
+    {"label": "puma-by-rank", "filters": 'product_type="sneakers" AND brand="Puma"', "sort": "rank"},
+    {"label": "reebok-by-rank", "filters": 'product_type="sneakers" AND brand="Reebok"', "sort": "rank"},
+    {"label": "asics-by-rank", "filters": 'product_type="sneakers" AND brand="Asics"', "sort": "rank"},
+    {
+        "label": "converse-by-rank",
+        "filters": 'product_type="sneakers" AND brand="Converse"',
+        "sort": "rank",
+    },
+    {"label": "vans-by-rank", "filters": 'product_type="sneakers" AND brand="Vans"', "sort": "rank"},
 ]
 
 

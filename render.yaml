@@ -299,6 +299,40 @@ services:
       - key: PRICECHARTING_API_TOKEN
         sync: false
 
+  # Refreshes the KicksDB StockX sneaker catalog daily -- re-runs the same
+  # 10 segments (general top-1,000-by-rank + the 9 brands that each
+  # independently hit the 1,000-result cap) the initial 9,062-item backfill
+  # used, now persisted as DEFAULT_SEGMENTS in the script itself instead of
+  # a one-off --segments-json override. The script is idempotent either way
+  # (kicksdb_catalog upsert + kicksdb_catalog_history sync both diff on
+  # content_hash and only touch rows that actually changed), so running it
+  # daily is what keeps current prices fresh AND accumulates real price
+  # history in kicksdb_catalog_history from here on, rather than only at
+  # backfill time. Daily matches KicksDB's own data refresh ceiling (their
+  # docs state data updates at most every 12-24h, so polling faster buys
+  # nothing). Costs ~100 requests/run (~3,000/month) -- well inside the Pro
+  # plan's 250,000/month budget.
+  - type: cron
+    name: packlox-refresh-kicksdb-catalog-sit
+    runtime: python
+    plan: starter
+    region: ohio
+    branch: main
+    schedule: "15 4 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m scripts.backfill_kicksdb_catalog --max-requests 120 --catalog-batch-size 100
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ENVIRONMENT
+        value: sit
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: KICKSDB_API_KEY
+        sync: false
+
   # TEMPORARY / diagnostic only: exists purely to get Shell access to a
   # different Render region (Ohio, vs. the Oregon used everywhere else) so
   # we can test whether sportscardspro.com's Cloudflare block is scoped to
