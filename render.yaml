@@ -11,7 +11,7 @@
 #   packlox-price-alerts-sit                 cron (Python 3) — 6-hourly alert pipeline
 #   packlox-catalog-promote-scan-derived-sit cron (Python 3) — daily scan-derived catalog promotion
 #   packlox-discover-pricecharting-sets-sit  cron (Python 3) — weekly comics/coins/sports-cards set discovery
-#   packlox-backfill-pricecharting-sets-sit  cron (Python 3) — comics/coins/sports-cards catalog backfill
+#   packlox-region-test-ohio-sit              cron (Python 3) — comics/coins/sports-cards catalog backfill (Ohio; see entry below for why)
 #   packlox-match-portfolio-catalog-sit      cron (Python 3) — hourly portfolio-item-to-catalog linking
 #
 # The three app-facing crons call the deployed web service over HTTP (so all
@@ -215,11 +215,22 @@ services:
   # single incident (see packlox-pricecharting-permission-and-expansion
   # memory) -- worth monitoring a few real runs before considering either
   # value more aggressive.
+  # Region is Ohio, not Oregon -- migrated 2026-08-09 after live-confirming
+  # sportscardspro.com's Cloudflare "Managed Challenge" was scoring our
+  # specific Oregon outbound IP badly (0% success on console_uid/CSV
+  # requests, even at the 30s pacing that gets 100% from an unrelated IP),
+  # while a fresh Ohio IP passed cleanly. Not an ASN-wide block -- the
+  # Oregon cron (packlox-backfill-pricecharting-sets-sit) was suspended and
+  # deleted rather than migrated in place, since Render doesn't support
+  # changing a service's region after creation. This entry was originally
+  # created as a throwaway region-test diagnostic (hence the name), then
+  # repurposed in place into the real production cron rather than creating
+  # a second service -- name kept as-is to match what's actually deployed.
   - type: cron
-    name: packlox-backfill-pricecharting-sets-sit
+    name: packlox-region-test-ohio-sit
     runtime: python
     plan: starter
-    region: oregon
+    region: ohio
     branch: main
     schedule: "*/15 * * * *"
     buildCommand: pip install -r requirements.txt
@@ -364,22 +375,6 @@ services:
         sync: false
       - key: PRICECHARTING_API_TOKEN
         sync: false
-
-  # TEMPORARY / diagnostic only: exists purely to get Shell access to a
-  # different Render region (Ohio, vs. the Oregon used everywhere else) so
-  # we can test whether sportscardspro.com's Cloudflare block is scoped to
-  # our specific Oregon outbound IP or to Render's ASN as a whole. Schedule
-  # is set far in the future -- this cron is never meant to actually run;
-  # only its Shell tab gets used. Safe to delete once the test is done.
-  - type: cron
-    name: packlox-region-test-ohio-sit
-    runtime: python
-    plan: starter
-    region: ohio
-    branch: main
-    schedule: "0 0 1 1 *"
-    buildCommand: pip install -r requirements.txt
-    startCommand: python3 -c "pass"
 
   # App-facing: batch re-price every portfolio item (persist refreshed values).
   # Calls the deployed web service, which owns all the pricing env; the endpoint
