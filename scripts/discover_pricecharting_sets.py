@@ -2,6 +2,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import time
 from typing import Any
 
@@ -13,6 +14,19 @@ REQUEST_HEADERS = {
     "User-Agent": "PackLoxSetDiscoveryBot/1.0 (+https://packlox.com; Legendary subscriber)",
 }
 
+# Lorcana, Funko Pops, and LEGO Sets have no /brand/<category>/<brand> index
+# pages (unlike comic-books/coins) -- their category page lists sets
+# directly. pricecharting.com's own "QUICK JUMP" search box on those pages
+# is backed by this JSON endpoint, confirmed live to return every set in the
+# category (not just the "popular" subset shown in the page HTML) along with
+# its console_uid, so discovery skips both the brand-page crawl and the
+# per-set console_uid resolve step entirely for these categories.
+FLAT_CATEGORY_CONFIGS = [
+    {"category": "lorcana-cards", "autocomplete_path": "/consoles-autocomplete/lorcana-cards"},
+    {"category": "funko-pops", "autocomplete_path": "/consoles-autocomplete/funko-pops"},
+    {"category": "lego-sets", "autocomplete_path": "/consoles-autocomplete/lego-sets"},
+]
+
 SITE_CONFIGS = {
     "pricecharting": {
         "source_site": "pricecharting",
@@ -22,6 +36,7 @@ SITE_CONFIGS = {
         # (scripts/refresh_pricecharting_catalog.py) -- only crawl the categories
         # that pipeline doesn't reach.
         "categories": {"comic-books", "coins"},
+        "flat_categories": FLAT_CATEGORY_CONFIGS,
     },
     "sportscardspro": {
         "source_site": "sportscardspro",
@@ -30,6 +45,7 @@ SITE_CONFIGS = {
         # None = accept every /brand/<category>/<brand> link found; this whole
         # site is sports cards, and the set of sports is discovered dynamically.
         "categories": None,
+        "flat_categories": [],
     },
 }
 
@@ -37,11 +53,24 @@ SITE_CONFIGS = {
 # manageable; sports cards (~36,000, 85% of the whole backlog across dozens
 # of dynamically-discovered sport categories) stays at the column default (3)
 # so it doesn't delay the smaller categories from getting full coverage.
+# Lorcana/Funko Pops/LEGO Sets are all small (dozens to low hundreds of
+# sets) and skip the console_uid resolve step entirely, so they clear fast
+# regardless of tier -- tier 1 just keeps them ahead of the sports-cards tail.
 PRIORITY_TIER_BY_CATEGORY = {
     "coins": 1,
     "comic-books": 2,
+    "lorcana-cards": 1,
+    "funko-pops": 1,
+    "lego-sets": 1,
 }
 DEFAULT_PRIORITY_TIER = 3
+
+_SLUG_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slugify(text: str) -> str:
+    slug = _SLUG_NON_ALNUM_RE.sub("-", text.lower()).strip("-")
+    return slug or "set"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -135,6 +164,22 @@ def discover_site(
                 )
             )
 
+    flat_categories = site.get("flat_categories") or []
+    for index, flat in enumerate(flat_categories):
+        if sleep_seconds > 0 and (brand_links or index > 0):
+            time.sleep(sleep_seconds)
+        flat_rows = discover_flat_category(
+            flat,
+            http=http,
+            base_url=site["base_url"],
+            source_site=source_site,
+        )
+        print(
+            f"  {flat['category']}: {len(flat_rows)} sets (via consoles-autocomplete)",
+            flush=True,
+        )
+        rows.extend(flat_rows)
+
     inserted = 0
     if not dry_run and rows:
         assert client is not None
@@ -142,8 +187,68 @@ def discover_site(
     return {
         "sourceSite": source_site,
         "brandPages": len(brand_links),
+        "flatCategories": len(flat_categories),
         "setsFound": len(rows),
         "setsInserted": inserted,
+    }
+
+
+def discover_flat_category(
+    flat: dict[str, str],
+    *,
+    http: httpx.Client,
+    base_url: str,
+    source_site: str,
+) -> list[dict[str, Any]]:
+    """Discover every set in a category whose page lists sets directly
+    (no /brand/<category>/<brand> indirection), via the same JSON endpoint
+    that powers pricecharting.com's own "QUICK JUMP" set search."""
+    category = flat["category"]
+    url = base_url + flat["autocomplete_path"]
+    try:
+        response = http.get(url)
+        response.raise_for_status()
+        entries = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        print(f"  Skipping flat category {category}: {exc}", flush=True)
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        console_uid = (entry or {}).get("value") or ""
+        set_name = (entry or {}).get("label") or ""
+        if not console_uid or not set_name:
+            continue
+        rows.append(
+            build_flat_registry_row(
+                source_site=source_site,
+                category=category,
+                set_name=set_name,
+                console_uid=console_uid,
+                base_url=base_url,
+            )
+        )
+    return rows
+
+
+def build_flat_registry_row(
+    *,
+    source_site: str,
+    category: str,
+    set_name: str,
+    console_uid: str,
+    base_url: str,
+) -> dict[str, Any]:
+    slug = f"{category}-{_slugify(set_name)}"
+    return {
+        "source_site": source_site,
+        "category": category,
+        "brand": category,
+        "slug": slug,
+        "set_name": set_name,
+        "url": f"{base_url}/console/{slug}",
+        "console_uid": console_uid,
+        "priority_tier": PRIORITY_TIER_BY_CATEGORY.get(category, DEFAULT_PRIORITY_TIER),
     }
 
 

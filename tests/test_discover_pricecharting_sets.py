@@ -11,7 +11,10 @@ from scripts.discover_pricecharting_sets import (
     SITE_CONFIGS,
     SupabaseRegistryClient,
     _selected_sites,
+    _slugify,
+    build_flat_registry_row,
     build_registry_row,
+    discover_flat_category,
     discover_site,
     parse_brand_links,
     parse_set_links,
@@ -130,6 +133,75 @@ class BuildRegistryRowTest(unittest.TestCase):
         self.assertEqual(sports_row["priority_tier"], DEFAULT_PRIORITY_TIER)
 
 
+class SlugifyTest(unittest.TestCase):
+    def test_lowercases_and_hyphenates(self) -> None:
+        self.assertEqual(_slugify("Funko Pop Marvel"), "funko-pop-marvel")
+
+    def test_strips_apostrophes_and_punctuation(self) -> None:
+        self.assertEqual(
+            _slugify("Lorcana Illumineer's Quest: Deep Trouble"),
+            "lorcana-illumineer-s-quest-deep-trouble",
+        )
+
+    def test_falls_back_to_set_for_empty_input(self) -> None:
+        self.assertEqual(_slugify("###"), "set")
+
+
+class BuildFlatRegistryRowTest(unittest.TestCase):
+    def test_builds_row_with_console_uid_prepopulated(self) -> None:
+        row = build_flat_registry_row(
+            source_site="pricecharting",
+            category="lorcana-cards",
+            set_name="Lorcana First Chapter",
+            console_uid="G67822",
+            base_url="https://www.pricecharting.com",
+        )
+        self.assertEqual(row["source_site"], "pricecharting")
+        self.assertEqual(row["category"], "lorcana-cards")
+        self.assertEqual(row["slug"], "lorcana-cards-lorcana-first-chapter")
+        self.assertEqual(row["console_uid"], "G67822")
+        self.assertEqual(
+            row["url"],
+            "https://www.pricecharting.com/console/lorcana-cards-lorcana-first-chapter",
+        )
+        self.assertEqual(row["priority_tier"], PRIORITY_TIER_BY_CATEGORY["lorcana-cards"])
+
+
+class DiscoverFlatCategoryTest(unittest.TestCase):
+    def test_parses_autocomplete_entries_and_skips_the_all_sentinel(self) -> None:
+        pages = {
+            "https://example.test/consoles-autocomplete/lorcana-cards": json.dumps(
+                [
+                    {"label": "all", "value": ""},
+                    {"label": "lorcana first chapter", "value": "G67822"},
+                    {"label": "lorcana fabled", "value": "G85944"},
+                ]
+            ),
+        }
+        http = httpx.Client(transport=_FixturePageTransport(pages))
+        flat = {"category": "lorcana-cards", "autocomplete_path": "/consoles-autocomplete/lorcana-cards"}
+
+        rows = discover_flat_category(
+            flat, http=http, base_url="https://example.test", source_site="pricecharting"
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            {row["console_uid"] for row in rows}, {"G67822", "G85944"}
+        )
+        self.assertTrue(all(row["category"] == "lorcana-cards" for row in rows))
+
+    def test_returns_empty_list_when_endpoint_fails(self) -> None:
+        http = httpx.Client(transport=_FixturePageTransport({}))
+        flat = {"category": "lorcana-cards", "autocomplete_path": "/consoles-autocomplete/lorcana-cards"}
+
+        rows = discover_flat_category(
+            flat, http=http, base_url="https://example.test", source_site="pricecharting"
+        )
+
+        self.assertEqual(rows, [])
+
+
 class SelectedSitesTest(unittest.TestCase):
     def test_defaults_to_every_configured_site(self) -> None:
         sites = _selected_sites(",".join(SITE_CONFIGS))
@@ -228,6 +300,44 @@ class DiscoverSiteTest(unittest.TestCase):
 
         self.assertEqual(summary["brandPages"], 2)
         self.assertEqual(summary["setsFound"], 2)
+
+    def test_includes_flat_category_sets_alongside_brand_pages(self) -> None:
+        pages = {
+            "https://example.test/": SEED_HTML,
+            "https://example.test/brand/comic-books/marvel": MARVEL_BRAND_HTML,
+            "https://example.test/brand/comic-books/dc": DC_BRAND_HTML,
+            "https://example.test/consoles-autocomplete/lorcana-cards": json.dumps(
+                [
+                    {"label": "all", "value": ""},
+                    {"label": "lorcana first chapter", "value": "G67822"},
+                ]
+            ),
+        }
+        http = httpx.Client(transport=_FixturePageTransport(pages))
+        site = {
+            "source_site": "pricecharting",
+            "base_url": "https://example.test",
+            "seed_path": "/",
+            "categories": {"comic-books"},
+            "flat_categories": [
+                {
+                    "category": "lorcana-cards",
+                    "autocomplete_path": "/consoles-autocomplete/lorcana-cards",
+                }
+            ],
+        }
+
+        summary = discover_site(
+            site=site,
+            http=http,
+            client=_ExplodingClient(),
+            dry_run=True,
+            batch_size=500,
+            sleep_seconds=0,
+        )
+
+        self.assertEqual(summary["flatCategories"], 1)
+        self.assertEqual(summary["setsFound"], 4)
 
 
 class SupabaseRegistryClientTest(unittest.TestCase):
