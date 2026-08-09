@@ -87,16 +87,17 @@ API_SEARCH_RESULT_CAP = 100
 # this is rate-based throttling, not a hard bot-fingerprint block -- an
 # early test (from a non-Render IP) found ~13% success at 2s spacing, 80%
 # at 15s, 100% (10/10) at 30s, which is where this was originally set.
-# Re-tested 2026-08-09 from Render's actual Ohio outbound IP (the IP that
-# actually matters -- Cloudflare's blocking here is IP/ASN-aware, not just
-# rate-based; see the Oregon->Ohio migration elsewhere in this repo) at
-# 10s spacing: 8/8 console_uid resolves succeeded, plus a real
-# download-custom CSV batch succeeded too. Small sample, so keep watching
-# real cron runs for 429s/circuit-breaker trips, but strong enough to move
-# off the original, more conservative 30s. pricecharting.com has no such
-# throttle and stays on the caller's normal --sleep-between-requests-seconds
-# pacing.
-SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS = 10.0
+# Re-tested 2026-08-09 from Render's actual Ohio outbound IP at 10s
+# spacing: a short live test (8 requests) succeeded cleanly, but after
+# running at 10s (plus a raised --sportscardspro-slow-path-limit and a
+# faster --sportscardspro-api-search-sleep-seconds) for roughly an hour of
+# sustained cron cycles, 429s started recurring -- short bursts-only tests
+# can't see a longer-window/aggregate volume limit, only sustained real
+# traffic reveals it. Backed off to 15s (roughly 2x the original 30s
+# baseline, not the ~3x that triggered the recurring 429s) as a more
+# sustainable middle ground. pricecharting.com has no such throttle and
+# stays on the caller's normal --sleep-between-requests-seconds pacing.
+SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS = 15.0
 SPORTSCARDSPRO_DEFAULT_MAX_ATTEMPTS = 3
 
 # The console_uid resolve step is fully serial at SPORTSCARDSPRO_DEFAULT_SLEEP_
