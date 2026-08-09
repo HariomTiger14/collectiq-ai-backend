@@ -308,6 +308,12 @@ def build_registry_row(
         "slug": slug,
         "set_name": set_name,
         "url": f"{base_url}/console/{slug}",
+        # Always present (even if null) so every row in a batch shares the
+        # same key set -- PostgREST's bulk insert rejects a batch where
+        # objects have different keys ("All object keys must match", seen
+        # live when a batch straddled these brand-crawled rows and the
+        # flat-category rows below, which do set console_uid).
+        "console_uid": None,
         "priority_tier": PRIORITY_TIER_BY_CATEGORY.get(category, DEFAULT_PRIORITY_TIER),
     }
 
