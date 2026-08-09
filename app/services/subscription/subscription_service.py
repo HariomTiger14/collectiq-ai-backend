@@ -14,7 +14,7 @@ import httpx
 from app.core.config import settings
 
 _VALID_PLANS = {"free", "pro", "premium"}
-_VALID_SOURCES = {"none", "mock", "google_play", "app_store"}
+_VALID_SOURCES = {"none", "mock", "google_play", "app_store", "admin_override"}
 _DEFAULT_ENTITLEMENT = {
     "plan": "free",
     "status": "active",
@@ -178,6 +178,53 @@ class SubscriptionService:
             return self._to_entitlement(rows[0])
         # Fall back to a read if the store didn't return the representation.
         return self.get_entitlement(user_id)
+
+    def get_scan_usage(self, user_id: str, *, free_monthly_limit: int) -> dict[str, Any]:
+        """Current-calendar-month scan usage for a user (admin visibility).
+
+        Mirrors check_and_bump_scan_usage's own month-window math (date_trunc
+        'month' in UTC) without going through the RPC, since this is a read
+        -only lookup, not a check-and-bump.
+        """
+        self._require_config()
+        month_start = datetime.now(timezone.utc).date().replace(day=1).isoformat()
+        response = self._supabase_request(
+            "GET",
+            "/rest/v1/user_scan_usage",
+            params={
+                "user_id": f"eq.{user_id}",
+                "usage_date": f"gte.{month_start}",
+                "select": "scans_used",
+            },
+        )
+        rows = response.json()
+        used = sum(int(row.get("scans_used") or 0) for row in rows if isinstance(row, dict))
+        return {
+            "used": used,
+            "limit": free_monthly_limit,
+            "periodStart": month_start,
+        }
+
+    def reset_scan_usage(self, user_id: str) -> dict[str, Any]:
+        """Zero out the current calendar month's scan usage rows for a user.
+
+        An admin support remedy for a quota-locked free user -- not exposed
+        to the client, only called from the admin surface with the service
+        role.
+        """
+        self._require_config()
+        month_start = datetime.now(timezone.utc).date().replace(day=1).isoformat()
+        self._supabase_request(
+            "PATCH",
+            "/rest/v1/user_scan_usage",
+            params={
+                "user_id": f"eq.{user_id}",
+                "usage_date": f"gte.{month_start}",
+            },
+            headers={"Prefer": "return=minimal"},
+            json={"scans_used": 0, "updated_at": datetime.now(timezone.utc).isoformat()},
+        )
+        return {"userId": user_id, "used": 0, "periodStart": month_start}
 
     # -- internals ----------------------------------------------------------
 

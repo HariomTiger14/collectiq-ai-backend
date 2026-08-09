@@ -20,6 +20,10 @@ class AdminRoleUpdateRequest(BaseModel):
     isAdmin: bool = False
 
 
+class AdminSubscriptionOverrideRequest(BaseModel):
+    plan: str = Field(pattern="^(free|pro|premium)$")
+
+
 @router.get("/{user_id}")
 def get_admin_user_detail(
     user_id: str,
@@ -150,6 +154,68 @@ def update_admin_user_role(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
                 "code": "admin_role_update_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+
+
+@router.post("/{user_id}/subscription")
+def override_user_subscription(
+    user_id: str,
+    request: AdminSubscriptionOverrideRequest,
+    admin: dict[str, Any] = Depends(require_admin_permission("users:write")),
+) -> dict[str, Any]:
+    try:
+        payload = AdminUserService().override_subscription(user_id=user_id, plan=request.plan)
+        _record_audit(
+            action="admin_users.subscription_overridden",
+            status="success",
+            target_id=user_id,
+            metadata={"plan": request.plan},
+        )
+        return payload
+    except AdminUserServiceError as error:
+        _record_audit(
+            action="admin_users.subscription_overridden",
+            status="failure",
+            target_id=user_id,
+            metadata={"plan": request.plan, "error": str(error)},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_subscription_override_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+
+
+@router.post("/{user_id}/scan-usage/reset")
+def reset_user_scan_usage(
+    user_id: str,
+    admin: dict[str, Any] = Depends(require_admin_permission("users:write")),
+) -> dict[str, Any]:
+    try:
+        payload = AdminUserService().reset_scan_usage(user_id)
+        _record_audit(
+            action="admin_users.scan_usage_reset",
+            status="success",
+            target_id=user_id,
+        )
+        return payload
+    except AdminUserServiceError as error:
+        _record_audit(
+            action="admin_users.scan_usage_reset",
+            status="failure",
+            target_id=user_id,
+            metadata={"error": str(error)},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_scan_usage_reset_unavailable",
                 "message": str(error),
                 "retryable": True,
             },
