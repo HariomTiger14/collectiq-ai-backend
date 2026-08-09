@@ -103,6 +103,29 @@ class BuildRegistryRowTest(unittest.TestCase):
         )
         self.assertEqual(row["source_site"], "pricecharting")
 
+    def test_key_set_matches_build_flat_registry_row(self) -> None:
+        # PostgREST's bulk insert rejects a batch where objects have
+        # different keys ("All object keys must match") -- seen live in
+        # production when a 500-row batch straddled brand-crawled rows
+        # (comics/coins) and flat-category rows (Lorcana/Funko/LEGO), which
+        # set console_uid. Every row builder must emit the same key set.
+        brand_row = build_registry_row(
+            source_site="pricecharting",
+            category="comic-books",
+            brand="marvel",
+            slug="comic-books-x-men",
+            set_name="X-Men",
+            base_url="https://www.pricecharting.com",
+        )
+        flat_row = build_flat_registry_row(
+            source_site="pricecharting",
+            category="lorcana-cards",
+            set_name="Lorcana First Chapter",
+            console_uid="G67822",
+            base_url="https://www.pricecharting.com",
+        )
+        self.assertEqual(set(brand_row.keys()), set(flat_row.keys()))
+
     def test_assigns_priority_tier_by_category(self) -> None:
         coins_row = build_registry_row(
             source_site="pricecharting",
