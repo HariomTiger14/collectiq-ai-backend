@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
 from fastapi.testclient import TestClient
@@ -48,12 +48,25 @@ class AdminUsersTest(unittest.TestCase):
 
     def test_repository_gets_user_detail_with_recent_activity(self) -> None:
         client = _FakeAdminUsersClient()
+        subscription_service = Mock()
+        subscription_service.get_entitlement.return_value = {
+            "plan": "pro",
+            "status": "active",
+            "source": "google_play",
+            "currentPeriodEnd": None,
+        }
+        subscription_service.get_scan_usage.return_value = {
+            "used": 5,
+            "limit": 30,
+            "periodStart": "2026-07-01",
+        }
         service = AdminUserService(
             repository=SupabaseAdminUserRepository(
                 supabase_url="https://supabase.test",
                 service_role_key="service-role",
                 client=client,
-            )
+            ),
+            subscription_service=subscription_service,
         )
 
         payload = service.get_user_detail("user-1")
@@ -65,6 +78,61 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(len(user["recentPortfolioItems"]), 2)
         self.assertEqual(len(user["recentScans"]), 1)
         self.assertEqual([item["id"] for item in user["pricingReviewItems"]], ["item-2"])
+        self.assertEqual(user["subscription"]["plan"], "pro")
+        self.assertEqual(user["scanUsage"]["used"], 5)
+        self.assertEqual(len(user["priceAlerts"]), 1)
+        self.assertEqual(user["priceAlerts"][0]["itemTitle"], "Charizard")
+        self.assertEqual(len(user["pushDevices"]), 1)
+        self.assertEqual(user["pushDevices"][0]["platform"], "ios")
+
+    def test_override_subscription_delegates_to_subscription_service(self) -> None:
+        subscription_service = Mock()
+        subscription_service.verify_and_grant.return_value = {
+            "plan": "pro",
+            "status": "active",
+            "source": "admin_override",
+            "currentPeriodEnd": None,
+        }
+        client = _FakeAdminUsersClient()
+        service = AdminUserService(
+            repository=SupabaseAdminUserRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            ),
+            subscription_service=subscription_service,
+        )
+
+        payload = service.override_subscription(user_id="user-1", plan="pro")
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["subscription"]["plan"], "pro")
+        subscription_service.verify_and_grant.assert_called_once_with(
+            user_id="user-1", plan="pro", source="admin_override", purchase_token=None
+        )
+
+    def test_reset_scan_usage_delegates_to_subscription_service(self) -> None:
+        subscription_service = Mock()
+        subscription_service.reset_scan_usage.return_value = {
+            "userId": "user-1",
+            "used": 0,
+            "periodStart": "2026-07-01",
+        }
+        client = _FakeAdminUsersClient()
+        service = AdminUserService(
+            repository=SupabaseAdminUserRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            ),
+            subscription_service=subscription_service,
+        )
+
+        payload = service.reset_scan_usage("user-1")
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["scanUsage"]["used"], 0)
+        subscription_service.reset_scan_usage.assert_called_once_with("user-1")
 
     def test_admin_user_detail_endpoint_records_audit(self) -> None:
         with patch("app.routers.admin_auth.settings") as auth_settings, patch(
@@ -89,6 +157,69 @@ class AdminUsersTest(unittest.TestCase):
         event = audit_response.json()["events"][0]
         self.assertEqual(event["action"], "admin_users.detail_viewed")
         self.assertEqual(event["metadata"]["userId"], "user-1")
+
+    def test_subscription_override_endpoint_records_audit(self) -> None:
+        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+            "app.routers.admin_users.AdminUserService",
+        ) as service:
+            auth_settings.admin_import_token = "secret-token"
+            service.return_value.override_subscription.return_value = {
+                "success": True,
+                "userId": "user-1",
+                "subscription": {"plan": "pro", "status": "active", "source": "admin_override"},
+            }
+            response = self.client.post(
+                "/admin/users/user-1/subscription",
+                json={"plan": "pro"},
+                headers={"Authorization": "Bearer secret-token"},
+            )
+            audit_response = self.client.get(
+                "/admin/audit/events?action=admin_users.subscription_overridden",
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["subscription"]["plan"], "pro")
+        service.return_value.override_subscription.assert_called_once_with(
+            user_id="user-1", plan="pro"
+        )
+        event = audit_response.json()["events"][0]
+        self.assertEqual(event["metadata"]["plan"], "pro")
+
+    def test_subscription_override_rejects_invalid_plan(self) -> None:
+        with patch("app.routers.admin_auth.settings") as auth_settings:
+            auth_settings.admin_import_token = "secret-token"
+            response = self.client.post(
+                "/admin/users/user-1/subscription",
+                json={"plan": "diamond"},
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_scan_usage_reset_endpoint_records_audit(self) -> None:
+        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+            "app.routers.admin_users.AdminUserService",
+        ) as service:
+            auth_settings.admin_import_token = "secret-token"
+            service.return_value.reset_scan_usage.return_value = {
+                "success": True,
+                "scanUsage": {"used": 0, "limit": 30, "periodStart": "2026-07-01"},
+            }
+            response = self.client.post(
+                "/admin/users/user-1/scan-usage/reset",
+                headers={"Authorization": "Bearer secret-token"},
+            )
+            audit_response = self.client.get(
+                "/admin/audit/events?action=admin_users.scan_usage_reset",
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["scanUsage"]["used"], 0)
+        service.return_value.reset_scan_usage.assert_called_once_with("user-1")
+        event = audit_response.json()["events"][0]
+        self.assertEqual(event["targetId"], "user-1")
 
     def test_admin_users_endpoint_records_search_audit(self) -> None:
         with patch("app.routers.admin_auth.settings") as auth_settings, patch(
@@ -183,8 +314,33 @@ class _FakeAdminUsersClient:
             ])
         if url.endswith("/rest/v1/scan_analysis_events"):
             return _response([{"id": "scan-1", "status": "failed", "provider": "openai"}])
+        if url.endswith("/rest/v1/price_alerts"):
+            return _response(
+                [
+                    {
+                        "id": "alert-1",
+                        "item_title": "Charizard",
+                        "portfolio_item_id": "item-1",
+                        "rule_type": "priceRisesAboveAmount",
+                        "target_amount": 500,
+                        "enabled": True,
+                        "status": "active",
+                        "updated_at": "2026-07-29T00:00:00Z",
+                    }
+                ]
+            )
         if url.endswith("/rest/v1/push_device_registrations"):
-            return _response([{"id": "device-1"}])
+            return _response(
+                [
+                    {
+                        "id": "device-1",
+                        "platform": "ios",
+                        "enabled": True,
+                        "status": "enabled",
+                        "last_seen_at": "2026-07-29T00:00:00Z",
+                    }
+                ]
+            )
         raise AssertionError(f"Unexpected URL: {url}")
 
 

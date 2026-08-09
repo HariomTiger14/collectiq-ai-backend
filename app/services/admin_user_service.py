@@ -5,6 +5,10 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.services.subscription.subscription_service import (
+    SubscriptionService,
+    SubscriptionServiceError,
+)
 
 
 class AdminUserServiceError(Exception):
@@ -16,8 +20,10 @@ class AdminUserService:
         self,
         *,
         repository: "SupabaseAdminUserRepository | None" = None,
+        subscription_service: SubscriptionService | None = None,
     ) -> None:
         self._repository = repository or SupabaseAdminUserRepository()
+        self._subscription_service = subscription_service or SubscriptionService()
 
     def list_users(self, *, query: str | None = None, limit: int = 50) -> dict[str, Any]:
         if not self._repository.is_configured:
@@ -33,10 +39,61 @@ class AdminUserService:
     def get_user_detail(self, user_id: str) -> dict[str, Any]:
         if not self._repository.is_configured:
             raise AdminUserServiceError("Supabase admin configuration is missing.")
+        user = self._repository.get_user_detail(user_id)
+        user["subscription"] = self._safe_entitlement(user_id)
+        user["scanUsage"] = self._safe_scan_usage(user_id)
         return {
             "success": True,
-            "user": self._repository.get_user_detail(user_id),
+            "user": user,
         }
+
+    def override_subscription(self, *, user_id: str, plan: str) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminUserServiceError("Supabase admin configuration is missing.")
+        try:
+            entitlement = self._subscription_service.verify_and_grant(
+                user_id=user_id,
+                plan=plan,
+                source="admin_override",
+                purchase_token=None,
+            )
+        except SubscriptionServiceError as error:
+            raise AdminUserServiceError(str(error)) from error
+        return {"success": True, "userId": user_id, "subscription": entitlement}
+
+    def reset_scan_usage(self, user_id: str) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminUserServiceError("Supabase admin configuration is missing.")
+        try:
+            result = self._subscription_service.reset_scan_usage(user_id)
+        except SubscriptionServiceError as error:
+            raise AdminUserServiceError(str(error)) from error
+        return {
+            "success": True,
+            "scanUsage": {
+                **result,
+                "limit": settings.subscription_free_monthly_scan_limit,
+            },
+        }
+
+    def _safe_entitlement(self, user_id: str) -> dict[str, Any]:
+        try:
+            return self._subscription_service.get_entitlement(user_id)
+        except SubscriptionServiceError:
+            return {"plan": "unknown", "status": "unknown", "source": "unknown", "currentPeriodEnd": None}
+
+    def _safe_scan_usage(self, user_id: str) -> dict[str, Any]:
+        try:
+            return self._subscription_service.get_scan_usage(
+                user_id,
+                free_monthly_limit=settings.subscription_free_monthly_scan_limit,
+            )
+        except SubscriptionServiceError:
+            return {
+                "used": None,
+                "limit": settings.subscription_free_monthly_scan_limit,
+                "periodStart": None,
+            }
 
     def resend_confirmation(self, *, email: str) -> dict[str, Any]:
         if not self._repository.is_configured:
@@ -123,6 +180,8 @@ class SupabaseAdminUserRepository:
         summary = self._admin_user_from_auth_user(auth_user)
         portfolio_items = self._optional_rows("portfolio_items", user_id, limit=10)
         scan_events = self._optional_rows("scan_analysis_events", user_id, limit=10)
+        price_alerts = self._optional_rows("price_alerts", user_id, limit=20)
+        push_devices = self._optional_rows("push_device_registrations", user_id, limit=20)
         pricing_review_items = [
             item
             for item in portfolio_items
@@ -138,6 +197,8 @@ class SupabaseAdminUserRepository:
             "recentPortfolioItems": [_compact_portfolio_item(item) for item in portfolio_items],
             "recentScans": [_compact_scan_event(event) for event in scan_events],
             "pricingReviewItems": [_compact_portfolio_item(item) for item in pricing_review_items[:10]],
+            "priceAlerts": [_compact_price_alert(alert) for alert in price_alerts],
+            "pushDevices": [_compact_push_device(device) for device in push_devices],
         }
 
     def _admin_user_from_auth_user(self, user: dict[str, Any]) -> dict[str, Any]:
@@ -341,6 +402,31 @@ def _compact_scan_event(row: dict[str, Any]) -> dict[str, Any]:
         "provider": row.get("provider") or payload.get("provider") or payload.get("aiProvider") or "Unknown",
         "confidence": row.get("confidence") or payload.get("confidence"),
         "createdAt": row.get("created_at") or payload.get("createdAt"),
+    }
+
+
+def _compact_price_alert(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "itemTitle": row.get("item_title") or "Item",
+        "portfolioItemId": row.get("portfolio_item_id"),
+        "ruleType": row.get("rule_type"),
+        "targetAmount": row.get("target_amount"),
+        "enabled": bool(row.get("enabled")),
+        "status": row.get("status") or "unknown",
+        "triggeredAt": row.get("triggered_at"),
+        "updatedAt": row.get("updated_at"),
+    }
+
+
+def _compact_push_device(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "platform": row.get("platform") or row.get("device_type") or "unknown",
+        "enabled": bool(row.get("enabled")),
+        "status": row.get("status") or ("enabled" if row.get("enabled") else "disabled"),
+        "lastSeenAt": row.get("last_seen_at"),
+        "updatedAt": row.get("updated_at"),
     }
 
 
