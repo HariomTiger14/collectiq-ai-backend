@@ -228,16 +228,26 @@ services:
   # raising further once a few real runs confirm no 429s/circuit-breaker
   # trips at this pace.
   #
-  # --sportscardspro-api-search-sleep-seconds 0.5 / --sportscardspro-api-
-  # search-concurrency 4: the /api/products search pre-pass (tries every
-  # sportscardspro row via cheap full-text search before falling back to
-  # the slow path) was inheriting the general --sleep-between-requests-
-  # seconds pacing even though this endpoint is confirmed NOT Cloudflare
-  # -throttled -- live-confirmed reliable at 0.5s from this same Ohio
-  # region. Some individual searches still take several seconds server
-  # -side for broad/ambiguous queries regardless of pacing, so concurrency
-  # (same round-robin-lane design as --console-resolve-concurrency) lets
-  # those overlap instead of serializing.
+  # --sportscardspro-api-search-sleep-seconds 0.5: the /api/products search
+  # pre-pass (tries every sportscardspro row via cheap full-text search
+  # before falling back to the slow path) was inheriting the general
+  # --sleep-between-requests-seconds pacing even though this endpoint is
+  # confirmed NOT Cloudflare-throttled -- live-confirmed reliable at 0.5s,
+  # serially, from this same Ohio region.
+  #
+  # --sportscardspro-api-search-concurrency 1 (NOT 4): concurrency was
+  # tried at 4 (round-robin lanes, same design as --console-resolve-
+  # concurrency) on the theory that individual searches vary widely in
+  # latency and overlapping them would help -- but live-confirmed
+  # 2026-08-09 that 4 parallel lanes each independently pacing at 0.5s
+  # produces real request BURSTS well above the validated serial rate when
+  # the lanes' timers align, and this DID trip a real Cloudflare 429 cascade
+  # in production (circuit breaker caught it correctly, no data loss, but
+  # the burst was real). A block also appeared to bleed into the separate
+  # slow-path console_uid resolve step immediately after, suggesting
+  # sportscardspro.com's throttle isn't perfectly isolated per-function
+  # once tripped. Reverted to 1 (serial, unchanged from original behavior)
+  # -- do not raise this again without a much more cautious, gradual test.
   - type: cron
     name: packlox-backfill-pricecharting-sets-sit
     runtime: python
@@ -246,7 +256,7 @@ services:
     branch: main
     schedule: "*/15 * * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m scripts.backfill_pricecharting_sets --limit 150 --batch-size 150 --catalog-batch-size 50 --sleep-between-requests-seconds 2 --console-resolve-concurrency 4 --sportscardspro-slow-path-limit 45 --sportscardspro-api-search-sleep-seconds 0.5 --sportscardspro-api-search-concurrency 4
+    startCommand: python -m scripts.backfill_pricecharting_sets --limit 150 --batch-size 150 --catalog-batch-size 50 --sleep-between-requests-seconds 2 --console-resolve-concurrency 4 --sportscardspro-slow-path-limit 45 --sportscardspro-api-search-sleep-seconds 0.5 --sportscardspro-api-search-concurrency 1
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
