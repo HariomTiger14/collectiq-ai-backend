@@ -416,6 +416,105 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
             ["1", "3"],
         )
 
+    def test_phase_seconds_starts_at_zero(self) -> None:
+        client = SupabaseCatalogClient(
+            supabase_url="https://example.supabase.co",
+            service_role_key=_fake_supabase_jwt("service_role"),
+            timeout_seconds=1,
+        )
+
+        self.assertEqual(
+            client.phase_seconds,
+            {
+                "unchanged_detection": 0.0,
+                "catalog_upsert": 0.0,
+                "scd2_comparison": 0.0,
+                "scd2_insert": 0.0,
+            },
+        )
+
+    def test_upsert_rows_only_times_the_upsert_when_something_actually_changed(self) -> None:
+        # All rows unchanged -- the hash-comparison lookup still runs (and
+        # must be timed), but _upsert() is never called, so its timer must
+        # stay untouched rather than reporting a phantom zero-row upsert.
+        unchanged_row = to_catalog_row(
+            {
+                "id": "1",
+                "product-name": "Unchanged",
+                "console-name": "Pokemon Cards",
+                "loose-price": "1000",
+            },
+            source_file="pokemon.csv",
+            source_downloaded_at="2026-07-25T00:00:00Z",
+        )
+        assert unchanged_row is not None
+        transport = _FakeSupabaseTransport(
+            current_rows=[
+                {"pricecharting_id": "1", "content_hash": unchanged_row["content_hash"]},
+            ]
+        )
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+            client.upsert_rows([unchanged_row], batch_size=100)
+
+        self.assertGreater(client.phase_seconds["unchanged_detection"], 0)
+        self.assertEqual(client.phase_seconds["catalog_upsert"], 0.0)
+        self.assertEqual(client.phase_seconds["scd2_comparison"], 0.0)
+        self.assertEqual(client.phase_seconds["scd2_insert"], 0.0)
+
+    def test_upsert_rows_times_both_phases_when_rows_change(self) -> None:
+        rows = [_catalog_row("1", "First")]
+        transport = _FakeSupabaseTransport(current_rows=[])
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+            client.upsert_rows(rows, batch_size=100)
+
+        self.assertGreater(client.phase_seconds["unchanged_detection"], 0)
+        self.assertGreater(client.phase_seconds["catalog_upsert"], 0)
+
+    def test_sync_scd2_history_rows_times_comparison_and_insert_separately(self) -> None:
+        rows = [_catalog_row("1", "First"), _catalog_row("2", "Second")]
+        transport = _FakeSupabaseTransport(current_rows=[])
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+            client.sync_scd2_history_rows(rows, batch_size=100)
+
+        self.assertGreater(client.phase_seconds["scd2_comparison"], 0)
+        self.assertGreater(client.phase_seconds["scd2_insert"], 0)
+        self.assertEqual(client.phase_seconds["unchanged_detection"], 0.0)
+        self.assertEqual(client.phase_seconds["catalog_upsert"], 0.0)
+
+    def test_phase_seconds_accumulate_across_multiple_calls(self) -> None:
+        rows = [_catalog_row("1", "First")]
+        transport = _FakeSupabaseTransport(current_rows=[])
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+            client.upsert_rows(rows, batch_size=100)
+            after_first_call = client.phase_seconds["catalog_upsert"]
+            client.upsert_rows(rows, batch_size=100)
+
+        self.assertGreater(client.phase_seconds["catalog_upsert"], after_first_call)
+
 
 def _catalog_row(pricecharting_id: str, name: str) -> dict:
     row = to_catalog_row(
