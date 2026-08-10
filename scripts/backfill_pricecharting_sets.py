@@ -189,6 +189,30 @@ SPORTSCARDSPRO_DEFAULT_BATCH_SIZE = 3
 SPORTSCARDSPRO_API_SEARCH_MAX_IN_FLIGHT = 2
 
 
+def _summarize_catalog_write_events(
+    events: list[dict[str, Any]], *, top_n: int = 10
+) -> dict[str, list[dict[str, Any]]]:
+    """Reduces the full list of per-write-event records down to the top N
+    slowest and top N largest, for surfacing outliers in the final JSON
+    without dumping every write event into it. One event is recorded per
+    write_catalog_rows() call: exactly one set for the sportscardspro
+    API-search path, but possibly several sets bundled into one chunk for
+    the console_uid+CSV path -- setNames reflects that (a list, not a
+    single value) so a slow/large CSV batch is still attributable to the
+    sets that made it up, even though true per-set write timing isn't
+    measurable once multiple sets' rows are written together."""
+    top_slowest = sorted(events, key=lambda event: event["elapsedSeconds"], reverse=True)[:top_n]
+    top_largest = sorted(events, key=lambda event: event["rowCount"], reverse=True)[:top_n]
+    return {
+        "topSlowestCatalogWrites": [
+            {**event, "elapsedSeconds": round(event["elapsedSeconds"], 3)} for event in top_slowest
+        ],
+        "topLargestCatalogWrites": [
+            {**event, "elapsedSeconds": round(event["elapsedSeconds"], 3)} for event in top_largest
+        ],
+    }
+
+
 def _build_result_summary(
     *,
     dry_run: bool,
@@ -203,6 +227,8 @@ def _build_result_summary(
     slow_path_attempted: int,
     rate_limit_429_count: int,
     phase_seconds: dict[str, float],
+    catalog_write_phase_seconds: dict[str, float],
+    catalog_write_events: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Assembles the final JSON printed to stdout -- pulled out of main() so
     the counters/timings it reports can be unit tested without wiring up a
@@ -230,6 +256,17 @@ def _build_result_summary(
         "consoleResolveSeconds": round(phase_seconds.get("console_resolve", 0.0), 3),
         "csvFetchSeconds": round(phase_seconds.get("csv_fetch", 0.0), 3),
         "catalogWriteSeconds": round(phase_seconds.get("catalog_write", 0.0), 3),
+        # Sub-phase breakdown of catalogWriteSeconds -- these won't sum
+        # exactly to it (Python-side list/dict work between HTTP calls
+        # isn't captured by any of the four), but they identify which
+        # phase actually dominates catalog-write wall clock.
+        "unchangedDetectionSeconds": round(
+            catalog_write_phase_seconds.get("unchanged_detection", 0.0), 3
+        ),
+        "catalogUpsertSeconds": round(catalog_write_phase_seconds.get("catalog_upsert", 0.0), 3),
+        "scd2ComparisonSeconds": round(catalog_write_phase_seconds.get("scd2_comparison", 0.0), 3),
+        "scd2InsertSeconds": round(catalog_write_phase_seconds.get("scd2_insert", 0.0), 3),
+        **_summarize_catalog_write_events(catalog_write_events),
     }
 
 
@@ -258,6 +295,60 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
 
+    # Dry runs never write to the catalog/history tables this lock protects
+    # -- skip acquiring it entirely rather than adding an unrelated Supabase
+    # dependency to a --dry-run invocation.
+    run_lock_client = (
+        None
+        if args.dry_run or args.skip_run_lock
+        else SupabaseRunLockClient(
+            supabase_url=args.supabase_url or os.getenv("SUPABASE_URL", ""),
+            service_role_key=args.service_role_key or os.getenv("SUPABASE_SERVICE_ROLE_KEY", ""),
+            timeout_seconds=args.timeout_seconds,
+        )
+    )
+    if run_lock_client is not None:
+        acquired, held_by = run_lock_client.acquire(
+            lock_name=args.run_lock_name,
+            worker_id=args.worker_id,
+            lease_seconds=args.run_lock_lease_seconds,
+        )
+        if not acquired:
+            print(
+                f"Run lock {args.run_lock_name!r} is currently held by {held_by!r} -- "
+                f"skipping this run to avoid overlapping catalog writes.",
+                flush=True,
+            )
+            print(
+                json.dumps(
+                    {
+                        "success": True,
+                        "claimed": 0,
+                        "runLockHeld": True,
+                        "runLockHeldBy": held_by,
+                    },
+                    indent=2,
+                ),
+                flush=True,
+            )
+            return 0
+
+    try:
+        return _run_backfill(
+            args, token=token, registry_client=registry_client, catalog_client=catalog_client
+        )
+    finally:
+        if run_lock_client is not None:
+            run_lock_client.release(lock_name=args.run_lock_name, worker_id=args.worker_id)
+
+
+def _run_backfill(
+    args: argparse.Namespace,
+    *,
+    token: str,
+    registry_client: "SupabaseRegistryOpsClient",
+    catalog_client: "SupabaseCatalogClient | None",
+) -> int:
     phase_seconds = {
         "claim": 0.0,
         "api_search": 0.0,
@@ -287,6 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     deferred_count = 0
     sportscardspro_slow_path_rows: list[dict[str, Any]] = []
     sportscardspro_429_counter = _Counter()
+    catalog_write_events: list[dict[str, Any]] = []
 
     with httpx.Client(
         timeout=args.timeout_seconds,
@@ -325,7 +417,16 @@ def main(argv: list[str] | None = None) -> int:
                     write_ok = write_catalog_rows(
                         catalog_client, catalog_rows, batch_size=args.catalog_batch_size
                     )
-                    phase_seconds["catalog_write"] += time.perf_counter() - write_started_at
+                    write_elapsed = time.perf_counter() - write_started_at
+                    phase_seconds["catalog_write"] += write_elapsed
+                    catalog_write_events.append(
+                        {
+                            "setNames": [row.get("set_name") or row.get("registry_id")],
+                            "sourceSite": "sportscardspro",
+                            "rowCount": len(catalog_rows),
+                            "elapsedSeconds": write_elapsed,
+                        }
+                    )
                     if not write_ok:
                         failed_rows.append(row)
                         continue
@@ -438,7 +539,18 @@ def main(argv: list[str] | None = None) -> int:
                         catalog_rows,
                         batch_size=args.catalog_batch_size,
                     )
-                    phase_seconds["catalog_write"] += time.perf_counter() - write_started_at
+                    write_elapsed = time.perf_counter() - write_started_at
+                    phase_seconds["catalog_write"] += write_elapsed
+                    catalog_write_events.append(
+                        {
+                            "setNames": [
+                                row.get("set_name") or row.get("console_uid") for row in chunk
+                            ],
+                            "sourceSite": source_site,
+                            "rowCount": len(catalog_rows),
+                            "elapsedSeconds": write_elapsed,
+                        }
+                    )
                     if not write_ok:
                         failed_rows.extend(chunk)
                         continue
@@ -466,6 +578,10 @@ def main(argv: list[str] | None = None) -> int:
                 slow_path_attempted=len(sportscardspro_slow_path_rows),
                 rate_limit_429_count=sportscardspro_429_counter.value,
                 phase_seconds=phase_seconds,
+                catalog_write_phase_seconds=(
+                    {} if catalog_client is None else catalog_client.phase_seconds
+                ),
+                catalog_write_events=catalog_write_events,
             ),
             indent=2,
         ),
@@ -777,6 +893,18 @@ def _resolve_via_api_for_small_sets_overlapped(
     return succeeded, remaining, counts
 
 
+def _redact_token(text: str, token: str) -> str:
+    """PRICECHARTING_API_TOKEN travels as a URL query param (?t=...), and
+    httpx's default exception message embeds the full request URL -- an
+    unredacted print() of that exception would put a live secret straight
+    into Render's cron log output. Plain string replacement (not URL
+    parsing) so it catches the token wherever it shows up in the message,
+    not just in a query string."""
+    if not token:
+        return text
+    return text.replace(token, "***REDACTED***")
+
+
 def _search_products(
     http: httpx.Client,
     *,
@@ -796,7 +924,7 @@ def _search_products(
         response.raise_for_status()
         payload = response.json()
     except httpx.HTTPStatusError as exc:
-        print(f"  API search failed for {query!r}: {exc}", flush=True)
+        print(f"  API search failed for {query!r}: {_redact_token(str(exc), token)}", flush=True)
         if exc.response.status_code == 429:
             if breaker is not None:
                 breaker.record_rate_limited()
@@ -804,7 +932,7 @@ def _search_products(
                 rate_limit_counter.increment()
         return None
     except (httpx.HTTPError, ValueError) as exc:
-        print(f"  API search failed for {query!r}: {exc}", flush=True)
+        print(f"  API search failed for {query!r}: {_redact_token(str(exc), token)}", flush=True)
         return None
     if breaker is not None:
         breaker.record_success()
@@ -1008,12 +1136,20 @@ def fetch_batch_csv(
         )
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        print(f"  Batch download failed for {len(console_uids)} sets: {exc}", flush=True)
+        print(
+            f"  Batch download failed for {len(console_uids)} sets: "
+            f"{_redact_token(str(exc), token)}",
+            flush=True,
+        )
         if rate_limit_counter is not None and exc.response.status_code == 429:
             rate_limit_counter.increment()
         return None
     except httpx.HTTPError as exc:
-        print(f"  Batch download failed for {len(console_uids)} sets: {exc}", flush=True)
+        print(
+            f"  Batch download failed for {len(console_uids)} sets: "
+            f"{_redact_token(str(exc), token)}",
+            flush=True,
+        )
         return None
     return response.text
 
@@ -1162,8 +1298,118 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--api-token", default="", help="Defaults to PRICECHARTING_API_TOKEN.")
     parser.add_argument("--supabase-url", default="", help="Defaults to SUPABASE_URL.")
     parser.add_argument("--service-role-key", default="", help="Defaults to SUPABASE_SERVICE_ROLE_KEY.")
+    parser.add_argument(
+        "--run-lock-name",
+        default="pricecharting_backfill",
+        help=(
+            "Name of the row in backfill_run_lock this run acquires before "
+            "claiming/writing anything, so two overlapping invocations of this "
+            "script never write to pricecharting_catalog/_history at the same "
+            "time (Render cron jobs can genuinely overlap -- a manually "
+            "triggered run is not blocked from starting while the previous "
+            "scheduled run is still executing)."
+        ),
+    )
+    parser.add_argument(
+        "--run-lock-lease-seconds",
+        type=float,
+        default=10800,
+        help=(
+            "Dead-man's-switch TTL on the run lock, not the primary release "
+            "mechanism -- this run releases explicitly in a finally block on "
+            "every normal exit (including on error). Only matters if the "
+            "process is killed outright (e.g. an OOM kill) before that finally "
+            "block runs. 10800s (3h) is set with margin above a live-observed "
+            "catalogWriteSeconds of ~7324s (~2.03h) alone for one run (219,628 "
+            "rows) -- if the lease is shorter than a legitimate slow run, a "
+            "second run could acquire the lock while the first is still "
+            "writing, which is exactly the failure mode this exists to "
+            "prevent. Revisit downward once the write-path instrumentation "
+            "added alongside this lock (unchangedDetectionSeconds/"
+            "catalogUpsertSeconds/scd2ComparisonSeconds/scd2InsertSeconds/"
+            "topSlowestCatalogWrites) shows what's actually driving that time "
+            "and it's been brought down."
+        ),
+    )
+    parser.add_argument(
+        "--skip-run-lock",
+        action="store_true",
+        help="Skip acquiring the run lock -- for local testing only.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
+
+
+class SupabaseRunLockClient:
+    """Prevents two backfill_pricecharting_sets.py runs from writing to the
+    catalog/history tables at the same time. Render cron jobs can genuinely
+    overlap -- a manually triggered run starting while the previous
+    scheduled run is still executing is not prevented by Render itself
+    (live-observed 2026-08-10) -- and two runs both hammering the same
+    upsert/SCD2 write paths concurrently was a suspected contributor to a
+    live-observed ~30 rows/sec catalog-write slowdown.
+
+    Uses the same acquire-throttle RPC pattern already established by
+    pricing_provider_throttle (see database/migrations/20260728_create_
+    pricing_provider_throttle.sql and app/services/pricing/cache.py): a
+    Postgres function wraps a pg_advisory_xact_lock around a real row's
+    read-check-write, so the acquire is atomic even though this codebase
+    never holds a persistent DB connection across HTTP calls -- see
+    database/migrations/20260811_create_backfill_run_lock.sql.
+    """
+
+    def __init__(self, *, supabase_url: str, service_role_key: str, timeout_seconds: float) -> None:
+        self.supabase_url = supabase_url.strip().rstrip("/")
+        self.service_role_key = service_role_key.strip()
+        self.timeout_seconds = timeout_seconds
+
+    def acquire(
+        self, *, lock_name: str, worker_id: str, lease_seconds: float
+    ) -> tuple[bool, str | None]:
+        with httpx.Client(timeout=self.timeout_seconds) as client:
+            response = client.post(
+                f"{self.supabase_url}/rest/v1/rpc/acquire_backfill_run_lock",
+                headers=self._headers(),
+                json={
+                    "lock_name_arg": lock_name,
+                    "worker_id_arg": worker_id,
+                    "lease_seconds_arg": int(lease_seconds),
+                },
+            )
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise SystemExit(
+                    f"Supabase run-lock acquire failed with HTTP {response.status_code}: "
+                    f"{response.text}"
+                ) from exc
+            payload = response.json()
+        row = payload[0] if isinstance(payload, list) and payload else payload
+        if not isinstance(row, dict):
+            return False, None
+        return bool(row.get("acquired")), row.get("locked_by")
+
+    def release(self, *, lock_name: str, worker_id: str) -> None:
+        # Best-effort: a failure here must not crash a run that already
+        # completed its real work -- the lease TTL is the backstop for a
+        # lock that never gets released.
+        try:
+            with httpx.Client(timeout=self.timeout_seconds) as client:
+                response = client.post(
+                    f"{self.supabase_url}/rest/v1/rpc/release_backfill_run_lock",
+                    headers=self._headers(),
+                    json={"lock_name_arg": lock_name, "worker_id_arg": worker_id},
+                )
+                response.raise_for_status()
+        except httpx.HTTPError as exc:
+            print(f"  Warning: failed to release run lock: {exc}", flush=True)
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "apikey": self.service_role_key,
+            "Authorization": f"Bearer {self.service_role_key}",
+            "Content-Type": "application/json",
+        }
 
 
 class SupabaseRegistryOpsClient:

@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -446,6 +447,21 @@ class SupabaseCatalogClient:
                 "SUPABASE_SERVICE_ROLE_KEY must be the Supabase service_role key "
                 f"for catalog imports, but the configured key has role '{role}'."
             )
+        # Accumulates across every upsert_rows()/sync_scd2_history_rows()
+        # call made through this instance (one instance is reused for a
+        # whole backfill run) -- lets the caller see WHERE catalog-write
+        # wall clock actually goes (e.g. investigating the 2026-08-10
+        # ~30 rows/sec slowdown) without instrumenting every call site
+        # individually. A sub-batch that raises mid-call loses whatever
+        # partial time it spent on the call that failed (the timer only
+        # records on success) -- acceptable since PartialCatalogWriteError
+        # is already a rare, logged path, not the common case this is for.
+        self.phase_seconds: dict[str, float] = {
+            "unchanged_detection": 0.0,
+            "catalog_upsert": 0.0,
+            "scd2_comparison": 0.0,
+            "scd2_insert": 0.0,
+        }
 
     def upsert_rows(self, rows: list[dict[str, Any]], *, batch_size: int) -> int:
         if batch_size <= 0:
@@ -457,7 +473,11 @@ class SupabaseCatalogClient:
             for index in range(0, len(rows), batch_size):
                 batch = rows[index : index + batch_size]
                 try:
+                    detection_started_at = time.perf_counter()
                     current_by_id = self._fetch_current_catalog_hashes(client, batch)
+                    self.phase_seconds["unchanged_detection"] += (
+                        time.perf_counter() - detection_started_at
+                    )
                     changed_rows = []
                     for row in batch:
                         product_id = str(row.get("pricecharting_id") or "").strip()
@@ -467,12 +487,16 @@ class SupabaseCatalogClient:
                             continue
                         changed_rows.append(row)
                     if changed_rows:
+                        upsert_started_at = time.perf_counter()
                         total += self._upsert(
                             table="pricecharting_catalog",
                             rows=changed_rows,
                             batch_size=batch_size,
                             on_conflict="pricecharting_id",
                             label="catalog",
+                        )
+                        self.phase_seconds["catalog_upsert"] += (
+                            time.perf_counter() - upsert_started_at
                         )
                 except (SystemExit, Exception) as exc:
                     # This sub-batch failed (e.g. a statement timeout on a
@@ -551,7 +575,11 @@ class SupabaseCatalogClient:
             for index in range(0, len(rows), batch_size):
                 batch = rows[index : index + batch_size]
                 try:
+                    comparison_started_at = time.perf_counter()
                     current_by_id = self._fetch_current_history_rows(client, batch)
+                    self.phase_seconds["scd2_comparison"] += (
+                        time.perf_counter() - comparison_started_at
+                    )
                     rows_to_insert = []
                     changed_ids = []
                     for row in batch:
@@ -566,6 +594,7 @@ class SupabaseCatalogClient:
                             changed_ids.append(product_id)
                         rows_to_insert.append(history_row)
 
+                    insert_started_at = time.perf_counter()
                     if changed_ids:
                         self._close_current_history_rows(
                             client,
@@ -578,6 +607,7 @@ class SupabaseCatalogClient:
                             rows_to_insert,
                             batch_offset=index,
                         )
+                    self.phase_seconds["scd2_insert"] += time.perf_counter() - insert_started_at
                 except (SystemExit, Exception) as exc:
                     # Same reasoning as upsert_rows(): don't let one
                     # sub-batch's failure abort every later sub-batch.

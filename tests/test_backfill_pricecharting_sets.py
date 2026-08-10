@@ -2,7 +2,7 @@ import json
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 
@@ -11,8 +11,10 @@ from scripts.backfill_pricecharting_sets import (
     CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD,
     SPORTSCARDSPRO_API_SEARCH_MAX_IN_FLIGHT,
     SupabaseRegistryOpsClient,
+    SupabaseRunLockClient,
     _Counter,
     _RateLimitCircuitBreaker,
+    _redact_token,
     _StartRateLimiter,
     _build_result_summary,
     _new_api_search_counts,
@@ -23,6 +25,7 @@ from scripts.backfill_pricecharting_sets import (
     fetch_batch_csv,
     fetch_batch_csv_with_retry,
     group_by_site,
+    main,
     resolve_console_uids,
     resolve_via_api_for_small_sets,
     write_catalog_rows,
@@ -339,6 +342,26 @@ class CounterTest(unittest.TestCase):
         self.assertEqual(counter.value, 5)
 
 
+class RedactTokenTest(unittest.TestCase):
+    def test_replaces_the_token_with_a_placeholder(self) -> None:
+        self.assertEqual(
+            _redact_token("failed for url '...?t=SECRET123&q=x'", "SECRET123"),
+            "failed for url '...?t=***REDACTED***&q=x'",
+        )
+
+    def test_leaves_text_unchanged_when_the_token_is_blank(self) -> None:
+        self.assertEqual(_redact_token("some error text", ""), "some error text")
+
+    def test_leaves_text_unchanged_when_the_token_does_not_appear(self) -> None:
+        self.assertEqual(_redact_token("unrelated error", "SECRET123"), "unrelated error")
+
+    def test_replaces_every_occurrence(self) -> None:
+        self.assertEqual(
+            _redact_token("SECRET123 appears twice: SECRET123", "SECRET123"),
+            "***REDACTED*** appears twice: ***REDACTED***",
+        )
+
+
 class RateLimitCircuitBreakerTest(unittest.TestCase):
     def test_not_tripped_before_the_threshold(self) -> None:
         breaker = _RateLimitCircuitBreaker(threshold=3)
@@ -412,6 +435,23 @@ class FetchBatchCsvTest(unittest.TestCase):
 
         self.assertEqual(counter.value, 0)
 
+    def test_does_not_leak_the_token_into_logs_on_an_error(self) -> None:
+        # httpx.HTTPStatusError's default message embeds the full request
+        # URL, which includes ?t=<token> here -- an unredacted print would
+        # put a live PRICECHARTING_API_TOKEN straight into cron logs.
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+        with patch("builtins.print") as mock_print:
+            fetch_batch_csv(
+                http,
+                base_url="https://example.test",
+                token="SECRET_TOKEN_123",
+                console_uids=["G1"],
+            )
+
+        printed = " ".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
+        self.assertNotIn("SECRET_TOKEN_123", printed)
+        self.assertIn("REDACTED", printed)
+
 
 def _product(product_id: str, name: str, console: str = "Baseball Cards 1962 Bazooka") -> dict:
     return {
@@ -476,6 +516,20 @@ class SearchProductsTest(unittest.TestCase):
         http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(429)))
         result = _search_products(http, base_url="https://example.test", token="tok", query="x")
         self.assertIsNone(result)
+
+    def test_does_not_leak_the_token_into_logs_on_an_error(self) -> None:
+        # httpx.HTTPStatusError's default message embeds the full request
+        # URL, which includes ?t=<token> here -- an unredacted print would
+        # put a live PRICECHARTING_API_TOKEN straight into cron logs.
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(429)))
+        with patch("builtins.print") as mock_print:
+            _search_products(
+                http, base_url="https://example.test", token="SECRET_TOKEN_123", query="x"
+            )
+
+        printed = " ".join(str(call.args[0]) for call in mock_print.call_args_list if call.args)
+        self.assertNotIn("SECRET_TOKEN_123", printed)
+        self.assertIn("REDACTED", printed)
 
 
 class ProductsMatchSetNameTest(unittest.TestCase):
@@ -1256,6 +1310,161 @@ class SupabaseRegistryOpsClientTest(unittest.TestCase):
         self.assertEqual(transport.patch_calls[1]["json"], {"console_uid": "G2"})
 
 
+class RunLockClientTest(unittest.TestCase):
+    def test_acquire_returns_true_when_the_lock_is_free(self) -> None:
+        transport = _FakeRunLockTransport(
+            acquire_payload=[
+                {"acquired": True, "locked_by": "worker-1", "expires_at": "2026-01-01T00:30:00Z"}
+            ]
+        )
+        with patch("scripts.backfill_pricecharting_sets.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseRunLockClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key="key",
+                timeout_seconds=1,
+            )
+            acquired, held_by = client.acquire(
+                lock_name="pricecharting_backfill", worker_id="worker-1", lease_seconds=1800
+            )
+
+        self.assertTrue(acquired)
+        self.assertEqual(held_by, "worker-1")
+        self.assertEqual(
+            transport.post_calls[0]["json"],
+            {
+                "lock_name_arg": "pricecharting_backfill",
+                "worker_id_arg": "worker-1",
+                "lease_seconds_arg": 1800,
+            },
+        )
+
+    def test_acquire_returns_false_when_the_lock_is_held_by_someone_else(self) -> None:
+        transport = _FakeRunLockTransport(
+            acquire_payload=[
+                {"acquired": False, "locked_by": "other-worker", "expires_at": "2026-01-01T00:10:00Z"}
+            ]
+        )
+        with patch("scripts.backfill_pricecharting_sets.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseRunLockClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key="key",
+                timeout_seconds=1,
+            )
+            acquired, held_by = client.acquire(
+                lock_name="pricecharting_backfill", worker_id="worker-1", lease_seconds=1800
+            )
+
+        self.assertFalse(acquired)
+        self.assertEqual(held_by, "other-worker")
+
+    def test_acquire_handles_a_dict_payload_not_wrapped_in_a_list(self) -> None:
+        transport = _FakeRunLockTransport(acquire_payload={"acquired": True, "locked_by": "worker-1"})
+        with patch("scripts.backfill_pricecharting_sets.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseRunLockClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key="key",
+                timeout_seconds=1,
+            )
+            acquired, held_by = client.acquire(lock_name="x", worker_id="worker-1", lease_seconds=60)
+
+        self.assertTrue(acquired)
+
+    def test_acquire_returns_false_for_an_empty_payload(self) -> None:
+        transport = _FakeRunLockTransport(acquire_payload=[])
+        with patch("scripts.backfill_pricecharting_sets.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseRunLockClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key="key",
+                timeout_seconds=1,
+            )
+            acquired, held_by = client.acquire(lock_name="x", worker_id="worker-1", lease_seconds=60)
+
+        self.assertFalse(acquired)
+        self.assertIsNone(held_by)
+
+    def test_acquire_raises_on_http_error(self) -> None:
+        transport = _FakeRunLockTransport(acquire_status_code=500)
+        with patch("scripts.backfill_pricecharting_sets.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseRunLockClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key="key",
+                timeout_seconds=1,
+            )
+            with self.assertRaises(SystemExit):
+                client.acquire(lock_name="x", worker_id="worker-1", lease_seconds=60)
+
+    def test_release_posts_the_lock_name_and_worker_id(self) -> None:
+        transport = _FakeRunLockTransport()
+        with patch("scripts.backfill_pricecharting_sets.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseRunLockClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key="key",
+                timeout_seconds=1,
+            )
+            client.release(lock_name="pricecharting_backfill", worker_id="worker-1")
+
+        release_call = next(
+            call for call in transport.post_calls if call["url"].endswith("release_backfill_run_lock")
+        )
+        self.assertEqual(
+            release_call["json"],
+            {"lock_name_arg": "pricecharting_backfill", "worker_id_arg": "worker-1"},
+        )
+
+    def test_release_does_not_raise_on_http_error(self) -> None:
+        transport = _FakeRunLockTransport(release_status_code=500)
+        with patch("scripts.backfill_pricecharting_sets.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseRunLockClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key="key",
+                timeout_seconds=1,
+            )
+            client.release(lock_name="pricecharting_backfill", worker_id="worker-1")
+
+
+class _FakeRunLockResponse:
+    def __init__(self, payload=None, *, status_code: int = 200) -> None:
+        self._payload = payload
+        self.status_code = status_code
+        self.text = json.dumps(payload) if payload is not None else ""
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("error", request=None, response=self)
+
+
+class _FakeRunLockTransport:
+    def __init__(
+        self,
+        *,
+        acquire_payload=None,
+        acquire_status_code: int = 200,
+        release_status_code: int = 200,
+    ) -> None:
+        self.acquire_payload = acquire_payload
+        self.acquire_status_code = acquire_status_code
+        self.release_status_code = release_status_code
+        self.post_calls: list[dict] = []
+
+    def post(self, url: str, **kwargs):
+        self.post_calls.append({"url": url, "json": kwargs.get("json", {})})
+        if url.endswith("acquire_backfill_run_lock"):
+            return _FakeRunLockResponse(self.acquire_payload, status_code=self.acquire_status_code)
+        if url.endswith("release_backfill_run_lock"):
+            return _FakeRunLockResponse(None, status_code=self.release_status_code)
+        raise AssertionError(f"unexpected url: {url}")
+
+
 class _FakeCatalogClient:
     def __init__(self, *, raise_on: str | None = None, error: Exception | None = None) -> None:
         self.raise_on = raise_on
@@ -1327,9 +1536,28 @@ class BuildResultSummaryTest(unittest.TestCase):
         counts.update(overrides)
         return counts
 
-    def test_counters_are_correct(self) -> None:
-        summary = _build_result_summary(
+    def _build(self, **overrides) -> dict:
+        defaults = dict(
             dry_run=False,
+            claimed_count=0,
+            succeeded_count=0,
+            api_search_succeeded=0,
+            deferred_count=0,
+            failed_count=0,
+            catalog_rows_written=0,
+            catalog_rows_parsed=0,
+            api_search_counts=self._counts(),
+            slow_path_attempted=0,
+            rate_limit_429_count=0,
+            phase_seconds={},
+            catalog_write_phase_seconds={},
+            catalog_write_events=[],
+        )
+        defaults.update(overrides)
+        return _build_result_summary(**defaults)
+
+    def test_counters_are_correct(self) -> None:
+        summary = self._build(
             claimed_count=50,
             succeeded_count=30,
             api_search_succeeded=10,
@@ -1342,7 +1570,6 @@ class BuildResultSummaryTest(unittest.TestCase):
             ),
             slow_path_attempted=12,
             rate_limit_429_count=5,
-            phase_seconds={},
         )
 
         self.assertEqual(summary["claimed"], 50)
@@ -1367,18 +1594,11 @@ class BuildResultSummaryTest(unittest.TestCase):
         self.assertEqual(summary["sportscardspro429Count"], 5)
 
     def test_final_json_includes_phase_timings(self) -> None:
-        summary = _build_result_summary(
-            dry_run=False,
+        summary = self._build(
             claimed_count=1,
             succeeded_count=1,
-            api_search_succeeded=0,
-            deferred_count=0,
-            failed_count=0,
             catalog_rows_written=1,
             catalog_rows_parsed=1,
-            api_search_counts=self._counts(),
-            slow_path_attempted=0,
-            rate_limit_429_count=0,
             phase_seconds={
                 "claim": 0.125,
                 "api_search": 1.5,
@@ -1406,26 +1626,187 @@ class BuildResultSummaryTest(unittest.TestCase):
             self.assertIn(key, decoded)
 
     def test_missing_phase_seconds_default_to_zero(self) -> None:
-        summary = _build_result_summary(
-            dry_run=True,
-            claimed_count=0,
-            succeeded_count=0,
-            api_search_succeeded=0,
-            deferred_count=0,
-            failed_count=0,
-            catalog_rows_written=0,
-            catalog_rows_parsed=0,
-            api_search_counts=self._counts(),
-            slow_path_attempted=0,
-            rate_limit_429_count=0,
-            phase_seconds={},
-        )
+        summary = self._build(dry_run=True)
 
         self.assertEqual(summary["claimSeconds"], 0.0)
         self.assertEqual(summary["apiSearchSeconds"], 0.0)
         self.assertEqual(summary["consoleResolveSeconds"], 0.0)
         self.assertEqual(summary["csvFetchSeconds"], 0.0)
         self.assertEqual(summary["catalogWriteSeconds"], 0.0)
+
+    def test_final_json_includes_catalog_write_sub_phase_timings(self) -> None:
+        summary = self._build(
+            catalog_write_phase_seconds={
+                "unchanged_detection": 200.5,
+                "catalog_upsert": 400.25,
+                "scd2_comparison": 150.0,
+                "scd2_insert": 300.75,
+            },
+        )
+
+        self.assertEqual(summary["unchangedDetectionSeconds"], 200.5)
+        self.assertEqual(summary["catalogUpsertSeconds"], 400.25)
+        self.assertEqual(summary["scd2ComparisonSeconds"], 150.0)
+        self.assertEqual(summary["scd2InsertSeconds"], 300.75)
+
+    def test_missing_catalog_write_phase_seconds_default_to_zero(self) -> None:
+        # dry-run has no catalog_client at all -- main() passes {} in that case.
+        summary = self._build(dry_run=True, catalog_write_phase_seconds={})
+
+        self.assertEqual(summary["unchangedDetectionSeconds"], 0.0)
+        self.assertEqual(summary["catalogUpsertSeconds"], 0.0)
+        self.assertEqual(summary["scd2ComparisonSeconds"], 0.0)
+        self.assertEqual(summary["scd2InsertSeconds"], 0.0)
+
+    def test_final_json_includes_top_slowest_and_largest_catalog_writes(self) -> None:
+        events = [
+            {"setNames": ["Set A"], "sourceSite": "sportscardspro", "rowCount": 10, "elapsedSeconds": 0.5},
+            {"setNames": ["Set B"], "sourceSite": "sportscardspro", "rowCount": 900, "elapsedSeconds": 0.1},
+            {"setNames": ["Set C", "Set D"], "sourceSite": "sportscardspro", "rowCount": 50, "elapsedSeconds": 5.0},
+        ]
+        summary = self._build(catalog_write_events=events)
+
+        self.assertEqual(
+            [event["setNames"] for event in summary["topSlowestCatalogWrites"]],
+            [["Set C", "Set D"], ["Set A"], ["Set B"]],
+        )
+        self.assertEqual(
+            [event["setNames"] for event in summary["topLargestCatalogWrites"]],
+            [["Set B"], ["Set C", "Set D"], ["Set A"]],
+        )
+
+    def test_top_catalog_writes_are_capped_at_ten(self) -> None:
+        events = [
+            {
+                "setNames": [f"Set {i}"],
+                "sourceSite": "sportscardspro",
+                "rowCount": i,
+                "elapsedSeconds": float(i),
+            }
+            for i in range(15)
+        ]
+        summary = self._build(catalog_write_events=events)
+
+        self.assertEqual(len(summary["topSlowestCatalogWrites"]), 10)
+        self.assertEqual(len(summary["topLargestCatalogWrites"]), 10)
+        # Both lists should be the 10 largest/slowest -- i.e. 5..14, not 0..9.
+        self.assertEqual(
+            {event["rowCount"] for event in summary["topSlowestCatalogWrites"]},
+            set(range(5, 15)),
+        )
+
+    def test_no_catalog_writes_produces_empty_top_lists(self) -> None:
+        summary = self._build(catalog_write_events=[])
+
+        self.assertEqual(summary["topSlowestCatalogWrites"], [])
+        self.assertEqual(summary["topLargestCatalogWrites"], [])
+
+
+class MainRunLockIntegrationTest(unittest.TestCase):
+    def _argv(self, *extra: str) -> list[str]:
+        return [
+            "--api-token",
+            "tok",
+            "--supabase-url",
+            "https://example.supabase.co",
+            "--service-role-key",
+            "key",
+            *extra,
+        ]
+
+    def _json_prints(self, mock_print) -> list[dict]:
+        parsed = []
+        for call in mock_print.call_args_list:
+            text = call.args[0] if call.args else None
+            if not isinstance(text, str):
+                continue
+            try:
+                obj = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and "success" in obj:
+                parsed.append(obj)
+        return parsed
+
+    def test_skips_the_run_and_never_claims_when_the_lock_is_held(self) -> None:
+        mock_lock_client = MagicMock()
+        mock_lock_client.acquire.return_value = (False, "other-worker")
+
+        with patch(
+            "scripts.backfill_pricecharting_sets.SupabaseRunLockClient",
+            return_value=mock_lock_client,
+        ), patch(
+            "scripts.backfill_pricecharting_sets.SupabaseRegistryOpsClient"
+        ) as registry_client_class, patch("builtins.print") as mock_print:
+            registry_client_class.return_value.claim_rows.side_effect = AssertionError(
+                "must not claim rows while the lock is held elsewhere"
+            )
+            exit_code = main(self._argv())
+
+        self.assertEqual(exit_code, 0)
+        mock_lock_client.acquire.assert_called_once()
+        mock_lock_client.release.assert_not_called()
+        summaries = self._json_prints(mock_print)
+        self.assertEqual(len(summaries), 1)
+        self.assertTrue(summaries[0]["runLockHeld"])
+        self.assertEqual(summaries[0]["runLockHeldBy"], "other-worker")
+
+    def test_acquires_and_releases_the_lock_around_a_normal_run(self) -> None:
+        mock_lock_client = MagicMock()
+        mock_lock_client.acquire.return_value = (True, "this-worker")
+
+        with patch(
+            "scripts.backfill_pricecharting_sets.SupabaseRunLockClient",
+            return_value=mock_lock_client,
+        ), patch(
+            "scripts.backfill_pricecharting_sets.SupabaseRegistryOpsClient"
+        ) as registry_client_class, patch("builtins.print"):
+            registry_client_class.return_value.claim_rows.return_value = []
+            exit_code = main(self._argv())
+
+        self.assertEqual(exit_code, 0)
+        mock_lock_client.acquire.assert_called_once()
+        mock_lock_client.release.assert_called_once()
+
+    def test_releases_the_lock_even_when_the_run_raises(self) -> None:
+        mock_lock_client = MagicMock()
+        mock_lock_client.acquire.return_value = (True, "this-worker")
+
+        with patch(
+            "scripts.backfill_pricecharting_sets.SupabaseRunLockClient",
+            return_value=mock_lock_client,
+        ), patch(
+            "scripts.backfill_pricecharting_sets.SupabaseRegistryOpsClient"
+        ) as registry_client_class, patch("builtins.print"):
+            registry_client_class.return_value.claim_rows.side_effect = RuntimeError("boom")
+            with self.assertRaises(RuntimeError):
+                main(self._argv())
+
+        mock_lock_client.release.assert_called_once()
+
+    def test_skip_run_lock_flag_bypasses_locking_entirely(self) -> None:
+        with patch(
+            "scripts.backfill_pricecharting_sets.SupabaseRunLockClient"
+        ) as lock_client_class, patch(
+            "scripts.backfill_pricecharting_sets.SupabaseRegistryOpsClient"
+        ) as registry_client_class, patch("builtins.print"):
+            registry_client_class.return_value.claim_rows.return_value = []
+            exit_code = main(self._argv("--skip-run-lock"))
+
+        self.assertEqual(exit_code, 0)
+        lock_client_class.assert_not_called()
+
+    def test_dry_run_bypasses_locking_entirely(self) -> None:
+        with patch(
+            "scripts.backfill_pricecharting_sets.SupabaseRunLockClient"
+        ) as lock_client_class, patch(
+            "scripts.backfill_pricecharting_sets.SupabaseRegistryOpsClient"
+        ) as registry_client_class, patch("builtins.print"):
+            registry_client_class.return_value.claim_rows.return_value = []
+            exit_code = main(self._argv("--dry-run"))
+
+        self.assertEqual(exit_code, 0)
+        lock_client_class.assert_not_called()
 
 
 if __name__ == "__main__":
