@@ -43,6 +43,8 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(user["portfolioCount"], 2)
         self.assertEqual(user["scanCount"], 1)
         self.assertEqual(user["pushDeviceCount"], 1)
+        self.assertEqual(user["plan"], "pro")
+        self.assertEqual(user["planStatus"], "active")
         self.assertEqual(client.requests[0]["headers"]["Authorization"], "Bearer service-role")
         self.assertEqual(client.requests[0]["params"]["email"], "collector@example.com")
 
@@ -338,6 +340,17 @@ class _FakeAdminUsersClient:
                         "enabled": True,
                         "status": "enabled",
                         "last_seen_at": "2026-07-29T00:00:00Z",
+                    }
+                ]
+            )
+        if url.endswith("/rest/v1/user_subscriptions"):
+            return _response(
+                [
+                    {
+                        "user_id": "user-1",
+                        "plan": "pro",
+                        "status": "active",
+                        "updated_at": "2026-07-29T00:00:00Z",
                     }
                 ]
             )
