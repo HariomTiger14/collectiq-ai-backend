@@ -5,6 +5,10 @@ from pydantic import BaseModel, Field
 
 from app.routers.admin_auth import require_admin_import_token, require_admin_permission
 from app.services.admin_audit_service import AdminAuditService
+from app.services.admin_subscription_metrics_service import (
+    AdminSubscriptionMetricsError,
+    AdminSubscriptionMetricsService,
+)
 from app.services.admin_user_service import AdminUserService, AdminUserServiceError
 
 
@@ -22,6 +26,23 @@ class AdminRoleUpdateRequest(BaseModel):
 
 class AdminSubscriptionOverrideRequest(BaseModel):
     plan: str = Field(pattern="^(free|pro|premium)$")
+
+
+@router.get("/subscription-summary")
+def get_admin_subscription_summary(
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    try:
+        return AdminSubscriptionMetricsService().get_summary()
+    except AdminSubscriptionMetricsError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_subscription_summary_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
 
 
 @router.get("/{user_id}")
