@@ -8,9 +8,30 @@ from pydantic import BaseModel, Field
 from app.routers.admin_auth import require_admin_import_token
 from app.services.admin_audit_service import AdminAuditService
 from app.services.admin_catalog_service import AdminCatalogError, AdminCatalogService
+from app.services.admin_pipeline_status_service import (
+    AdminPipelineStatusError,
+    AdminPipelineStatusService,
+)
 
 
 router = APIRouter(prefix="/admin/catalog", tags=["Admin Catalog"])
+
+
+@router.get("/pipelines")
+def get_catalog_pipeline_status(
+    _admin: None = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    try:
+        return AdminPipelineStatusService().get_summary()
+    except AdminPipelineStatusError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_pipeline_status_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
 
 
 class CatalogUpdateRequest(BaseModel):
