@@ -2,6 +2,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import queue
 import re
 import threading
 import time
@@ -67,6 +68,39 @@ class _Counter:
     def value(self) -> int:
         with self._lock:
             return self._value
+
+
+class _StartRateLimiter:
+    """Gates request START times across every worker sharing one instance,
+    independent of how many workers are running concurrently.
+
+    This is the piece the round-robin-lane concurrency used elsewhere in
+    this file doesn't have: each lane there paces itself independently, so
+    N lanes' timers can drift into alignment and burst well above the
+    intended per-lane rate -- live-confirmed on 2026-08-09 to trip a real
+    Cloudflare 429 cascade (see --sportscardspro-api-search-concurrency's
+    own history). A single shared gate can't drift like that: every caller
+    blocks on the same lock, so successive calls to wait_for_slot() -- from
+    however many threads -- are always spaced at least min_interval_seconds
+    apart, measured from the previous call's START, not its finish. That's
+    exactly what lets slow response latency overlap without ever raising
+    how often a new request is allowed to begin.
+    """
+
+    def __init__(self, min_interval_seconds: float) -> None:
+        self._min_interval_seconds = min_interval_seconds
+        self._lock = threading.Lock()
+        self._next_allowed_start: float | None = None
+
+    def wait_for_slot(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            if self._next_allowed_start is not None:
+                wait = self._next_allowed_start - now
+                if wait > 0:
+                    time.sleep(wait)
+                    now = time.monotonic()
+            self._next_allowed_start = now + self._min_interval_seconds
 
 
 from scripts.import_pricecharting_catalog import (
@@ -142,6 +176,17 @@ SPORTSCARDSPRO_DEFAULT_SLOW_PATH_LIMIT = 20
 # batch's parsed rows (each held in memory, plus a duplicated raw_payload
 # per row) can blow past the memory limit.
 SPORTSCARDSPRO_DEFAULT_BATCH_SIZE = 3
+
+# Hard ceiling on how many /api/products searches the controlled-overlap
+# scheduler (see _resolve_via_api_for_small_sets_overlapped) allows in
+# flight at once, regardless of how high --sportscardspro-api-search-
+# concurrency is set. This is a deliberately conservative first step after
+# the 2026-08-09 concurrency incident: overlap enough to hide slow-response
+# latency behind the existing request-start pacing, not a general-purpose
+# concurrency knob. Raising it needs its own live-traffic validation, same
+# as every other pacing lever in this file -- do not wire this to the CLI
+# flag's raw value.
+SPORTSCARDSPRO_API_SEARCH_MAX_IN_FLIGHT = 2
 
 
 def _build_result_summary(
@@ -486,6 +531,33 @@ def _merge_api_search_counts(counts_list: list[dict[str, int]]) -> dict[str, int
     return merged
 
 
+def _evaluate_api_search_products(
+    products: list[dict[str, Any]] | None,
+    set_name: str,
+    source_downloaded_at: str,
+) -> tuple[str, list[dict[str, Any]] | None]:
+    """Classifies one row's /api/products search result into exactly one
+    outcome bucket -- "succeeded", "empty", "hit_cap", or "rejected_ambiguous"
+    -- shared by every scheduling strategy (serial, and the controlled-
+    overlap scheduler below) so the acceptance rules themselves (cap check,
+    then strong-match validation) can never drift between them. catalog_rows
+    is only non-None for "succeeded"."""
+    if products is None or not products:
+        return "empty", None
+    if len(products) >= API_SEARCH_RESULT_CAP:
+        return "hit_cap", None
+    if not _products_match_set_name(products, set_name):
+        return "rejected_ambiguous", None
+    catalog_rows = [
+        to_catalog_row(product, "sportscardspro-api-search", source_downloaded_at)
+        for product in products
+    ]
+    catalog_rows = [catalog_row for catalog_row in catalog_rows if catalog_row is not None]
+    if not catalog_rows:
+        return "empty", None
+    return "succeeded", catalog_rows
+
+
 def resolve_via_api_for_small_sets(
     rows: list[dict[str, Any]],
     *,
@@ -510,16 +582,17 @@ def resolve_via_api_for_small_sets(
     path already works directly via plain HTTP, so there's no reason to
     spend extra per-set API calls there.
 
-    Individual searches vary a lot in latency -- live-confirmed some broad
-    /ambiguous queries take several seconds server-side even though the
-    endpoint itself isn't Cloudflare-throttled -- so this step benefits from
-    the same round-robin thread-sharded concurrency as resolve_console_uids
-    (max_concurrency>1 overlaps those slow searches instead of serializing
-    them; each lane keeps the same per-request sleep_seconds pacing, so
-    total request rate scales with lane count, not per-lane speed).
     max_concurrency=1 (the default) runs the exact original single-lane
-    loop, unchanged. A dedicated circuit breaker (independent from any other
-    phase's) still aborts every lane on repeated 429s.
+    loop, unchanged -- this default is preserved deliberately; nothing about
+    the currently-deployed pacing changes unless this is explicitly raised.
+    max_concurrency>1 switches to a controlled-overlap scheduler (see
+    _resolve_via_api_for_small_sets_overlapped) instead of independently
+    -paced lanes: individual searches vary a lot in latency (live-confirmed
+    some broad/ambiguous queries take several seconds server-side even
+    though the endpoint itself isn't Cloudflare-throttled), and this
+    overlaps that latency without ever raising how often a new request is
+    allowed to start. A dedicated circuit breaker (independent from any
+    other phase's) still aborts every in-flight worker on repeated 429s.
     """
     breaker = _RateLimitCircuitBreaker(CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD)
     if max_concurrency <= 1 or len(rows) <= 1:
@@ -533,28 +606,16 @@ def resolve_via_api_for_small_sets(
             rate_limit_counter=rate_limit_counter,
         )
 
-    lanes = _shard_round_robin(rows, max_concurrency)
-    succeeded: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
-    remaining: list[dict[str, Any]] = []
-    lane_counts: list[dict[str, int]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(lanes)) as pool:
-        lane_results = pool.map(
-            lambda lane: _resolve_via_api_for_small_sets_lane(
-                lane,
-                http=http,
-                token=token,
-                sleep_seconds=sleep_seconds,
-                source_downloaded_at=source_downloaded_at,
-                breaker=breaker,
-                rate_limit_counter=rate_limit_counter,
-            ),
-            lanes,
-        )
-        for lane_succeeded, lane_remaining, lane_count in lane_results:
-            succeeded.extend(lane_succeeded)
-            remaining.extend(lane_remaining)
-            lane_counts.append(lane_count)
-    return succeeded, remaining, _merge_api_search_counts(lane_counts)
+    return _resolve_via_api_for_small_sets_overlapped(
+        rows,
+        http=http,
+        token=token,
+        sleep_seconds=sleep_seconds,
+        source_downloaded_at=source_downloaded_at,
+        breaker=breaker,
+        rate_limit_counter=rate_limit_counter,
+        max_in_flight=min(max_concurrency, SPORTSCARDSPRO_API_SEARCH_MAX_IN_FLIGHT),
+    )
 
 
 def _resolve_via_api_for_small_sets_lane(
@@ -593,39 +654,125 @@ def _resolve_via_api_for_small_sets_lane(
             breaker=breaker,
             rate_limit_counter=rate_limit_counter,
         )
-        if products is None or not products:
-            counts["empty"] += 1
-            remaining.append(row)
-            continue
-        if len(products) >= API_SEARCH_RESULT_CAP:
-            counts["hit_cap"] += 1
-            remaining.append(row)
-            continue
-        if not _products_match_set_name(products, set_name):
-            counts["rejected_ambiguous"] += 1
+        outcome, catalog_rows = _evaluate_api_search_products(
+            products, set_name, source_downloaded_at
+        )
+        counts[outcome] += 1
+        if outcome == "succeeded":
             print(
-                f"  API search for {set_name!r} returned ambiguous/mismatched "
-                f"console names -- falling back to slow path.",
+                f"  API search complete for {set_name!r}: "
+                f"{len(catalog_rows)} cards.",
                 flush=True,
             )
+            succeeded.append((row, catalog_rows))
+        else:
+            if outcome == "rejected_ambiguous":
+                print(
+                    f"  API search for {set_name!r} returned ambiguous/mismatched "
+                    f"console names -- falling back to slow path.",
+                    flush=True,
+                )
             remaining.append(row)
-            continue
-        catalog_rows = [
-            to_catalog_row(product, "sportscardspro-api-search", source_downloaded_at)
-            for product in products
-        ]
-        catalog_rows = [catalog_row for catalog_row in catalog_rows if catalog_row is not None]
-        if not catalog_rows:
-            counts["empty"] += 1
-            remaining.append(row)
-            continue
-        print(
-            f"  API search complete for {set_name!r}: "
-            f"{len(catalog_rows)} cards.",
-            flush=True,
-        )
-        counts["succeeded"] += 1
-        succeeded.append((row, catalog_rows))
+
+    return succeeded, remaining, counts
+
+
+def _resolve_via_api_for_small_sets_overlapped(
+    rows: list[dict[str, Any]],
+    *,
+    http: httpx.Client,
+    token: str,
+    sleep_seconds: float,
+    source_downloaded_at: str,
+    breaker: "_RateLimitCircuitBreaker",
+    max_in_flight: int,
+    rate_limit_counter: "_Counter | None" = None,
+) -> tuple[list[tuple[dict[str, Any], list[dict[str, Any]]]], list[dict[str, Any]], dict[str, int]]:
+    """Controlled-overlap scheduler: unlike the round-robin-lane concurrency
+    used elsewhere in this file (independent per-lane pacing -- already
+    proven on 2026-08-09 to burst when lanes' timers align), every worker
+    here shares one _StartRateLimiter gating request starts to no more than
+    one per sleep_seconds, globally. The worker COUNT itself (capped at
+    max_in_flight, not a separate semaphore) is what bounds how many
+    requests can genuinely be in flight at once -- a slow response from one
+    worker just means the next worker's already-scheduled request overlaps
+    it instead of queueing serially behind it; the request-start cadence is
+    unchanged either way. Workers pull from a shared queue rather than a
+    static round-robin split so no worker can race ahead of the others."""
+    work_queue: "queue.Queue[dict[str, Any]]" = queue.Queue()
+    for row in rows:
+        work_queue.put(row)
+
+    rate_limiter = _StartRateLimiter(sleep_seconds)
+    base_url = SOURCE_SITE_BASE_URLS["sportscardspro"]
+    results_lock = threading.Lock()
+    succeeded: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    remaining: list[dict[str, Any]] = []
+    counts = _new_api_search_counts()
+
+    def worker() -> None:
+        while True:
+            try:
+                row = work_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if breaker.tripped:
+                    print(
+                        f"  Circuit breaker tripped (repeated 429s) -- skipping "
+                        f"{row.get('set_name')!r} without attempting.",
+                        flush=True,
+                    )
+                    with results_lock:
+                        remaining.append(row)
+                    continue
+
+                # The rate gate -- not a per-worker sleep -- is what keeps
+                # request starts at the same cadence as the original serial
+                # loop regardless of worker count.
+                rate_limiter.wait_for_slot()
+
+                set_name = row.get("set_name") or ""
+                with results_lock:
+                    counts["attempted"] += 1
+                products = _search_products(
+                    http,
+                    base_url=base_url,
+                    token=token,
+                    query=set_name,
+                    breaker=breaker,
+                    rate_limit_counter=rate_limit_counter,
+                )
+                outcome, catalog_rows = _evaluate_api_search_products(
+                    products, set_name, source_downloaded_at
+                )
+                with results_lock:
+                    counts[outcome] += 1
+                    if outcome == "succeeded":
+                        succeeded.append((row, catalog_rows))
+                    else:
+                        remaining.append(row)
+                if outcome == "succeeded":
+                    print(
+                        f"  API search complete for {set_name!r}: "
+                        f"{len(catalog_rows)} cards.",
+                        flush=True,
+                    )
+                elif outcome == "rejected_ambiguous":
+                    print(
+                        f"  API search for {set_name!r} returned ambiguous/mismatched "
+                        f"console names -- falling back to slow path.",
+                        flush=True,
+                    )
+            finally:
+                work_queue.task_done()
+
+    worker_count = max(1, min(max_in_flight, len(rows)))
+    threads = [threading.Thread(target=worker) for _ in range(worker_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
 
     return succeeded, remaining, counts
 
