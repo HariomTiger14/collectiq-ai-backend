@@ -50,10 +50,31 @@ class _RateLimitCircuitBreaker:
         with self._lock:
             self._consecutive_failures = 0
 
+
+class _Counter:
+    """Thread-safe accumulator shared across concurrent lanes for a single
+    run-wide tally (e.g. total 429s seen), where a plain int would race."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._value = 0
+
+    def increment(self, amount: int = 1) -> None:
+        with self._lock:
+            self._value += amount
+
+    @property
+    def value(self) -> int:
+        with self._lock:
+            return self._value
+
+
 from scripts.import_pricecharting_catalog import (
+    TEXT_FIELDS,
     PartialCatalogWriteError,
     SupabaseCatalogClient,
     load_rows_from_text,
+    pick_text,
     to_catalog_row,
 )
 
@@ -123,6 +144,50 @@ SPORTSCARDSPRO_DEFAULT_SLOW_PATH_LIMIT = 20
 SPORTSCARDSPRO_DEFAULT_BATCH_SIZE = 3
 
 
+def _build_result_summary(
+    *,
+    dry_run: bool,
+    claimed_count: int,
+    succeeded_count: int,
+    api_search_succeeded: int,
+    deferred_count: int,
+    failed_count: int,
+    catalog_rows_written: int,
+    catalog_rows_parsed: int,
+    api_search_counts: dict[str, int],
+    slow_path_attempted: int,
+    rate_limit_429_count: int,
+    phase_seconds: dict[str, float],
+) -> dict[str, Any]:
+    """Assembles the final JSON printed to stdout -- pulled out of main() so
+    the counters/timings it reports can be unit tested without wiring up a
+    full httpx/Supabase-mocked run."""
+    return {
+        "success": True,
+        "dryRun": dry_run,
+        "claimed": claimed_count,
+        "succeeded": succeeded_count,
+        "succeededViaApiSearch": api_search_succeeded,
+        "deferredToLaterRun": deferred_count,
+        "failed": failed_count,
+        "catalogRowsWritten": catalog_rows_written,
+        "catalogRowsParsed": catalog_rows_parsed,
+        "sportscardsproApiAttempted": api_search_counts["attempted"],
+        "sportscardsproApiSucceeded": api_search_counts["succeeded"],
+        "sportscardsproApiRejectedAmbiguous": api_search_counts["rejected_ambiguous"],
+        "sportscardsproApiHitCap": api_search_counts["hit_cap"],
+        "sportscardsproApiEmpty": api_search_counts["empty"],
+        "sportscardsproSlowPathAttempted": slow_path_attempted,
+        "sportscardsproDeferred": deferred_count,
+        "sportscardspro429Count": rate_limit_429_count,
+        "claimSeconds": round(phase_seconds.get("claim", 0.0), 3),
+        "apiSearchSeconds": round(phase_seconds.get("api_search", 0.0), 3),
+        "consoleResolveSeconds": round(phase_seconds.get("console_resolve", 0.0), 3),
+        "csvFetchSeconds": round(phase_seconds.get("csv_fetch", 0.0), 3),
+        "catalogWriteSeconds": round(phase_seconds.get("catalog_write", 0.0), 3),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     token = args.api_token or os.getenv("PRICECHARTING_API_TOKEN", "")
@@ -148,11 +213,21 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
 
+    phase_seconds = {
+        "claim": 0.0,
+        "api_search": 0.0,
+        "console_resolve": 0.0,
+        "csv_fetch": 0.0,
+        "catalog_write": 0.0,
+    }
+
+    claim_started_at = time.perf_counter()
     claimed_rows = registry_client.claim_rows(
         limit=args.limit,
         lease_minutes=args.lease_minutes,
         worker_id=args.worker_id,
     )
+    phase_seconds["claim"] = time.perf_counter() - claim_started_at
     print(f"Claimed {len(claimed_rows)} registry rows.", flush=True)
     if not claimed_rows:
         print(json.dumps({"success": True, "claimed": 0}, indent=2), flush=True)
@@ -163,6 +238,10 @@ def main(argv: list[str] | None = None) -> int:
     failed_rows: list[dict[str, Any]] = []
     total_catalog_rows = 0
     api_search_succeeded = 0
+    api_search_counts = _new_api_search_counts()
+    deferred_count = 0
+    sportscardspro_slow_path_rows: list[dict[str, Any]] = []
+    sportscardspro_429_counter = _Counter()
 
     with httpx.Client(
         timeout=args.timeout_seconds,
@@ -182,21 +261,27 @@ def main(argv: list[str] | None = None) -> int:
         ]
         api_remaining: list[dict[str, Any]] = []
         if sportscardspro_rows:
-            api_succeeded, api_remaining = resolve_via_api_for_small_sets(
+            api_search_started_at = time.perf_counter()
+            api_succeeded, api_remaining, api_search_counts = resolve_via_api_for_small_sets(
                 sportscardspro_rows,
                 http=http,
                 token=token,
                 sleep_seconds=args.sportscardspro_api_search_sleep_seconds,
                 source_downloaded_at=source_downloaded_at,
                 max_concurrency=args.sportscardspro_api_search_concurrency,
+                rate_limit_counter=sportscardspro_429_counter,
             )
+            phase_seconds["api_search"] += time.perf_counter() - api_search_started_at
             for row, catalog_rows in api_succeeded:
                 total_catalog_rows += len(catalog_rows)
                 if not args.dry_run and catalog_rows:
                     assert catalog_client is not None
-                    if not write_catalog_rows(
+                    write_started_at = time.perf_counter()
+                    write_ok = write_catalog_rows(
                         catalog_client, catalog_rows, batch_size=args.catalog_batch_size
-                    ):
+                    )
+                    phase_seconds["catalog_write"] += time.perf_counter() - write_started_at
+                    if not write_ok:
                         failed_rows.append(row)
                         continue
                 succeeded_ids.append(row["registry_id"])
@@ -227,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"(slow-path cap {args.sportscardspro_slow_path_limit} reached).",
                 flush=True,
             )
+        console_resolve_started_at = time.perf_counter()
         resolved_pricecharting, resolve_failed_pricecharting = resolve_console_uids(
             remaining_rows,
             http=http,
@@ -242,7 +328,9 @@ def main(argv: list[str] | None = None) -> int:
             sleep_seconds=args.sportscardspro_sleep_seconds,
             dry_run=args.dry_run,
             max_concurrency=1,
+            rate_limit_counter=sportscardspro_429_counter,
         )
+        phase_seconds["console_resolve"] += time.perf_counter() - console_resolve_started_at
         resolved = resolved_pricecharting + resolved_sportscardspro
         failed_rows.extend(resolve_failed_pricecharting)
         failed_rows.extend(resolve_failed_sportscardspro)
@@ -266,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"Fetching {source_site} batch of {len(chunk)} sets...",
                     flush=True,
                 )
+                csv_fetch_started_at = time.perf_counter()
                 csv_text = (
                     fetch_batch_csv_with_retry(
                         http,
@@ -274,12 +363,14 @@ def main(argv: list[str] | None = None) -> int:
                         console_uids=console_uids,
                         max_attempts=args.sportscardspro_max_attempts,
                         retry_sleep_seconds=args.sportscardspro_sleep_seconds,
+                        rate_limit_counter=sportscardspro_429_counter,
                     )
                     if is_sportscardspro
                     else fetch_batch_csv(
                         http, base_url=base_url, token=token, console_uids=console_uids
                     )
                 )
+                phase_seconds["csv_fetch"] += time.perf_counter() - csv_fetch_started_at
                 if csv_text is None:
                     failed_rows.extend(chunk)
                     continue
@@ -296,11 +387,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if not args.dry_run and catalog_rows:
                     assert catalog_client is not None
-                    if not write_catalog_rows(
+                    write_started_at = time.perf_counter()
+                    write_ok = write_catalog_rows(
                         catalog_client,
                         catalog_rows,
                         batch_size=args.catalog_batch_size,
-                    ):
+                    )
+                    phase_seconds["catalog_write"] += time.perf_counter() - write_started_at
+                    if not write_ok:
                         failed_rows.extend(chunk)
                         continue
 
@@ -314,22 +408,82 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         json.dumps(
-            {
-                "success": True,
-                "dryRun": args.dry_run,
-                "claimed": len(claimed_rows),
-                "succeeded": len(succeeded_ids),
-                "succeededViaApiSearch": api_search_succeeded,
-                "deferredToLaterRun": deferred_count,
-                "failed": len(failed_rows),
-                "catalogRowsWritten": 0 if args.dry_run else total_catalog_rows,
-                "catalogRowsParsed": total_catalog_rows,
-            },
+            _build_result_summary(
+                dry_run=args.dry_run,
+                claimed_count=len(claimed_rows),
+                succeeded_count=len(succeeded_ids),
+                api_search_succeeded=api_search_succeeded,
+                deferred_count=deferred_count,
+                failed_count=len(failed_rows),
+                catalog_rows_written=0 if args.dry_run else total_catalog_rows,
+                catalog_rows_parsed=total_catalog_rows,
+                api_search_counts=api_search_counts,
+                slow_path_attempted=len(sportscardspro_slow_path_rows),
+                rate_limit_429_count=sportscardspro_429_counter.value,
+                phase_seconds=phase_seconds,
+            ),
             indent=2,
         ),
         flush=True,
     )
     return 0
+
+
+_MATCH_NORMALIZE_PATTERN = re.compile(r"[^a-z0-9]+")
+
+
+def _normalize_for_match(value: str) -> str:
+    return _MATCH_NORMALIZE_PATTERN.sub(" ", (value or "").lower()).strip()
+
+
+def _console_name_strongly_matches_set_name(console_name: str, set_name: str) -> bool:
+    """A "strong" match requires every word of the registry row's set_name to
+    appear in the product's own console-name -- e.g. set_name "1962 Bazooka"
+    matches console-name "Baseball Cards 1962 Bazooka". This is deliberately
+    conservative (word-subset, not similarity-scored) because a false
+    accept here silently writes a wrong/incomplete checklist to the
+    catalog, while a false reject only costs an extra trip through the
+    slower but always-correct console_uid+CSV path."""
+    set_tokens = _normalize_for_match(set_name).split()
+    console_tokens = set(_normalize_for_match(console_name).split())
+    if not set_tokens or not console_tokens:
+        return False
+    return all(token in console_tokens for token in set_tokens)
+
+
+def _products_match_set_name(products: list[dict[str, Any]], set_name: str) -> bool:
+    """/api/products is a fuzzy full-text search -- live-confirmed to
+    sometimes bleed in items from a different, similarly-named set (see
+    refresh_small_sets.py's "Creepshow" example). Every returned product's
+    own console-name must strongly match the set_name being searched for,
+    or the whole result is untrustworthy as this set's complete checklist
+    and must fall back to the console_uid+CSV path instead."""
+    if not products:
+        return False
+    return all(
+        _console_name_strongly_matches_set_name(
+            pick_text(product, TEXT_FIELDS["console_name"]), set_name
+        )
+        for product in products
+    )
+
+
+def _new_api_search_counts() -> dict[str, int]:
+    return {
+        "attempted": 0,
+        "succeeded": 0,
+        "rejected_ambiguous": 0,
+        "hit_cap": 0,
+        "empty": 0,
+    }
+
+
+def _merge_api_search_counts(counts_list: list[dict[str, int]]) -> dict[str, int]:
+    merged = _new_api_search_counts()
+    for counts in counts_list:
+        for key in merged:
+            merged[key] += counts.get(key, 0)
+    return merged
 
 
 def resolve_via_api_for_small_sets(
@@ -340,7 +494,12 @@ def resolve_via_api_for_small_sets(
     sleep_seconds: float,
     source_downloaded_at: str,
     max_concurrency: int = 1,
-) -> tuple[list[tuple[dict[str, Any], list[dict[str, Any]]]], list[dict[str, Any]]]:
+    rate_limit_counter: "_Counter | None" = None,
+) -> tuple[
+    list[tuple[dict[str, Any], list[dict[str, Any]]]],
+    list[dict[str, Any]],
+    dict[str, int],
+]:
     """Try the sanctioned /api/products search for each row's set name --
     cheap, not Cloudflare-blocked, and a complete result for any set with
     fewer than API_SEARCH_RESULT_CAP cards. Sets that come back empty or hit
@@ -371,11 +530,13 @@ def resolve_via_api_for_small_sets(
             sleep_seconds=sleep_seconds,
             source_downloaded_at=source_downloaded_at,
             breaker=breaker,
+            rate_limit_counter=rate_limit_counter,
         )
 
     lanes = _shard_round_robin(rows, max_concurrency)
     succeeded: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
     remaining: list[dict[str, Any]] = []
+    lane_counts: list[dict[str, int]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(lanes)) as pool:
         lane_results = pool.map(
             lambda lane: _resolve_via_api_for_small_sets_lane(
@@ -385,13 +546,15 @@ def resolve_via_api_for_small_sets(
                 sleep_seconds=sleep_seconds,
                 source_downloaded_at=source_downloaded_at,
                 breaker=breaker,
+                rate_limit_counter=rate_limit_counter,
             ),
             lanes,
         )
-        for lane_succeeded, lane_remaining in lane_results:
+        for lane_succeeded, lane_remaining, lane_count in lane_results:
             succeeded.extend(lane_succeeded)
             remaining.extend(lane_remaining)
-    return succeeded, remaining
+            lane_counts.append(lane_count)
+    return succeeded, remaining, _merge_api_search_counts(lane_counts)
 
 
 def _resolve_via_api_for_small_sets_lane(
@@ -402,9 +565,11 @@ def _resolve_via_api_for_small_sets_lane(
     sleep_seconds: float,
     source_downloaded_at: str,
     breaker: "_RateLimitCircuitBreaker",
-) -> tuple[list[tuple[dict[str, Any], list[dict[str, Any]]]], list[dict[str, Any]]]:
+    rate_limit_counter: "_Counter | None" = None,
+) -> tuple[list[tuple[dict[str, Any], list[dict[str, Any]]]], list[dict[str, Any]], dict[str, int]]:
     succeeded: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
     remaining: list[dict[str, Any]] = []
+    counts = _new_api_search_counts()
     base_url = SOURCE_SITE_BASE_URLS["sportscardspro"]
 
     for index, row in enumerate(rows):
@@ -418,10 +583,31 @@ def _resolve_via_api_for_small_sets_lane(
             continue
         if index > 0 and sleep_seconds > 0:
             time.sleep(sleep_seconds)
+        set_name = row.get("set_name") or ""
+        counts["attempted"] += 1
         products = _search_products(
-            http, base_url=base_url, token=token, query=row.get("set_name") or "", breaker=breaker
+            http,
+            base_url=base_url,
+            token=token,
+            query=set_name,
+            breaker=breaker,
+            rate_limit_counter=rate_limit_counter,
         )
-        if products is None or not (0 < len(products) < API_SEARCH_RESULT_CAP):
+        if products is None or not products:
+            counts["empty"] += 1
+            remaining.append(row)
+            continue
+        if len(products) >= API_SEARCH_RESULT_CAP:
+            counts["hit_cap"] += 1
+            remaining.append(row)
+            continue
+        if not _products_match_set_name(products, set_name):
+            counts["rejected_ambiguous"] += 1
+            print(
+                f"  API search for {set_name!r} returned ambiguous/mismatched "
+                f"console names -- falling back to slow path.",
+                flush=True,
+            )
             remaining.append(row)
             continue
         catalog_rows = [
@@ -430,16 +616,18 @@ def _resolve_via_api_for_small_sets_lane(
         ]
         catalog_rows = [catalog_row for catalog_row in catalog_rows if catalog_row is not None]
         if not catalog_rows:
+            counts["empty"] += 1
             remaining.append(row)
             continue
         print(
-            f"  API search complete for {row.get('set_name')!r}: "
+            f"  API search complete for {set_name!r}: "
             f"{len(catalog_rows)} cards.",
             flush=True,
         )
+        counts["succeeded"] += 1
         succeeded.append((row, catalog_rows))
 
-    return succeeded, remaining
+    return succeeded, remaining, counts
 
 
 def _search_products(
@@ -449,6 +637,7 @@ def _search_products(
     token: str,
     query: str,
     breaker: "_RateLimitCircuitBreaker | None" = None,
+    rate_limit_counter: "_Counter | None" = None,
 ) -> list[dict[str, Any]] | None:
     if not query:
         return None
@@ -461,8 +650,11 @@ def _search_products(
         payload = response.json()
     except httpx.HTTPStatusError as exc:
         print(f"  API search failed for {query!r}: {exc}", flush=True)
-        if breaker is not None and exc.response.status_code == 429:
-            breaker.record_rate_limited()
+        if exc.response.status_code == 429:
+            if breaker is not None:
+                breaker.record_rate_limited()
+            if rate_limit_counter is not None:
+                rate_limit_counter.increment()
         return None
     except (httpx.HTTPError, ValueError) as exc:
         print(f"  API search failed for {query!r}: {exc}", flush=True)
@@ -482,6 +674,7 @@ def resolve_console_uids(
     sleep_seconds: float,
     dry_run: bool,
     max_concurrency: int = 1,
+    rate_limit_counter: "_Counter | None" = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     # This resolve phase (one plain page fetch per unresolved set, looking
     # for the VGPC.console_uid script tag) dominates a backfill run's wall
@@ -497,7 +690,11 @@ def resolve_console_uids(
     breaker = _RateLimitCircuitBreaker(CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD)
     if max_concurrency <= 1 or len(rows) <= 1:
         resolved, failed, newly_resolved = _resolve_console_uids_lane(
-            rows, http=http, sleep_seconds=sleep_seconds, breaker=breaker
+            rows,
+            http=http,
+            sleep_seconds=sleep_seconds,
+            breaker=breaker,
+            rate_limit_counter=rate_limit_counter,
         )
     else:
         lanes = _shard_round_robin(rows, max_concurrency)
@@ -505,7 +702,11 @@ def resolve_console_uids(
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(lanes)) as pool:
             lane_results = pool.map(
                 lambda lane: _resolve_console_uids_lane(
-                    lane, http=http, sleep_seconds=sleep_seconds, breaker=breaker
+                    lane,
+                    http=http,
+                    sleep_seconds=sleep_seconds,
+                    breaker=breaker,
+                    rate_limit_counter=rate_limit_counter,
                 ),
                 lanes,
             )
@@ -526,6 +727,7 @@ def _resolve_console_uids_lane(
     http: httpx.Client,
     sleep_seconds: float,
     breaker: "_RateLimitCircuitBreaker",
+    rate_limit_counter: "_Counter | None" = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     resolved: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
@@ -553,6 +755,8 @@ def _resolve_console_uids_lane(
             failed.append(row)
             if exc.response.status_code == 429:
                 breaker.record_rate_limited()
+                if rate_limit_counter is not None:
+                    rate_limit_counter.increment()
             continue
         except httpx.HTTPError as exc:
             print(f"  Failed to resolve console_uid for {row['url']}: {exc}", flush=True)
@@ -648,6 +852,7 @@ def fetch_batch_csv(
     base_url: str,
     token: str,
     console_uids: list[str],
+    rate_limit_counter: "_Counter | None" = None,
 ) -> str | None:
     try:
         response = http.get(
@@ -655,6 +860,11 @@ def fetch_batch_csv(
             params={"t": token, "console-uids": ",".join(console_uids)},
         )
         response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        print(f"  Batch download failed for {len(console_uids)} sets: {exc}", flush=True)
+        if rate_limit_counter is not None and exc.response.status_code == 429:
+            rate_limit_counter.increment()
+        return None
     except httpx.HTTPError as exc:
         print(f"  Batch download failed for {len(console_uids)} sets: {exc}", flush=True)
         return None
@@ -669,6 +879,7 @@ def fetch_batch_csv_with_retry(
     console_uids: list[str],
     max_attempts: int,
     retry_sleep_seconds: float,
+    rate_limit_counter: "_Counter | None" = None,
 ) -> str | None:
     # A single 30s-paced request already succeeds ~100% of the time
     # (confirmed live), so this retry exists purely as a safety margin for
@@ -676,7 +887,11 @@ def fetch_batch_csv_with_retry(
     # waiting a full 15-minute cron cycle for the next attempt.
     for attempt in range(1, max_attempts + 1):
         csv_text = fetch_batch_csv(
-            http, base_url=base_url, token=token, console_uids=console_uids
+            http,
+            base_url=base_url,
+            token=token,
+            console_uids=console_uids,
+            rate_limit_counter=rate_limit_counter,
         )
         if csv_text is not None:
             return csv_text

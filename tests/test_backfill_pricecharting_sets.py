@@ -8,7 +8,11 @@ from scripts.backfill_pricecharting_sets import (
     API_SEARCH_RESULT_CAP,
     CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD,
     SupabaseRegistryOpsClient,
+    _Counter,
     _RateLimitCircuitBreaker,
+    _build_result_summary,
+    _new_api_search_counts,
+    _products_match_set_name,
     _search_products,
     cap_slow_path_rows,
     chunked,
@@ -277,6 +281,59 @@ class ResolveConsoleUidsTest(unittest.TestCase):
         self.assertEqual(failed, [])
         self.assertEqual(resolved[0]["console_uid"], "G58495")
 
+    def test_records_429s_on_the_given_rate_limit_counter(self) -> None:
+        rows = [
+            {"registry_id": str(i), "url": f"https://example.test/{i}", "console_uid": None}
+            for i in range(2)
+        ]
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(429)))
+        registry_client = _ExplodingRegistryClient()
+        counter = _Counter()
+
+        resolve_console_uids(
+            rows,
+            http=http,
+            registry_client=registry_client,
+            sleep_seconds=0,
+            dry_run=True,
+            rate_limit_counter=counter,
+        )
+
+        self.assertEqual(counter.value, 2)
+
+    def test_does_not_record_a_non_429_error_on_the_rate_limit_counter(self) -> None:
+        rows = [{"registry_id": "1", "url": "https://example.test/x", "console_uid": None}]
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(404)))
+        registry_client = _ExplodingRegistryClient()
+        counter = _Counter()
+
+        resolve_console_uids(
+            rows,
+            http=http,
+            registry_client=registry_client,
+            sleep_seconds=0,
+            dry_run=True,
+            rate_limit_counter=counter,
+        )
+
+        self.assertEqual(counter.value, 0)
+
+
+class CounterTest(unittest.TestCase):
+    def test_starts_at_zero(self) -> None:
+        self.assertEqual(_Counter().value, 0)
+
+    def test_increment_defaults_to_one(self) -> None:
+        counter = _Counter()
+        counter.increment()
+        counter.increment()
+        self.assertEqual(counter.value, 2)
+
+    def test_increment_accepts_a_custom_amount(self) -> None:
+        counter = _Counter()
+        counter.increment(5)
+        self.assertEqual(counter.value, 5)
+
 
 class RateLimitCircuitBreakerTest(unittest.TestCase):
     def test_not_tripped_before_the_threshold(self) -> None:
@@ -321,6 +378,35 @@ class FetchBatchCsvTest(unittest.TestCase):
         http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(500)))
         text = fetch_batch_csv(http, base_url="https://example.test", token="tok", console_uids=["G1"])
         self.assertIsNone(text)
+
+    def test_records_a_429_on_the_given_rate_limit_counter(self) -> None:
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(429)))
+        counter = _Counter()
+
+        text = fetch_batch_csv(
+            http,
+            base_url="https://example.test",
+            token="tok",
+            console_uids=["G1"],
+            rate_limit_counter=counter,
+        )
+
+        self.assertIsNone(text)
+        self.assertEqual(counter.value, 1)
+
+    def test_does_not_record_a_non_429_error_on_the_rate_limit_counter(self) -> None:
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+        counter = _Counter()
+
+        fetch_batch_csv(
+            http,
+            base_url="https://example.test",
+            token="tok",
+            console_uids=["G1"],
+            rate_limit_counter=counter,
+        )
+
+        self.assertEqual(counter.value, 0)
 
 
 def _product(product_id: str, name: str, console: str = "Baseball Cards 1962 Bazooka") -> dict:
@@ -388,6 +474,36 @@ class SearchProductsTest(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class ProductsMatchSetNameTest(unittest.TestCase):
+    def test_a_consistent_set_of_console_names_matches(self) -> None:
+        products = [
+            _product("1", "Card A", console="Baseball Cards 1962 Bazooka"),
+            _product("2", "Card B", console="Baseball Cards 1962 Bazooka"),
+        ]
+        self.assertTrue(_products_match_set_name(products, "1962 Bazooka"))
+
+    def test_a_single_mismatched_console_name_rejects_the_whole_result(self) -> None:
+        # One item resolving to a different set (a fuzzy /api/products
+        # false-positive) taints the whole result -- it can no longer be
+        # trusted as this set's complete, correct checklist.
+        products = [
+            _product("1", "Card A", console="Baseball Cards 1962 Bazooka"),
+            _product("2", "Card B", console="Baseball Cards 1963 Topps"),
+        ]
+        self.assertFalse(_products_match_set_name(products, "1962 Bazooka"))
+
+    def test_an_unrelated_console_name_does_not_match(self) -> None:
+        products = [_product("1", "Stray Dogs: Dog Days [Creepshow]", console="Movies")]
+        self.assertFalse(_products_match_set_name(products, "Creepshow"))
+
+    def test_empty_products_do_not_match(self) -> None:
+        self.assertFalse(_products_match_set_name([], "1962 Bazooka"))
+
+    def test_a_blank_set_name_does_not_match(self) -> None:
+        products = [_product("1", "Card A", console="Baseball Cards 1962 Bazooka")]
+        self.assertFalse(_products_match_set_name(products, ""))
+
+
 class ResolveViaApiForSmallSetsTest(unittest.TestCase):
     def test_a_small_set_succeeds_and_is_removed_from_remaining(self) -> None:
         rows = [{"registry_id": "1", "set_name": "1962 Bazooka", "source_site": "sportscardspro"}]
@@ -397,7 +513,7 @@ class ResolveViaApiForSmallSetsTest(unittest.TestCase):
             return httpx.Response(200, json={"status": "success", "products": products})
 
         http = httpx.Client(transport=httpx.MockTransport(handler))
-        succeeded, remaining = resolve_via_api_for_small_sets(
+        succeeded, remaining, counts = resolve_via_api_for_small_sets(
             rows, http=http, token="tok", sleep_seconds=0, source_downloaded_at="2026-01-01T00:00:00Z"
         )
 
@@ -407,6 +523,31 @@ class ResolveViaApiForSmallSetsTest(unittest.TestCase):
         self.assertEqual(row["registry_id"], "1")
         self.assertEqual(len(catalog_rows), 2)
         self.assertEqual(catalog_rows[0]["pricecharting_id"], "1")
+        self.assertEqual(counts, {"attempted": 1, "succeeded": 1, "rejected_ambiguous": 0, "hit_cap": 0, "empty": 0})
+
+    def test_a_set_with_mismatched_console_names_is_rejected_as_ambiguous(self) -> None:
+        # Mirrors the real "Creepshow" false-positive noted in
+        # refresh_small_sets.py: a fuzzy /api/products search can bleed in
+        # an item from a different set. That must not be silently accepted
+        # as this set's complete checklist.
+        rows = [{"registry_id": "1", "set_name": "1962 Bazooka", "source_site": "sportscardspro"}]
+        products = [
+            _product("1", "Card A", console="Baseball Cards 1962 Bazooka"),
+            _product("2", "Card B", console="Baseball Cards 1963 Topps"),
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"status": "success", "products": products})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        succeeded, remaining, counts = resolve_via_api_for_small_sets(
+            rows, http=http, token="tok", sleep_seconds=0, source_downloaded_at="2026-01-01T00:00:00Z"
+        )
+
+        self.assertEqual(succeeded, [])
+        self.assertEqual(remaining, rows)
+        self.assertEqual(counts["rejected_ambiguous"], 1)
+        self.assertEqual(counts["succeeded"], 0)
 
     def test_a_set_at_the_cap_falls_back_to_remaining(self) -> None:
         rows = [{"registry_id": "1", "set_name": "2023 Panini Prizm", "source_site": "sportscardspro"}]
@@ -416,7 +557,7 @@ class ResolveViaApiForSmallSetsTest(unittest.TestCase):
             return httpx.Response(200, json={"status": "success", "products": products})
 
         http = httpx.Client(transport=httpx.MockTransport(handler))
-        succeeded, remaining = resolve_via_api_for_small_sets(
+        succeeded, remaining, counts = resolve_via_api_for_small_sets(
             rows, http=http, token="tok", sleep_seconds=0, source_downloaded_at="2026-01-01T00:00:00Z"
         )
 
@@ -424,6 +565,8 @@ class ResolveViaApiForSmallSetsTest(unittest.TestCase):
         # not be trusted as a complete result.
         self.assertEqual(succeeded, [])
         self.assertEqual(remaining, rows)
+        self.assertEqual(counts["hit_cap"], 1)
+        self.assertEqual(counts["rejected_ambiguous"], 0)
 
     def test_an_empty_result_falls_back_to_remaining(self) -> None:
         rows = [{"registry_id": "1", "set_name": "nonexistent set", "source_site": "sportscardspro"}]
@@ -432,23 +575,25 @@ class ResolveViaApiForSmallSetsTest(unittest.TestCase):
             return httpx.Response(200, json={"status": "success", "products": []})
 
         http = httpx.Client(transport=httpx.MockTransport(handler))
-        succeeded, remaining = resolve_via_api_for_small_sets(
+        succeeded, remaining, counts = resolve_via_api_for_small_sets(
             rows, http=http, token="tok", sleep_seconds=0, source_downloaded_at="2026-01-01T00:00:00Z"
         )
 
         self.assertEqual(succeeded, [])
         self.assertEqual(remaining, rows)
+        self.assertEqual(counts["empty"], 1)
 
     def test_a_fetch_error_falls_back_to_remaining(self) -> None:
         rows = [{"registry_id": "1", "set_name": "1962 Bazooka", "source_site": "sportscardspro"}]
         http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(403)))
 
-        succeeded, remaining = resolve_via_api_for_small_sets(
+        succeeded, remaining, counts = resolve_via_api_for_small_sets(
             rows, http=http, token="tok", sleep_seconds=0, source_downloaded_at="2026-01-01T00:00:00Z"
         )
 
         self.assertEqual(succeeded, [])
         self.assertEqual(remaining, rows)
+        self.assertEqual(counts["empty"], 1)
 
     def test_multiple_rows_are_each_evaluated_independently(self) -> None:
         rows = [
@@ -459,11 +604,11 @@ class ResolveViaApiForSmallSetsTest(unittest.TestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             query = request.url.params.get("q")
             count = 5 if query == "small set" else API_SEARCH_RESULT_CAP
-            products = [_product(str(i), f"Card {i}") for i in range(count)]
+            products = [_product(str(i), f"Card {i}", console=query) for i in range(count)]
             return httpx.Response(200, json={"status": "success", "products": products})
 
         http = httpx.Client(transport=httpx.MockTransport(handler))
-        succeeded, remaining = resolve_via_api_for_small_sets(
+        succeeded, remaining, counts = resolve_via_api_for_small_sets(
             rows, http=http, token="tok", sleep_seconds=0, source_downloaded_at="2026-01-01T00:00:00Z"
         )
 
@@ -471,6 +616,10 @@ class ResolveViaApiForSmallSetsTest(unittest.TestCase):
         self.assertEqual(succeeded[0][0]["registry_id"], "1")
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0]["registry_id"], "2")
+        self.assertEqual(
+            counts,
+            {"attempted": 2, "succeeded": 1, "rejected_ambiguous": 0, "hit_cap": 1, "empty": 0},
+        )
 
     def test_concurrency_resolves_every_row_exactly_once(self) -> None:
         rows = [
@@ -479,11 +628,12 @@ class ResolveViaApiForSmallSetsTest(unittest.TestCase):
         ]
 
         def handler(request: httpx.Request) -> httpx.Response:
-            products = [_product("1", "Card A")]
+            query = request.url.params.get("q")
+            products = [_product("1", "Card A", console=query)]
             return httpx.Response(200, json={"status": "success", "products": products})
 
         http = httpx.Client(transport=httpx.MockTransport(handler))
-        succeeded, remaining = resolve_via_api_for_small_sets(
+        succeeded, remaining, counts = resolve_via_api_for_small_sets(
             rows,
             http=http,
             token="tok",
@@ -498,6 +648,8 @@ class ResolveViaApiForSmallSetsTest(unittest.TestCase):
             {row["registry_id"] for row, _ in succeeded},
             {row["registry_id"] for row in rows},
         )
+        self.assertEqual(counts["succeeded"], 9)
+        self.assertEqual(counts["attempted"], 9)
 
     def test_circuit_breaker_stops_after_consecutive_429s_without_attempting_the_rest(self) -> None:
         rows = [
@@ -512,13 +664,35 @@ class ResolveViaApiForSmallSetsTest(unittest.TestCase):
             return httpx.Response(429)
 
         http = httpx.Client(transport=httpx.MockTransport(handler))
-        succeeded, remaining = resolve_via_api_for_small_sets(
+        succeeded, remaining, counts = resolve_via_api_for_small_sets(
             rows, http=http, token="tok", sleep_seconds=0, source_downloaded_at="2026-01-01T00:00:00Z"
         )
 
         self.assertEqual(succeeded, [])
         self.assertEqual(len(remaining), 6)
         self.assertEqual(request_count, CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD)
+        # Only the requests that actually hit the network count as attempted
+        # -- rows skipped once the breaker trips were never attempted.
+        self.assertEqual(counts["attempted"], CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD)
+
+    def test_records_429s_on_the_given_rate_limit_counter(self) -> None:
+        rows = [
+            {"registry_id": str(i), "set_name": f"set {i}", "source_site": "sportscardspro"}
+            for i in range(2)
+        ]
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(429)))
+        counter = _Counter()
+
+        resolve_via_api_for_small_sets(
+            rows,
+            http=http,
+            token="tok",
+            sleep_seconds=0,
+            source_downloaded_at="2026-01-01T00:00:00Z",
+            rate_limit_counter=counter,
+        )
+
+        self.assertEqual(counter.value, 2)
 
     def test_concurrency_with_a_single_row_does_not_spawn_a_thread_pool(self) -> None:
         rows = [{"registry_id": "1", "set_name": "1962 Bazooka", "source_site": "sportscardspro"}]
@@ -528,7 +702,7 @@ class ResolveViaApiForSmallSetsTest(unittest.TestCase):
             return httpx.Response(200, json={"status": "success", "products": products})
 
         http = httpx.Client(transport=httpx.MockTransport(handler))
-        succeeded, remaining = resolve_via_api_for_small_sets(
+        succeeded, remaining, counts = resolve_via_api_for_small_sets(
             rows,
             http=http,
             token="tok",
@@ -539,6 +713,7 @@ class ResolveViaApiForSmallSetsTest(unittest.TestCase):
 
         self.assertEqual(remaining, [])
         self.assertEqual(len(succeeded), 1)
+        self.assertEqual(counts["succeeded"], 1)
 
 
 class FetchBatchCsvWithRetryTest(unittest.TestCase):
@@ -608,6 +783,22 @@ class FetchBatchCsvWithRetryTest(unittest.TestCase):
 
         self.assertIsNone(text)
         self.assertEqual(request_count, 3)
+
+    def test_records_a_429_for_every_attempt_on_the_rate_limit_counter(self) -> None:
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(429)))
+        counter = _Counter()
+
+        fetch_batch_csv_with_retry(
+            http,
+            base_url="https://example.test",
+            token="tok",
+            console_uids=["G1"],
+            max_attempts=3,
+            retry_sleep_seconds=0,
+            rate_limit_counter=counter,
+        )
+
+        self.assertEqual(counter.value, 3)
 
 
 class WriteCatalogRowsTest(unittest.TestCase):
@@ -812,6 +1003,113 @@ class _FakeRegistryOpsTransport:
     def patch(self, url: str, **kwargs):
         self.patch_calls.append({"params": kwargs.get("params", {}), "json": kwargs.get("json", {})})
         return _FakeRegistryOpsResponse()
+
+
+class BuildResultSummaryTest(unittest.TestCase):
+    def _counts(self, **overrides) -> dict:
+        counts = _new_api_search_counts()
+        counts.update(overrides)
+        return counts
+
+    def test_counters_are_correct(self) -> None:
+        summary = _build_result_summary(
+            dry_run=False,
+            claimed_count=50,
+            succeeded_count=30,
+            api_search_succeeded=10,
+            deferred_count=4,
+            failed_count=16,
+            catalog_rows_written=900,
+            catalog_rows_parsed=900,
+            api_search_counts=self._counts(
+                attempted=17, succeeded=10, rejected_ambiguous=2, hit_cap=3, empty=2
+            ),
+            slow_path_attempted=12,
+            rate_limit_429_count=5,
+            phase_seconds={},
+        )
+
+        self.assertEqual(summary["claimed"], 50)
+        self.assertEqual(summary["succeeded"], 30)
+        self.assertEqual(summary["failed"], 16)
+        self.assertEqual(summary["sportscardsproApiAttempted"], 17)
+        self.assertEqual(summary["sportscardsproApiSucceeded"], 10)
+        self.assertEqual(summary["sportscardsproApiRejectedAmbiguous"], 2)
+        self.assertEqual(summary["sportscardsproApiHitCap"], 3)
+        self.assertEqual(summary["sportscardsproApiEmpty"], 2)
+        # succeeded + rejected_ambiguous + hit_cap + empty accounts for every attempted row.
+        self.assertEqual(
+            summary["sportscardsproApiSucceeded"]
+            + summary["sportscardsproApiRejectedAmbiguous"]
+            + summary["sportscardsproApiHitCap"]
+            + summary["sportscardsproApiEmpty"],
+            summary["sportscardsproApiAttempted"],
+        )
+        self.assertEqual(summary["sportscardsproSlowPathAttempted"], 12)
+        self.assertEqual(summary["sportscardsproDeferred"], 4)
+        self.assertEqual(summary["deferredToLaterRun"], 4)
+        self.assertEqual(summary["sportscardspro429Count"], 5)
+
+    def test_final_json_includes_phase_timings(self) -> None:
+        summary = _build_result_summary(
+            dry_run=False,
+            claimed_count=1,
+            succeeded_count=1,
+            api_search_succeeded=0,
+            deferred_count=0,
+            failed_count=0,
+            catalog_rows_written=1,
+            catalog_rows_parsed=1,
+            api_search_counts=self._counts(),
+            slow_path_attempted=0,
+            rate_limit_429_count=0,
+            phase_seconds={
+                "claim": 0.125,
+                "api_search": 1.5,
+                "console_resolve": 12.0,
+                "csv_fetch": 3.25,
+                "catalog_write": 0.75,
+            },
+        )
+
+        self.assertEqual(summary["claimSeconds"], 0.125)
+        self.assertEqual(summary["apiSearchSeconds"], 1.5)
+        self.assertEqual(summary["consoleResolveSeconds"], 12.0)
+        self.assertEqual(summary["csvFetchSeconds"], 3.25)
+        self.assertEqual(summary["catalogWriteSeconds"], 0.75)
+        # A valid JSON encode/decode round-trip is the real contract here --
+        # this is what the cron's log output actually is.
+        decoded = json.loads(json.dumps(summary))
+        for key in (
+            "claimSeconds",
+            "apiSearchSeconds",
+            "consoleResolveSeconds",
+            "csvFetchSeconds",
+            "catalogWriteSeconds",
+        ):
+            self.assertIn(key, decoded)
+
+    def test_missing_phase_seconds_default_to_zero(self) -> None:
+        summary = _build_result_summary(
+            dry_run=True,
+            claimed_count=0,
+            succeeded_count=0,
+            api_search_succeeded=0,
+            deferred_count=0,
+            failed_count=0,
+            catalog_rows_written=0,
+            catalog_rows_parsed=0,
+            api_search_counts=self._counts(),
+            slow_path_attempted=0,
+            rate_limit_429_count=0,
+            phase_seconds={},
+        )
+
+        self.assertEqual(summary["claimSeconds"], 0.0)
+        self.assertEqual(summary["apiSearchSeconds"], 0.0)
+        self.assertEqual(summary["consoleResolveSeconds"], 0.0)
+        self.assertEqual(summary["csvFetchSeconds"], 0.0)
+        self.assertEqual(summary["catalogWriteSeconds"], 0.0)
 
 
 if __name__ == "__main__":
