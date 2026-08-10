@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -7,9 +9,11 @@ import httpx
 from scripts.backfill_pricecharting_sets import (
     API_SEARCH_RESULT_CAP,
     CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD,
+    SPORTSCARDSPRO_API_SEARCH_MAX_IN_FLIGHT,
     SupabaseRegistryOpsClient,
     _Counter,
     _RateLimitCircuitBreaker,
+    _StartRateLimiter,
     _build_result_summary,
     _new_api_search_counts,
     _products_match_set_name,
@@ -714,6 +718,318 @@ class ResolveViaApiForSmallSetsTest(unittest.TestCase):
         self.assertEqual(remaining, [])
         self.assertEqual(len(succeeded), 1)
         self.assertEqual(counts["succeeded"], 1)
+
+
+class StartRateLimiterTest(unittest.TestCase):
+    def test_first_call_does_not_wait(self) -> None:
+        limiter = _StartRateLimiter(0.05)
+        start = time.monotonic()
+        limiter.wait_for_slot()
+        self.assertLess(time.monotonic() - start, 0.02)
+
+    def test_a_second_call_waits_out_the_remaining_interval(self) -> None:
+        limiter = _StartRateLimiter(0.05)
+        limiter.wait_for_slot()
+        start = time.monotonic()
+        limiter.wait_for_slot()
+        self.assertGreaterEqual(time.monotonic() - start, 0.045)
+
+    def test_concurrent_callers_are_still_globally_spaced(self) -> None:
+        # The whole point of this limiter: however many threads call it,
+        # successive slot grants are still spaced by min_interval_seconds --
+        # unlike per-lane pacing, there is exactly one shared clock.
+        limiter = _StartRateLimiter(0.03)
+        lock = threading.Lock()
+        timestamps: list[float] = []
+
+        def call() -> None:
+            limiter.wait_for_slot()
+            with lock:
+                timestamps.append(time.monotonic())
+
+        threads = [threading.Thread(target=call) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        timestamps.sort()
+        gaps = [b - a for a, b in zip(timestamps, timestamps[1:])]
+        for gap in gaps:
+            self.assertGreaterEqual(gap, 0.025)
+
+
+class ResolveViaApiForSmallSetsOverlapTest(unittest.TestCase):
+    def test_default_concurrency_never_touches_the_overlap_scheduler(self) -> None:
+        rows = [
+            {"registry_id": str(i), "set_name": f"set {i}", "source_site": "sportscardspro"}
+            for i in range(5)
+        ]
+        http = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(200, json={"status": "success", "products": []})
+            )
+        )
+
+        with patch(
+            "scripts.backfill_pricecharting_sets._resolve_via_api_for_small_sets_overlapped"
+        ) as overlapped_mock:
+            resolve_via_api_for_small_sets(
+                rows,
+                http=http,
+                token="tok",
+                sleep_seconds=0,
+                source_downloaded_at="2026-01-01T00:00:00Z",
+            )
+            overlapped_mock.assert_not_called()
+
+    def test_explicit_concurrency_above_one_uses_the_overlap_scheduler(self) -> None:
+        rows = [
+            {"registry_id": str(i), "set_name": f"set {i}", "source_site": "sportscardspro"}
+            for i in range(5)
+        ]
+        http = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(200, json={"status": "success", "products": []})
+            )
+        )
+
+        with patch(
+            "scripts.backfill_pricecharting_sets._resolve_via_api_for_small_sets_overlapped",
+            return_value=([], [], _new_api_search_counts()),
+        ) as overlapped_mock:
+            resolve_via_api_for_small_sets(
+                rows,
+                http=http,
+                token="tok",
+                sleep_seconds=0,
+                source_downloaded_at="2026-01-01T00:00:00Z",
+                max_concurrency=2,
+            )
+            overlapped_mock.assert_called_once()
+
+    def test_max_in_flight_is_clamped_to_the_safety_ceiling(self) -> None:
+        rows = [
+            {"registry_id": str(i), "set_name": f"set {i}", "source_site": "sportscardspro"}
+            for i in range(2)
+        ]
+        http = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(200, json={"status": "success", "products": []})
+            )
+        )
+
+        with patch(
+            "scripts.backfill_pricecharting_sets._resolve_via_api_for_small_sets_overlapped",
+            return_value=([], [], _new_api_search_counts()),
+        ) as overlapped_mock:
+            resolve_via_api_for_small_sets(
+                rows,
+                http=http,
+                token="tok",
+                sleep_seconds=0,
+                source_downloaded_at="2026-01-01T00:00:00Z",
+                # Well above the safety ceiling -- must still clamp, not scale.
+                max_concurrency=10,
+            )
+            _, kwargs = overlapped_mock.call_args
+            self.assertEqual(kwargs["max_in_flight"], SPORTSCARDSPRO_API_SEARCH_MAX_IN_FLIGHT)
+
+    def test_never_exceeds_the_in_flight_ceiling_even_at_a_higher_concurrency_flag(self) -> None:
+        rows = [
+            {"registry_id": str(i), "set_name": f"set {i}", "source_site": "sportscardspro"}
+            for i in range(10)
+        ]
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.02)
+            with lock:
+                active -= 1
+            query = request.url.params.get("q")
+            products = [_product("1", "Card A", console=query)]
+            return httpx.Response(200, json={"status": "success", "products": products})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        succeeded, remaining, counts = resolve_via_api_for_small_sets(
+            rows,
+            http=http,
+            token="tok",
+            sleep_seconds=0,
+            source_downloaded_at="2026-01-01T00:00:00Z",
+            max_concurrency=10,
+        )
+
+        self.assertLessEqual(max_active, SPORTSCARDSPRO_API_SEARCH_MAX_IN_FLIGHT)
+        self.assertEqual(len(succeeded), 10)
+        self.assertEqual(counts["attempted"], 10)
+
+    def test_request_starts_never_bunch_up_across_workers(self) -> None:
+        rows = [
+            {"registry_id": str(i), "set_name": f"set {i}", "source_site": "sportscardspro"}
+            for i in range(5)
+        ]
+        lock = threading.Lock()
+        start_times: list[float] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            with lock:
+                start_times.append(time.monotonic())
+            query = request.url.params.get("q")
+            products = [_product("1", "Card A", console=query)]
+            return httpx.Response(200, json={"status": "success", "products": products})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        resolve_via_api_for_small_sets(
+            rows,
+            http=http,
+            token="tok",
+            sleep_seconds=0.03,
+            source_downloaded_at="2026-01-01T00:00:00Z",
+            max_concurrency=2,
+        )
+
+        start_times.sort()
+        gaps = [b - a for a, b in zip(start_times, start_times[1:])]
+        # Two workers sharing one rate limiter must never start two
+        # requests closer together than the configured interval -- this is
+        # exactly what the old round-robin-lane concurrency could NOT
+        # guarantee (independent per-lane timers can align into a burst).
+        for gap in gaps:
+            self.assertGreaterEqual(gap, 0.025)
+
+    def test_overlap_hides_slow_response_latency_compared_to_serial(self) -> None:
+        rows = [
+            {"registry_id": str(i), "set_name": f"set {i}", "source_site": "sportscardspro"}
+            for i in range(4)
+        ]
+
+        def make_handler():
+            def handler(request: httpx.Request) -> httpx.Response:
+                time.sleep(0.05)
+                query = request.url.params.get("q")
+                products = [_product("1", "Card A", console=query)]
+                return httpx.Response(200, json={"status": "success", "products": products})
+
+            return handler
+
+        http_serial = httpx.Client(transport=httpx.MockTransport(make_handler()))
+        start = time.monotonic()
+        resolve_via_api_for_small_sets(
+            rows,
+            http=http_serial,
+            token="tok",
+            sleep_seconds=0.03,
+            source_downloaded_at="2026-01-01T00:00:00Z",
+            max_concurrency=1,
+        )
+        serial_elapsed = time.monotonic() - start
+
+        http_overlap = httpx.Client(transport=httpx.MockTransport(make_handler()))
+        start = time.monotonic()
+        resolve_via_api_for_small_sets(
+            rows,
+            http=http_overlap,
+            token="tok",
+            sleep_seconds=0.03,
+            source_downloaded_at="2026-01-01T00:00:00Z",
+            max_concurrency=2,
+        )
+        overlap_elapsed = time.monotonic() - start
+
+        # Overlap must meaningfully beat serial when responses are slower
+        # than the pacing interval -- that's the entire point of this mode.
+        self.assertLess(overlap_elapsed, serial_elapsed * 0.85)
+
+    def test_validation_still_rejects_ambiguous_results_under_overlap(self) -> None:
+        rows = [
+            {"registry_id": "1", "set_name": "1962 Bazooka", "source_site": "sportscardspro"},
+            {"registry_id": "2", "set_name": "set two", "source_site": "sportscardspro"},
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            query = request.url.params.get("q")
+            if query == "1962 Bazooka":
+                products = [
+                    _product("1", "Card A", console="Baseball Cards 1962 Bazooka"),
+                    _product("2", "Card B", console="Baseball Cards 1963 Topps"),
+                ]
+            else:
+                products = [_product("3", "Card C", console=query)]
+            return httpx.Response(200, json={"status": "success", "products": products})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        succeeded, remaining, counts = resolve_via_api_for_small_sets(
+            rows,
+            http=http,
+            token="tok",
+            sleep_seconds=0,
+            source_downloaded_at="2026-01-01T00:00:00Z",
+            max_concurrency=2,
+        )
+
+        self.assertEqual(len(succeeded), 1)
+        self.assertEqual(succeeded[0][0]["registry_id"], "2")
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["registry_id"], "1")
+        self.assertEqual(counts["rejected_ambiguous"], 1)
+
+    def test_circuit_breaker_still_stops_the_run_globally_under_overlap(self) -> None:
+        rows = [
+            {"registry_id": str(i), "set_name": f"set {i}", "source_site": "sportscardspro"}
+            for i in range(8)
+        ]
+        lock = threading.Lock()
+        request_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal request_count
+            with lock:
+                request_count += 1
+            return httpx.Response(429)
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        succeeded, remaining, counts = resolve_via_api_for_small_sets(
+            rows,
+            http=http,
+            token="tok",
+            sleep_seconds=0,
+            source_downloaded_at="2026-01-01T00:00:00Z",
+            max_concurrency=2,
+        )
+
+        self.assertEqual(succeeded, [])
+        self.assertEqual(len(remaining), 8)
+        # Two workers can race a couple of requests past the trip point, but
+        # the breaker must still cut this off well short of all 8 rows.
+        self.assertLess(request_count, len(rows))
+        self.assertGreaterEqual(request_count, CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD)
+
+    def test_records_429s_on_the_shared_rate_limit_counter_under_overlap(self) -> None:
+        rows = [
+            {"registry_id": str(i), "set_name": f"set {i}", "source_site": "sportscardspro"}
+            for i in range(2)
+        ]
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(429)))
+        counter = _Counter()
+
+        resolve_via_api_for_small_sets(
+            rows,
+            http=http,
+            token="tok",
+            sleep_seconds=0,
+            source_downloaded_at="2026-01-01T00:00:00Z",
+            max_concurrency=2,
+            rate_limit_counter=counter,
+        )
+
+        self.assertEqual(counter.value, 2)
 
 
 class FetchBatchCsvWithRetryTest(unittest.TestCase):
