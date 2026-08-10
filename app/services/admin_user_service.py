@@ -208,6 +208,8 @@ class SupabaseAdminUserRepository:
         portfolio_count = self._optional_count("portfolio_items", user_id)
         scan_count = self._optional_count("scan_analysis_events", user_id)
         device_count = self._optional_count("push_device_registrations", user_id)
+        subscription_rows = self._optional_rows("user_subscriptions", user_id, limit=1)
+        subscription_row = subscription_rows[0] if subscription_rows else {}
         return {
             "id": user_id,
             "email": email,
@@ -219,6 +221,8 @@ class SupabaseAdminUserRepository:
             "portfolioCount": portfolio_count,
             "scanCount": scan_count,
             "pushDeviceCount": device_count,
+            "plan": subscription_row.get("plan") or "free",
+            "planStatus": subscription_row.get("status") or "active",
             "lastActivityAt": _latest_text(
                 user.get("last_sign_in_at"),
                 profile.get("updated_at"),
