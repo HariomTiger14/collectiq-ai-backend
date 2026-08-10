@@ -45,6 +45,12 @@ DEFAULT_MAX_REQUESTS = 120
 # meta.total=1000 regardless of how many pages were requested).
 API_RESULT_CAP = 1000
 
+# A handful of live cron runs have seen isolated 500s from kicks.dev mid-
+# segment (e.g. New Balance, Reebok) that succeed again on the next page --
+# retry transient server errors once before giving up on the segment.
+PAGE_FETCH_ATTEMPTS = 2
+PAGE_FETCH_RETRY_DELAY_SECONDS = 2.0
+
 # The general "sneakers-by-rank" segment plus the 9 brands confirmed live to
 # each independently hit the 1,000-result cap on their own (i.e. each has
 # 1,000+ sneakers in KicksDB's catalog) -- this is the real, full segment
@@ -103,7 +109,15 @@ def main(argv: list[str] | None = None) -> int:
     source_downloaded_at = datetime.now(timezone.utc).isoformat()
     request_budget = RequestBudget(args.max_requests)
 
-    all_rows: list[dict[str, Any]] = []
+    # Rows (each carrying a full raw_payload + per-size variants) are written
+    # to Supabase segment-by-segment instead of being accumulated across all
+    # segments and written once at the end -- holding all ~10 segments'
+    # worth of rows in memory simultaneously is what was pushing this cron
+    # past its memory limit. Writing (and letting each segment's rows fall
+    # out of scope) as we go keeps peak memory to one segment at a time.
+    products_found = 0
+    unique_ids: set[str] = set()
+    catalog_rows_written = 0
     segment_summaries: list[dict[str, Any]] = []
     with httpx.Client(timeout=args.timeout_seconds, follow_redirects=True) as http:
         for segment in segments:
@@ -132,17 +146,22 @@ def main(argv: list[str] | None = None) -> int:
                 for product in products
             ]
             rows = [row for row in rows if row is not None]
-            all_rows.extend(rows)
+            rows = dedupe_catalog_rows(rows)
+
+            products_found += len(products)
+            unique_ids.update(row["kicksdb_id"] for row in rows)
+
+            if rows:
+                if args.dry_run:
+                    catalog_rows_written += len(rows)
+                else:
+                    assert client is not None
+                    if write_catalog_rows(client, rows, batch_size=args.catalog_batch_size):
+                        catalog_rows_written += len(rows)
+
             segment_summaries.append(
                 {"label": segment["label"], "products": len(products), "requests": requests_used}
             )
-
-    deduped_rows = dedupe_catalog_rows(all_rows)
-
-    written = True
-    if not args.dry_run and deduped_rows:
-        assert client is not None
-        written = write_catalog_rows(client, deduped_rows, batch_size=args.catalog_batch_size)
 
     print(
         json.dumps(
@@ -151,9 +170,9 @@ def main(argv: list[str] | None = None) -> int:
                 "dryRun": args.dry_run,
                 "requestsUsed": request_budget.used,
                 "segments": segment_summaries,
-                "productsFound": len(all_rows),
-                "uniqueProducts": len(deduped_rows),
-                "catalogRowsWritten": len(deduped_rows) if written else 0,
+                "productsFound": products_found,
+                "uniqueProducts": len(unique_ids),
+                "catalogRowsWritten": catalog_rows_written,
             },
             indent=2,
         ),
@@ -203,15 +222,31 @@ def fetch_segment(
             "display[prices]": "true",
         }
         try:
-            response = http.get(
-                f"{api_base}/v3/stockx/products",
-                params=params,
-                headers={"Authorization": api_key, "Accept": "application/json"},
-            )
-            request_budget.consume()
-            requests_used += 1
-            response.raise_for_status()
-            payload = response.json()
+            payload = None
+            last_exc: Exception | None = None
+            for attempt in range(PAGE_FETCH_ATTEMPTS):
+                if attempt > 0:
+                    time.sleep(PAGE_FETCH_RETRY_DELAY_SECONDS)
+                try:
+                    response = http.get(
+                        f"{api_base}/v3/stockx/products",
+                        params=params,
+                        headers={"Authorization": api_key, "Accept": "application/json"},
+                    )
+                    request_budget.consume()
+                    requests_used += 1
+                    response.raise_for_status()
+                    payload = response.json()
+                    last_exc = None
+                    break
+                except httpx.HTTPStatusError as exc:
+                    last_exc = exc
+                    # Only transient server errors are worth a retry -- a 4xx
+                    # (bad filter, auth) will fail identically every time.
+                    if exc.response.status_code < 500:
+                        break
+            if last_exc is not None:
+                raise last_exc
         except (httpx.HTTPError, ValueError) as exc:
             print(f"    Page {page} failed for {segment['label']!r}: {exc}", flush=True)
             break
