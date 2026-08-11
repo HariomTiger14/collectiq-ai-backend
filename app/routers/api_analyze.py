@@ -110,7 +110,13 @@ SUPPORTED_CATEGORIES = {
     response_model=ApiAnalyzeResponse,
     summary="Analyze a collectible image from the Flutter backend contract",
 )
-async def analyze_collectible(payload: ApiAnalyzeRequest) -> ApiAnalyzeResponse:
+async def analyze_collectible(
+    request: Request,
+    payload: ApiAnalyzeRequest,
+) -> ApiAnalyzeResponse:
+    # Same monthly free-plan cap as the root /analyze route — without this the
+    # /api-prefixed variant was an unmetered bypass of the scan quota.
+    await run_in_threadpool(_enforce_scan_quota, request)
     return await _analyze_collectible(payload)
 
 
