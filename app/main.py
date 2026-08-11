@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from app.core.config import UPLOAD_DIR, settings
 from app.routers import (
@@ -45,8 +44,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Scratch directory for in-flight scanner uploads. Files are deleted after
+# analysis; nothing here is served over HTTP.
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 app.include_router(health.router)
 app.include_router(auth.router)

@@ -21,7 +21,9 @@ class PricingResponse(BaseModel):
 class ScannerAnalysisResponse(BaseModel):
     success: bool
     filename: str
-    imageUrl: str
+    # Uploads are transient analysis inputs and are no longer hosted, so there
+    # is no URL to hand back.
+    imageUrl: str | None = None
     title: str
     category: str
     confidence: int
