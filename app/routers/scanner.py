@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, File, HTTPException, UploadFile, status
 
 from app.core.config import (
     ALLOWED_CONTENT_TYPES,
@@ -46,7 +46,6 @@ def ensure_upload_dir() -> None:
     summary="Analyze an uploaded scanner image",
 )
 async def analyze_scanner_image(
-    request: Request,
     image: Annotated[
         UploadFile,
         File(
@@ -81,52 +80,51 @@ async def analyze_scanner_image(
     finally:
         await image.close()
 
-    image_url = str(request.url_for("uploads", path=filename))
+    # The upload is a transient input to the AI provider only. It is deleted in
+    # every path (success included) and is never served over HTTP.
     try:
-        recognition = get_ai_recognition_provider().recognize(destination)
-    except ValueError as exc:
+        try:
+            recognition = get_ai_recognition_provider().recognize(destination)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=str(exc),
+            ) from exc
+        except AIProviderNotConfiguredError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail=str(exc),
+            ) from exc
+        except OpenAITimeoutError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail=str(exc),
+            ) from exc
+        except OpenAIInvalidResponseError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
+            ) from exc
+        except OpenAIProviderError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
+            ) from exc
+        try:
+            pricing = get_pricing_provider().price(recognition)
+        except PricingProviderUnavailableError as exc:
+            pricing = _pricing_placeholder("provider_not_configured", "not_configured", str(exc))
+        except EmptyMarketDataError as exc:
+            pricing = _pricing_placeholder("no_market_match", "auto", str(exc))
+        except (
+            PricingProviderTimeoutError,
+            PricingProviderRateLimitError,
+            PricingProviderError,
+            ValueError,
+        ) as exc:
+            pricing = _pricing_placeholder("lookup_failed", "auto", str(exc))
+    finally:
         destination.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(exc),
-        ) from exc
-    except AIProviderNotConfiguredError as exc:
-        destination.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail=str(exc),
-        ) from exc
-    except OpenAITimeoutError as exc:
-        destination.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail=str(exc),
-        ) from exc
-    except OpenAIInvalidResponseError as exc:
-        destination.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=str(exc),
-        ) from exc
-    except OpenAIProviderError as exc:
-        destination.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=str(exc),
-        ) from exc
-    try:
-        pricing = get_pricing_provider().price(recognition)
-    except PricingProviderUnavailableError as exc:
-        pricing = _pricing_placeholder("provider_not_configured", "not_configured", str(exc))
-    except EmptyMarketDataError as exc:
-        pricing = _pricing_placeholder("no_market_match", "auto", str(exc))
-    except (
-        PricingProviderTimeoutError,
-        PricingProviderRateLimitError,
-        PricingProviderError,
-        ValueError,
-    ) as exc:
-        pricing = _pricing_placeholder("lookup_failed", "auto", str(exc))
     logger.info(
         "Scanner analysis completed filename=%s processingTimeMs=%s aiProvider=%s",
         filename,
@@ -137,7 +135,7 @@ async def analyze_scanner_image(
     return ScannerAnalysisResponse(
         success=True,
         filename=filename,
-        imageUrl=image_url,
+        imageUrl=None,
         title=recognition.title,
         category=recognition.category,
         confidence=recognition.confidence,
