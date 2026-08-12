@@ -45,8 +45,28 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(user["pushDeviceCount"], 1)
         self.assertEqual(user["plan"], "pro")
         self.assertEqual(user["planStatus"], "active")
+        # Console access (role/isAdmin) is independent of subscription plan —
+        # this user is Pro *and* an admin; both must be reported.
+        self.assertEqual(user["role"], "admin")
+        self.assertTrue(user["isAdmin"])
         self.assertEqual(client.requests[0]["headers"]["Authorization"], "Bearer service-role")
         self.assertEqual(client.requests[0]["params"]["email"], "collector@example.com")
+
+    def test_repository_lists_users_default_role_when_profile_has_none(self) -> None:
+        client = _FakeAdminUsersClientNoRole()
+        service = AdminUserService(
+            repository=SupabaseAdminUserRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.list_users(query=None, limit=10)
+
+        user = payload["users"][0]
+        self.assertEqual(user["role"], "user")
+        self.assertFalse(user["isAdmin"])
 
     def test_repository_gets_user_detail_with_recent_activity(self) -> None:
         client = _FakeAdminUsersClient()
@@ -286,6 +306,8 @@ class _FakeAdminUsersClient:
                     {
                         "id": "user-1",
                         "display_name": "Collector One",
+                        "role": "admin",
+                        "is_admin": True,
                         "updated_at": "2026-07-29T01:00:00Z",
                     }
                 ]
@@ -355,6 +377,26 @@ class _FakeAdminUsersClient:
                 ]
             )
         raise AssertionError(f"Unexpected URL: {url}")
+
+
+class _FakeAdminUsersClientNoRole(_FakeAdminUsersClient):
+    """Same fixtures as the base fake, but the profile row carries no
+    role/is_admin — the realistic shape for an ordinary collector who has
+    never been granted console access."""
+
+    def request(self, method: str, url: str, **kwargs):
+        if url.endswith("/rest/v1/profiles"):
+            self.requests.append({"method": method, "url": url, **kwargs})
+            return _response(
+                [
+                    {
+                        "id": "user-1",
+                        "display_name": "Collector One",
+                        "updated_at": "2026-07-29T01:00:00Z",
+                    }
+                ]
+            )
+        return super().request(method, url, **kwargs)
 
 
 def _response(payload) -> httpx.Response:

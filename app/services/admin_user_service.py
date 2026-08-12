@@ -223,6 +223,12 @@ class SupabaseAdminUserRepository:
             "pushDeviceCount": device_count,
             "plan": subscription_row.get("plan") or "free",
             "planStatus": subscription_row.get("status") or "active",
+            # Console access (role/isAdmin) is unrelated to the subscription
+            # plan above — an admin can be on any plan. Sourced from the same
+            # profile row already fetched for displayName, so this costs no
+            # extra request.
+            "role": profile.get("role") or "user",
+            "isAdmin": bool(profile.get("is_admin", False)),
             "lastActivityAt": _latest_text(
                 user.get("last_sign_in_at"),
                 profile.get("updated_at"),
