@@ -237,7 +237,35 @@ class SupabaseAdminUserRepository:
                 if normalized_query in str(user.get("id") or "").lower()
                 or normalized_query in str(user.get("email") or "").lower()
             ]
-        return [self._admin_user_from_auth_user(user) for user in raw_users[:limit]], has_more
+        raw_users = raw_users[:limit]
+
+        # Enrich the whole page with 6 batched requests total instead of up
+        # to 6 sequential requests PER user — this is the fix for a 50-user
+        # page previously making ~300 round-trips to Supabase.
+        user_ids = [str(u.get("id")) for u in raw_users if u.get("id")]
+        profiles_by_id = self._batch_profiles_by_id(
+            user_ids, table=settings.admin_profile_table or "profiles", id_column="id",
+        )
+        collector_profiles_by_id = self._batch_profiles_by_id(
+            user_ids, table="collector_profiles", id_column="user_id",
+        )
+        portfolio_counts = self._batch_counts("portfolio_items", user_ids)
+        scan_counts = self._batch_counts("scan_analysis_events", user_ids)
+        device_counts = self._batch_counts("push_device_registrations", user_ids)
+        subscriptions_by_user = self._batch_first_row_by_user("user_subscriptions", user_ids)
+
+        return [
+            self._admin_user_from_auth_user(
+                user,
+                profile=profiles_by_id.get(str(user.get("id")), {}),
+                collector_profile=collector_profiles_by_id.get(str(user.get("id")), {}),
+                portfolio_count=portfolio_counts.get(str(user.get("id")), 0),
+                scan_count=scan_counts.get(str(user.get("id")), 0),
+                device_count=device_counts.get(str(user.get("id")), 0),
+                subscription_row=subscriptions_by_user.get(str(user.get("id")), {}),
+            )
+            for user in raw_users
+        ], has_more
 
     def get_user_detail(self, user_id: str) -> dict[str, Any]:
         auth_user = self._get_auth_user(user_id)
@@ -274,7 +302,17 @@ class SupabaseAdminUserRepository:
             "pushDeliveries": [_compact_push_delivery(row) for row in push_deliveries],
         }
 
-    def _admin_user_from_auth_user(self, user: dict[str, Any]) -> dict[str, Any]:
+    def _admin_user_from_auth_user(
+        self,
+        user: dict[str, Any],
+        *,
+        profile: dict[str, Any] | None = None,
+        collector_profile: dict[str, Any] | None = None,
+        portfolio_count: int | None = None,
+        scan_count: int | None = None,
+        device_count: int | None = None,
+        subscription_row: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         user_id = str(user.get("id") or "")
         email = str(user.get("email") or "")
         # Two distinct profile tables, deliberately queried separately:
@@ -283,13 +321,27 @@ class SupabaseAdminUserRepository:
         # (display name, avatar, country, currency). Reading displayName from
         # `profiles` was a real bug — that table is never populated by the
         # app, so every real collector's name showed blank in admin.
-        profile = self._optional_profile(user_id)
-        collector_profile = self._optional_collector_profile(user_id)
-        portfolio_count = self._optional_count("portfolio_items", user_id)
-        scan_count = self._optional_count("scan_analysis_events", user_id)
-        device_count = self._optional_count("push_device_registrations", user_id)
-        subscription_rows = self._optional_rows("user_subscriptions", user_id, limit=1)
-        subscription_row = subscription_rows[0] if subscription_rows else {}
+        #
+        # Every pre-fetched value below is optional: the single-user detail
+        # path (get_user_detail) calls this with nothing pre-fetched and
+        # falls back to one-off requests, since it's inherently a single
+        # user and there's no N+1 concern there. The list path
+        # (list_users) fetches all of this in one batch per field across
+        # the whole page and passes it in, so a 50-user page load doesn't
+        # turn into ~300 sequential Supabase requests.
+        if profile is None:
+            profile = self._optional_profile(user_id)
+        if collector_profile is None:
+            collector_profile = self._optional_collector_profile(user_id)
+        if portfolio_count is None:
+            portfolio_count = self._optional_count("portfolio_items", user_id)
+        if scan_count is None:
+            scan_count = self._optional_count("scan_analysis_events", user_id)
+        if device_count is None:
+            device_count = self._optional_count("push_device_registrations", user_id)
+        if subscription_row is None:
+            subscription_rows = self._optional_rows("user_subscriptions", user_id, limit=1)
+            subscription_row = subscription_rows[0] if subscription_rows else {}
         return {
             "id": user_id,
             "email": email,
@@ -388,6 +440,83 @@ class SupabaseAdminUserRepository:
         content_range = response.headers.get("content-range", "")
         total = content_range.rsplit("/", 1)[-1] if "/" in content_range else ""
         return int(total) if total.isdigit() else None
+
+    @staticmethod
+    def _in_filter(user_ids: list[str]) -> str:
+        # PostgREST's "in" operator: in.(id1,id2,...). No quoting needed —
+        # UUIDs never contain commas or parentheses.
+        return "in.(" + ",".join(user_ids) + ")"
+
+    def _batch_profiles_by_id(self, user_ids: list[str], *, table: str, id_column: str) -> dict[str, dict[str, Any]]:
+        # One request across the whole page instead of one per user. Used
+        # for both `profiles` (keyed by id) and `collector_profiles` (keyed
+        # by user_id) — same shape, different key column.
+        if not user_ids:
+            return {}
+        try:
+            payload = self._request(
+                "GET",
+                f"/rest/v1/{table}",
+                params={id_column: self._in_filter(user_ids), "select": "*"},
+            )
+        except AdminUserServiceError:
+            return {}
+        if not isinstance(payload, list):
+            return {}
+        return {
+            str(row.get(id_column)): row
+            for row in payload
+            if isinstance(row, dict) and row.get(id_column)
+        }
+
+    def _batch_counts(self, table: str, user_ids: list[str]) -> dict[str, int]:
+        # One request across the whole page — fetches only the user_id
+        # column (not full rows) for every matching row, then counts them
+        # per user in Python. Cheaper than N separate count=exact requests
+        # and cheaper than fetching full rows, at the cost of one response
+        # sized to the page's total row count in that table (still far
+        # smaller than fetching up to 1000 full rows per user).
+        if not user_ids:
+            return {}
+        try:
+            payload = self._request(
+                "GET",
+                f"/rest/v1/{table}",
+                params={"user_id": self._in_filter(user_ids), "select": "user_id", "limit": "10000"},
+            )
+        except AdminUserServiceError:
+            return {}
+        if not isinstance(payload, list):
+            return {}
+        counts: dict[str, int] = {}
+        for row in payload:
+            if isinstance(row, dict) and row.get("user_id"):
+                key = str(row["user_id"])
+                counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def _batch_first_row_by_user(self, table: str, user_ids: list[str]) -> dict[str, dict[str, Any]]:
+        # One request across the whole page, keeping only the first row
+        # seen per user_id (matches the single-user `_optional_rows(...,
+        # limit=1)` semantics this replaces for the list endpoint).
+        if not user_ids:
+            return {}
+        try:
+            payload = self._request(
+                "GET",
+                f"/rest/v1/{table}",
+                params={"user_id": self._in_filter(user_ids), "select": "*"},
+            )
+        except AdminUserServiceError:
+            return {}
+        if not isinstance(payload, list):
+            return {}
+        first_by_user: dict[str, dict[str, Any]] = {}
+        for row in payload:
+            if isinstance(row, dict) and row.get("user_id"):
+                key = str(row["user_id"])
+                first_by_user.setdefault(key, row)
+        return first_by_user
 
     def _optional_rows(self, table: str, user_id: str, *, limit: int) -> list[dict[str, Any]]:
         if not user_id:
