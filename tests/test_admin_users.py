@@ -68,11 +68,13 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(user["role"], "user")
         self.assertFalse(user["isAdmin"])
 
-    def test_counts_use_content_range_header_not_full_row_fetch(self) -> None:
-        # Regression test: _optional_count used to fetch up to 1000 full rows
-        # per table just to call len() on them. It must now ask for a single
-        # row (limit=1) with Prefer: count=exact and read the total off the
-        # Content-Range header instead.
+    def test_list_users_batches_enrichment_across_the_page(self) -> None:
+        # Regression test: the list endpoint used to make ~6 sequential
+        # per-user requests (profile, collector_profile, 3 counts each
+        # fetching up to 1000 full rows, subscription) — a 50-user page was
+        # ~300 round-trips to Supabase. It must now make exactly one batched
+        # request per table across the WHOLE page, using an `in.()` filter
+        # over every user_id, regardless of how many users are on the page.
         client = _FakeAdminUsersClient()
         service = AdminUserService(
             repository=SupabaseAdminUserRepository(
@@ -82,14 +84,43 @@ class AdminUsersTest(unittest.TestCase):
             )
         )
 
-        service.list_users(query="collector@example.com", limit=10)
+        payload = service.list_users(query="collector@example.com", limit=10)
+
+        for table in ("portfolio_items", "scan_analysis_events", "push_device_registrations", "user_subscriptions"):
+            table_requests = [r for r in client.requests if r["url"].endswith(f"/rest/v1/{table}")]
+            self.assertEqual(len(table_requests), 1, f"expected exactly 1 batched request for {table}")
+            self.assertIn("in.(user-1)", table_requests[0]["params"]["user_id"])
+
+        user = payload["users"][0]
+        self.assertEqual(user["portfolioCount"], 2)
+        self.assertEqual(user["scanCount"], 1)
+        self.assertEqual(user["pushDeviceCount"], 1)
+        self.assertEqual(user["plan"], "pro")
+
+    def test_get_user_detail_still_uses_per_user_count_requests(self) -> None:
+        # The single-user detail path has no N+1 concern (there's only one
+        # user), so it keeps the per-user count=exact request rather than
+        # going through the batch path meant for list pages.
+        client = _FakeAdminUsersClient()
+        subscription_service = Mock()
+        subscription_service.get_entitlement.return_value = {"plan": "pro", "status": "active", "source": "mock", "currentPeriodEnd": None}
+        subscription_service.get_scan_usage.return_value = {"used": 0, "limit": 30, "periodStart": "2026-07-01"}
+        service = AdminUserService(
+            repository=SupabaseAdminUserRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            ),
+            subscription_service=subscription_service,
+        )
+
+        service.get_user_detail("user-1")
 
         count_requests = [
             r for r in client.requests
-            if r["url"].endswith("/rest/v1/portfolio_items") and r["method"] == "GET"
+            if r["url"].endswith("/rest/v1/portfolio_items") and r["params"].get("limit") == "1"
         ]
         self.assertEqual(len(count_requests), 1)
-        self.assertEqual(count_requests[0]["params"]["limit"], "1")
         self.assertEqual(count_requests[0]["headers"]["Prefer"], "count=exact")
 
     def test_list_users_reports_has_more_when_page_is_full(self) -> None:
@@ -670,6 +701,7 @@ class _FakeAdminUsersClient:
                 [
                     {
                         "id": "item-1",
+                        "user_id": "user-1",
                         "title": "Healthy Card",
                         "category": "Card",
                         "pricing": {
@@ -680,6 +712,7 @@ class _FakeAdminUsersClient:
                     },
                     {
                         "id": "item-2",
+                        "user_id": "user-1",
                         "title": "Needs Review",
                         "category": "Card",
                         "needs_review": True,
@@ -694,7 +727,7 @@ class _FakeAdminUsersClient:
             )
         if url.endswith("/rest/v1/scan_analysis_events"):
             return _response(
-                [{"id": "scan-1", "status": "failed", "provider": "openai"}],
+                [{"id": "scan-1", "user_id": "user-1", "status": "failed", "provider": "openai"}],
                 headers={"content-range": "0-0/1"},
             )
         if url.endswith("/rest/v1/price_alerts"):
@@ -717,6 +750,7 @@ class _FakeAdminUsersClient:
                 [
                     {
                         "id": "device-1",
+                        "user_id": "user-1",
                         "platform": "ios",
                         "enabled": True,
                         "status": "enabled",
