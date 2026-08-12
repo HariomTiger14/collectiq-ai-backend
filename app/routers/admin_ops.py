@@ -19,6 +19,26 @@ router = APIRouter(prefix="/admin/ops", tags=["Admin Operations"])
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
 
+@router.get("/readiness")
+def ops_readiness(
+    _admin: None = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    # A fast subset of /admin/ops/summary — just the config-readiness
+    # checklist, which is pure in-memory settings inspection (sub-ms).
+    # The full summary also runs PricingHealthService().health(), which
+    # calls a Supabase RPC (pricecharting_catalog_health_summary) that has
+    # been observed taking ~49s in production against the real catalog
+    # tables (known unindexed-aggregation issue, tracked separately — see
+    # A-to-Z doc §7). Callers that only need readiness (e.g. the admin
+    # console's Dashboard, which never reads summary.pricing or
+    # summary.health) should use this endpoint instead of paying that cost.
+    return {
+        "success": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "readiness": _configuration_readiness(),
+    }
+
+
 @router.get("/summary")
 def ops_summary(
     _admin: None = Depends(require_admin_import_token),
