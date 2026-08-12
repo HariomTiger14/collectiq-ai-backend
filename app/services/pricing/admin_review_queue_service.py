@@ -240,16 +240,15 @@ class SupabasePricingReviewQueueRepository:
     def is_configured(self) -> bool:
         return bool(self._supabase_url and self._service_role_key)
 
-    def list_items(self, *, limit: int = 200) -> list[PortfolioItem]:
-        payload = self._request(
-            "GET",
-            f"/rest/v1/{self._table_name}",
-            params={
-                "select": "*",
-                "limit": str(limit),
-                "order": "updated_at.desc.nullslast,created_at.desc.nullslast",
-            },
-        )
+    def list_items(self, *, limit: int = 200, user_id: str | None = None) -> list[PortfolioItem]:
+        params = {
+            "select": "*",
+            "limit": str(limit),
+            "order": "updated_at.desc.nullslast,created_at.desc.nullslast",
+        }
+        if user_id:
+            params["user_id"] = f"eq.{user_id}"
+        payload = self._request("GET", f"/rest/v1/{self._table_name}", params=params)
         if not isinstance(payload, list):
             raise ReviewQueueRepositoryError("Supabase portfolio response shape was invalid.")
         return [

@@ -1,10 +1,14 @@
 import unittest
 from unittest.mock import patch
 
+import httpx
 from fastapi.testclient import TestClient
 
 from app.main import app
 from app.schemas.portfolio import PortfolioCreateRequest
+from app.services.pricing.admin_review_queue_service import (
+    SupabasePricingReviewQueueRepository,
+)
 from app.services.portfolio_service import portfolio_service
 
 
@@ -128,6 +132,45 @@ class AdminPortfolioTest(unittest.TestCase):
         self.assertEqual(item["confidence"], 88)
         self.assertEqual(item["valuationStatus"], "reviewed")
         self.assertEqual(item["adminNotes"], "Verified from admin portal.")
+
+
+    def test_repository_filters_items_by_user_id(self) -> None:
+        # There was previously no way to see all of a specific user's
+        # portfolio items in the admin console — the list endpoint had no
+        # owner filter at all, only a title-text search. This is the
+        # backend half of adding one.
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabasePricingReviewQueueRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.list_items(limit=50, user_id="user-42")
+
+        self.assertEqual(captured["params"]["user_id"], "eq.user-42")
+
+    def test_endpoint_passes_user_id_query_param_through(self) -> None:
+        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+            "app.routers.admin_portfolio.AdminPortfolioService",
+        ) as service:
+            auth_settings.admin_import_token = "secret-token"
+            service.return_value.list_items.return_value = {
+                "success": True, "query": "", "count": 0, "totalCount": 0, "items": [],
+            }
+            response = self.client.get(
+                "/admin/portfolio/items?userId=user-42",
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        service.return_value.list_items.assert_called_once_with(query=None, limit=50, user_id="user-42")
 
 
 if __name__ == "__main__":

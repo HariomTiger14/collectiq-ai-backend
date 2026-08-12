@@ -11,6 +11,13 @@ from app.services.subscription.subscription_service import (
 )
 
 
+# Matches the mobile app's SupabaseCloudProfileSyncService.bucketName default
+# (packlox-mobile-final/lib/core/cloud/supabase/supabase_cloud_profile_sync_service.dart).
+# The bucket is private (the app itself only ever reads via an authenticated
+# .download() call), so admin needs a signed URL rather than a public one.
+AVATAR_STORAGE_BUCKET = "collectiq-portfolio-images"
+
+
 class AdminUserServiceError(Exception):
     """Raised when admin user data cannot be read safely."""
 
@@ -287,10 +294,15 @@ class SupabaseAdminUserRepository:
             or _pricing_value(item) <= 0
         ]
         total_value = sum(_pricing_value(item) for item in portfolio_items)
+        collector_profile = self._optional_collector_profile(user_id)
+        compact_collector_profile = _compact_collector_profile(collector_profile)
+        compact_collector_profile["avatarSignedUrl"] = self._signed_avatar_url(
+            collector_profile.get("avatar_path")
+        )
         return {
             **summary,
             "profile": self._optional_profile(user_id),
-            "collectorProfile": _compact_collector_profile(self._optional_collector_profile(user_id)),
+            "collectorProfile": compact_collector_profile,
             "portfolioValue": round(total_value, 2),
             "recentPortfolioItems": [_compact_portfolio_item(item) for item in portfolio_items],
             "recentScans": [_compact_scan_event(event) for event in scan_events],
@@ -556,6 +568,30 @@ class SupabaseAdminUserRepository:
         if isinstance(payload, list) and payload and isinstance(payload[0], dict):
             return payload[0]
         return {}
+
+    def _signed_avatar_url(self, avatar_path: str | None, *, expires_in: int = 3600) -> str | None:
+        if not avatar_path:
+            return None
+        try:
+            payload = self._request(
+                "POST",
+                f"/storage/v1/object/sign/{AVATAR_STORAGE_BUCKET}/{avatar_path}",
+                json_payload={"expiresIn": expires_in},
+            )
+        except AdminUserServiceError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        signed_path = payload.get("signedURL") or payload.get("signedUrl")
+        if not isinstance(signed_path, str) or not signed_path:
+            return None
+        if signed_path.startswith("http"):
+            return signed_path
+        if not signed_path.startswith("/"):
+            signed_path = "/" + signed_path
+        if signed_path.startswith("/storage"):
+            return f"{self._supabase_url}{signed_path}"
+        return f"{self._supabase_url}/storage/v1{signed_path}"
 
     def _optional_wishlist(self, user_id: str, *, limit: int) -> list[dict[str, Any]]:
         if not user_id:
