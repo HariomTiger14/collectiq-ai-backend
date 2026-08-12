@@ -441,15 +441,16 @@ def delete_user_price_alert(
 def list_admin_users(
     q: str | None = Query(default=None, min_length=1),
     limit: int = Query(50, ge=1, le=100),
+    page: int = Query(1, ge=1),
     _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     action = "admin_users.searched" if q else "admin_users.viewed"
     try:
-        payload = AdminUserService().list_users(query=q, limit=limit)
+        payload = AdminUserService().list_users(query=q, limit=limit, page=page)
         _record_audit(
             action=action,
             status="success",
-            metadata={"query": q or "", "count": payload.get("count", 0)},
+            metadata={"query": q or "", "count": payload.get("count", 0), "page": page},
         )
         return payload
     except AdminUserServiceError as error:
