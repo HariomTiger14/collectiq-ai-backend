@@ -25,14 +25,16 @@ class AdminUserService:
         self._repository = repository or SupabaseAdminUserRepository()
         self._subscription_service = subscription_service or SubscriptionService()
 
-    def list_users(self, *, query: str | None = None, limit: int = 50) -> dict[str, Any]:
+    def list_users(self, *, query: str | None = None, limit: int = 50, page: int = 1) -> dict[str, Any]:
         if not self._repository.is_configured:
             raise AdminUserServiceError("Supabase admin configuration is missing.")
-        users = self._repository.list_users(query=query, limit=limit)
+        users, has_more = self._repository.list_users(query=query, limit=limit, page=page)
         return {
             "success": True,
             "query": query or "",
+            "page": page,
             "count": len(users),
+            "hasMore": has_more,
             "users": users,
         }
 
@@ -213,14 +215,21 @@ class SupabaseAdminUserRepository:
     def is_configured(self) -> bool:
         return bool(self._supabase_url and self._service_role_key)
 
-    def list_users(self, *, query: str | None, limit: int) -> list[dict[str, Any]]:
+    def list_users(self, *, query: str | None, limit: int, page: int = 1) -> tuple[list[dict[str, Any]], bool]:
         normalized_query = (query or "").strip().lower()
-        params = {"per_page": str(limit)}
+        params = {"per_page": str(limit), "page": str(max(1, page))}
         if normalized_query and "@" in normalized_query:
             params["email"] = normalized_query
 
         payload = self._request("GET", "/auth/v1/admin/users", params=params)
         raw_users = _users_from_payload(payload)
+        # GoTrue's admin list-users endpoint doesn't return a total count, so
+        # "has another page" is inferred from getting a full page back — a
+        # partial/empty page means this was the last one. A free-text (non-
+        # email) query only filters within the fetched page, since GoTrue has
+        # no server-side substring search; use `@`-prefixed email search in
+        # the global search bar to reach a specific user beyond page one.
+        has_more = len(raw_users) >= limit
         if normalized_query and "@" not in normalized_query:
             raw_users = [
                 user
@@ -228,7 +237,7 @@ class SupabaseAdminUserRepository:
                 if normalized_query in str(user.get("id") or "").lower()
                 or normalized_query in str(user.get("email") or "").lower()
             ]
-        return [self._admin_user_from_auth_user(user) for user in raw_users[:limit]]
+        return [self._admin_user_from_auth_user(user) for user in raw_users[:limit]], has_more
 
     def get_user_detail(self, user_id: str) -> dict[str, Any]:
         auth_user = self._get_auth_user(user_id)
@@ -360,10 +369,25 @@ class SupabaseAdminUserRepository:
         return {}
 
     def _optional_count(self, table: str, user_id: str) -> int | None:
+        # Uses PostgREST's exact-count header instead of fetching rows to
+        # count them client-side — the old approach pulled up to 1000 full
+        # rows per user just to call len() on the result, which meant a
+        # 50-user list page could trigger hundreds of oversized requests.
         if not user_id:
             return None
-        rows = self._optional_rows(table, user_id, limit=1000)
-        return len(rows) if isinstance(rows, list) else None
+        try:
+            response = self._request(
+                "GET",
+                f"/rest/v1/{table}",
+                params={"user_id": f"eq.{user_id}", "select": "user_id", "limit": "1"},
+                extra_headers={"Prefer": "count=exact"},
+                return_response=True,
+            )
+        except AdminUserServiceError:
+            return None
+        content_range = response.headers.get("content-range", "")
+        total = content_range.rsplit("/", 1)[-1] if "/" in content_range else ""
+        return int(total) if total.isdigit() else None
 
     def _optional_rows(self, table: str, user_id: str, *, limit: int) -> list[dict[str, Any]]:
         if not user_id:
@@ -520,6 +544,7 @@ class SupabaseAdminUserRepository:
         params: dict[str, str] | None = None,
         json_payload: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
+        return_response: bool = False,
     ):
         headers = {
             "apikey": self._service_role_key,
@@ -540,6 +565,8 @@ class SupabaseAdminUserRepository:
                 json=json_payload,
             )
             response.raise_for_status()
+            if return_response:
+                return response
             if not response.content:
                 return None
             return response.json()

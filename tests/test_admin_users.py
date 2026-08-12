@@ -68,6 +68,83 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(user["role"], "user")
         self.assertFalse(user["isAdmin"])
 
+    def test_counts_use_content_range_header_not_full_row_fetch(self) -> None:
+        # Regression test: _optional_count used to fetch up to 1000 full rows
+        # per table just to call len() on them. It must now ask for a single
+        # row (limit=1) with Prefer: count=exact and read the total off the
+        # Content-Range header instead.
+        client = _FakeAdminUsersClient()
+        service = AdminUserService(
+            repository=SupabaseAdminUserRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        service.list_users(query="collector@example.com", limit=10)
+
+        count_requests = [
+            r for r in client.requests
+            if r["url"].endswith("/rest/v1/portfolio_items") and r["method"] == "GET"
+        ]
+        self.assertEqual(len(count_requests), 1)
+        self.assertEqual(count_requests[0]["params"]["limit"], "1")
+        self.assertEqual(count_requests[0]["headers"]["Prefer"], "count=exact")
+
+    def test_list_users_reports_has_more_when_page_is_full(self) -> None:
+        client = _FakeAdminUsersClient()
+        service = AdminUserService(
+            repository=SupabaseAdminUserRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        # The fixture's /auth/v1/admin/users response always returns exactly
+        # one user, so limit=1 makes this page "full" (hasMore) and limit=10
+        # makes it "not full" (last page).
+        full_page = service.list_users(query=None, limit=1, page=1)
+        partial_page = service.list_users(query=None, limit=10, page=1)
+
+        self.assertTrue(full_page["hasMore"])
+        self.assertFalse(partial_page["hasMore"])
+        self.assertEqual(full_page["page"], 1)
+
+    def test_list_users_passes_page_param_to_gotrue(self) -> None:
+        client = _FakeAdminUsersClient()
+        service = AdminUserService(
+            repository=SupabaseAdminUserRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        service.list_users(query=None, limit=25, page=3)
+
+        users_request = next(r for r in client.requests if r["url"].endswith("/auth/v1/admin/users"))
+        self.assertEqual(users_request["params"]["page"], "3")
+        self.assertEqual(users_request["params"]["per_page"], "25")
+
+    def test_users_list_endpoint_accepts_page_query_param(self) -> None:
+        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+            "app.routers.admin_users.AdminUserService",
+        ) as service:
+            auth_settings.admin_import_token = "secret-token"
+            service.return_value.list_users.return_value = {
+                "success": True, "query": "", "page": 2, "count": 0, "hasMore": False, "users": [],
+            }
+            response = self.client.get(
+                "/admin/users?page=2",
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["page"], 2)
+        service.return_value.list_users.assert_called_once_with(query=None, limit=50, page=2)
+
     def test_repository_gets_user_detail_with_recent_activity(self) -> None:
         client = _FakeAdminUsersClient()
         subscription_service = Mock()
@@ -589,31 +666,37 @@ class _FakeAdminUsersClient:
                 ]
             )
         if url.endswith("/rest/v1/portfolio_items"):
-            return _response([
-                {
-                    "id": "item-1",
-                    "title": "Healthy Card",
-                    "category": "Card",
-                    "pricing": {
-                        "estimatedMarketValue": 125.5,
-                        "currency": "USD",
-                        "pricingConfidence": 90,
+            return _response(
+                [
+                    {
+                        "id": "item-1",
+                        "title": "Healthy Card",
+                        "category": "Card",
+                        "pricing": {
+                            "estimatedMarketValue": 125.5,
+                            "currency": "USD",
+                            "pricingConfidence": 90,
+                        },
                     },
-                },
-                {
-                    "id": "item-2",
-                    "title": "Needs Review",
-                    "category": "Card",
-                    "needs_review": True,
-                    "pricing": {
-                        "estimatedMarketValue": 0,
-                        "currency": "USD",
-                        "pricingConfidence": 20,
+                    {
+                        "id": "item-2",
+                        "title": "Needs Review",
+                        "category": "Card",
+                        "needs_review": True,
+                        "pricing": {
+                            "estimatedMarketValue": 0,
+                            "currency": "USD",
+                            "pricingConfidence": 20,
+                        },
                     },
-                },
-            ])
+                ],
+                headers={"content-range": "0-1/2"},
+            )
         if url.endswith("/rest/v1/scan_analysis_events"):
-            return _response([{"id": "scan-1", "status": "failed", "provider": "openai"}])
+            return _response(
+                [{"id": "scan-1", "status": "failed", "provider": "openai"}],
+                headers={"content-range": "0-0/1"},
+            )
         if url.endswith("/rest/v1/price_alerts"):
             return _response(
                 [
@@ -639,7 +722,8 @@ class _FakeAdminUsersClient:
                         "status": "enabled",
                         "last_seen_at": "2026-07-29T00:00:00Z",
                     }
-                ]
+                ],
+                headers={"content-range": "0-0/1"},
             )
         if url.endswith("/rest/v1/user_subscriptions"):
             return _response(
@@ -675,10 +759,11 @@ class _FakeAdminUsersClientNoRole(_FakeAdminUsersClient):
         return super().request(method, url, **kwargs)
 
 
-def _response(payload) -> httpx.Response:
+def _response(payload, headers: dict | None = None) -> httpx.Response:
     return httpx.Response(
         status_code=200,
         json=payload,
+        headers=headers,
         request=httpx.Request("GET", "https://supabase.test"),
     )
 
