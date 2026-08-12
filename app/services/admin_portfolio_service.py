@@ -18,9 +18,9 @@ class AdminPortfolioService:
     ) -> None:
         self._repository = repository or SupabasePricingReviewQueueRepository()
 
-    def list_items(self, *, query: str | None = None, limit: int = 50) -> dict[str, Any]:
+    def list_items(self, *, query: str | None = None, limit: int = 50, user_id: str | None = None) -> dict[str, Any]:
         items = (
-            self._repository.list_items(limit=max(limit, 200))
+            self._repository.list_items(limit=max(limit, 200), user_id=user_id)
             if self._repository.is_configured
             else portfolio_service.list_items()
         )

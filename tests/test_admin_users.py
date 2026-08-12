@@ -220,6 +220,12 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(user["collectorProfile"]["displayName"], "Collector One")
         self.assertEqual(user["collectorProfile"]["countryCode"], "AU")
         self.assertEqual(user["collectorProfile"]["preferredCurrency"], "AUD")
+        # The avatar bucket is private — admin needs a signed URL, not the
+        # raw storage path, to actually display the user's photo.
+        self.assertEqual(
+            user["collectorProfile"]["avatarSignedUrl"],
+            "https://supabase.test/storage/v1/object/sign/collectiq-portfolio-images/users/user-1/profile/avatar.jpg?token=fake-signed-token",
+        )
         self.assertEqual(len(user["wishlistEntries"]), 1)
         self.assertEqual(user["wishlistEntries"][0]["status"], "wanted")
         self.assertEqual(len(user["valuationHistory"]), 1)
@@ -601,6 +607,8 @@ class _FakeAdminUsersClient:
 
     def request(self, method: str, url: str, **kwargs):
         self.requests.append({"method": method, "url": url, **kwargs})
+        if "/storage/v1/object/sign/" in url:
+            return _response({"signedURL": "/object/sign/collectiq-portfolio-images/users/user-1/profile/avatar.jpg?token=fake-signed-token"})
         if url.endswith("/auth/v1/admin/users/user-1"):
             return _response(
                 {
