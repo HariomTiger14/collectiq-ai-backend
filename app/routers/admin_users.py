@@ -28,6 +28,24 @@ class AdminSubscriptionOverrideRequest(BaseModel):
     plan: str = Field(pattern="^(free|pro|premium)$")
 
 
+class CollectorProfileUpdateRequest(BaseModel):
+    displayName: str | None = Field(default=None, max_length=200)
+    countryCode: str | None = Field(default=None, max_length=8)
+    preferredCurrency: str | None = Field(default=None, max_length=8)
+
+
+class WishlistEntryUpdateRequest(BaseModel):
+    status: str = Field(pattern="^(owned|wanted|missing)$")
+
+
+class PriceAlertUpdateRequest(BaseModel):
+    enabled: bool | None = None
+    status: str | None = Field(default=None, pattern="^(active|triggered|notified|paused)$")
+    targetAmount: float | None = None
+    percentage: float | None = None
+    message: str | None = Field(default=None, max_length=500)
+
+
 @router.get("/subscription-summary")
 def get_admin_subscription_summary(
     _admin: dict[str, Any] = Depends(require_admin_import_token),
@@ -237,6 +255,182 @@ def reset_user_scan_usage(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
                 "code": "admin_scan_usage_reset_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+
+
+@router.patch("/{user_id}/collector-profile")
+def update_user_collector_profile(
+    user_id: str,
+    request: CollectorProfileUpdateRequest,
+    admin: dict[str, Any] = Depends(require_admin_permission("users:write")),
+) -> dict[str, Any]:
+    try:
+        payload = AdminUserService().update_collector_profile(
+            user_id=user_id,
+            display_name=request.displayName,
+            country_code=request.countryCode,
+            preferred_currency=request.preferredCurrency,
+        )
+        _record_audit(
+            action="admin_users.collector_profile_updated",
+            status="success",
+            target_id=user_id,
+            metadata=request.model_dump(exclude_none=True),
+        )
+        return payload
+    except AdminUserServiceError as error:
+        _record_audit(
+            action="admin_users.collector_profile_updated",
+            status="failure",
+            target_id=user_id,
+            metadata={"error": str(error)},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_collector_profile_update_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+
+
+@router.patch("/{user_id}/wishlist/{item_id}")
+def update_user_wishlist_entry(
+    user_id: str,
+    item_id: str,
+    request: WishlistEntryUpdateRequest,
+    admin: dict[str, Any] = Depends(require_admin_permission("users:write")),
+) -> dict[str, Any]:
+    try:
+        payload = AdminUserService().update_wishlist_entry(
+            user_id=user_id, item_id=item_id, status=request.status
+        )
+        _record_audit(
+            action="admin_users.wishlist_entry_updated",
+            status="success",
+            target_id=user_id,
+            metadata={"itemId": item_id, "status": request.status},
+        )
+        return payload
+    except AdminUserServiceError as error:
+        _record_audit(
+            action="admin_users.wishlist_entry_updated",
+            status="failure",
+            target_id=user_id,
+            metadata={"itemId": item_id, "error": str(error)},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_wishlist_update_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+
+
+@router.delete("/{user_id}/wishlist/{item_id}")
+def delete_user_wishlist_entry(
+    user_id: str,
+    item_id: str,
+    admin: dict[str, Any] = Depends(require_admin_permission("users:write")),
+) -> dict[str, Any]:
+    try:
+        payload = AdminUserService().delete_wishlist_entry(user_id=user_id, item_id=item_id)
+        _record_audit(
+            action="admin_users.wishlist_entry_deleted",
+            status="success",
+            target_id=user_id,
+            metadata={"itemId": item_id},
+        )
+        return payload
+    except AdminUserServiceError as error:
+        _record_audit(
+            action="admin_users.wishlist_entry_deleted",
+            status="failure",
+            target_id=user_id,
+            metadata={"itemId": item_id, "error": str(error)},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_wishlist_delete_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+
+
+@router.patch("/{user_id}/price-alerts/{alert_id}")
+def update_user_price_alert(
+    user_id: str,
+    alert_id: str,
+    request: PriceAlertUpdateRequest,
+    admin: dict[str, Any] = Depends(require_admin_permission("users:write")),
+) -> dict[str, Any]:
+    fields = {
+        "enabled": request.enabled,
+        "status": request.status,
+        "target_amount": request.targetAmount,
+        "percentage": request.percentage,
+        "message": request.message,
+    }
+    try:
+        payload = AdminUserService().update_price_alert(user_id=user_id, alert_id=alert_id, fields=fields)
+        _record_audit(
+            action="admin_users.price_alert_updated",
+            status="success",
+            target_id=user_id,
+            metadata={"alertId": alert_id, **request.model_dump(exclude_none=True)},
+        )
+        return payload
+    except AdminUserServiceError as error:
+        _record_audit(
+            action="admin_users.price_alert_updated",
+            status="failure",
+            target_id=user_id,
+            metadata={"alertId": alert_id, "error": str(error)},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_price_alert_update_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+
+
+@router.delete("/{user_id}/price-alerts/{alert_id}")
+def delete_user_price_alert(
+    user_id: str,
+    alert_id: str,
+    admin: dict[str, Any] = Depends(require_admin_permission("users:write")),
+) -> dict[str, Any]:
+    try:
+        payload = AdminUserService().delete_price_alert(user_id=user_id, alert_id=alert_id)
+        _record_audit(
+            action="admin_users.price_alert_deleted",
+            status="success",
+            target_id=user_id,
+            metadata={"alertId": alert_id},
+        )
+        return payload
+    except AdminUserServiceError as error:
+        _record_audit(
+            action="admin_users.price_alert_deleted",
+            status="failure",
+            target_id=user_id,
+            metadata={"alertId": alert_id, "error": str(error)},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_price_alert_delete_unavailable",
                 "message": str(error),
                 "retryable": True,
             },

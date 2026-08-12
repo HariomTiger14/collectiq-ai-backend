@@ -47,6 +47,63 @@ class AdminUserService:
             "user": user,
         }
 
+    def update_collector_profile(
+        self,
+        *,
+        user_id: str,
+        display_name: str | None = None,
+        country_code: str | None = None,
+        preferred_currency: str | None = None,
+    ) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminUserServiceError("Supabase admin configuration is missing.")
+        fields: dict[str, Any] = {}
+        if display_name is not None:
+            fields["display_name"] = display_name
+        if country_code is not None:
+            fields["country_code"] = country_code
+        if preferred_currency is not None:
+            fields["preferred_currency"] = preferred_currency
+        if not fields:
+            raise AdminUserServiceError("No editable profile fields were supplied.")
+        profile = self._repository.update_collector_profile(user_id=user_id, fields=fields)
+        return {"success": True, "userId": user_id, "collectorProfile": _compact_collector_profile(profile)}
+
+    def update_wishlist_entry(self, *, user_id: str, item_id: str, status: str) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminUserServiceError("Supabase admin configuration is missing.")
+        entry = self._repository.update_wishlist_entry(user_id=user_id, item_id=item_id, status=status)
+        return {"success": True, "userId": user_id, "itemId": item_id, "entry": _compact_wishlist_entry(entry)}
+
+    def delete_wishlist_entry(self, *, user_id: str, item_id: str) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminUserServiceError("Supabase admin configuration is missing.")
+        # Soft delete, matching the app's own delete semantics for this table
+        # (see collector_wishlist_entries: `deleted` flag, never a hard DELETE)
+        # so a stray sync from the device can't resurrect the entry.
+        self._repository.delete_wishlist_entry(user_id=user_id, item_id=item_id)
+        return {"success": True, "userId": user_id, "itemId": item_id, "deleted": True}
+
+    def update_price_alert(self, *, user_id: str, alert_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminUserServiceError("Supabase admin configuration is missing.")
+        allowed = {"enabled", "status", "target_amount", "percentage", "message"}
+        payload = {k: v for k, v in fields.items() if k in allowed and v is not None}
+        if not payload:
+            raise AdminUserServiceError("No editable alert fields were supplied.")
+        alert = self._repository.update_price_alert(user_id=user_id, alert_id=alert_id, fields=payload)
+        return {"success": True, "userId": user_id, "alertId": alert_id, "alert": _compact_price_alert(alert)}
+
+    def delete_price_alert(self, *, user_id: str, alert_id: str) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminUserServiceError("Supabase admin configuration is missing.")
+        # Soft delete, matching the app's own delete semantics for this table
+        # (status='paused', enabled=false) rather than a hard DELETE.
+        self._repository.update_price_alert(
+            user_id=user_id, alert_id=alert_id, fields={"status": "paused", "enabled": False}
+        )
+        return {"success": True, "userId": user_id, "alertId": alert_id, "deleted": True}
+
     def override_subscription(self, *, user_id: str, plan: str) -> dict[str, Any]:
         if not self._repository.is_configured:
             raise AdminUserServiceError("Supabase admin configuration is missing.")
@@ -182,6 +239,9 @@ class SupabaseAdminUserRepository:
         scan_events = self._optional_rows("scan_analysis_events", user_id, limit=10)
         price_alerts = self._optional_rows("price_alerts", user_id, limit=20)
         push_devices = self._optional_rows("push_device_registrations", user_id, limit=20)
+        wishlist_entries = self._optional_wishlist(user_id, limit=20)
+        valuation_history = self._optional_valuation_history(user_id, limit=30)
+        push_deliveries = self._optional_push_deliveries(user_id, limit=10)
         pricing_review_items = [
             item
             for item in portfolio_items
@@ -193,18 +253,29 @@ class SupabaseAdminUserRepository:
         return {
             **summary,
             "profile": self._optional_profile(user_id),
+            "collectorProfile": _compact_collector_profile(self._optional_collector_profile(user_id)),
             "portfolioValue": round(total_value, 2),
             "recentPortfolioItems": [_compact_portfolio_item(item) for item in portfolio_items],
             "recentScans": [_compact_scan_event(event) for event in scan_events],
             "pricingReviewItems": [_compact_portfolio_item(item) for item in pricing_review_items[:10]],
             "priceAlerts": [_compact_price_alert(alert) for alert in price_alerts],
             "pushDevices": [_compact_push_device(device) for device in push_devices],
+            "wishlistEntries": [_compact_wishlist_entry(entry) for entry in wishlist_entries],
+            "valuationHistory": [_compact_valuation_snapshot(row) for row in valuation_history],
+            "pushDeliveries": [_compact_push_delivery(row) for row in push_deliveries],
         }
 
     def _admin_user_from_auth_user(self, user: dict[str, Any]) -> dict[str, Any]:
         user_id = str(user.get("id") or "")
         email = str(user.get("email") or "")
+        # Two distinct profile tables, deliberately queried separately:
+        # `profiles` (admin_profile_table) holds console role/is_admin only;
+        # `collector_profiles` is what the mobile app actually writes
+        # (display name, avatar, country, currency). Reading displayName from
+        # `profiles` was a real bug — that table is never populated by the
+        # app, so every real collector's name showed blank in admin.
         profile = self._optional_profile(user_id)
+        collector_profile = self._optional_collector_profile(user_id)
         portfolio_count = self._optional_count("portfolio_items", user_id)
         scan_count = self._optional_count("scan_analysis_events", user_id)
         device_count = self._optional_count("push_device_registrations", user_id)
@@ -217,7 +288,7 @@ class SupabaseAdminUserRepository:
             "lastSignInAt": user.get("last_sign_in_at"),
             "emailConfirmedAt": user.get("email_confirmed_at") or user.get("confirmed_at"),
             "authStatus": _auth_status(user),
-            "displayName": profile.get("display_name") or profile.get("name") or "",
+            "displayName": collector_profile.get("display_name") or "",
             "portfolioCount": portfolio_count,
             "scanCount": scan_count,
             "pushDeviceCount": device_count,
@@ -231,8 +302,7 @@ class SupabaseAdminUserRepository:
             "isAdmin": bool(profile.get("is_admin", False)),
             "lastActivityAt": _latest_text(
                 user.get("last_sign_in_at"),
-                profile.get("updated_at"),
-                profile.get("last_seen_at"),
+                collector_profile.get("updated_at"),
             ),
         }
 
@@ -314,6 +384,133 @@ class SupabaseAdminUserRepository:
         if not isinstance(payload, list):
             return []
         return [row for row in payload if isinstance(row, dict)]
+
+    def _optional_collector_profile(self, user_id: str) -> dict[str, Any]:
+        # collector_profiles is the table the mobile app actually writes
+        # (display name, avatar, country, currency) — distinct from the
+        # admin_profile_table (`profiles`) used for console role/is_admin.
+        # Its primary key is `user_id`, not `id`.
+        if not user_id:
+            return {}
+        try:
+            payload = self._request(
+                "GET",
+                "/rest/v1/collector_profiles",
+                params={"user_id": f"eq.{user_id}", "select": "*", "limit": "1"},
+            )
+        except AdminUserServiceError:
+            return {}
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            return payload[0]
+        return {}
+
+    def _optional_wishlist(self, user_id: str, *, limit: int) -> list[dict[str, Any]]:
+        if not user_id:
+            return []
+        try:
+            payload = self._request(
+                "GET",
+                "/rest/v1/collector_wishlist_entries",
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "deleted": "eq.false",
+                    "select": "*",
+                    "limit": str(limit),
+                    "order": "updated_at.desc.nullslast",
+                },
+            )
+        except AdminUserServiceError:
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [row for row in payload if isinstance(row, dict)]
+
+    def _optional_valuation_history(self, user_id: str, *, limit: int) -> list[dict[str, Any]]:
+        if not user_id:
+            return []
+        try:
+            payload = self._request(
+                "GET",
+                "/rest/v1/portfolio_valuation_snapshots",
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "select": "*",
+                    "limit": str(limit),
+                    "order": "priced_at.desc",
+                },
+            )
+        except AdminUserServiceError:
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [row for row in payload if isinstance(row, dict)]
+
+    def _optional_push_deliveries(self, user_id: str, *, limit: int) -> list[dict[str, Any]]:
+        if not user_id:
+            return []
+        try:
+            payload = self._request(
+                "GET",
+                "/rest/v1/push_notification_deliveries",
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "select": "*",
+                    "limit": str(limit),
+                    "order": "created_at.desc",
+                },
+            )
+        except AdminUserServiceError:
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [row for row in payload if isinstance(row, dict)]
+
+    def update_collector_profile(self, *, user_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        payload = self._request(
+            "PATCH",
+            "/rest/v1/collector_profiles",
+            params={"user_id": f"eq.{user_id}", "select": "*"},
+            json_payload=fields,
+            extra_headers={"Prefer": "return=representation"},
+        )
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            return payload[0]
+        raise AdminUserServiceError("Supabase collector profile update response shape was invalid.")
+
+    def update_wishlist_entry(self, *, user_id: str, item_id: str, status: str) -> dict[str, Any]:
+        payload = self._request(
+            "PATCH",
+            "/rest/v1/collector_wishlist_entries",
+            params={"user_id": f"eq.{user_id}", "portfolio_item_id": f"eq.{item_id}", "select": "*"},
+            json_payload={"status": status},
+            extra_headers={"Prefer": "return=representation"},
+        )
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            return payload[0]
+        raise AdminUserServiceError(f"Wishlist entry {item_id} was not found for this user.")
+
+    def delete_wishlist_entry(self, *, user_id: str, item_id: str) -> None:
+        payload = self._request(
+            "PATCH",
+            "/rest/v1/collector_wishlist_entries",
+            params={"user_id": f"eq.{user_id}", "portfolio_item_id": f"eq.{item_id}", "select": "*"},
+            json_payload={"deleted": True},
+            extra_headers={"Prefer": "return=representation"},
+        )
+        if not (isinstance(payload, list) and payload):
+            raise AdminUserServiceError(f"Wishlist entry {item_id} was not found for this user.")
+
+    def update_price_alert(self, *, user_id: str, alert_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        payload = self._request(
+            "PATCH",
+            "/rest/v1/price_alerts",
+            params={"user_id": f"eq.{user_id}", "id": f"eq.{alert_id}", "select": "*"},
+            json_payload=fields,
+            extra_headers={"Prefer": "return=representation"},
+        )
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            return payload[0]
+        raise AdminUserServiceError(f"Price alert {alert_id} was not found for this user.")
 
     def _request(
         self,
@@ -437,6 +634,52 @@ def _compact_push_device(row: dict[str, Any]) -> dict[str, Any]:
         "status": row.get("status") or ("enabled" if row.get("enabled") else "disabled"),
         "lastSeenAt": row.get("last_seen_at"),
         "updatedAt": row.get("updated_at"),
+    }
+
+
+def _compact_collector_profile(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "displayName": row.get("display_name") or "",
+        "avatarPath": row.get("avatar_path"),
+        "countryCode": row.get("country_code"),
+        "preferredCurrency": row.get("preferred_currency"),
+        "updatedAt": row.get("updated_at"),
+    }
+
+
+def _compact_wishlist_entry(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "portfolioItemId": row.get("portfolio_item_id"),
+        "title": row.get("title") or "Item",
+        "category": row.get("category") or "Unknown",
+        "status": row.get("status") or "owned",
+        "updatedAt": row.get("updated_at"),
+    }
+
+
+def _compact_valuation_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "portfolioItemId": row.get("portfolio_item_id"),
+        "valueAud": row.get("value_aud"),
+        "displayString": row.get("display_string"),
+        "valuationStatus": row.get("valuation_status"),
+        "valuationStrategy": row.get("valuation_strategy"),
+        "pricedAt": row.get("priced_at"),
+    }
+
+
+def _compact_push_delivery(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "priceAlertId": row.get("price_alert_id"),
+        "portfolioItemId": row.get("portfolio_item_id"),
+        "title": row.get("title") or "Notification",
+        "body": row.get("body"),
+        "status": row.get("status") or "unknown",
+        "errorMessage": row.get("error_message"),
+        "sentAt": row.get("sent_at"),
+        "createdAt": row.get("created_at"),
     }
 
 
