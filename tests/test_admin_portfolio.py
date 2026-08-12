@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.schemas.portfolio import PortfolioCreateRequest
 from app.services.pricing.admin_review_queue_service import (
+    ReviewQueueRepositoryError,
     SupabasePricingReviewQueueRepository,
 )
 from app.services.portfolio_service import portfolio_service
@@ -157,6 +158,7 @@ class AdminPortfolioTest(unittest.TestCase):
         self.assertEqual(captured["params"]["user_id"], "eq.user-42")
 
     def test_endpoint_passes_user_id_query_param_through(self) -> None:
+        user_id = "372c586d-4658-4144-8969-e450322e622d"
         with patch("app.routers.admin_auth.settings") as auth_settings, patch(
             "app.routers.admin_portfolio.AdminPortfolioService",
         ) as service:
@@ -165,12 +167,44 @@ class AdminPortfolioTest(unittest.TestCase):
                 "success": True, "query": "", "count": 0, "totalCount": 0, "items": [],
             }
             response = self.client.get(
-                "/admin/portfolio/items?userId=user-42",
+                f"/admin/portfolio/items?userId={user_id}",
                 headers={"Authorization": "Bearer secret-token"},
             )
 
         self.assertEqual(response.status_code, 200)
-        service.return_value.list_items.assert_called_once_with(query=None, limit=50, user_id="user-42")
+        service.return_value.list_items.assert_called_once_with(query=None, limit=50, user_id=user_id)
+
+    def test_endpoint_rejects_non_uuid_user_id_with_a_clean_422(self) -> None:
+        # Regression test: Supabase/PostgREST rejects a non-UUID `eq.`
+        # filter on the user_id column with its own 500, which used to
+        # surface here as an unhandled crash instead of a clean error.
+        # Verified live against production before this fix landed.
+        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+            "app.routers.admin_portfolio.AdminPortfolioService",
+        ) as service:
+            auth_settings.admin_import_token = "secret-token"
+            response = self.client.get(
+                "/admin/portfolio/items?userId=totally-fake-user-id-xyz",
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "invalid_user_id")
+        service.return_value.list_items.assert_not_called()
+
+    def test_endpoint_returns_503_when_repository_fails(self) -> None:
+        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+            "app.routers.admin_portfolio.AdminPortfolioService",
+        ) as service:
+            auth_settings.admin_import_token = "secret-token"
+            service.return_value.list_items.side_effect = ReviewQueueRepositoryError("Supabase request failed.")
+            response = self.client.get(
+                "/admin/portfolio/items",
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "admin_portfolio_items_unavailable")
 
 
 if __name__ == "__main__":
