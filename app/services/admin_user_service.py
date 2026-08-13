@@ -811,6 +811,7 @@ def _compact_price_alert(row: dict[str, Any]) -> dict[str, Any]:
         "portfolioItemId": row.get("portfolio_item_id"),
         "ruleType": row.get("rule_type"),
         "targetAmount": row.get("target_amount"),
+        "percentage": row.get("percentage"),
         "enabled": bool(row.get("enabled")),
         "status": row.get("status") or "unknown",
         "triggeredAt": row.get("triggered_at"),

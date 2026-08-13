@@ -6,7 +6,11 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.services.admin_audit_service import clear_in_memory_audit_events
-from app.services.admin_user_service import AdminUserService, SupabaseAdminUserRepository
+from app.services.admin_user_service import (
+    AdminUserService,
+    SupabaseAdminUserRepository,
+    _compact_price_alert,
+)
 
 
 class AdminUsersTest(unittest.TestCase):
@@ -232,6 +236,26 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(user["valuationHistory"][0]["valueAud"], 125.5)
         self.assertEqual(len(user["pushDeliveries"]), 1)
         self.assertEqual(user["pushDeliveries"][0]["status"], "sent")
+
+    def test_compact_price_alert_includes_percentage(self) -> None:
+        # Regression test: percentage-rule alerts (e.g. "notify me on a 10%
+        # rise") showed a blank % field on the admin user-detail page even
+        # though the value was saved — _compact_price_alert dropped the
+        # `percentage` column while still returning `targetAmount`, so
+        # amount-rule alerts looked fine and percentage-rule alerts didn't.
+        alert = _compact_price_alert(
+            {
+                "id": "alert-2",
+                "item_title": "Air Force 1",
+                "rule_type": "percentageIncrease",
+                "target_amount": None,
+                "percentage": 10,
+                "enabled": True,
+                "status": "active",
+            }
+        )
+
+        self.assertEqual(alert["percentage"], 10)
 
     def test_override_subscription_delegates_to_subscription_service(self) -> None:
         subscription_service = Mock()
@@ -747,6 +771,7 @@ class _FakeAdminUsersClient:
                         "portfolio_item_id": "item-1",
                         "rule_type": "priceRisesAboveAmount",
                         "target_amount": 500,
+                        "percentage": None,
                         "enabled": True,
                         "status": "active",
                         "updated_at": "2026-07-29T00:00:00Z",
