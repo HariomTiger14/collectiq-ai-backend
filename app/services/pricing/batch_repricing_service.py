@@ -46,6 +46,7 @@ from app.services.pricing.currency_conversion import _exchange_rate
 from app.services.pricing.reprice_service import (
     RepriceService,
     RepriceValidationError,
+    _display_string,
 )
 
 
@@ -217,7 +218,7 @@ class BatchRepricingService:
             lowEstimate=low,
             highEstimate=high,
             currency=display_currency,
-            displayString=f"{display_currency} {value}" if available else None,
+            displayString=_display_string(value, display_currency) if available else None,
             confidenceScore=result.confidence,
             pricingConfidence=round(result.confidence * 100),
             valuationStrategy="catalog_lookup",
