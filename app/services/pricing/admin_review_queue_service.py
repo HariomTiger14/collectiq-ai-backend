@@ -282,6 +282,20 @@ class SupabasePricingReviewQueueRepository:
             if isinstance(row, dict) and row.get("user_id") and row.get("display_name")
         }
 
+    # Supabase Auth (GoTrue) has no bulk-by-ids admin lookup — only a single-
+    # user GET. Callers should only use this for owners that batch_owner_
+    # display_names() didn't already cover, and should cap how many distinct
+    # owners they're willing to look up this way per page.
+    def get_user_email(self, user_id: str) -> str | None:
+        try:
+            payload = self._request("GET", f"/auth/v1/admin/users/{user_id}")
+        except ReviewQueueRepositoryError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        email = payload.get("email")
+        return str(email) if email else None
+
     def get_item(self, item_id: str) -> PortfolioItem | None:
         payload = self._request(
             "GET",

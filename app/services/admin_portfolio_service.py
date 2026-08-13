@@ -9,6 +9,10 @@ from app.services.pricing.admin_review_queue_service import (
     SupabasePricingReviewQueueRepository,
 )
 
+# Caps the per-request fan-out of single-user Supabase Auth lookups used to
+# fill in an email for owners with no collector_profiles display name.
+_MAX_OWNER_EMAIL_LOOKUPS = 20
+
 
 class AdminPortfolioService:
     def __init__(
@@ -36,6 +40,16 @@ class AdminPortfolioService:
         if self._repository.is_configured:
             owner_ids = [str(item.data.get("userId")) for item in limited if item.data.get("userId")]
             owner_names = self._repository.batch_owner_display_names(owner_ids)
+            # Not every user sets a display name. For the (usually small)
+            # remainder, fall back to their real email — one request per
+            # distinct owner, since Supabase Auth has no bulk-by-ids lookup.
+            # Capped so a page full of strangers can't turn into an
+            # unbounded fan-out of admin API calls.
+            missing_ids = list(dict.fromkeys(oid for oid in owner_ids if oid not in owner_names))
+            for owner_id in missing_ids[:_MAX_OWNER_EMAIL_LOOKUPS]:
+                email = self._repository.get_user_email(owner_id)
+                if email:
+                    owner_names[owner_id] = email
         return {
             "success": True,
             "query": query or "",
