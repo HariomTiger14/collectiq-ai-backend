@@ -257,6 +257,31 @@ class SupabasePricingReviewQueueRepository:
             if isinstance(row, dict) and (item := _portfolio_item_from_row(row)) is not None
         ]
 
+    def batch_owner_display_names(self, user_ids: list[str]) -> dict[str, str]:
+        # One request across every distinct owner on the page, not one per
+        # item — the same batching approach used for the admin users list.
+        # collector_profiles has no email column (email lives only in
+        # Supabase Auth, with no efficient bulk-by-id lookup), so this uses
+        # display_name as the human-readable "Owner" value instead.
+        ids = [uid for uid in dict.fromkeys(user_ids) if uid]
+        if not ids:
+            return {}
+        try:
+            payload = self._request(
+                "GET",
+                "/rest/v1/collector_profiles",
+                params={"user_id": "in.(" + ",".join(ids) + ")", "select": "user_id,display_name"},
+            )
+        except ReviewQueueRepositoryError:
+            return {}
+        if not isinstance(payload, list):
+            return {}
+        return {
+            str(row["user_id"]): str(row["display_name"])
+            for row in payload
+            if isinstance(row, dict) and row.get("user_id") and row.get("display_name")
+        }
+
     def get_item(self, item_id: str) -> PortfolioItem | None:
         payload = self._request(
             "GET",
@@ -444,6 +469,7 @@ def _portfolio_item_from_row(row: dict[str, Any]) -> PortfolioItem | None:
             for key, value in {
                 "title": _first_value(row, "title", "item_name", "name"),
                 "itemName": _first_value(row, "item_name"),
+                "userId": _first_value(row, "user_id", "owner_id"),
                 "category": _first_value(row, "category", "item_category"),
                 "condition": _first_value(row, "condition"),
                 "brand": _first_value(row, "brand"),
