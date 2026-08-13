@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.schemas.portfolio import PortfolioCreateRequest
+from app.services.admin_portfolio_service import AdminPortfolioService
 from app.services.pricing.admin_review_queue_service import (
     SupabasePricingReviewQueueRepository,
 )
@@ -194,6 +195,91 @@ class AdminPortfolioTest(unittest.TestCase):
         repository.list_items(limit=50, user_id="user-42")
 
         self.assertEqual(captured["params"]["user_id"], "eq.user-42")
+
+    def test_repository_row_parsing_includes_user_id(self) -> None:
+        # Regression test: _portfolio_item_from_row copied over title,
+        # category, condition, etc. from the raw Supabase row but forgot
+        # user_id — so every item's "owner" showed the literal string
+        # "Unknown" instead of the real (filterable) user_id, even though
+        # the column itself was always there and correctly used for
+        # filtering (test above).
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "item-1",
+                        "user_id": "user-42",
+                        "title": "Charizard",
+                        "category": "Trading Card",
+                    }
+                ],
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabasePricingReviewQueueRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        items = repository.list_items(limit=50)
+
+        self.assertEqual(items[0].data["userId"], "user-42")
+
+    def test_repository_batches_owner_display_names(self) -> None:
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(
+                200,
+                json=[
+                    {"user_id": "user-1", "display_name": "Collector One"},
+                    {"user_id": "user-2", "display_name": ""},  # no display name set — dropped
+                ],
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabasePricingReviewQueueRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        names = repository.batch_owner_display_names(["user-1", "user-2", "user-1"])  # dupes collapsed
+
+        self.assertEqual(captured["params"]["user_id"], "in.(user-1,user-2)")
+        self.assertEqual(names, {"user-1": "Collector One"})
+
+    def test_list_items_fills_owner_field_with_display_name(self) -> None:
+        # End-to-end: a real Supabase-backed list_items() call should show
+        # a human-readable owner instead of "Unknown" once both fixes above
+        # are wired together.
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/rest/v1/portfolio_items"):
+                return httpx.Response(
+                    200,
+                    json=[{"id": "item-1", "user_id": "user-42", "title": "Charizard", "category": "Trading Card"}],
+                )
+            if request.url.path.endswith("/rest/v1/collector_profiles"):
+                return httpx.Response(200, json=[{"user_id": "user-42", "display_name": "Jordan T."}])
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        service = AdminPortfolioService(
+            repository=SupabasePricingReviewQueueRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.list_items(limit=50)
+
+        item = payload["items"][0]
+        self.assertEqual(item["userId"], "user-42")
+        self.assertEqual(item["ownerEmail"], "Jordan T.")
 
     def test_endpoint_passes_user_id_query_param_through(self) -> None:
         with patch("app.routers.admin_auth.settings") as auth_settings, patch(

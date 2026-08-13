@@ -32,12 +32,19 @@ class AdminPortfolioService:
                 if normalized_query in _portfolio_search_text(item)
             ]
         limited = items[:limit]
+        owner_names: dict[str, str] = {}
+        if self._repository.is_configured:
+            owner_ids = [str(item.data.get("userId")) for item in limited if item.data.get("userId")]
+            owner_names = self._repository.batch_owner_display_names(owner_ids)
         return {
             "success": True,
             "query": query or "",
             "count": len(limited),
             "totalCount": len(items),
-            "items": [_compact_portfolio_item(item) for item in limited],
+            "items": [
+                _compact_portfolio_item(item, owner_display_name=owner_names.get(str(item.data.get("userId"))))
+                for item in limited
+            ],
         }
 
     def get_item(self, item_id: str) -> dict[str, Any]:
@@ -103,7 +110,9 @@ def _portfolio_search_text(item: PortfolioItem) -> str:
     return " ".join(str(value) for value in values if value).lower()
 
 
-def _compact_portfolio_item(item: PortfolioItem, *, include_raw: bool = False) -> dict[str, Any]:
+def _compact_portfolio_item(
+    item: PortfolioItem, *, include_raw: bool = False, owner_display_name: str | None = None,
+) -> dict[str, Any]:
     data = item.data
     pricing = data.get("pricing") if isinstance(data.get("pricing"), dict) else {}
     value = _first_value(data, pricing, "estimatedValue", "estimatedMarketValue", "marketValue", "price")
@@ -113,7 +122,11 @@ def _compact_portfolio_item(item: PortfolioItem, *, include_raw: bool = False) -
         "category": _first_text(data, "category", "type") or "Unknown",
         "condition": _first_text(data, "condition") or "Unknown",
         "userId": _first_text(data, "userId", "ownerId", "user_id", "owner_id") or "Unknown",
-        "ownerEmail": _first_text(data, "ownerEmail", "email"),
+        # There's no email column on this table (email lives only in
+        # Supabase Auth) — ownerEmail is really "owner display name" when
+        # sourced from collector_profiles, kept under its original field
+        # name so the frontend doesn't need to change.
+        "ownerEmail": owner_display_name or _first_text(data, "ownerEmail", "email"),
         "price": value,
         "currency": _first_text(data, pricing, "currency", "displayCurrency") or "USD",
         "provider": _provider_name(pricing),
