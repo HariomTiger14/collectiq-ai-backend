@@ -113,11 +113,6 @@ class AdminPortfolioTest(unittest.TestCase):
                     "category": "Sneakers",
                     "condition": "Near Mint",
                     "adminNotes": "Verified from admin portal.",
-                    "valuationStatus": "reviewed",
-                    "price": 212.5,
-                    "currency": "AUD",
-                    "confidence": 88,
-                    "pricingProvider": "admin_override",
                 },
             )
 
@@ -127,11 +122,55 @@ class AdminPortfolioTest(unittest.TestCase):
         item = payload["item"]
         self.assertEqual(item["category"], "Sneakers")
         self.assertEqual(item["condition"], "Near Mint")
-        self.assertEqual(item["price"], 212.5)
-        self.assertEqual(item["currency"], "AUD")
-        self.assertEqual(item["confidence"], 88)
-        self.assertEqual(item["valuationStatus"], "reviewed")
         self.assertEqual(item["adminNotes"], "Verified from admin portal.")
+
+    def test_admin_portfolio_update_ignores_pricing_and_workflow_fields(self) -> None:
+        # Regression test: price/currency/confidence/pricingProvider/
+        # valuationStatus/reviewStatus used to be editable through this
+        # general-purpose endpoint with no note requirement — a second,
+        # looser door to the same fields the Pricing Review Queue's
+        # override flow already controls with a mandatory note + typed
+        # confirmation. A client sending them now must have no effect.
+        portfolio_service.add_item(
+            PortfolioCreateRequest(
+                id="item-locked-fields",
+                data={
+                    "title": "Locked Fields Item",
+                    "category": "Trading Card",
+                    "userId": "collector-1",
+                    "pricing": {
+                        "estimatedMarketValue": 100,
+                        "currency": "USD",
+                        "pricingConfidence": 90,
+                        "pricingSource": {"name": "pricecharting_catalog"},
+                    },
+                },
+            )
+        )
+
+        with patch("app.routers.admin_auth.settings") as settings:
+            settings.admin_import_token = "secret-token"
+            response = self.client.patch(
+                "/admin/portfolio/items/item-locked-fields",
+                headers={"Authorization": "Bearer secret-token"},
+                json={
+                    "category": "Sneakers",
+                    "valuationStatus": "reviewed",
+                    "reviewStatus": "reviewed",
+                    "price": 9999,
+                    "currency": "AUD",
+                    "confidence": 12,
+                    "pricingProvider": "admin_override",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        item = response.json()["item"]
+        self.assertEqual(item["category"], "Sneakers")  # the one field that IS editable did change
+        self.assertEqual(item["price"], 100)  # untouched — provider price, not the attempted 9999
+        self.assertEqual(item["currency"], "USD")
+        self.assertEqual(item["confidence"], 90)
+        self.assertEqual(item["provider"], "pricecharting_catalog")
 
 
     def test_repository_filters_items_by_user_id(self) -> None:
