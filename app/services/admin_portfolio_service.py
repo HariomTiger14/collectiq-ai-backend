@@ -136,43 +136,20 @@ def _compact_portfolio_item(item: PortfolioItem, *, include_raw: bool = False) -
 
 
 def _editable_portfolio_updates(updates: dict[str, Any]) -> dict[str, Any]:
+    # Financial/workflow fields (price, currency, confidence, pricingProvider,
+    # valuationStatus, reviewStatus) are deliberately not editable here — see
+    # the comment on PortfolioItemUpdateRequest for why.
     cleaned: dict[str, Any] = {}
     text_fields = {
         "category": "category",
         "condition": "condition",
         "adminNotes": "adminNotes",
-        "valuationStatus": "valuationStatus",
-        "reviewStatus": "reviewStatus",
-        "pricingProvider": "pricingProvider",
-        "currency": "currency",
     }
     for source_key, target_key in text_fields.items():
         value = updates.get(source_key)
         if value is not None:
             cleaned[target_key] = str(value).strip()
-    if "confidence" in updates and updates["confidence"] not in (None, ""):
-        cleaned["pricingConfidence"] = _bounded_number(updates["confidence"], minimum=0, maximum=100)
-    if "price" in updates and updates["price"] not in (None, ""):
-        price = _bounded_number(updates["price"], minimum=0)
-        cleaned["estimatedMarketValue"] = price
-        pricing = updates.get("pricing") if isinstance(updates.get("pricing"), dict) else {}
-        cleaned["pricing"] = {
-            **pricing,
-            "estimatedMarketValue": price,
-            "currency": cleaned.get("currency") or pricing.get("currency") or "USD",
-            "pricingConfidence": cleaned.get("pricingConfidence"),
-            "pricingSource": {"name": cleaned.get("pricingProvider") or pricing.get("pricingProvider") or "admin_override"},
-        }
     return {key: value for key, value in cleaned.items() if value not in (None, "")}
-
-
-def _bounded_number(value: Any, *, minimum: float = 0, maximum: float | None = None) -> float:
-    number = float(value)
-    if number < minimum:
-        number = minimum
-    if maximum is not None and number > maximum:
-        number = maximum
-    return number
 
 
 def _provider_name(pricing: dict[str, Any]) -> str:
