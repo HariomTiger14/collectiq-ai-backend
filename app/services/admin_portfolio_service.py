@@ -52,11 +52,21 @@ class AdminPortfolioService:
                 email = self._repository.get_user_email(owner_id)
                 if email:
                     owner_names[owner_id] = email
+        # A real DB total only means "total pages" when there's no active
+        # search term -- search filters client-side over a fetched batch,
+        # not at the DB level (see PR #81), so an exact count=exact total
+        # would be the whole table's count, not the search's. Falls back to
+        # the old fetched-batch-length approximation while searching.
+        total_count = (
+            self._repository.count_items(user_id=user_id)
+            if self._repository.is_configured and not normalized_query
+            else len(items)
+        )
         return {
             "success": True,
             "query": query or "",
             "count": len(limited),
-            "totalCount": len(items),
+            "totalCount": total_count,
             "items": [
                 _compact_portfolio_item(item, owner_display_name=owner_names.get(str(item.data.get("userId"))))
                 for item in limited

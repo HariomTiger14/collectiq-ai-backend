@@ -258,6 +258,35 @@ class SupabasePricingReviewQueueRepository:
             if isinstance(row, dict) and (item := _portfolio_item_from_row(row)) is not None
         ]
 
+    def count_items(self, *, user_id: str | None = None) -> int:
+        # Exact row count for numbered pagination -- this is the real total
+        # in the table (optionally filtered by owner), not the text-search
+        # result count, since search filtering happens client-side over a
+        # fetched batch rather than as a DB-level filter (a known,
+        # documented limitation -- see PR #81).
+        params: dict[str, str] = {"select": "id", "limit": "1"}
+        if user_id:
+            params["user_id"] = f"eq.{user_id}"
+        headers = {
+            "apikey": self._service_role_key,
+            "Authorization": f"Bearer {self._service_role_key}",
+            "Accept": "application/json",
+            "Prefer": "count=exact",
+        }
+        client = self._client or httpx.Client(timeout=self._timeout_seconds)
+        should_close = self._client is None
+        try:
+            response = client.request(
+                "GET", f"{self._supabase_url}/rest/v1/{self._table_name}", headers=headers, params=params,
+            )
+            response.raise_for_status()
+            return _total_from_content_range(response.headers.get("content-range"))
+        except httpx.HTTPError as error:
+            raise ReviewQueueRepositoryError("Supabase portfolio count request failed.") from error
+        finally:
+            if should_close:
+                client.close()
+
     def batch_owner_display_names(self, user_ids: list[str]) -> dict[str, str]:
         # One request across every distinct owner on the page, not one per
         # item — the same batching approach used for the admin users list.
@@ -497,6 +526,17 @@ def _reprice_request_from_item(item: PortfolioItem) -> RepriceRequest:
             notes=_first_text(data, "notes"),
         ),
     )
+
+
+def _total_from_content_range(content_range: str | None) -> int:
+    # PostgREST's Prefer: count=exact returns a Content-Range header shaped
+    # like "0-0/1234" (or "*/1234" for an empty result). Falls back to 0 for
+    # a missing/malformed header rather than raising -- pagination should
+    # degrade to "unknown total", not break the page.
+    if not content_range or "/" not in content_range:
+        return 0
+    total = content_range.rsplit("/", 1)[-1]
+    return int(total) if total.isdigit() else 0
 
 
 def _pricing_payload(data: dict[str, Any]) -> dict[str, Any]:

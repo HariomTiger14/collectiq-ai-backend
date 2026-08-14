@@ -219,9 +219,78 @@ class AdminPortfolioTest(unittest.TestCase):
 
         self.assertEqual(captured["params"]["offset"], "150")
 
+    def test_repository_count_items_reads_content_range_total(self) -> None:
+        # Regression: numbered pagination (page 1, 2, 3...) needs a real
+        # total, not the length of whatever batch happened to get fetched --
+        # this is Supabase's Prefer: count=exact / Content-Range mechanism.
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.headers.get("prefer"), "count=exact")
+            return httpx.Response(200, json=[], headers={"content-range": "0-0/1234"})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabasePricingReviewQueueRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        total = repository.count_items()
+
+        self.assertEqual(total, 1234)
+
+    def test_service_uses_real_total_when_not_searching(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/rest/v1/portfolio_items"):
+                if request.headers.get("prefer") == "count=exact":
+                    return httpx.Response(200, json=[], headers={"content-range": "0-0/500"})
+                return httpx.Response(200, json=[{"id": "item-1", "user_id": "user-1"}])
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        service = AdminPortfolioService(
+            repository=SupabasePricingReviewQueueRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.list_items(limit=50)
+
+        self.assertEqual(payload["totalCount"], 500)
+
+    def test_service_falls_back_to_batch_length_while_searching(self) -> None:
+        # A real DB total wouldn't reflect the search filter (client-side,
+        # not a DB filter -- see PR #81), so a search in progress keeps the
+        # old fetched-batch-length approximation instead of a misleading
+        # whole-table count.
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/rest/v1/portfolio_items"):
+                self.assertNotEqual(request.headers.get("prefer"), "count=exact")
+                return httpx.Response(
+                    200,
+                    json=[{"id": "item-1", "user_id": "user-1", "title": "Charizard"}],
+                )
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        service = AdminPortfolioService(
+            repository=SupabasePricingReviewQueueRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.list_items(query="charizard", limit=50)
+
+        self.assertEqual(payload["totalCount"], 1)
+
     def test_service_passes_offset_through_to_repository(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path.endswith("/rest/v1/portfolio_items"):
+                if request.headers.get("prefer") == "count=exact":
+                    return httpx.Response(200, json=[], headers={"content-range": "0-0/250"})
                 assert request.url.params.get("offset") == "100"
                 return httpx.Response(200, json=[{"id": f"item-{i}", "user_id": "user-1"} for i in range(50)])
             return httpx.Response(200, json=[])
