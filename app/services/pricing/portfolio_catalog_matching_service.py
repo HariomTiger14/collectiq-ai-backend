@@ -68,7 +68,7 @@ def match_unlinked_portfolio_items(
         if not query:
             skipped_missing_title += 1
             continue
-        match = find_best_match(catalog, query)
+        match = find_best_match(catalog, query, item)
         if match is not None:
             matched += 1
             updates.append(
@@ -118,29 +118,83 @@ def build_match_query(item: dict[str, Any]) -> str:
     # Mirrors what a user would type manually searching Discover for the
     # same item -- title alone is usually specific enough (AI-generated
     # titles tend to read like "Amazing Spider-Man #300", not just "comic").
+    #
+    # Deliberately doesn't fold setName/edition/cardNumber into this query
+    # string even though they're extracted separately (see
+    # _item_identity_fields) -- search_pricecharting_catalog() matches the
+    # WHOLE query as one contiguous ilike substring (not tokenized/AND'd
+    # terms), so appending fields the catalog's own product_name doesn't
+    # happen to contain in that exact position would silently turn a
+    # working title-only match into a zero-result one. Those fields are
+    # used downstream instead, to disambiguate AMONG whatever candidates
+    # this query already finds -- see find_best_match.
     title = str(item.get("title") or "").strip()
     return title
 
 
-def find_best_match(catalog: CatalogSearchService, query: str) -> dict[str, Any] | None:
+def _item_identity_fields(item: dict[str, Any]) -> dict[str, str]:
+    raw = item.get("raw_json") if isinstance(item.get("raw_json"), dict) else {}
+    fields: dict[str, str] = {}
+    for key in ("cardNumber", "edition", "year", "setName"):
+        value = str(raw.get(key) or "").strip()
+        if value:
+            fields[key] = value
+    return fields
+
+
+def _pick_best_candidate(candidates: list[Any], identity: dict[str, str]) -> Any:
+    # Many real prints legitimately share a title (dozens of "Charizard"
+    # cards across different sets/editions/years) -- when several
+    # candidates all clear MIN_AUTO_LINK_CONFIDENCE, CatalogSearchService's
+    # own ranking ties them (all "product name contains query"), and the
+    # tiebreak is alphabetical product_name, not "the one this user has".
+    # When this item's recognition already extracted a card number,
+    # edition, year, or set (RecognitionResult has these; build_match_query
+    # can't use them -- see above), prefer whichever candidate's own text
+    # actually contains that detail instead of blindly taking whichever
+    # the substring ranking sorted first. Python's sort is stable, so with
+    # no identity fields (or none of them matching any candidate) this is
+    # a no-op -- unchanged, first-candidate behavior.
+    if not identity:
+        return candidates[0]
+
+    def match_count(candidate: Any) -> int:
+        haystack = " ".join(
+            str(value) for value in (candidate.title, candidate.setName, candidate.identifier) if value
+        ).lower()
+        return sum(1 for value in identity.values() if value.lower() in haystack)
+
+    return max(candidates, key=match_count)
+
+
+def find_best_match(
+    catalog: CatalogSearchService, query: str, item: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    identity = _item_identity_fields(item) if item else {}
+    # A wider net (20 vs the original 5) only when there's real
+    # disambiguating data to search among -- otherwise this is pure added
+    # query cost for no benefit, since there'd be nothing to prefer one
+    # candidate over another with.
+    search_limit = 20 if identity else 5
     try:
-        response = catalog.search(query, limit=5)
+        response = catalog.search(query, limit=search_limit)
     except CatalogSearchError:
         return None
-    for result in response.results:
-        if result.confidence >= MIN_AUTO_LINK_CONFIDENCE:
-            # pricecharting_match_score is an integer column -- store as a
-            # 0-100 percentage (matches RepricePricingResponse.pricingConfidence's
-            # existing int convention elsewhere in this codebase), not the raw
-            # 0.0-1.0 float confidence (writing that raw crashed with Postgres
-            # 22P02 "invalid input syntax for type integer" on a live run).
-            return {
-                "id": result.id,
-                "score": round(result.confidence * 100),
-                "source": result.source,
-                "confidence": result.confidence,
-            }
-    return None
+    candidates = [result for result in response.results if result.confidence >= MIN_AUTO_LINK_CONFIDENCE]
+    if not candidates:
+        return None
+    best = _pick_best_candidate(candidates, identity)
+    # pricecharting_match_score is an integer column -- store as a
+    # 0-100 percentage (matches RepricePricingResponse.pricingConfidence's
+    # existing int convention elsewhere in this codebase), not the raw
+    # 0.0-1.0 float confidence (writing that raw crashed with Postgres
+    # 22P02 "invalid input syntax for type integer" on a live run).
+    return {
+        "id": best.id,
+        "score": round(best.confidence * 100),
+        "source": best.source,
+        "confidence": best.confidence,
+    }
 
 
 def backfill_catalog_history_for_item(
