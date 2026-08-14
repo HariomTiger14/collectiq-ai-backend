@@ -324,6 +324,41 @@ class AdminPortfolioTest(unittest.TestCase):
         self.assertEqual(len(payload["valuationHistory"]), 1)
         self.assertEqual(payload["valuationHistory"][0]["displayString"], "AUD $217.00")
 
+    def test_valuation_history_pages_through_everything_not_just_first_page(self) -> None:
+        # Regression: this used to cap at a fixed limit=30, truncating the
+        # chart/list to the 30 most recent snapshots even though the table
+        # itself retains every snapshot ever priced -- 1M/6M/MAX ranges are
+        # meaningless if the data behind them is already cut off. Simulates
+        # more than one page (page size is 500) to prove it actually pages
+        # through instead of stopping after the first request.
+        requests_seen = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            offset = int(request.url.params.get("offset", "0"))
+            requests_seen.append(offset)
+            if offset == 0:
+                rows = [
+                    {"id": f"snap-{i}", "portfolio_item_id": "item-1", "value_aud": float(i), "priced_at": "2026-08-01T00:00:00Z"}
+                    for i in range(500)
+                ]
+            elif offset == 500:
+                rows = [{"id": "snap-500", "portfolio_item_id": "item-1", "value_aud": 500.0, "priced_at": "2026-08-01T00:00:00Z"}]
+            else:
+                rows = []
+            return httpx.Response(200, json=rows)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabasePricingReviewQueueRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        rows = repository.list_valuation_history_for_item("item-1")
+
+        self.assertEqual(requests_seen, [0, 500])
+        self.assertEqual(len(rows), 501)
+
     def test_endpoint_passes_user_id_query_param_through(self) -> None:
         with patch("app.routers.admin_auth.settings") as auth_settings, patch(
             "app.routers.admin_portfolio.AdminPortfolioService",
