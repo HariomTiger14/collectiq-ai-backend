@@ -313,23 +313,38 @@ class SupabasePricingReviewQueueRepository:
         row = payload[0]
         return _portfolio_item_from_row(row) if isinstance(row, dict) else None
 
-    def list_valuation_history_for_item(self, item_id: str, *, limit: int = 30) -> list[dict[str, Any]]:
-        try:
-            payload = self._request(
-                "GET",
-                "/rest/v1/portfolio_valuation_snapshots",
-                params={
-                    "portfolio_item_id": f"eq.{item_id}",
-                    "select": "*",
-                    "limit": str(limit),
-                    "order": "priced_at.desc",
-                },
-            )
-        except ReviewQueueRepositoryError:
-            return []
-        if not isinstance(payload, list):
-            return []
-        return [row for row in payload if isinstance(row, dict)]
+    def list_valuation_history_for_item(self, item_id: str) -> list[dict[str, Any]]:
+        # Every snapshot ever priced for this item lives here forever --
+        # nothing prunes this table -- so this pages through all of it
+        # instead of an arbitrary recent-N cap, for a real full-history
+        # chart (1M/6M/MAX ranges only mean something if the data behind
+        # them isn't already truncated). Paged in chunks of 500 (under
+        # PostgREST's default max-rows) with a 20-page safety backstop
+        # (10,000 snapshots) against a runaway loop on unexpected data.
+        page_size = 500
+        max_pages = 20
+        rows: list[dict[str, Any]] = []
+        for page in range(max_pages):
+            try:
+                payload = self._request(
+                    "GET",
+                    "/rest/v1/portfolio_valuation_snapshots",
+                    params={
+                        "portfolio_item_id": f"eq.{item_id}",
+                        "select": "*",
+                        "limit": str(page_size),
+                        "offset": str(page * page_size),
+                        "order": "priced_at.desc",
+                    },
+                )
+            except ReviewQueueRepositoryError:
+                break
+            if not isinstance(payload, list):
+                break
+            rows.extend(row for row in payload if isinstance(row, dict))
+            if len(payload) < page_size:
+                break
+        return rows
 
     def update_item_data(self, item_id: str, data: dict[str, Any]) -> PortfolioItem | None:
         current = self.get_item(item_id)
