@@ -324,6 +324,55 @@ class AdminPortfolioTest(unittest.TestCase):
         self.assertEqual(len(payload["valuationHistory"]), 1)
         self.assertEqual(payload["valuationHistory"][0]["displayString"], "AUD $217.00")
 
+    def test_get_item_resolves_owner_display_name(self) -> None:
+        # Regression: list_items() resolved a real name/email for the Owner
+        # column (batch display-name lookup, falling back to a single Auth
+        # email lookup), but get_item() -- the single-item detail page --
+        # never got the same treatment, so the exact same item showed a
+        # resolved owner on the list and a raw UUID on its own detail page.
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/rest/v1/portfolio_items"):
+                return httpx.Response(200, json=[{"id": "item-1", "user_id": "user-42", "title": "Air Force 1"}])
+            if request.url.path.endswith("/rest/v1/collector_profiles"):
+                return httpx.Response(200, json=[{"user_id": "user-42", "display_name": "Jordan T."}])
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        service = AdminPortfolioService(
+            repository=SupabasePricingReviewQueueRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.get_item("item-1")
+
+        self.assertEqual(payload["item"]["ownerEmail"], "Jordan T.")
+
+    def test_get_item_falls_back_to_email_when_no_display_name(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/rest/v1/portfolio_items"):
+                return httpx.Response(200, json=[{"id": "item-1", "user_id": "user-42", "title": "Air Force 1"}])
+            if request.url.path.endswith("/rest/v1/collector_profiles"):
+                return httpx.Response(200, json=[])  # no display name set
+            if request.url.path.endswith("/auth/v1/admin/users/user-42"):
+                return httpx.Response(200, json={"id": "user-42", "email": "collector@example.com"})
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        service = AdminPortfolioService(
+            repository=SupabasePricingReviewQueueRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.get_item("item-1")
+
+        self.assertEqual(payload["item"]["ownerEmail"], "collector@example.com")
+
     def test_valuation_history_pages_through_everything_not_just_first_page(self) -> None:
         # Regression: this used to cap at a fixed limit=30, truncating the
         # chart/list to the 30 most recent snapshots even though the table

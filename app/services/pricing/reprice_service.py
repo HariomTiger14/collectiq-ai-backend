@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from app.schemas.pricing import (
     RepriceComparableSaleResponse,
     RepricePricingResponse,
@@ -20,6 +22,12 @@ from app.services.pricing.currency_conversion import (
     normalize_display_currency,
 )
 from app.services.pricing.provider_factory import get_pricing_provider
+from app.services.pricing.shared_cache_repository import (
+    SharedPricingCacheError,
+    SharedPricingCacheRepository,
+)
+
+logger = logging.getLogger("collectiq.pricing.reprice")
 
 
 class RepriceValidationError(Exception):
@@ -27,11 +35,31 @@ class RepriceValidationError(Exception):
 
 
 class RepriceService:
+    def __init__(self, *, shared_cache: SharedPricingCacheRepository | None = None) -> None:
+        self._shared_cache = shared_cache or SharedPricingCacheRepository()
+
     def reprice(self, request: RepriceRequest) -> RepriceResponse:
         recognition = _recognition_from_request(request)
         display_currency = normalize_display_currency(
             request.displayCurrency or request.previousCurrency
         )
+
+        # Shared across every caller of this item's normalized identity
+        # (title/category/condition) -- the same cache api_analyze.py already
+        # consults on the initial scan. Without this, an unmatched item (no
+        # pricecharting_id) got repriced by an independent live-API call on
+        # every scheduled sweep, so two users' visually-identical unmatched
+        # items would drift apart in price over time even though a scan-time
+        # cache hit might have started them off equal.
+        cached_pricing = self._get_cached_pricing(recognition, display_currency)
+        if cached_pricing is not None:
+            return RepriceResponse(
+                itemId=request.itemId,
+                correctionSource=request.correctionSource,
+                identity=request.identity,
+                pricing=_response_from_pricing(cached_pricing),
+            )
+
         try:
             pricing = get_pricing_provider().price(recognition)
         except PricingProviderUnavailableError as error:
@@ -64,6 +92,7 @@ class RepriceService:
                 currency=display_currency,
             )
         pricing = convert_pricing_result(pricing, target_currency=display_currency)
+        self._set_cached_pricing(recognition, pricing, display_currency)
 
         return RepriceResponse(
             itemId=request.itemId,
@@ -71,6 +100,23 @@ class RepriceService:
             identity=request.identity,
             pricing=_response_from_pricing(pricing),
         )
+
+    def _get_cached_pricing(
+        self, recognition: RecognitionResult, display_currency: str,
+    ) -> PricingResult | None:
+        try:
+            return self._shared_cache.get(recognition, display_currency=display_currency)
+        except SharedPricingCacheError as error:
+            logger.warning("reprice shared cache read failed error=%s", error)
+            return None
+
+    def _set_cached_pricing(
+        self, recognition: RecognitionResult, pricing: PricingResult, display_currency: str,
+    ) -> None:
+        try:
+            self._shared_cache.set(recognition, pricing, display_currency=display_currency)
+        except SharedPricingCacheError as error:
+            logger.warning("reprice shared cache write failed error=%s", error)
 
 
 def _recognition_from_request(request: RepriceRequest) -> RecognitionResult:

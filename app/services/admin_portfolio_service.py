@@ -74,9 +74,20 @@ class AdminPortfolioService:
             if self._repository.is_configured
             else []
         )
+        # list_items() resolves a real name/email for the Owner column, but
+        # this single-item lookup never did the same -- the item detail page
+        # showed a raw UUID even when the exact same item's row on the list
+        # page showed a real name.
+        owner_display_name = None
+        if self._repository.is_configured:
+            user_id = item.data.get("userId")
+            if user_id:
+                owner_display_name = self._repository.batch_owner_display_names([str(user_id)]).get(str(user_id))
+                if not owner_display_name:
+                    owner_display_name = self._repository.get_user_email(str(user_id))
         return {
             "success": True,
-            "item": _compact_portfolio_item(item, include_raw=True),
+            "item": _compact_portfolio_item(item, include_raw=True, owner_display_name=owner_display_name),
             "valuationHistory": [_compact_valuation_snapshot(row) for row in valuation_history],
         }
 
