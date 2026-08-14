@@ -65,6 +65,61 @@ class AdminCatalogListItemsTest(unittest.TestCase):
         self.assertTrue(captured["path"].endswith("/rest/v1/kicksdb_catalog"))
         self.assertEqual(captured["params"]["order"], "rank.asc.nullslast")
 
+    def test_repository_filters_by_category(self) -> None:
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabaseAdminCatalogRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.list_catalog_rows(source="pricecharting", limit=50, offset=0, category="Pokemon")
+
+        self.assertEqual(captured["params"]["category"], "ilike.*Pokemon*")
+
+    def test_repository_filters_pricecharting_by_price_range_on_loose_price(self) -> None:
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabaseAdminCatalogRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.list_catalog_rows(source="pricecharting", limit=50, offset=0, min_price=10, max_price=50)
+
+        self.assertEqual(captured["params"]["and"], "(loose_price_cents.gte.1000,loose_price_cents.lte.5000)")
+
+    def test_repository_filters_kicksdb_by_price_range_on_avg_price(self) -> None:
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabaseAdminCatalogRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.list_catalog_rows(source="kicksdb", limit=50, offset=0, min_price=100)
+
+        self.assertEqual(captured["params"]["avg_price_cents"], "gte.10000")
+        self.assertNotIn("and", captured["params"])
+
     def test_repository_counts_pricecharting_rows_via_content_range(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             self.assertEqual(request.headers.get("prefer"), "count=estimated")
@@ -205,7 +260,9 @@ class AdminCatalogListItemsTest(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        service.return_value.list_items.assert_called_once_with(source="kicksdb", limit=50, offset=100)
+        service.return_value.list_items.assert_called_once_with(
+            source="kicksdb", limit=50, offset=100, category=None, min_price=None, max_price=None,
+        )
 
 
 if __name__ == "__main__":

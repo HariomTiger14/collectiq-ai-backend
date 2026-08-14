@@ -240,7 +240,14 @@ class SupabasePricingReviewQueueRepository:
     def is_configured(self) -> bool:
         return bool(self._supabase_url and self._service_role_key)
 
-    def list_items(self, *, limit: int = 200, user_id: str | None = None, offset: int = 0) -> list[PortfolioItem]:
+    def list_items(
+        self,
+        *,
+        limit: int = 200,
+        user_id: str | None = None,
+        offset: int = 0,
+        category: str | None = None,
+    ) -> list[PortfolioItem]:
         params = {
             "select": "*",
             "limit": str(limit),
@@ -249,6 +256,8 @@ class SupabasePricingReviewQueueRepository:
         }
         if user_id:
             params["user_id"] = f"eq.{user_id}"
+        if category:
+            params["category"] = f"ilike.*{category}*"
         payload = self._request("GET", f"/rest/v1/{self._table_name}", params=params)
         if not isinstance(payload, list):
             raise ReviewQueueRepositoryError("Supabase portfolio response shape was invalid.")
@@ -258,7 +267,7 @@ class SupabasePricingReviewQueueRepository:
             if isinstance(row, dict) and (item := _portfolio_item_from_row(row)) is not None
         ]
 
-    def count_items(self, *, user_id: str | None = None) -> int:
+    def count_items(self, *, user_id: str | None = None, category: str | None = None) -> int:
         # count=estimated, not count=exact: a real exact COUNT(*) over this
         # whole table under RLS (enabled 20260811) forces a full scan, and
         # this table has a documented history of breaking production from
@@ -272,6 +281,8 @@ class SupabasePricingReviewQueueRepository:
         params: dict[str, str] = {"select": "id", "limit": "1"}
         if user_id:
             params["user_id"] = f"eq.{user_id}"
+        if category:
+            params["category"] = f"ilike.*{category}*"
         headers = {
             "apikey": self._service_role_key,
             "Authorization": f"Bearer {self._service_role_key}",

@@ -23,10 +23,18 @@ class AdminPortfolioService:
         self._repository = repository or SupabasePricingReviewQueueRepository()
 
     def list_items(
-        self, *, query: str | None = None, limit: int = 50, user_id: str | None = None, offset: int = 0,
+        self,
+        *,
+        query: str | None = None,
+        limit: int = 50,
+        user_id: str | None = None,
+        offset: int = 0,
+        category: str | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
     ) -> dict[str, Any]:
         items = (
-            self._repository.list_items(limit=max(limit, 200), user_id=user_id, offset=offset)
+            self._repository.list_items(limit=max(limit, 200), user_id=user_id, offset=offset, category=category)
             if self._repository.is_configured
             else portfolio_service.list_items()
         )
@@ -37,6 +45,13 @@ class AdminPortfolioService:
                 for item in items
                 if normalized_query in _portfolio_search_text(item)
             ]
+        # Client-side, not a DB filter -- same limitation class as text
+        # search (see the comment below on totalCount). Price mostly lives
+        # inside the pricing/data JSONB blob, not a plain indexed column
+        # (only a scan-derived fallback, estimated_value, is a real column),
+        # so a correct DB-level range filter isn't safely expressible here.
+        if min_price is not None or max_price is not None:
+            items = [item for item in items if _item_price_in_range(item, min_price, max_price)]
         limited = items[:limit]
         owner_names: dict[str, str] = {}
         if self._repository.is_configured:
@@ -52,14 +67,16 @@ class AdminPortfolioService:
                 email = self._repository.get_user_email(owner_id)
                 if email:
                     owner_names[owner_id] = email
-        # A real DB total only means "total pages" when there's no active
-        # search term -- search filters client-side over a fetched batch,
-        # not at the DB level (see PR #81), so an exact count=exact total
-        # would be the whole table's count, not the search's. Falls back to
-        # the old fetched-batch-length approximation while searching.
+        # A real DB total only means "total pages" when nothing is being
+        # filtered client-side (search or price range) -- both filter over
+        # a fetched batch, not at the DB level, so a count=estimated total
+        # would be the whole table's/category's count, not the filtered
+        # result's. Falls back to the old fetched-batch-length
+        # approximation whenever either is active.
+        has_client_side_filter = bool(normalized_query) or min_price is not None or max_price is not None
         total_count = (
-            self._repository.count_items(user_id=user_id)
-            if self._repository.is_configured and not normalized_query
+            self._repository.count_items(user_id=user_id, category=category)
+            if self._repository.is_configured and not has_client_side_filter
             else len(items)
         )
         return {
@@ -151,6 +168,23 @@ def _portfolio_search_text(item: PortfolioItem) -> str:
         data.get("pricingAssignee"),
     ]
     return " ".join(str(value) for value in values if value).lower()
+
+
+def _item_price_in_range(item: PortfolioItem, min_price: float | None, max_price: float | None) -> bool:
+    data = item.data
+    pricing = data.get("pricing") if isinstance(data.get("pricing"), dict) else {}
+    value = _first_value(data, pricing, "estimatedValue", "estimatedMarketValue", "marketValue", "price")
+    try:
+        price = float(value) if value is not None else None
+    except (TypeError, ValueError):
+        price = None
+    if price is None:
+        return False
+    if min_price is not None and price < min_price:
+        return False
+    if max_price is not None and price > max_price:
+        return False
+    return True
 
 
 def _compact_portfolio_item(
