@@ -240,10 +240,11 @@ class SupabasePricingReviewQueueRepository:
     def is_configured(self) -> bool:
         return bool(self._supabase_url and self._service_role_key)
 
-    def list_items(self, *, limit: int = 200, user_id: str | None = None) -> list[PortfolioItem]:
+    def list_items(self, *, limit: int = 200, user_id: str | None = None, offset: int = 0) -> list[PortfolioItem]:
         params = {
             "select": "*",
             "limit": str(limit),
+            "offset": str(offset),
             "order": "updated_at.desc.nullslast,created_at.desc.nullslast",
         }
         if user_id:
