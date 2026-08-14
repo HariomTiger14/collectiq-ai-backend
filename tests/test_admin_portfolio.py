@@ -197,6 +197,48 @@ class AdminPortfolioTest(unittest.TestCase):
 
         self.assertEqual(captured["params"]["user_id"], "eq.user-42")
 
+    def test_repository_passes_offset_for_pagination(self) -> None:
+        # Regression: the Portfolio items list had a hard limit=100 cap with
+        # no way to page past it at all -- for a catalog of thousands of
+        # items, admin could only ever see the first ~100 (by
+        # updated_at/created_at), full stop.
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabasePricingReviewQueueRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.list_items(limit=50, offset=150)
+
+        self.assertEqual(captured["params"]["offset"], "150")
+
+    def test_service_passes_offset_through_to_repository(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/rest/v1/portfolio_items"):
+                assert request.url.params.get("offset") == "100"
+                return httpx.Response(200, json=[{"id": f"item-{i}", "user_id": "user-1"} for i in range(50)])
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        service = AdminPortfolioService(
+            repository=SupabasePricingReviewQueueRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.list_items(limit=50, offset=100)
+
+        self.assertEqual(payload["count"], 50)
+
     def test_repository_row_parsing_includes_user_id(self) -> None:
         # Regression test: _portfolio_item_from_row copied over title,
         # category, condition, etc. from the raw Supabase row but forgot
@@ -422,7 +464,7 @@ class AdminPortfolioTest(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        service.return_value.list_items.assert_called_once_with(query=None, limit=50, user_id="user-42")
+        service.return_value.list_items.assert_called_once_with(query=None, limit=50, user_id="user-42", offset=0)
 
 
 if __name__ == "__main__":
