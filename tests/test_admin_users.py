@@ -10,6 +10,7 @@ from app.services.admin_user_service import (
     AdminUserService,
     SupabaseAdminUserRepository,
     _compact_price_alert,
+    _compact_valuation_snapshot,
 )
 
 
@@ -234,6 +235,10 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(user["wishlistEntries"][0]["status"], "wanted")
         self.assertEqual(len(user["valuationHistory"]), 1)
         self.assertEqual(user["valuationHistory"][0]["valueAud"], 125.5)
+        # Regression: valuation snapshot rows only ever stored
+        # portfolio_item_id, not a title, so the admin page couldn't tell
+        # which item a history entry belonged to.
+        self.assertEqual(user["valuationHistory"][0]["itemTitle"], "Healthy Card")
         self.assertEqual(len(user["pushDeliveries"]), 1)
         self.assertEqual(user["pushDeliveries"][0]["status"], "sent")
 
@@ -256,6 +261,17 @@ class AdminUsersTest(unittest.TestCase):
         )
 
         self.assertEqual(alert["percentage"], 10)
+
+    def test_compact_valuation_snapshot_falls_back_when_item_title_unknown(self) -> None:
+        # A snapshot can outlive the item it priced (item deleted, or its id
+        # just wasn't in the batch lookup) -- should read as an explicit
+        # "unknown", not a blank title.
+        snapshot = _compact_valuation_snapshot(
+            {"id": "snap-2", "portfolio_item_id": "item-missing", "value_aud": 10},
+            item_titles={},
+        )
+
+        self.assertEqual(snapshot["itemTitle"], "Deleted or unknown item")
 
     def test_override_subscription_delegates_to_subscription_service(self) -> None:
         subscription_service = Mock()
