@@ -1,3 +1,4 @@
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -6,6 +7,9 @@ from pydantic import BaseModel, Field
 from app.routers.admin_auth import require_admin_import_token
 from app.services.admin_audit_service import AdminAuditService
 from app.services.admin_portfolio_service import AdminPortfolioService
+from app.services.pricing.admin_review_queue_service import (
+    ReviewQueueRepositoryError,
+)
 
 
 router = APIRouter(prefix="/admin/portfolio", tags=["Admin Portfolio"])
@@ -32,7 +36,37 @@ def list_admin_portfolio_items(
     userId: str | None = Query(default=None, min_length=1),
     _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
-    payload = AdminPortfolioService().list_items(query=q, limit=limit, user_id=userId)
+    # user_id is a Postgres uuid column — Supabase/PostgREST rejects a
+    # non-UUID `eq.` filter value with its own 500, which would otherwise
+    # surface as an unhandled crash here rather than a clean 422.
+    if userId is not None:
+        try:
+            uuid.UUID(userId)
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "invalid_user_id",
+                    "message": "userId must be a valid UUID.",
+                    "retryable": False,
+                },
+            ) from error
+    try:
+        payload = AdminPortfolioService().list_items(query=q, limit=limit, user_id=userId)
+    except ReviewQueueRepositoryError as error:
+        _record_audit(
+            action="admin_portfolio.items_viewed",
+            status="failure",
+            metadata={"query": q or "", "userId": userId or "", "error": str(error)},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_portfolio_items_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
     _record_audit(
         action="admin_portfolio.items_viewed",
         status="success",
