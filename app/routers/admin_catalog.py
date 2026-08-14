@@ -40,6 +40,7 @@ def list_catalog_items(
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     category: str | None = Query(default=None, min_length=1),
+    categoryGroup: str | None = Query(default=None, min_length=1),
     minPrice: float | None = Query(default=None, ge=0),
     maxPrice: float | None = Query(default=None, ge=0),
     _admin: None = Depends(require_admin_import_token),
@@ -47,7 +48,7 @@ def list_catalog_items(
     try:
         return AdminCatalogService().list_items(
             source=source, limit=limit, offset=offset,
-            category=category, min_price=minPrice, max_price=maxPrice,
+            category=category, category_group=categoryGroup, min_price=minPrice, max_price=maxPrice,
         )
     except AdminCatalogError as error:
         raise HTTPException(

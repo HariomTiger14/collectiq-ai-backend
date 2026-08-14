@@ -40,6 +40,7 @@ class AdminCatalogService:
         limit: int = 100,
         offset: int = 0,
         category: str | None = None,
+        category_group: str | None = None,
         min_price: float | None = None,
         max_price: float | None = None,
     ) -> dict[str, Any]:
@@ -49,14 +50,15 @@ class AdminCatalogService:
         bounded_limit = max(1, min(limit, 100))
         rows = self._repository.list_catalog_rows(
             source=normalized_source, limit=bounded_limit, offset=max(0, offset),
-            category=category, min_price=min_price, max_price=max_price,
+            category=category, category_group=category_group, min_price=min_price, max_price=max_price,
         )
         return {
             "success": True,
             "source": normalized_source,
             "count": len(rows),
             "totalCount": self._repository.count_catalog_rows(
-                source=normalized_source, category=category, min_price=min_price, max_price=max_price,
+                source=normalized_source, category=category, category_group=category_group,
+                min_price=min_price, max_price=max_price,
             ),
             "items": [_compact_catalog_row(row, source=normalized_source) for row in rows],
         }
@@ -107,6 +109,7 @@ class SupabaseAdminCatalogRepository:
         limit: int,
         offset: int,
         category: str | None = None,
+        category_group: str | None = None,
         min_price: float | None = None,
         max_price: float | None = None,
     ) -> list[dict[str, Any]]:
@@ -129,7 +132,9 @@ class SupabaseAdminCatalogRepository:
             else ("pricecharting_catalog", "pricecharting_id.asc")
         )
         params = {"select": "*", "order": order, "limit": str(limit), "offset": str(offset)}
-        params.update(_catalog_filter_params(source, category=category, min_price=min_price, max_price=max_price))
+        params.update(_catalog_filter_params(
+            source, category=category, category_group=category_group, min_price=min_price, max_price=max_price,
+        ))
         payload = self._request("GET", f"/rest/v1/{table_name}", params=params)
         if not isinstance(payload, list):
             raise AdminCatalogError("Supabase catalog response shape was invalid.")
@@ -140,6 +145,7 @@ class SupabaseAdminCatalogRepository:
         *,
         source: str,
         category: str | None = None,
+        category_group: str | None = None,
         min_price: float | None = None,
         max_price: float | None = None,
     ) -> int:
@@ -164,7 +170,9 @@ class SupabaseAdminCatalogRepository:
             "Prefer": "count=estimated",
         }
         params = {"select": id_column, "limit": "1"}
-        params.update(_catalog_filter_params(source, category=category, min_price=min_price, max_price=max_price))
+        params.update(_catalog_filter_params(
+            source, category=category, category_group=category_group, min_price=min_price, max_price=max_price,
+        ))
         client = self._client or httpx.Client(timeout=self._timeout_seconds)
         should_close = self._client is None
         try:
@@ -220,11 +228,40 @@ class SupabaseAdminCatalogRepository:
                 client.close()
 
 
+# pricecharting_catalog's raw `category` column is far too granular for a
+# dropdown ("Basketball Cards 2019 Panini Donruss Optic", not "Sports
+# Cards") -- there's no separate coarse-category column, so these groups
+# are keyword sets or'd together against the same raw column. Directly
+# grounded in the taxonomy this codebase already tracks elsewhere (the
+# Catalog page's own "PriceCharting set backfill" panel groups sets into
+# exactly coins/comic-books/funko-pops/lego-sets/lorcana-cards/*-cards),
+# plus trading-card-games for Magic/Pokemon/Yugioh, which are clearly
+# present in the raw data but aren't one of that panel's pipeline buckets.
+# KicksDB has no equivalent taxonomy defined anywhere in this system, so
+# it isn't included here -- its category filter stays free text.
+PRICECHARTING_CATEGORY_GROUPS: dict[str, list[str]] = {
+    "sports-cards": ["Baseball", "Basketball", "Football", "Hockey", "Soccer"],
+    "trading-card-games": ["Magic", "Pokemon", "Yugioh", "Lorcana"],
+    "comics": ["Comic"],
+    "funko-pops": ["Funko"],
+    "lego-sets": ["Lego"],
+    "coins": ["Coin"],
+}
+
+
 def _catalog_filter_params(
-    source: str, *, category: str | None, min_price: float | None, max_price: float | None,
+    source: str,
+    *,
+    category: str | None,
+    category_group: str | None = None,
+    min_price: float | None,
+    max_price: float | None,
 ) -> dict[str, str]:
     params: dict[str, str] = {}
-    if category:
+    keywords = PRICECHARTING_CATEGORY_GROUPS.get(category_group or "") if source != "kicksdb" else None
+    if keywords:
+        params["or"] = "(" + ",".join(f"category.ilike.*{kw}*" for kw in keywords) + ")"
+    elif category:
         params["category"] = f"ilike.*{category}*"
     if min_price is None and max_price is None:
         return params

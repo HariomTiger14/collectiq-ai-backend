@@ -83,6 +83,56 @@ class AdminCatalogListItemsTest(unittest.TestCase):
 
         self.assertEqual(captured["params"]["category"], "ilike.*Pokemon*")
 
+    def test_repository_filters_by_category_group_ors_keywords(self) -> None:
+        # Regression: pricecharting_catalog's raw category column is too
+        # granular for a dropdown ("Basketball Cards 2019 Panini Donruss
+        # Optic", not "Sports Cards") -- category groups or-match a curated
+        # keyword set against that same raw column instead.
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabaseAdminCatalogRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.list_catalog_rows(source="pricecharting", limit=50, offset=0, category_group="sports-cards")
+
+        self.assertEqual(
+            captured["params"]["or"],
+            "(category.ilike.*Baseball*,category.ilike.*Basketball*,category.ilike.*Football*,"
+            "category.ilike.*Hockey*,category.ilike.*Soccer*)",
+        )
+        self.assertNotIn("category", captured["params"])
+
+    def test_repository_category_group_ignored_for_kicksdb(self) -> None:
+        # KicksDB has no equivalent taxonomy defined anywhere in this system
+        # -- a category_group meant for PriceCharting shouldn't silently
+        # apply to it (or=(category.ilike...) against a table where that
+        # grouping was never designed to make sense).
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabaseAdminCatalogRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.list_catalog_rows(source="kicksdb", limit=50, offset=0, category_group="sports-cards")
+
+        self.assertNotIn("or", captured["params"])
+        self.assertNotIn("category", captured["params"])
+
     def test_repository_filters_pricecharting_by_price_range_on_loose_price(self) -> None:
         captured = {}
 
@@ -261,7 +311,7 @@ class AdminCatalogListItemsTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         service.return_value.list_items.assert_called_once_with(
-            source="kicksdb", limit=50, offset=100, category=None, min_price=None, max_price=None,
+            source="kicksdb", limit=50, offset=100, category=None, category_group=None, min_price=None, max_price=None,
         )
 
 
