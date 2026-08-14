@@ -91,6 +91,7 @@ class AdminPortfolioTest(unittest.TestCase):
         self.assertEqual(item["userId"], "collector-1")
         self.assertEqual(item["assignment"]["assignee"], "pricing@packlox.com")
         self.assertIn("raw", item)
+        self.assertEqual(response.json()["valuationHistory"], [])
 
     def test_admin_portfolio_update_writes_editable_fields(self) -> None:
         portfolio_service.add_item(
@@ -280,6 +281,48 @@ class AdminPortfolioTest(unittest.TestCase):
         item = payload["items"][0]
         self.assertEqual(item["userId"], "user-42")
         self.assertEqual(item["ownerEmail"], "Jordan T.")
+
+    def test_get_item_includes_valuation_history_for_that_item_only(self) -> None:
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/rest/v1/portfolio_items"):
+                return httpx.Response(
+                    200,
+                    json=[{"id": "item-1", "user_id": "user-42", "title": "Charizard"}],
+                )
+            if request.url.path.endswith("/rest/v1/portfolio_valuation_snapshots"):
+                captured["params"] = dict(request.url.params)
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "id": "snap-1",
+                            "portfolio_item_id": "item-1",
+                            "value_aud": 217.0,
+                            "display_string": "AUD $217.00",
+                            "valuation_status": "market_estimated",
+                            "valuation_strategy": "market_estimated",
+                            "priced_at": "2026-08-13T00:00:00Z",
+                        }
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        service = AdminPortfolioService(
+            repository=SupabasePricingReviewQueueRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.get_item("item-1")
+
+        self.assertEqual(captured["params"]["portfolio_item_id"], "eq.item-1")
+        self.assertEqual(len(payload["valuationHistory"]), 1)
+        self.assertEqual(payload["valuationHistory"][0]["displayString"], "AUD $217.00")
 
     def test_endpoint_passes_user_id_query_param_through(self) -> None:
         with patch("app.routers.admin_auth.settings") as auth_settings, patch(
