@@ -34,7 +34,14 @@ class AdminCatalogService:
         return {"success": True, "itemId": item_id, "item": row}
 
     def list_items(
-        self, *, source: str = "pricecharting", limit: int = 100, offset: int = 0,
+        self,
+        *,
+        source: str = "pricecharting",
+        limit: int = 100,
+        offset: int = 0,
+        category: str | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
     ) -> dict[str, Any]:
         if not self._repository.is_configured:
             raise AdminCatalogError("Supabase catalog configuration is missing.")
@@ -42,12 +49,15 @@ class AdminCatalogService:
         bounded_limit = max(1, min(limit, 100))
         rows = self._repository.list_catalog_rows(
             source=normalized_source, limit=bounded_limit, offset=max(0, offset),
+            category=category, min_price=min_price, max_price=max_price,
         )
         return {
             "success": True,
             "source": normalized_source,
             "count": len(rows),
-            "totalCount": self._repository.count_catalog_rows(source=normalized_source),
+            "totalCount": self._repository.count_catalog_rows(
+                source=normalized_source, category=category, min_price=min_price, max_price=max_price,
+            ),
             "items": [_compact_catalog_row(row, source=normalized_source) for row in rows],
         }
 
@@ -91,7 +101,14 @@ class SupabaseAdminCatalogRepository:
         raise AdminCatalogError("Catalog item was not found.")
 
     def list_catalog_rows(
-        self, *, source: str, limit: int, offset: int,
+        self,
+        *,
+        source: str,
+        limit: int,
+        offset: int,
+        category: str | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
     ) -> list[dict[str, Any]]:
         # Independent of self._table_name (which stays scoped to
         # pricecharting_catalog for writes) -- this is read-only browsing
@@ -111,16 +128,21 @@ class SupabaseAdminCatalogRepository:
             if source == "kicksdb"
             else ("pricecharting_catalog", "pricecharting_id.asc")
         )
-        payload = self._request(
-            "GET",
-            f"/rest/v1/{table_name}",
-            params={"select": "*", "order": order, "limit": str(limit), "offset": str(offset)},
-        )
+        params = {"select": "*", "order": order, "limit": str(limit), "offset": str(offset)}
+        params.update(_catalog_filter_params(source, category=category, min_price=min_price, max_price=max_price))
+        payload = self._request("GET", f"/rest/v1/{table_name}", params=params)
         if not isinstance(payload, list):
             raise AdminCatalogError("Supabase catalog response shape was invalid.")
         return [row for row in payload if isinstance(row, dict)]
 
-    def count_catalog_rows(self, *, source: str) -> int:
+    def count_catalog_rows(
+        self,
+        *,
+        source: str,
+        category: str | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+    ) -> int:
         # count=estimated, not count=exact: pricecharting_catalog has ~43k
         # rows and RLS enabled (20260811_enable_rls_on_catalog_and_admin_
         # tables.sql), so an exact COUNT(*) forces a full RLS-filtered scan.
@@ -130,7 +152,9 @@ class SupabaseAdminCatalogRepository:
         # worth risking a repeat for a pagination total that doesn't need
         # to be perfectly exact. PostgREST's estimated mode uses the
         # planner's row estimate for large tables, falling back to an exact
-        # count when the result set is already small.
+        # count when the result set is already small -- this holds even
+        # with the same filters applied, since the planner's estimate
+        # already accounts for filter selectivity.
         table_name = "kicksdb_catalog" if source == "kicksdb" else "pricecharting_catalog"
         id_column = "kicksdb_id" if source == "kicksdb" else "pricecharting_id"
         headers = {
@@ -139,6 +163,8 @@ class SupabaseAdminCatalogRepository:
             "Accept": "application/json",
             "Prefer": "count=estimated",
         }
+        params = {"select": id_column, "limit": "1"}
+        params.update(_catalog_filter_params(source, category=category, min_price=min_price, max_price=max_price))
         client = self._client or httpx.Client(timeout=self._timeout_seconds)
         should_close = self._client is None
         try:
@@ -146,7 +172,7 @@ class SupabaseAdminCatalogRepository:
                 "GET",
                 f"{self._supabase_url}/rest/v1/{table_name}",
                 headers=headers,
-                params={"select": id_column, "limit": "1"},
+                params=params,
             )
             response.raise_for_status()
             return _total_from_content_range(response.headers.get("content-range"))
@@ -192,6 +218,33 @@ class SupabaseAdminCatalogRepository:
         finally:
             if should_close:
                 client.close()
+
+
+def _catalog_filter_params(
+    source: str, *, category: str | None, min_price: float | None, max_price: float | None,
+) -> dict[str, str]:
+    params: dict[str, str] = {}
+    if category:
+        params["category"] = f"ilike.*{category}*"
+    if min_price is None and max_price is None:
+        return params
+    # A single representative price column per source, not every tier a
+    # pricecharting_catalog row can carry (loose/cib/new/graded) -- there's
+    # no single "market value" column to filter on, and PostgREST can't
+    # express "whichever of these four is populated" as a plain filter.
+    # loose is the most commonly populated tier in practice; an item priced
+    # only on a different tier won't match a range filter here. Same
+    # approximation _compact_catalog_row already makes for display.
+    price_column = "avg_price_cents" if source == "kicksdb" else "loose_price_cents"
+    min_cents = int(min_price * 100) if min_price is not None else None
+    max_cents = int(max_price * 100) if max_price is not None else None
+    if min_cents is not None and max_cents is not None:
+        params["and"] = f"({price_column}.gte.{min_cents},{price_column}.lte.{max_cents})"
+    elif min_cents is not None:
+        params[price_column] = f"gte.{min_cents}"
+    else:
+        params[price_column] = f"lte.{max_cents}"
+    return params
 
 
 def _compact_catalog_row(row: dict[str, Any], *, source: str) -> dict[str, Any]:

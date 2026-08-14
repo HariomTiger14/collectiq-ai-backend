@@ -219,6 +219,56 @@ class AdminPortfolioTest(unittest.TestCase):
 
         self.assertEqual(captured["params"]["offset"], "150")
 
+    def test_repository_filters_items_by_category(self) -> None:
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabasePricingReviewQueueRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.list_items(limit=50, category="Trading Card")
+
+        self.assertEqual(captured["params"]["category"], "ilike.*Trading Card*")
+
+    def test_service_filters_by_price_range_client_side(self) -> None:
+        # Price mostly lives in the pricing/data JSONB blob, not a plain
+        # column, so this is filtered in Python over the fetched batch --
+        # same limitation class as text search, not a DB-level filter.
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/rest/v1/portfolio_items"):
+                return httpx.Response(
+                    200,
+                    json=[
+                        {"id": "cheap", "user_id": "user-1", "pricing": {"estimatedMarketValue": 10}},
+                        {"id": "mid", "user_id": "user-1", "pricing": {"estimatedMarketValue": 150}},
+                        {"id": "expensive", "user_id": "user-1", "pricing": {"estimatedMarketValue": 900}},
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        service = AdminPortfolioService(
+            repository=SupabasePricingReviewQueueRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.list_items(limit=50, min_price=100, max_price=500)
+
+        self.assertEqual([item["id"] for item in payload["items"]], ["mid"])
+        # totalCount falls back to the filtered-batch length while a price
+        # filter is active, same as while searching.
+        self.assertEqual(payload["totalCount"], 1)
+
     def test_repository_count_items_reads_content_range_total(self) -> None:
         # Regression: numbered pagination (page 1, 2, 3...) needs a real
         # total, not the length of whatever batch happened to get fetched --
@@ -533,7 +583,9 @@ class AdminPortfolioTest(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        service.return_value.list_items.assert_called_once_with(query=None, limit=50, user_id="user-42", offset=0)
+        service.return_value.list_items.assert_called_once_with(
+            query=None, limit=50, user_id="user-42", offset=0, category=None, min_price=None, max_price=None,
+        )
 
 
 if __name__ == "__main__":

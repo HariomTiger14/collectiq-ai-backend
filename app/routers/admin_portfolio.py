@@ -31,13 +31,22 @@ def list_admin_portfolio_items(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     userId: str | None = Query(default=None, min_length=1),
+    category: str | None = Query(default=None, min_length=1),
+    minPrice: float | None = Query(default=None, ge=0),
+    maxPrice: float | None = Query(default=None, ge=0),
     _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
-    payload = AdminPortfolioService().list_items(query=q, limit=limit, user_id=userId, offset=offset)
+    payload = AdminPortfolioService().list_items(
+        query=q, limit=limit, user_id=userId, offset=offset,
+        category=category, min_price=minPrice, max_price=maxPrice,
+    )
     _record_audit(
         action="admin_portfolio.items_viewed",
         status="success",
-        metadata={"query": q or "", "userId": userId or "", "offset": offset, "count": payload.get("count", 0)},
+        metadata={
+            "query": q or "", "userId": userId or "", "offset": offset, "count": payload.get("count", 0),
+            "category": category or "", "minPrice": minPrice, "maxPrice": maxPrice,
+        },
     )
     return payload
 
