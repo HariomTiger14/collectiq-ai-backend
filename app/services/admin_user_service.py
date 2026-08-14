@@ -285,6 +285,22 @@ class SupabaseAdminUserRepository:
         push_devices = self._optional_rows("push_device_registrations", user_id, limit=20)
         wishlist_entries = self._optional_wishlist(user_id, limit=20)
         valuation_history = self._optional_valuation_history(user_id, limit=30)
+        # The snapshot rows only ever stored portfolio_item_id, not the
+        # item's title, so the valuation history panel showed no way to
+        # tell which item each entry belonged to. History spans more items
+        # over time than the 10 "recent" portfolio_items fetched above
+        # cover, so this looks titles up directly by the ids actually
+        # referenced in the history rows.
+        history_item_ids = list({
+            str(row["portfolio_item_id"])
+            for row in valuation_history
+            if row.get("portfolio_item_id")
+        })
+        history_item_titles = (
+            self._batch_profiles_by_id(history_item_ids, table="portfolio_items", id_column="id")
+            if history_item_ids
+            else {}
+        )
         push_deliveries = self._optional_push_deliveries(user_id, limit=10)
         pricing_review_items = [
             item
@@ -310,7 +326,9 @@ class SupabaseAdminUserRepository:
             "priceAlerts": [_compact_price_alert(alert) for alert in price_alerts],
             "pushDevices": [_compact_push_device(device) for device in push_devices],
             "wishlistEntries": [_compact_wishlist_entry(entry) for entry in wishlist_entries],
-            "valuationHistory": [_compact_valuation_snapshot(row) for row in valuation_history],
+            "valuationHistory": [
+                _compact_valuation_snapshot(row, item_titles=history_item_titles) for row in valuation_history
+            ],
             "pushDeliveries": [_compact_push_delivery(row) for row in push_deliveries],
         }
 
@@ -850,10 +868,15 @@ def _compact_wishlist_entry(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _compact_valuation_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+def _compact_valuation_snapshot(
+    row: dict[str, Any], *, item_titles: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    item = (item_titles or {}).get(str(row.get("portfolio_item_id")))
+    item_title = (item.get("title") or item.get("item_name")) if item else None
     return {
         "id": row.get("id"),
         "portfolioItemId": row.get("portfolio_item_id"),
+        "itemTitle": item_title or "Deleted or unknown item",
         "valueAud": row.get("value_aud"),
         "displayString": row.get("display_string"),
         "valuationStatus": row.get("valuation_status"),
