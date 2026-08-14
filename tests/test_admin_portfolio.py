@@ -222,9 +222,9 @@ class AdminPortfolioTest(unittest.TestCase):
     def test_repository_count_items_reads_content_range_total(self) -> None:
         # Regression: numbered pagination (page 1, 2, 3...) needs a real
         # total, not the length of whatever batch happened to get fetched --
-        # this is Supabase's Prefer: count=exact / Content-Range mechanism.
+        # this is Supabase's Prefer: count=estimated / Content-Range mechanism.
         def handler(request: httpx.Request) -> httpx.Response:
-            self.assertEqual(request.headers.get("prefer"), "count=exact")
+            self.assertEqual(request.headers.get("prefer"), "count=estimated")
             return httpx.Response(200, json=[], headers={"content-range": "0-0/1234"})
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -241,7 +241,7 @@ class AdminPortfolioTest(unittest.TestCase):
     def test_service_uses_real_total_when_not_searching(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path.endswith("/rest/v1/portfolio_items"):
-                if request.headers.get("prefer") == "count=exact":
+                if request.headers.get("prefer") == "count=estimated":
                     return httpx.Response(200, json=[], headers={"content-range": "0-0/500"})
                 return httpx.Response(200, json=[{"id": "item-1", "user_id": "user-1"}])
             return httpx.Response(200, json=[])
@@ -266,7 +266,7 @@ class AdminPortfolioTest(unittest.TestCase):
         # whole-table count.
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path.endswith("/rest/v1/portfolio_items"):
-                self.assertNotEqual(request.headers.get("prefer"), "count=exact")
+                self.assertNotEqual(request.headers.get("prefer"), "count=estimated")
                 return httpx.Response(
                     200,
                     json=[{"id": "item-1", "user_id": "user-1", "title": "Charizard"}],
@@ -289,7 +289,7 @@ class AdminPortfolioTest(unittest.TestCase):
     def test_service_passes_offset_through_to_repository(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path.endswith("/rest/v1/portfolio_items"):
-                if request.headers.get("prefer") == "count=exact":
+                if request.headers.get("prefer") == "count=estimated":
                     return httpx.Response(200, json=[], headers={"content-range": "0-0/250"})
                 assert request.url.params.get("offset") == "100"
                 return httpx.Response(200, json=[{"id": f"item-{i}", "user_id": "user-1"} for i in range(50)])
