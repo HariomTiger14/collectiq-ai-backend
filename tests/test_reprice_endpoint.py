@@ -1,9 +1,10 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.schemas.pricing import RepriceIdentityRequest, RepriceRequest
 from app.services.pricing.base_pricing_provider import (
     EmptyMarketDataError,
     MarketComparableSale,
@@ -11,6 +12,7 @@ from app.services.pricing.base_pricing_provider import (
     PricingResult,
     utc_timestamp,
 )
+from app.services.pricing.reprice_service import RepriceService
 
 
 class RepriceEndpointTest(unittest.TestCase):
@@ -107,6 +109,51 @@ class RepriceEndpointTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["code"], "invalid_reprice_identity")
+
+
+class RepriceServiceSharedCacheTest(unittest.TestCase):
+    # Regression: unmatched items (no pricecharting_id) used to always hit
+    # the live provider independently on every scheduled reprice, so two
+    # users' visually-identical unmatched items would drift apart in price
+    # over time even if they started out equal. RepriceService now consults
+    # the same shared cache api_analyze.py already used at scan time.
+
+    def test_cache_hit_skips_the_live_provider_entirely(self) -> None:
+        cached_pricing = PricingResult(
+            estimatedMarketValue=250,
+            lowEstimate=200,
+            highEstimate=300,
+            currency="AUD",
+            pricingSource="PriceCharting",
+            pricingConfidence=88,
+            lastUpdated=utc_timestamp(),
+            valuationStatus="market_estimated",
+        )
+        shared_cache = Mock()
+        shared_cache.get.return_value = cached_pricing
+        service = RepriceService(shared_cache=shared_cache)
+
+        with patch("app.services.pricing.reprice_service.get_pricing_provider") as get_provider:
+            response = service.reprice(_request())
+
+        get_provider.assert_not_called()
+        shared_cache.set.assert_not_called()
+        self.assertEqual(response.pricing.estimatedMarketValue, 250)
+        self.assertEqual(response.pricing.displayString, "AUD $250.00")
+
+    def test_cache_miss_calls_provider_then_writes_the_cache(self) -> None:
+        shared_cache = Mock()
+        shared_cache.get.return_value = None
+        service = RepriceService(shared_cache=shared_cache)
+
+        with patch(
+            "app.services.pricing.reprice_service.get_pricing_provider",
+            return_value=_FakePricingProvider(),
+        ):
+            response = service.reprice(_request())
+
+        shared_cache.set.assert_called_once()
+        self.assertEqual(response.pricing.estimatedMarketValue, 420)
 
 
 class _FakePricingProvider:
@@ -227,6 +274,24 @@ def _payload() -> dict:
             "year": "1999",
         },
     }
+
+
+def _request() -> RepriceRequest:
+    return RepriceRequest(
+        itemId="portfolio-1",
+        previousValue=300,
+        previousCurrency="AUD",
+        correctionSource="manual",
+        identity=RepriceIdentityRequest(
+            title="1999 Pokemon Charizard Holo",
+            category="Pokemon Card",
+            brand="Pokemon",
+            setName="Base Set",
+            cardNumber="4/102",
+            condition="Near Mint",
+            year="1999",
+        ),
+    )
 
 
 if __name__ == "__main__":
