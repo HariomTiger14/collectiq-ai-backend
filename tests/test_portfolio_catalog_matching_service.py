@@ -114,6 +114,84 @@ class FindBestMatchTest(unittest.TestCase):
 
         self.assertIsNone(find_best_match(catalog, "q"))
 
+    def test_without_an_item_ignores_identity_fields_and_keeps_first_candidate(self) -> None:
+        # No item passed at all -- must behave exactly like before this
+        # feature existed (title-only, first-qualifying-result-wins).
+        catalog = _StubCatalog(
+            CatalogSearchResponse(
+                query="charizard",
+                count=2,
+                results=[_result(id="first", confidence=0.96), _result(id="second", confidence=0.96)],
+            )
+        )
+
+        match = find_best_match(catalog, "Charizard")
+
+        assert match is not None
+        self.assertEqual(match["id"], "first")
+
+    def test_prefers_the_candidate_whose_set_name_matches_the_items_recognized_set(self) -> None:
+        wrong_set = _result(id="wrong-set", confidence=0.96)
+        right_set = CatalogSearchResult(
+            id="right-set",
+            title="Charizard #4",
+            category="Trading Cards",
+            source="PriceCharting",
+            setName="Base Set Shadowless",
+            identifier=None,
+            productUrl=None,
+            sourceFile=None,
+            confidence=0.96,
+            attribution="Pricing data by PriceCharting",
+            lastUpdated=None,
+            imageUrl=None,
+            pricing=CatalogSearchPricing(
+                currency="USD",
+                marketValue=100.0,
+                lowEstimate=80.0,
+                highEstimate=120.0,
+                loosePrice=100.0,
+                cibPrice=None,
+                newPrice=None,
+                gradedPrice=None,
+            ),
+        )
+        catalog = _StubCatalog(
+            CatalogSearchResponse(query="charizard", count=2, results=[wrong_set, right_set])
+        )
+        item = {"title": "Charizard", "raw_json": {"setName": "Base Set Shadowless"}}
+
+        match = find_best_match(catalog, "Charizard", item)
+
+        assert match is not None
+        self.assertEqual(match["id"], "right-set")
+
+    def test_falls_back_to_the_first_candidate_when_no_identity_field_matches_any_of_them(self) -> None:
+        catalog = _StubCatalog(
+            CatalogSearchResponse(
+                query="charizard",
+                count=2,
+                results=[_result(id="first", confidence=0.96), _result(id="second", confidence=0.96)],
+            )
+        )
+        item = {"title": "Charizard", "raw_json": {"setName": "Some Set Not In Either Candidate"}}
+
+        match = find_best_match(catalog, "Charizard", item)
+
+        assert match is not None
+        self.assertEqual(match["id"], "first")
+
+    def test_ignores_identity_fields_that_are_missing_or_blank(self) -> None:
+        catalog = _StubCatalog(
+            CatalogSearchResponse(query="q", count=1, results=[_result(id="x", confidence=0.96)])
+        )
+        item = {"title": "q", "raw_json": {"cardNumber": "", "edition": None}}
+
+        match = find_best_match(catalog, "q", item)
+
+        assert match is not None
+        self.assertEqual(match["id"], "x")
+
 
 class DisplayCurrencyFromItemTest(unittest.TestCase):
     def test_uses_raw_json_currency(self) -> None:
