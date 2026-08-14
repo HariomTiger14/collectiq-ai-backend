@@ -65,6 +65,44 @@ class AdminCatalogListItemsTest(unittest.TestCase):
         self.assertTrue(captured["path"].endswith("/rest/v1/kicksdb_catalog"))
         self.assertEqual(captured["params"]["order"], "rank.asc.nullslast")
 
+    def test_repository_counts_pricecharting_rows_via_content_range(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.headers.get("prefer"), "count=exact")
+            return httpx.Response(200, json=[], headers={"content-range": "0-0/9284"})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabaseAdminCatalogRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        total = repository.count_catalog_rows(source="pricecharting")
+
+        self.assertEqual(total, 9284)
+
+    def test_service_includes_total_count(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.headers.get("prefer") == "count=exact":
+                return httpx.Response(200, json=[], headers={"content-range": "0-0/9284"})
+            return httpx.Response(
+                200,
+                json=[{"pricecharting_id": "1", "product_name": "Item", "currency": "USD"}],
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        service = AdminCatalogService(
+            repository=SupabaseAdminCatalogRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.list_items(source="pricecharting", limit=100, offset=0)
+
+        self.assertEqual(payload["totalCount"], 9284)
+
     def test_service_compacts_pricecharting_rows(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(

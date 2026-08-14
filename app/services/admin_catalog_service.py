@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.services.pricing.admin_review_queue_service import _total_from_content_range
 
 
 class AdminCatalogError(Exception):
@@ -46,6 +47,7 @@ class AdminCatalogService:
             "success": True,
             "source": normalized_source,
             "count": len(rows),
+            "totalCount": self._repository.count_catalog_rows(source=normalized_source),
             "items": [_compact_catalog_row(row, source=normalized_source) for row in rows],
         }
 
@@ -117,6 +119,32 @@ class SupabaseAdminCatalogRepository:
         if not isinstance(payload, list):
             raise AdminCatalogError("Supabase catalog response shape was invalid.")
         return [row for row in payload if isinstance(row, dict)]
+
+    def count_catalog_rows(self, *, source: str) -> int:
+        table_name = "kicksdb_catalog" if source == "kicksdb" else "pricecharting_catalog"
+        id_column = "kicksdb_id" if source == "kicksdb" else "pricecharting_id"
+        headers = {
+            "apikey": self._service_role_key,
+            "Authorization": f"Bearer {self._service_role_key}",
+            "Accept": "application/json",
+            "Prefer": "count=exact",
+        }
+        client = self._client or httpx.Client(timeout=self._timeout_seconds)
+        should_close = self._client is None
+        try:
+            response = client.request(
+                "GET",
+                f"{self._supabase_url}/rest/v1/{table_name}",
+                headers=headers,
+                params={"select": id_column, "limit": "1"},
+            )
+            response.raise_for_status()
+            return _total_from_content_range(response.headers.get("content-range"))
+        except httpx.HTTPError as error:
+            raise AdminCatalogError("Supabase catalog count request failed.") from error
+        finally:
+            if should_close:
+                client.close()
 
     def _request(
         self,
