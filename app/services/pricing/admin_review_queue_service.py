@@ -313,6 +313,24 @@ class SupabasePricingReviewQueueRepository:
         row = payload[0]
         return _portfolio_item_from_row(row) if isinstance(row, dict) else None
 
+    def list_valuation_history_for_item(self, item_id: str, *, limit: int = 30) -> list[dict[str, Any]]:
+        try:
+            payload = self._request(
+                "GET",
+                "/rest/v1/portfolio_valuation_snapshots",
+                params={
+                    "portfolio_item_id": f"eq.{item_id}",
+                    "select": "*",
+                    "limit": str(limit),
+                    "order": "priced_at.desc",
+                },
+            )
+        except ReviewQueueRepositoryError:
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [row for row in payload if isinstance(row, dict)]
+
     def update_item_data(self, item_id: str, data: dict[str, Any]) -> PortfolioItem | None:
         current = self.get_item(item_id)
         if current is None:

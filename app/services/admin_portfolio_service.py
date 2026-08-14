@@ -69,9 +69,15 @@ class AdminPortfolioService:
         )
         if item is None:
             raise KeyError(f"Portfolio item {item_id} was not found.")
+        valuation_history = (
+            self._repository.list_valuation_history_for_item(item_id)
+            if self._repository.is_configured
+            else []
+        )
         return {
             "success": True,
             "item": _compact_portfolio_item(item, include_raw=True),
+            "valuationHistory": [_compact_valuation_snapshot(row) for row in valuation_history],
         }
 
     def update_item(self, item_id: str, updates: dict[str, Any], *, actor: str = "admin") -> dict[str, Any]:
@@ -177,6 +183,17 @@ def _editable_portfolio_updates(updates: dict[str, Any]) -> dict[str, Any]:
         if value is not None:
             cleaned[target_key] = str(value).strip()
     return {key: value for key, value in cleaned.items() if value not in (None, "")}
+
+
+def _compact_valuation_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "valueAud": row.get("value_aud"),
+        "displayString": row.get("display_string"),
+        "valuationStatus": row.get("valuation_status"),
+        "valuationStrategy": row.get("valuation_strategy"),
+        "pricedAt": row.get("priced_at"),
+    }
 
 
 def _provider_name(pricing: dict[str, Any]) -> str:
