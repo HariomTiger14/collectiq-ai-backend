@@ -259,11 +259,16 @@ class SupabasePricingReviewQueueRepository:
         ]
 
     def count_items(self, *, user_id: str | None = None) -> int:
-        # Exact row count for numbered pagination -- this is the real total
-        # in the table (optionally filtered by owner), not the text-search
-        # result count, since search filtering happens client-side over a
-        # fetched batch rather than as a DB-level filter (a known,
-        # documented limitation -- see PR #81).
+        # count=estimated, not count=exact: a real exact COUNT(*) over this
+        # whole table under RLS (enabled 20260811) forces a full scan, and
+        # this table has a documented history of breaking production from
+        # exactly this class of expensive-query mistake (statement timeouts
+        # in 20260808_drop_unused_pricecharting_catalog_indexes.sql -- a
+        # different table there, but the same lesson applies here).
+        # PostgREST's estimated mode uses the planner's row estimate for
+        # large tables and only falls back to an exact count when the
+        # result set is already small, which is the right tradeoff for a
+        # pagination total -- doesn't need to be perfectly exact.
         params: dict[str, str] = {"select": "id", "limit": "1"}
         if user_id:
             params["user_id"] = f"eq.{user_id}"
@@ -271,7 +276,7 @@ class SupabasePricingReviewQueueRepository:
             "apikey": self._service_role_key,
             "Authorization": f"Bearer {self._service_role_key}",
             "Accept": "application/json",
-            "Prefer": "count=exact",
+            "Prefer": "count=estimated",
         }
         client = self._client or httpx.Client(timeout=self._timeout_seconds)
         should_close = self._client is None

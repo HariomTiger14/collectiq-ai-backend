@@ -67,7 +67,7 @@ class AdminCatalogListItemsTest(unittest.TestCase):
 
     def test_repository_counts_pricecharting_rows_via_content_range(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
-            self.assertEqual(request.headers.get("prefer"), "count=exact")
+            self.assertEqual(request.headers.get("prefer"), "count=estimated")
             return httpx.Response(200, json=[], headers={"content-range": "0-0/9284"})
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -83,7 +83,7 @@ class AdminCatalogListItemsTest(unittest.TestCase):
 
     def test_service_includes_total_count(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
-            if request.headers.get("prefer") == "count=exact":
+            if request.headers.get("prefer") == "count=estimated":
                 return httpx.Response(200, json=[], headers={"content-range": "0-0/9284"})
             return httpx.Response(
                 200,

@@ -121,13 +121,23 @@ class SupabaseAdminCatalogRepository:
         return [row for row in payload if isinstance(row, dict)]
 
     def count_catalog_rows(self, *, source: str) -> int:
+        # count=estimated, not count=exact: pricecharting_catalog has ~43k
+        # rows and RLS enabled (20260811_enable_rls_on_catalog_and_admin_
+        # tables.sql), so an exact COUNT(*) forces a full RLS-filtered scan.
+        # This table already has a documented production incident from an
+        # unrelated expensive-query mistake (statement timeouts, see
+        # 20260808_drop_unused_pricecharting_catalog_indexes.sql) -- not
+        # worth risking a repeat for a pagination total that doesn't need
+        # to be perfectly exact. PostgREST's estimated mode uses the
+        # planner's row estimate for large tables, falling back to an exact
+        # count when the result set is already small.
         table_name = "kicksdb_catalog" if source == "kicksdb" else "pricecharting_catalog"
         id_column = "kicksdb_id" if source == "kicksdb" else "pricecharting_id"
         headers = {
             "apikey": self._service_role_key,
             "Authorization": f"Bearer {self._service_role_key}",
             "Accept": "application/json",
-            "Prefer": "count=exact",
+            "Prefer": "count=estimated",
         }
         client = self._client or httpx.Client(timeout=self._timeout_seconds)
         should_close = self._client is None
