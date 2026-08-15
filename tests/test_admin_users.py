@@ -725,16 +725,27 @@ class AdminTeamTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 503)
 
-    def test_team_invite_request_rejects_the_default_user_role(self) -> None:
-        # Inviting someone onto the team with the no-access default role
-        # would just be a pointless invite email -- validated at the
-        # request-model level, same style as AdminRoleUpdateRequest's
-        # pattern constraint.
+    def test_team_invite_request_accepts_the_plain_user_role(self) -> None:
+        # This same invite flow doubles as "create a plain app account" --
+        # not just staff -- so role="user" must pass request validation
+        # (it fails downstream at 503 in this test only because Supabase
+        # isn't configured, not because of the role).
         with patch("app.routers.admin_auth.settings") as auth_settings:
             auth_settings.admin_import_token = "secret-token"
             response = self.client.post(
                 "/admin/users/team",
                 json={"email": "new.hire@packlox.com", "role": "user"},
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+        self.assertEqual(response.status_code, 503)
+
+    def test_team_invite_request_rejects_an_unknown_role(self) -> None:
+        with patch("app.routers.admin_auth.settings") as auth_settings:
+            auth_settings.admin_import_token = "secret-token"
+            response = self.client.post(
+                "/admin/users/team",
+                json={"email": "new.hire@packlox.com", "role": "owner"},
                 headers={"Authorization": "Bearer secret-token"},
             )
 
