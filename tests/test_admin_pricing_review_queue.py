@@ -310,6 +310,38 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
         self.assertTrue(request["url"].endswith("/rest/v1/portfolio_items"))
         self.assertEqual(request["headers"]["Authorization"], "Bearer service-role")
 
+    def test_supabase_review_queue_reads_pricing_from_raw_json(self) -> None:
+        # The scheduled repricing sweep (batch_repricing_service.py) only
+        # ever writes pricing into raw_json.pricing/raw_json.estimatedValue,
+        # never the top-level pricing/data columns. An item priced that way
+        # used to be misread as unpriced/0% confidence and wrongly show up
+        # here needing review, despite being correctly priced.
+        client = _FakeSupabaseClient(
+            get_rows=[
+                {
+                    "id": "swept-item",
+                    "title": "Swept Card",
+                    "category": "Pokemon Card",
+                    "raw_json": {
+                        "estimatedValue": 42.75,
+                        "pricing": {"estimatedMarketValue": 42.75, "pricingConfidence": 88},
+                    },
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            ]
+        )
+        service = AdminPricingReviewQueueService(
+            repository=SupabasePricingReviewQueueRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.list_queue()
+
+        self.assertEqual(payload["totalCount"], 0)
+
     def test_supabase_mark_reviewed_patches_persistent_item(self) -> None:
         client = _FakeSupabaseClient(
             get_rows=[

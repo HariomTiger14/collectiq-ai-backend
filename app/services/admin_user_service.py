@@ -787,11 +787,24 @@ def _latest_text(*values: Any) -> str | None:
     return max(strings) if strings else None
 
 
-def _compact_portfolio_item(row: dict[str, Any]) -> dict[str, Any]:
-    data = row.get("data") if isinstance(row.get("data"), dict) else {}
+def _resolve_pricing_dict(row: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    # The scheduled repricing sweep (batch_repricing_service.py) only ever
+    # writes pricing into raw_json.pricing -- never the top-level pricing/
+    # data columns these admin reads originally checked. Any item priced by
+    # that sweep (valuationStatus "market_estimated"/"catalog_lookup") was
+    # silently computing as $0/0% confidence here despite being correctly
+    # priced -- live-confirmed via a real user whose valuation history
+    # showed real recent prices while this page's totals showed $0.
+    raw = row.get("raw_json") if isinstance(row.get("raw_json"), dict) else {}
     pricing = row.get("pricing") if isinstance(row.get("pricing"), dict) else data.get("pricing")
     if not isinstance(pricing, dict):
-        pricing = {}
+        pricing = raw.get("pricing")
+    return pricing if isinstance(pricing, dict) else {}
+
+
+def _compact_portfolio_item(row: dict[str, Any]) -> dict[str, Any]:
+    data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    pricing = _resolve_pricing_dict(row, data)
     return {
         "id": row.get("id") or data.get("id"),
         "title": (
@@ -901,15 +914,16 @@ def _compact_push_delivery(row: dict[str, Any]) -> dict[str, Any]:
 
 def _pricing_value(row: dict[str, Any]) -> float:
     data = row.get("data") if isinstance(row.get("data"), dict) else {}
-    pricing = row.get("pricing") if isinstance(row.get("pricing"), dict) else data.get("pricing")
-    if not isinstance(pricing, dict):
-        pricing = {}
+    raw = row.get("raw_json") if isinstance(row.get("raw_json"), dict) else {}
+    pricing = _resolve_pricing_dict(row, data)
     value = (
         pricing.get("estimatedMarketValue")
         or pricing.get("marketValue")
         or pricing.get("value")
         or row.get("estimated_value")
+        or row.get("estimated_value_low")
         or data.get("estimatedMarketValue")
+        or raw.get("estimatedValue")
     )
     try:
         return max(0.0, float(value))
@@ -919,9 +933,7 @@ def _pricing_value(row: dict[str, Any]) -> float:
 
 def _pricing_confidence(row: dict[str, Any]) -> int:
     data = row.get("data") if isinstance(row.get("data"), dict) else {}
-    pricing = row.get("pricing") if isinstance(row.get("pricing"), dict) else data.get("pricing")
-    if not isinstance(pricing, dict):
-        pricing = {}
+    pricing = _resolve_pricing_dict(row, data)
     value = (
         pricing.get("pricingConfidence")
         or pricing.get("confidence")

@@ -45,7 +45,7 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(user["email"], "collector@example.com")
         self.assertEqual(user["authStatus"], "confirmed")
         self.assertEqual(user["displayName"], "Collector One")
-        self.assertEqual(user["portfolioCount"], 2)
+        self.assertEqual(user["portfolioCount"], 3)
         self.assertEqual(user["scanCount"], 1)
         self.assertEqual(user["pushDeviceCount"], 1)
         self.assertEqual(user["plan"], "pro")
@@ -97,7 +97,7 @@ class AdminUsersTest(unittest.TestCase):
             self.assertIn("in.(user-1)", table_requests[0]["params"]["user_id"])
 
         user = payload["users"][0]
-        self.assertEqual(user["portfolioCount"], 2)
+        self.assertEqual(user["portfolioCount"], 3)
         self.assertEqual(user["scanCount"], 1)
         self.assertEqual(user["pushDeviceCount"], 1)
         self.assertEqual(user["plan"], "pro")
@@ -209,10 +209,13 @@ class AdminUsersTest(unittest.TestCase):
         self.assertTrue(payload["success"])
         user = payload["user"]
         self.assertEqual(user["id"], "user-1")
-        self.assertEqual(user["portfolioValue"], 125.5)
-        self.assertEqual(len(user["recentPortfolioItems"]), 2)
+        self.assertEqual(user["portfolioValue"], 168.25)
+        self.assertEqual(len(user["recentPortfolioItems"]), 3)
         self.assertEqual(len(user["recentScans"]), 1)
         self.assertEqual([item["id"] for item in user["pricingReviewItems"]], ["item-2"])
+        swept_item = next(item for item in user["recentPortfolioItems"] if item["id"] == "item-3")
+        self.assertEqual(swept_item["price"], 42.75)
+        self.assertEqual(swept_item["confidence"], 88)
         self.assertEqual(user["subscription"]["plan"], "pro")
         self.assertEqual(user["scanUsage"]["used"], 5)
         self.assertEqual(len(user["priceAlerts"]), 1)
@@ -770,8 +773,27 @@ class _FakeAdminUsersClient:
                             "pricingConfidence": 20,
                         },
                     },
+                    {
+                        # Priced by the scheduled repricing sweep, which only
+                        # writes raw_json -- never top-level pricing/data.
+                        # Regression coverage for a real bug: this used to
+                        # compute as $0/0% confidence here despite being
+                        # correctly priced.
+                        "id": "item-3",
+                        "user_id": "user-1",
+                        "title": "Swept Card",
+                        "category": "Card",
+                        "raw_json": {
+                            "estimatedValue": 42.75,
+                            "pricing": {
+                                "estimatedMarketValue": 42.75,
+                                "currency": "AUD",
+                                "pricingConfidence": 88,
+                            },
+                        },
+                    },
                 ],
-                headers={"content-range": "0-1/2"},
+                headers={"content-range": "0-2/3"},
             )
         if url.endswith("/rest/v1/scan_analysis_events"):
             return _response(

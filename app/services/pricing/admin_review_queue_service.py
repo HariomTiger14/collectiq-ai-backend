@@ -565,8 +565,20 @@ def _portfolio_item_from_row(row: dict[str, Any]) -> PortfolioItem | None:
     if not item_id:
         return None
     data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    # The scheduled repricing sweep (batch_repricing_service.py) only ever
+    # writes pricing into raw_json.pricing/raw_json.estimatedValue -- never
+    # the top-level pricing/data columns this used to check exclusively.
+    # Any item priced by that sweep showed as $0/unpriced here despite
+    # being correctly priced (its raw_json was just never consulted).
+    raw = row.get("raw_json") if isinstance(row.get("raw_json"), dict) else {}
     pricing = row.get("pricing") if isinstance(row.get("pricing"), dict) else data.get("pricing")
+    if not isinstance(pricing, dict):
+        pricing = raw.get("pricing")
+    estimated_value = raw.get("estimatedValue")
+    if estimated_value is None:
+        estimated_value = row.get("estimated_value") or row.get("estimated_value_low")
     merged = {
+        **({"estimatedValue": estimated_value} if estimated_value is not None else {}),
         **data,
         **{
             key: value
