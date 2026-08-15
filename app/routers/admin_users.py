@@ -46,6 +46,79 @@ class PriceAlertUpdateRequest(BaseModel):
     message: str | None = Field(default=None, max_length=500)
 
 
+class TeamInviteRequest(BaseModel):
+    email: str = Field(max_length=320)
+    # No "user" here (unlike AdminRoleUpdateRequest) -- inviting someone
+    # onto the team with the default no-access role would be a pointless
+    # invite email.
+    role: str = Field(pattern="^(admin|support|viewer|pricing_reviewer)$")
+    isAdmin: bool = False
+
+
+# Registered before /{user_id} below -- FastAPI matches path routes in
+# registration order, so /team must come first or "/admin/users/team"
+# would be swallowed by get_admin_user_detail with user_id="team" (same
+# reason /subscription-summary above is also ordered ahead of it).
+@router.get("/team")
+def list_admin_team(
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    try:
+        payload = AdminUserService().list_team()
+        _record_audit(admin=_admin, action="admin_users.team_viewed", status="success")
+        return payload
+    except AdminUserServiceError as error:
+        _record_audit(
+            admin=_admin,
+            action="admin_users.team_viewed",
+            status="failure",
+            metadata={"error": str(error)},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_team_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+
+
+@router.post("/team")
+def invite_admin_team_member(
+    request: TeamInviteRequest,
+    admin: dict[str, Any] = Depends(require_admin_permission("users:write")),
+) -> dict[str, Any]:
+    email = request.email.strip().lower()
+    try:
+        payload = AdminUserService().invite_team_member(
+            email=email, role=request.role, is_admin=request.isAdmin,
+        )
+        _record_audit(
+            admin=admin,
+            action="admin_users.team_invited",
+            status="success",
+            target_id=payload.get("userId"),
+            metadata={"email": email, "role": request.role, "isAdmin": request.isAdmin},
+        )
+        return payload
+    except AdminUserServiceError as error:
+        _record_audit(
+            admin=admin,
+            action="admin_users.team_invited",
+            status="failure",
+            metadata={"email": email, "role": request.role, "error": str(error)},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_team_invite_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+
+
 @router.get("/subscription-summary")
 def get_admin_subscription_summary(
     _admin: dict[str, Any] = Depends(require_admin_import_token),
@@ -71,6 +144,7 @@ def get_admin_user_detail(
     try:
         payload = AdminUserService().get_user_detail(user_id)
         _record_audit(
+            admin=_admin,
             action="admin_users.detail_viewed",
             status="success",
             metadata={"userId": user_id},
@@ -78,6 +152,7 @@ def get_admin_user_detail(
         return payload
     except AdminUserServiceError as error:
         _record_audit(
+            admin=_admin,
             action="admin_users.detail_viewed",
             status="failure",
             metadata={"userId": user_id, "error": str(error)},
@@ -131,6 +206,7 @@ def run_user_support_action(
         else:
             payload = service.enable_user(user_id)
         _record_audit(
+            admin=admin,
             action=f"admin_users.support.{action}",
             status="success",
             target_id=user_id,
@@ -139,6 +215,7 @@ def run_user_support_action(
         return payload
     except AdminUserServiceError as error:
         _record_audit(
+            admin=admin,
             action=f"admin_users.support.{action}",
             status="failure",
             target_id=user_id,
@@ -176,6 +253,7 @@ def update_admin_user_role(
             is_admin=request.isAdmin,
         )
         _record_audit(
+            admin=admin,
             action="admin_users.role_updated",
             status="success",
             target_id=user_id,
@@ -184,6 +262,7 @@ def update_admin_user_role(
         return payload
     except AdminUserServiceError as error:
         _record_audit(
+            admin=admin,
             action="admin_users.role_updated",
             status="failure",
             target_id=user_id,
@@ -208,6 +287,7 @@ def override_user_subscription(
     try:
         payload = AdminUserService().override_subscription(user_id=user_id, plan=request.plan)
         _record_audit(
+            admin=admin,
             action="admin_users.subscription_overridden",
             status="success",
             target_id=user_id,
@@ -216,6 +296,7 @@ def override_user_subscription(
         return payload
     except AdminUserServiceError as error:
         _record_audit(
+            admin=admin,
             action="admin_users.subscription_overridden",
             status="failure",
             target_id=user_id,
@@ -239,6 +320,7 @@ def reset_user_scan_usage(
     try:
         payload = AdminUserService().reset_scan_usage(user_id)
         _record_audit(
+            admin=admin,
             action="admin_users.scan_usage_reset",
             status="success",
             target_id=user_id,
@@ -246,6 +328,7 @@ def reset_user_scan_usage(
         return payload
     except AdminUserServiceError as error:
         _record_audit(
+            admin=admin,
             action="admin_users.scan_usage_reset",
             status="failure",
             target_id=user_id,
@@ -275,6 +358,7 @@ def update_user_collector_profile(
             preferred_currency=request.preferredCurrency,
         )
         _record_audit(
+            admin=admin,
             action="admin_users.collector_profile_updated",
             status="success",
             target_id=user_id,
@@ -283,6 +367,7 @@ def update_user_collector_profile(
         return payload
     except AdminUserServiceError as error:
         _record_audit(
+            admin=admin,
             action="admin_users.collector_profile_updated",
             status="failure",
             target_id=user_id,
@@ -310,6 +395,7 @@ def update_user_wishlist_entry(
             user_id=user_id, item_id=item_id, status=request.status
         )
         _record_audit(
+            admin=admin,
             action="admin_users.wishlist_entry_updated",
             status="success",
             target_id=user_id,
@@ -318,6 +404,7 @@ def update_user_wishlist_entry(
         return payload
     except AdminUserServiceError as error:
         _record_audit(
+            admin=admin,
             action="admin_users.wishlist_entry_updated",
             status="failure",
             target_id=user_id,
@@ -342,6 +429,7 @@ def delete_user_wishlist_entry(
     try:
         payload = AdminUserService().delete_wishlist_entry(user_id=user_id, item_id=item_id)
         _record_audit(
+            admin=admin,
             action="admin_users.wishlist_entry_deleted",
             status="success",
             target_id=user_id,
@@ -350,6 +438,7 @@ def delete_user_wishlist_entry(
         return payload
     except AdminUserServiceError as error:
         _record_audit(
+            admin=admin,
             action="admin_users.wishlist_entry_deleted",
             status="failure",
             target_id=user_id,
@@ -382,6 +471,7 @@ def update_user_price_alert(
     try:
         payload = AdminUserService().update_price_alert(user_id=user_id, alert_id=alert_id, fields=fields)
         _record_audit(
+            admin=admin,
             action="admin_users.price_alert_updated",
             status="success",
             target_id=user_id,
@@ -390,6 +480,7 @@ def update_user_price_alert(
         return payload
     except AdminUserServiceError as error:
         _record_audit(
+            admin=admin,
             action="admin_users.price_alert_updated",
             status="failure",
             target_id=user_id,
@@ -414,6 +505,7 @@ def delete_user_price_alert(
     try:
         payload = AdminUserService().delete_price_alert(user_id=user_id, alert_id=alert_id)
         _record_audit(
+            admin=admin,
             action="admin_users.price_alert_deleted",
             status="success",
             target_id=user_id,
@@ -422,6 +514,7 @@ def delete_user_price_alert(
         return payload
     except AdminUserServiceError as error:
         _record_audit(
+            admin=admin,
             action="admin_users.price_alert_deleted",
             status="failure",
             target_id=user_id,
@@ -448,6 +541,7 @@ def list_admin_users(
     try:
         payload = AdminUserService().list_users(query=q, limit=limit, page=page)
         _record_audit(
+            admin=_admin,
             action=action,
             status="success",
             metadata={"query": q or "", "count": payload.get("count", 0), "page": page},
@@ -455,6 +549,7 @@ def list_admin_users(
         return payload
     except AdminUserServiceError as error:
         _record_audit(
+            admin=_admin,
             action=action,
             status="failure",
             metadata={"query": q or "", "error": str(error)},
@@ -471,6 +566,7 @@ def list_admin_users(
 
 def _record_audit(
     *,
+    admin: dict[str, Any],
     action: str,
     status: str,
     target_id: str | None = None,
@@ -483,6 +579,12 @@ def _record_audit(
             target_type="user" if target_id else None,
             target_id=target_id,
             metadata=metadata,
+            # Every call site here used to omit actor entirely, so every
+            # role change / support action / etc. landed with the generic
+            # default "admin_token" regardless of who actually did it --
+            # "last admin action by this person" (the Team & access roster)
+            # depends on this being the real acting admin's identity.
+            actor=str(admin.get("email") or admin.get("id") or "admin_token"),
         )
     except Exception:
         return
