@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.services.admin_audit_service import AdminAuditService
 from app.services.subscription.apple_verification_service import (
     AppleTransactionInvalidError,
     AppleVerificationNotConfiguredError,
@@ -65,6 +66,7 @@ class SubscriptionService:
         client: httpx.Client | None = None,
         google_play_verifier: GooglePlayVerificationService | None = None,
         apple_verifier: AppleVerificationService | None = None,
+        audit_service: AdminAuditService | None = None,
     ) -> None:
         self._supabase_url = (
             supabase_url if supabase_url is not None else settings.supabase_url
@@ -80,6 +82,7 @@ class SubscriptionService:
         self._client = client or httpx.Client(timeout=15)
         self._google_play_verifier = google_play_verifier or GooglePlayVerificationService()
         self._apple_verifier = apple_verifier or AppleVerificationService()
+        self._audit_service = audit_service or AdminAuditService()
 
     # -- public API ---------------------------------------------------------
 
@@ -199,6 +202,13 @@ class SubscriptionService:
             row["plan"] = claimed_plan
             row["status"] = "active"
 
+        # Read before write so a genuine plan/status change can be recorded
+        # -- the Subscriptions admin page's "Recent entitlement changes" has
+        # nothing to show otherwise, since this table only ever stores
+        # current state, never history. Deliberately after verification, not
+        # before -- a rejected/invalid purchase shouldn't touch this table
+        # at all.
+        previous = self.get_entitlement(user_id)
         response = self._supabase_request(
             "POST",
             "/rest/v1/user_subscriptions",
@@ -209,10 +219,36 @@ class SubscriptionService:
             json=[row],
         )
         rows = response.json()
-        if isinstance(rows, list) and rows:
-            return self._to_entitlement(rows[0])
-        # Fall back to a read if the store didn't return the representation.
-        return self.get_entitlement(user_id)
+        new_entitlement = (
+            self._to_entitlement(rows[0])
+            if isinstance(rows, list) and rows
+            # Fall back to a read if the store didn't return the representation.
+            else self.get_entitlement(user_id)
+        )
+        self._record_entitlement_change(user_id, previous, new_entitlement)
+        return new_entitlement
+
+    def _record_entitlement_change(
+        self, user_id: str, previous: dict[str, Any], new: dict[str, Any],
+    ) -> None:
+        if previous.get("plan") == new.get("plan") and previous.get("status") == new.get("status"):
+            return
+        try:
+            self._audit_service.record(
+                action="subscription.entitlement_changed",
+                status="success",
+                target_type="user",
+                target_id=user_id,
+                metadata={
+                    "fromPlan": previous.get("plan"),
+                    "toPlan": new.get("plan"),
+                    "fromStatus": previous.get("status"),
+                    "toStatus": new.get("status"),
+                    "source": new.get("source"),
+                },
+            )
+        except Exception:  # noqa: BLE001 - a missed audit row can't block the grant
+            pass
 
     def _verify_google_play(self, purchase_token: str | None, claimed_plan: str) -> dict[str, Any]:
         try:

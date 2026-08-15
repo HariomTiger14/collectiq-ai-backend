@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
 from fastapi.testclient import TestClient
@@ -38,6 +38,79 @@ class AdminSubscriptionMetricsServiceTest(unittest.TestCase):
         admin_override_bucket = next(b for b in payload["bySource"] if b["label"] == "admin_override")
         self.assertEqual(admin_override_bucket["count"], 5)
         self.assertEqual(payload["recentAdminOverrides"], {"days": 30, "count": 3})
+
+    def test_get_summary_computes_mrr_and_pro_conversion_from_pro_count_only(self) -> None:
+        # 20 pro users at the real app price (AUD 9.99/mo); premium is
+        # deliberately excluded (no confirmed live price -- it's the "2
+        # legacy" bucket the console itself already flags as not currently
+        # sold).
+        client = _FakeSubscriptionMetricsClient()
+        service = AdminSubscriptionMetricsService(
+            repository=SupabaseSubscriptionMetricsRepository(
+                supabase_url="https://supabase.test", service_role_key="service-role", client=client,
+            ),
+            audit_service=_FakeAuditService(count=3),
+        )
+
+        payload = service.get_summary()
+
+        self.assertEqual(payload["mrrAud"], round(20 * 9.99, 2))
+        self.assertEqual(payload["proConversionPercent"], round(20 / 120 * 100, 1))
+        self.assertEqual(payload["activeAdminOverrides"], 5)
+
+    def test_upgrades_this_month_counts_only_free_to_paid_transitions(self) -> None:
+        client = _FakeSubscriptionMetricsClient()
+        audit_service = _FakeAuditService(
+            count=3,
+            events=[
+                {"metadata": {"fromPlan": "free", "toPlan": "pro"}},
+                {"metadata": {"fromPlan": "free", "toPlan": "premium"}},
+                # Not an upgrade -- a downgrade and a lateral admin change.
+                {"metadata": {"fromPlan": "pro", "toPlan": "free"}},
+                {"metadata": {"fromPlan": "pro", "toPlan": "pro"}},
+            ],
+        )
+        service = AdminSubscriptionMetricsService(
+            repository=SupabaseSubscriptionMetricsRepository(
+                supabase_url="https://supabase.test", service_role_key="service-role", client=client,
+            ),
+            audit_service=audit_service,
+        )
+
+        payload = service.get_summary()
+
+        self.assertEqual(payload["upgradesThisMonth"], 2)
+
+    def test_recent_entitlement_changes_includes_user_email_and_plan_transition(self) -> None:
+        client = _FakeSubscriptionMetricsClient()
+        audit_service = _FakeAuditService(
+            count=0,
+            events=[
+                {
+                    "targetId": "user-1",
+                    "metadata": {"fromPlan": "free", "toPlan": "pro", "source": "admin_override"},
+                    "createdAt": "2026-08-16T14:20:00Z",
+                },
+            ],
+        )
+        user_repository = Mock()
+        user_repository._get_auth_user.return_value = {"id": "user-1", "email": "jordan@example.com"}
+        service = AdminSubscriptionMetricsService(
+            repository=SupabaseSubscriptionMetricsRepository(
+                supabase_url="https://supabase.test", service_role_key="service-role", client=client,
+            ),
+            audit_service=audit_service,
+            user_repository=user_repository,
+        )
+
+        payload = service.get_summary()
+
+        self.assertEqual(len(payload["recentEntitlementChanges"]), 1)
+        change = payload["recentEntitlementChanges"][0]
+        self.assertEqual(change["userLabel"], "jordan@example.com")
+        self.assertEqual(change["fromPlan"], "free")
+        self.assertEqual(change["toPlan"], "pro")
+        self.assertEqual(change["source"], "admin_override")
 
     def test_get_summary_handles_zero_users_without_dividing_by_zero(self) -> None:
         client = _FakeSubscriptionMetricsClient(rows=[])
@@ -107,11 +180,12 @@ class _FakeSubscriptionMetricsClient:
 
 
 class _FakeAuditService:
-    def __init__(self, *, count: int) -> None:
+    def __init__(self, *, count: int, events: list | None = None) -> None:
         self._count = count
+        self._events = events or []
 
     def list_events(self, **kwargs):
-        return {"success": True, "count": self._count, "events": []}
+        return {"success": True, "count": self._count, "events": self._events}
 
 
 if __name__ == "__main__":

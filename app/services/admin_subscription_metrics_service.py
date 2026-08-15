@@ -12,6 +12,16 @@ import httpx
 
 from app.core.config import settings
 from app.services.admin_audit_service import AdminAuditService
+from app.services.admin_user_service import SupabaseAdminUserRepository
+
+# Best-effort MRR estimate -- there's no price column anywhere in the
+# database (user_subscriptions only stores plan/status/source), so this
+# mirrors the price actually charged in the app (Settings/paywall copy,
+# SitDummyBillingRepository's product listing: "AUD 9.99 / month"). Premium
+# is deliberately excluded: the admin console's own "2 legacy" label on the
+# Plan mix card already signals it's not a currently-sold tier with a known
+# price, so estimating revenue from it would be a guess dressed up as data.
+PRO_MONTHLY_PRICE_AUD = 9.99
 
 
 class AdminSubscriptionMetricsError(Exception):
@@ -24,22 +34,35 @@ class AdminSubscriptionMetricsService:
         *,
         repository: "SupabaseSubscriptionMetricsRepository | None" = None,
         audit_service: AdminAuditService | None = None,
+        user_repository: SupabaseAdminUserRepository | None = None,
     ) -> None:
         self._repository = repository or SupabaseSubscriptionMetricsRepository()
         self._audit_service = audit_service or AdminAuditService()
+        self._user_repository = user_repository or SupabaseAdminUserRepository()
 
     def get_summary(self) -> dict[str, Any]:
         if not self._repository.is_configured:
             raise AdminSubscriptionMetricsError("Supabase admin configuration is missing.")
         rows = self._repository.subscription_summary()
         total_users = sum(int(row.get("total") or 0) for row in rows)
+        by_plan = _grouped(rows, "plan", total_users)
+        by_source = _grouped(rows, "source", total_users)
+        pro_count = next((bucket["count"] for bucket in by_plan if bucket["label"] == "pro"), 0)
+        admin_override_count = next(
+            (bucket["count"] for bucket in by_source if bucket["label"] == "admin_override"), 0,
+        )
         return {
             "success": True,
             "totalUsers": total_users,
-            "byPlan": _grouped(rows, "plan", total_users),
+            "byPlan": by_plan,
             "byStatus": _grouped(rows, "status", total_users),
-            "bySource": _grouped(rows, "source", total_users),
+            "bySource": by_source,
             "recentAdminOverrides": self._recent_admin_overrides(),
+            "mrrAud": round(pro_count * PRO_MONTHLY_PRICE_AUD, 2),
+            "proConversionPercent": round((pro_count / total_users) * 100, 1) if total_users else 0.0,
+            "activeAdminOverrides": admin_override_count,
+            "upgradesThisMonth": self._upgrades_this_month(),
+            "recentEntitlementChanges": self._recent_entitlement_changes(),
         }
 
     def _recent_admin_overrides(self, *, days: int = 30) -> dict[str, Any]:
@@ -54,6 +77,54 @@ class AdminSubscriptionMetricsService:
         except Exception:
             return {"days": days, "count": None}
         return {"days": days, "count": payload.get("count")}
+
+    def _upgrades_this_month(self) -> int:
+        # "Upgrade" specifically = free -> a paid plan, not every entitlement
+        # change (a lateral admin correction or a downgrade shouldn't count).
+        month_start = datetime.now(timezone.utc).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0,
+        ).isoformat()
+        try:
+            payload = self._audit_service.list_events(
+                action="subscription.entitlement_changed",
+                status="success",
+                since=month_start,
+                limit=1000,
+            )
+        except Exception:
+            return 0
+        events = payload.get("events") or []
+        return sum(
+            1
+            for event in events
+            if event.get("metadata", {}).get("fromPlan") == "free"
+            and event.get("metadata", {}).get("toPlan") in ("pro", "premium")
+        )
+
+    def _recent_entitlement_changes(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        try:
+            payload = self._audit_service.list_events(
+                action="subscription.entitlement_changed", status="success", limit=limit,
+            )
+        except Exception:
+            return []
+        events = payload.get("events") or []
+        changes = []
+        for event in events:
+            user_id = event.get("targetId")
+            metadata = event.get("metadata") or {}
+            auth_user = self._user_repository._get_auth_user(user_id) if user_id else None
+            changes.append(
+                {
+                    "userId": user_id,
+                    "userLabel": (auth_user or {}).get("email") or user_id or "Unknown",
+                    "fromPlan": metadata.get("fromPlan"),
+                    "toPlan": metadata.get("toPlan"),
+                    "source": metadata.get("source"),
+                    "changedAt": event.get("createdAt"),
+                }
+            )
+        return changes
 
 
 def _grouped(rows: list[dict[str, Any]], key: str, total_users: int) -> list[dict[str, Any]]:
