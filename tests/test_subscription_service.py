@@ -201,6 +201,57 @@ class VerifyAndGrantRealVerificationTest(unittest.TestCase):
             service.verify_and_grant(user_id="user-1", plan="pro", source="app_store", purchase_token="forged")
 
 
+class EntitlementChangeAuditTest(unittest.TestCase):
+    def test_a_real_plan_change_is_audit_logged(self) -> None:
+        client = _FakeSubscriptionClient()
+        client.subscription_lookup_rows = [{"plan": "free", "status": "active", "source": "none"}]
+        audit_service = Mock()
+        service = SubscriptionService(
+            supabase_url="https://supabase.test", service_role_key="service-role", anon_key="anon-key",
+            client=client, audit_service=audit_service,
+        )
+
+        service.verify_and_grant(user_id="user-1", plan="pro", source="admin_override", purchase_token=None)
+
+        audit_service.record.assert_called_once()
+        call_kwargs = audit_service.record.call_args.kwargs
+        self.assertEqual(call_kwargs["action"], "subscription.entitlement_changed")
+        self.assertEqual(call_kwargs["target_id"], "user-1")
+        self.assertEqual(call_kwargs["metadata"]["fromPlan"], "free")
+        self.assertEqual(call_kwargs["metadata"]["toPlan"], "pro")
+        self.assertEqual(call_kwargs["metadata"]["source"], "admin_override")
+
+    def test_no_actual_change_is_not_audit_logged(self) -> None:
+        # Re-verifying an already-active pro subscription (e.g. a routine
+        # re-sync) must not spam the audit log with a no-op "change".
+        client = _FakeSubscriptionClient()
+        client.subscription_lookup_rows = [{"plan": "pro", "status": "active", "source": "admin_override"}]
+        audit_service = Mock()
+        service = SubscriptionService(
+            supabase_url="https://supabase.test", service_role_key="service-role", anon_key="anon-key",
+            client=client, audit_service=audit_service,
+        )
+
+        service.verify_and_grant(user_id="user-1", plan="pro", source="admin_override", purchase_token=None)
+
+        audit_service.record.assert_not_called()
+
+    def test_a_failed_verification_never_reaches_the_audit_log(self) -> None:
+        client = _FakeSubscriptionClient()
+        google_verifier = Mock()
+        google_verifier.verify_purchase_token.side_effect = GooglePlayPurchaseInvalidError("nope")
+        audit_service = Mock()
+        service = SubscriptionService(
+            supabase_url="https://supabase.test", service_role_key="service-role", anon_key="anon-key",
+            client=client, google_play_verifier=google_verifier, audit_service=audit_service,
+        )
+
+        with self.assertRaises(SubscriptionPurchaseInvalidError):
+            service.verify_and_grant(user_id="user-1", plan="pro", source="google_play", purchase_token="forged")
+
+        audit_service.record.assert_not_called()
+
+
 class ResyncFromWebhookTest(unittest.TestCase):
     def test_resync_from_google_play_token_looks_up_user_and_regrants(self) -> None:
         client = _FakeSubscriptionClient()
