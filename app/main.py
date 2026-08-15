@@ -26,6 +26,7 @@ from app.routers import (
     push,
     scanner,
     search,
+    subscription_webhooks,
 )
 
 
@@ -66,6 +67,7 @@ app.include_router(push.router)
 app.include_router(api_analyze.root_router)
 app.include_router(api_analyze.router)
 app.include_router(api_subscription.router)
+app.include_router(subscription_webhooks.router)
 app.include_router(scanner.router)
 app.include_router(portfolio.router)
 app.include_router(pricing.router)

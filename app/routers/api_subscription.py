@@ -6,6 +6,7 @@ from app.schemas.api_subscription import (
 )
 from app.services.subscription.subscription_service import (
     SubscriptionNotConfiguredError,
+    SubscriptionPurchaseInvalidError,
     SubscriptionService,
     SubscriptionServiceError,
     SubscriptionUnauthorizedError,
@@ -36,6 +37,14 @@ def _handle(callable_):
     except SubscriptionNotConfiguredError as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        )
+    except SubscriptionPurchaseInvalidError as error:
+        # A forged/wrong-app/wrong-environment purchase claim -- distinct
+        # from a transient store-API failure (502 below), so the app can
+        # tell "your purchase is invalid" apart from "try again shortly".
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(error),
         )
     except SubscriptionServiceError as error:
