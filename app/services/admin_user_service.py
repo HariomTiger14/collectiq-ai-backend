@@ -5,6 +5,7 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.services.admin_audit_service import AdminAuditError, AdminAuditService
 from app.services.subscription.subscription_service import (
     SubscriptionService,
     SubscriptionServiceError,
@@ -28,9 +29,11 @@ class AdminUserService:
         *,
         repository: "SupabaseAdminUserRepository | None" = None,
         subscription_service: SubscriptionService | None = None,
+        audit_service: AdminAuditService | None = None,
     ) -> None:
         self._repository = repository or SupabaseAdminUserRepository()
         self._subscription_service = subscription_service or SubscriptionService()
+        self._audit_service = audit_service or AdminAuditService()
 
     def list_users(self, *, query: str | None = None, limit: int = 50, page: int = 1) -> dict[str, Any]:
         if not self._repository.is_configured:
@@ -196,6 +199,90 @@ class AdminUserService:
             "isAdmin": bool(profile.get("is_admin", is_admin)),
             "profile": profile,
         }
+
+    def list_team(self) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminUserServiceError("Supabase admin configuration is missing.")
+        from app.routers.admin_auth import ROLE_PERMISSIONS  # local import: avoids a router->service->router cycle at module load time
+
+        profiles = self._repository.list_elevated_profiles()
+        audit = self._audit_service
+        members = []
+        for profile in profiles:
+            user_id = str(profile.get("id") or "")
+            if not user_id:
+                continue
+            auth_user = self._repository._get_auth_user(user_id) or {}
+            email = str(auth_user.get("email") or "")
+            collector_profile = self._repository._optional_collector_profile(user_id)
+            role = str(profile.get("role") or "user")
+            members.append(
+                {
+                    "id": user_id,
+                    "email": email,
+                    "displayName": collector_profile.get("display_name") or email or "Unknown",
+                    "role": role,
+                    "isAdmin": bool(profile.get("is_admin", False)),
+                    "permissions": sorted(ROLE_PERMISSIONS.get(role, set())),
+                    "lastAdminAction": _safe_last_audit_event(audit, actor=email),
+                    "addedAt": _safe_first_role_grant(audit, target_id=user_id),
+                }
+            )
+        return {"success": True, "count": len(members), "members": members}
+
+    def invite_team_member(self, *, email: str, role: str, is_admin: bool) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminUserServiceError("Supabase admin configuration is missing.")
+        auth_user = self._repository.invite_user(email=email)
+        user_id = str(auth_user.get("id") or "")
+        if not user_id:
+            raise AdminUserServiceError("Supabase invite response did not include a user id.")
+        profile = self._repository.upsert_profile_role(user_id=user_id, role=role, is_admin=is_admin)
+        return {
+            "success": True,
+            "userId": user_id,
+            "email": email,
+            "role": profile.get("role") or role,
+            "isAdmin": bool(profile.get("is_admin", is_admin)),
+        }
+
+
+def _safe_last_audit_event(audit: AdminAuditService, *, actor: str) -> dict[str, Any] | None:
+    # A team member with no email (invite still pending, or the auth
+    # lookup failed) has nothing to query by -- avoid matching every
+    # actor="" event in the log, which would misattribute someone else's
+    # action.
+    if not actor:
+        return None
+    try:
+        payload = audit.list_events(actor=actor, limit=1)
+    except AdminAuditError:
+        return None
+    events = payload.get("events") or []
+    if not events:
+        return None
+    event = events[0]
+    return {"action": event.get("action"), "createdAt": event.get("createdAt")}
+
+
+def _safe_first_role_grant(audit: AdminAuditService, *, target_id: str) -> str | None:
+    # profiles has no created_at/added_at column (confirmed: the only
+    # migration touching it just adds role/is_admin) -- this is a
+    # best-effort proxy using the earliest role-change audit event for
+    # this user, not a guaranteed-accurate "added" date. Accounts granted
+    # a role before audit logging existed (or outside this endpoint) will
+    # have no such event and show nothing here, rather than a fabricated
+    # date.
+    if not target_id:
+        return None
+    try:
+        payload = audit.list_events(
+            target_id=target_id, action="admin_users.role_updated", status="success", limit=1, oldest_first=True,
+        )
+    except AdminAuditError:
+        return None
+    events = payload.get("events") or []
+    return events[0].get("createdAt") if events else None
 
 
 class SupabaseAdminUserRepository:
@@ -434,6 +521,48 @@ class SupabaseAdminUserRepository:
         if isinstance(payload, list) and payload and isinstance(payload[0], dict):
             return payload[0]
         raise AdminUserServiceError("Supabase admin profile update response shape was invalid.")
+
+    def list_elevated_profiles(self) -> list[dict[str, Any]]:
+        # "Elevated access" = role != the default "user", OR is_admin is
+        # set directly (belt-and-braces in case a row has is_admin=true
+        # without role having been set to "admin" to match).
+        payload = self._request(
+            "GET",
+            f"/rest/v1/{settings.admin_profile_table or 'profiles'}",
+            params={"or": "(role.neq.user,is_admin.eq.true)", "select": "id,role,is_admin", "order": "role.asc"},
+        )
+        if not isinstance(payload, list):
+            return []
+        return [row for row in payload if isinstance(row, dict) and row.get("id")]
+
+    def invite_user(self, *, email: str) -> dict[str, Any]:
+        # GoTrue's admin invite endpoint creates the auth.users row and
+        # emails the person a signup link -- no admin-set password to
+        # generate or communicate out-of-band.
+        payload = self._request(
+            "POST",
+            "/auth/v1/invite",
+            json_payload={"email": email},
+        )
+        if not isinstance(payload, dict) or not payload.get("id"):
+            raise AdminUserServiceError("Supabase invite response shape was invalid.")
+        return payload
+
+    def upsert_profile_role(self, *, user_id: str, role: str, is_admin: bool) -> dict[str, Any]:
+        # Upsert, not a plain PATCH like update_profile_role -- right after
+        # an invite there's a race between GoTrue creating the auth.users
+        # row and any DB trigger that creates the matching profiles row. A
+        # PATCH would silently match zero rows if the profile doesn't
+        # exist yet.
+        payload = self._request(
+            "POST",
+            f"/rest/v1/{settings.admin_profile_table or 'profiles'}",
+            json_payload={"id": user_id, "role": role, "is_admin": is_admin},
+            extra_headers={"Prefer": "return=representation,resolution=merge-duplicates"},
+        )
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            return payload[0]
+        raise AdminUserServiceError("Supabase admin profile upsert response shape was invalid.")
 
     def _optional_profile(self, user_id: str) -> dict[str, Any]:
         if not user_id:

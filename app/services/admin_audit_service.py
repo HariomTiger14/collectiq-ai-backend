@@ -57,6 +57,7 @@ class AdminAuditService:
         since: str | None = None,
         until: str | None = None,
         limit: int = 50,
+        oldest_first: bool = False,
     ) -> dict[str, Any]:
         if self._repository.is_configured:
             events = self._repository.list_events(
@@ -68,9 +69,10 @@ class AdminAuditService:
                 since=since,
                 until=until,
                 limit=limit,
+                oldest_first=oldest_first,
             )
         else:
-            events = [
+            matching = [
                 event
                 for event in _IN_MEMORY_AUDIT_EVENTS
                 if _event_matches(
@@ -83,7 +85,11 @@ class AdminAuditService:
                     since=since,
                     until=until,
                 )
-            ][:limit]
+            ]
+            # _IN_MEMORY_AUDIT_EVENTS is newest-first (record() inserts at
+            # index 0) -- reverse before truncating so oldest_first actually
+            # returns the oldest matches, not the newest N reversed.
+            events = (list(reversed(matching)) if oldest_first else matching)[:limit]
         return {
             "success": True,
             "count": len(events),
@@ -149,11 +155,12 @@ class SupabaseAdminAuditRepository:
         since: str | None = None,
         until: str | None = None,
         limit: int = 50,
+        oldest_first: bool = False,
     ) -> list[dict[str, Any]]:
         params = {
             "select": "*",
             "limit": str(limit),
-            "order": "created_at.desc",
+            "order": "created_at.asc" if oldest_first else "created_at.desc",
         }
         if action:
             params["action"] = f"eq.{action}"

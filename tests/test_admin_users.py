@@ -644,6 +644,103 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(patch_request["json"], {"status": "paused", "enabled": False})
 
 
+class AdminTeamTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+        clear_in_memory_audit_events()
+
+    def tearDown(self) -> None:
+        clear_in_memory_audit_events()
+
+    def test_list_team_reads_elevated_profiles_with_permissions_and_audit_history(self) -> None:
+        client = _FakeTeamClient()
+
+        def fake_list_events(**kwargs):
+            if kwargs.get("actor") == "ava.chen@packlox.com":
+                return {"events": [{"action": "admin_users.role_updated", "createdAt": "2026-08-14T19:41:00Z"}]}
+            if kwargs.get("target_id") == "staff-1" and kwargs.get("oldest_first"):
+                return {"events": [{"action": "admin_users.role_updated", "createdAt": "2026-08-03T00:00:00Z"}]}
+            return {"events": []}
+
+        audit_service = Mock()
+        audit_service.list_events.side_effect = fake_list_events
+        service = AdminUserService(
+            repository=SupabaseAdminUserRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            ),
+            audit_service=audit_service,
+        )
+
+        payload = service.list_team()
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["count"], 1)
+        member = payload["members"][0]
+        self.assertEqual(member["id"], "staff-1")
+        self.assertEqual(member["email"], "ava.chen@packlox.com")
+        self.assertEqual(member["displayName"], "Ava Chen")
+        self.assertEqual(member["role"], "pricing_reviewer")
+        self.assertIn("pricing:write", member["permissions"])
+        self.assertNotIn("users:write", member["permissions"])
+        self.assertEqual(member["lastAdminAction"]["action"], "admin_users.role_updated")
+        self.assertEqual(member["addedAt"], "2026-08-03T00:00:00Z")
+        # Confirms the query actually scopes to elevated roles, not every
+        # profile row -- role.neq.user is the whole point of this endpoint.
+        list_request = next(r for r in client.requests if r["url"].endswith("/rest/v1/profiles") and r["method"] == "GET")
+        self.assertEqual(list_request["params"]["or"], "(role.neq.user,is_admin.eq.true)")
+
+    def test_list_team_endpoint_requires_admin_token(self) -> None:
+        response = self.client.get("/admin/users/team")
+
+        self.assertEqual(response.status_code, 503)
+
+    def test_invite_team_member_creates_auth_user_and_sets_role(self) -> None:
+        client = _FakeTeamClient()
+        service = AdminUserService(
+            repository=SupabaseAdminUserRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.invite_team_member(email="new.hire@packlox.com", role="support", is_admin=False)
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["userId"], "new-staff-id")
+        self.assertEqual(payload["role"], "support")
+        invite_request = next(r for r in client.requests if r["url"].endswith("/auth/v1/invite"))
+        self.assertEqual(invite_request["json"], {"email": "new.hire@packlox.com"})
+        upsert_request = next(r for r in client.requests if r["method"] == "POST" and r["url"].endswith("/rest/v1/profiles"))
+        self.assertEqual(upsert_request["json"], {"id": "new-staff-id", "role": "support", "is_admin": False})
+        self.assertEqual(upsert_request["headers"]["Prefer"], "return=representation,resolution=merge-duplicates")
+
+    def test_invite_team_member_endpoint_requires_users_write_permission(self) -> None:
+        response = self.client.post(
+            "/admin/users/team",
+            json={"email": "new.hire@packlox.com", "role": "support"},
+        )
+
+        self.assertEqual(response.status_code, 503)
+
+    def test_team_invite_request_rejects_the_default_user_role(self) -> None:
+        # Inviting someone onto the team with the no-access default role
+        # would just be a pointless invite email -- validated at the
+        # request-model level, same style as AdminRoleUpdateRequest's
+        # pattern constraint.
+        with patch("app.routers.admin_auth.settings") as auth_settings:
+            auth_settings.admin_import_token = "secret-token"
+            response = self.client.post(
+                "/admin/users/team",
+                json={"email": "new.hire@packlox.com", "role": "user"},
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+        self.assertEqual(response.status_code, 422)
+
+
 class _FakeAdminUsersClient:
     def __init__(self) -> None:
         self.requests: list[dict] = []
@@ -862,6 +959,25 @@ class _FakeAdminUsersClientNoRole(_FakeAdminUsersClient):
                 ]
             )
         return super().request(method, url, **kwargs)
+
+
+class _FakeTeamClient:
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+
+    def request(self, method: str, url: str, **kwargs):
+        self.requests.append({"method": method, "url": url, **kwargs})
+        if method == "GET" and url.endswith("/rest/v1/profiles"):
+            return _response([{"id": "staff-1", "role": "pricing_reviewer", "is_admin": False}])
+        if method == "GET" and url.endswith("/auth/v1/admin/users/staff-1"):
+            return _response({"id": "staff-1", "email": "ava.chen@packlox.com"})
+        if method == "GET" and url.endswith("/rest/v1/collector_profiles"):
+            return _response([{"user_id": "staff-1", "display_name": "Ava Chen"}])
+        if method == "POST" and url.endswith("/auth/v1/invite"):
+            return _response({"id": "new-staff-id", "email": "new.hire@packlox.com"})
+        if method == "POST" and url.endswith("/rest/v1/profiles"):
+            return _response([{"id": "new-staff-id", "role": "support", "is_admin": False}])
+        raise AssertionError(f"Unexpected request: {method} {url}")
 
 
 def _response(payload, headers: dict | None = None) -> httpx.Response:
