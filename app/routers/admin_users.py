@@ -48,10 +48,11 @@ class PriceAlertUpdateRequest(BaseModel):
 
 class TeamInviteRequest(BaseModel):
     email: str = Field(max_length=320)
-    # No "user" here (unlike AdminRoleUpdateRequest) -- inviting someone
-    # onto the team with the default no-access role would be a pointless
-    # invite email.
-    role: str = Field(pattern="^(admin|support|viewer|pricing_reviewer)$")
+    # "user" included so this same invite flow can create a plain app
+    # account (no console access), not just staff -- e.g. onboarding a
+    # real collector directly rather than waiting for them to sign up
+    # through the app.
+    role: str = Field(pattern="^(admin|support|viewer|pricing_reviewer|user)$")
     isAdmin: bool = False
 
 
