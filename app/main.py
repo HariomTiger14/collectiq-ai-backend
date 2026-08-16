@@ -19,6 +19,7 @@ from app.routers import (
     api_analyze,
     api_subscription,
     auth,
+    data_requests,
     health,
     metadata,
     pricing,
@@ -63,6 +64,7 @@ app.include_router(admin_pricing.router)
 app.include_router(admin_reports.router)
 app.include_router(admin_scans.router)
 app.include_router(admin_users.router)
+app.include_router(data_requests.router)
 app.include_router(push.router)
 app.include_router(api_analyze.root_router)
 app.include_router(api_analyze.router)
