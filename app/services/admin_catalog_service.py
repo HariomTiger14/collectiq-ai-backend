@@ -7,6 +7,10 @@ import httpx
 
 from app.core.config import settings
 from app.services.pricing.admin_review_queue_service import _total_from_content_range
+from app.services.pricing.catalog_search_service import (
+    _funko_lookup_title,
+    select_best_funko_image,
+)
 
 
 class AdminCatalogError(Exception):
@@ -52,6 +56,9 @@ class AdminCatalogService:
             source=normalized_source, limit=bounded_limit, offset=max(0, offset),
             category=category, category_group=category_group, min_price=min_price, max_price=max_price,
         )
+        items = [_compact_catalog_row(row, source=normalized_source) for row in rows]
+        if normalized_source == "pricecharting":
+            items = self._enrich_funko_images(items)
         return {
             "success": True,
             "source": normalized_source,
@@ -60,8 +67,29 @@ class AdminCatalogService:
                 source=normalized_source, category=category, category_group=category_group,
                 min_price=min_price, max_price=max_price,
             ),
-            "items": [_compact_catalog_row(row, source=normalized_source) for row in rows],
+            "items": items,
         }
+
+    def _enrich_funko_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # PriceCharting has no image data at all (confirmed live — see
+        # catalog_search_service.py). One batched lookup per page covers
+        # every Funko row on it, not one request per row.
+        lookup_by_index = {
+            index: _funko_lookup_title(str(item.get("title") or ""))
+            for index, item in enumerate(items)
+            if item.get("setName") and "funko" in str(item["setName"]).lower()
+        }
+        titles = sorted({title for title in lookup_by_index.values() if title})
+        if not titles:
+            return items
+        images_by_title = self._repository.fetch_funko_images(titles)
+        if not images_by_title:
+            return items
+        for index, lookup_title in lookup_by_index.items():
+            image_url = images_by_title.get(lookup_title)
+            if image_url:
+                items[index]["imageUrl"] = image_url
+        return items
 
 
 class SupabaseAdminCatalogRepository:
@@ -189,6 +217,37 @@ class SupabaseAdminCatalogRepository:
         finally:
             if should_close:
                 client.close()
+
+    def fetch_funko_images(self, normalized_titles: list[str]) -> dict[str, str]:
+        # One batched request for every distinct Funko title on a page,
+        # not one request per row -- see AdminCatalogService._enrich_funko_
+        # images. PostgREST's in.() filter needs each value double-quoted
+        # so titles containing spaces are treated as single list entries.
+        unique_titles = sorted({title for title in normalized_titles if title})
+        if not unique_titles:
+            return {}
+        quoted = ",".join(f'"{title}"' for title in unique_titles)
+        payload = self._request(
+            "GET",
+            "/rest/v1/funko_pop_catalog",
+            params={
+                "select": "normalized_title,image_url,series",
+                "normalized_title": f"in.({quoted})",
+            },
+        )
+        if not isinstance(payload, list):
+            return {}
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            grouped.setdefault(str(row.get("normalized_title") or ""), []).append(row)
+        images_by_title: dict[str, str] = {}
+        for title, candidates in grouped.items():
+            image_url = select_best_funko_image(candidates)
+            if image_url:
+                images_by_title[title] = image_url
+        return images_by_title
 
     def _request(
         self,
@@ -319,6 +378,7 @@ def _compact_catalog_row(row: dict[str, Any], *, source: str) -> dict[str, Any]:
         "setName": row.get("console_name"),
         "source": "PriceCharting",
         "lastUpdated": row.get("updated_at"),
+        "imageUrl": None,
         "pricing": {"marketValue": market_value, "currency": (row.get("currency") or "USD").upper()},
     }
 

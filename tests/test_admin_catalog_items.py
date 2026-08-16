@@ -244,6 +244,72 @@ class AdminCatalogListItemsTest(unittest.TestCase):
         self.assertEqual(item["source"], "PriceCharting")
         self.assertEqual(item["pricing"]["marketValue"], 388.0)
 
+    def test_service_batches_funko_image_lookup_for_pricecharting_rows(self) -> None:
+        # PriceCharting has real pricing for Funko rows but no image data at
+        # all -- the admin browse table enriches with a single batched
+        # lookup against funko_pop_catalog, not one request per row.
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            url = str(request.url)
+            if "funko_pop_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "normalized_title": "1950 batmobile",
+                            "image_url": "https://images.hobbydb.com/1950-batmobile.png",
+                            "series": ["Funko Vinyl Art Toys"],
+                        },
+                    ],
+                )
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "pricecharting_id": "7531531",
+                        "product_name": "1950 Batmobile #277",
+                        "category": "Batman: 80th Anniversary",
+                        "console_name": "Funko POP Rides",
+                        "loose_price_cents": 999,
+                        "currency": "USD",
+                        "updated_at": "2026-08-16T00:00:00Z",
+                    },
+                    {
+                        "pricecharting_id": "999",
+                        "product_name": "Charizard Base Set",
+                        "category": "Trading Card",
+                        "console_name": "Base Set",
+                        "loose_price_cents": 38800,
+                        "currency": "USD",
+                        "updated_at": "2026-08-13T00:00:00Z",
+                    },
+                ],
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        service = AdminCatalogService(
+            repository=SupabaseAdminCatalogRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            )
+        )
+
+        payload = service.list_items(source="pricecharting", limit=100, offset=0)
+
+        items_by_id = {item["id"]: item for item in payload["items"]}
+        self.assertEqual(
+            items_by_id["7531531"]["imageUrl"],
+            "https://images.hobbydb.com/1950-batmobile.png",
+        )
+        self.assertIsNone(items_by_id["999"]["imageUrl"])
+        # Exactly one funko_pop_catalog request for the whole page, not one
+        # per Funko row.
+        funko_requests = [r for r in requests if "funko_pop_catalog" in str(r.url)]
+        self.assertEqual(len(funko_requests), 1)
+
     def test_service_compacts_kicksdb_rows(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(

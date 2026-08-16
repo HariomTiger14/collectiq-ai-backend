@@ -238,19 +238,7 @@ class CatalogSearchService:
         payload = self._request("GET", "/rest/v1/funko_pop_catalog", params=params)
         if not isinstance(payload, list) or not payload:
             return None
-        candidates = [row for row in payload if isinstance(row, dict) and row.get("image_url")]
-        if not candidates:
-            return None
-        # Prefer an actual Pop! vinyl figure entry over pins/apparel/other
-        # merch that happens to share the same character name.
-        for row in candidates:
-            series = row.get("series") or []
-            series_text = " ".join(str(s) for s in series).lower()
-            if "pop!" in series_text and not any(
-                bad in series_text for bad in ("pin", "apparel", "tee", "sticker", "keychain")
-            ):
-                return str(row["image_url"])
-        return str(candidates[0]["image_url"])
+        return select_best_funko_image(payload)
 
     def _fetch_kicksdb_rows(self, query: str, limit: int) -> list[dict[str, Any]]:
         # Mirrors _fetch_rows()'s RPC-based ranking (see that method's
@@ -538,6 +526,25 @@ def _funko_lookup_title(product_title: str) -> str:
     text = _FUNKO_FIGURE_NUMBER_RE.sub("", text)
     text = _FUNKO_YEAR_RE.sub("", text)
     return " ".join(text.strip().lower().split())
+
+
+def select_best_funko_image(candidate_rows: list[dict[str, Any]]) -> str | None:
+    # Shared by catalog_search_service (mobile/public search) and
+    # admin_catalog_service (admin catalog browse) so both pick the same
+    # image for the same title, rather than reimplementing this twice.
+    # Prefer an actual Pop! vinyl figure entry over pins/apparel/other merch
+    # that happens to share the same character name.
+    candidates = [row for row in candidate_rows if isinstance(row, dict) and row.get("image_url")]
+    if not candidates:
+        return None
+    for row in candidates:
+        series = row.get("series") or []
+        series_text = " ".join(str(s) for s in series).lower()
+        if "pop!" in series_text and not any(
+            bad in series_text for bad in ("pin", "apparel", "tee", "sticker", "keychain")
+        ):
+            return str(row["image_url"])
+    return str(candidates[0]["image_url"])
 
 
 def _cents_to_units(value: Any) -> float | None:
