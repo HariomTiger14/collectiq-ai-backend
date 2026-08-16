@@ -258,6 +258,7 @@ class AdminCatalogListItemsTest(unittest.TestCase):
                         "avg_price_cents": 12000,
                         "currency": "USD",
                         "updated_at": "2026-08-13T00:00:00Z",
+                        "image_url": "https://images.kicks.dev/air-force-1-white.png",
                     }
                 ],
             )
@@ -279,6 +280,9 @@ class AdminCatalogListItemsTest(unittest.TestCase):
         self.assertEqual(item["source"], "KicksDB")
         self.assertEqual(item["setName"], "Nike")
         self.assertEqual(item["pricing"]["marketValue"], 120.0)
+        self.assertEqual(
+            item["imageUrl"], "https://images.kicks.dev/air-force-1-white.png"
+        )
 
     def test_endpoint_requires_admin_token(self) -> None:
         response = self.client.get("/admin/catalog/items")

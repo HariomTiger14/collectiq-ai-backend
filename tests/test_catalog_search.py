@@ -18,6 +18,8 @@ class CatalogSearchServiceTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             requests.append(request)
+            if "search_kicksdb_catalog" in str(request.url):
+                return httpx.Response(200, json=[])
             return httpx.Response(
                 200,
                 json=[
@@ -113,6 +115,8 @@ class CatalogSearchServiceTest(unittest.TestCase):
         # estimate_cents. A result must still surface a real price and the
         # correct provider name, not silently show null/"PriceCharting".
         def handler(request: httpx.Request) -> httpx.Response:
+            if "search_kicksdb_catalog" in str(request.url):
+                return httpx.Response(200, json=[])
             return httpx.Response(
                 200,
                 json=[
@@ -148,6 +152,111 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertEqual(response.results[0].pricing.currency, "USD")
         self.assertEqual(response.results[0].source, "KicksDB")
         self.assertEqual(response.results[0].attribution, "Pricing data by KicksDB")
+
+    def test_search_merges_real_kicksdb_catalog_results_with_images(self) -> None:
+        # kicksdb_catalog is a separate table from pricecharting_catalog
+        # (confirmed 100% image_url coverage live, 11,415/11,415 rows) —
+        # this pins search() to actually querying it and surfacing a real
+        # product image, not just the scan-derived-row relabeling covered
+        # by the previous test.
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if "search_kicksdb_catalog" in str(request.url):
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "kicksdb_id": "kdb-1",
+                            "title": "Air Jordan 1 Retro High OG",
+                            "brand": "Jordan",
+                            "model": "Air Jordan 1",
+                            "category": "Sneakers",
+                            "product_type": "shoe",
+                            "image_url": "https://images.kicks.dev/air-jordan-1.png",
+                            "currency": "USD",
+                            "min_price_cents": 22000,
+                            "max_price_cents": 41000,
+                            "avg_price_cents": 31000,
+                            "product_url": "https://kicks.dev/air-jordan-1",
+                            "sku": "555088-134",
+                            "updated_at": "2026-08-10T00:00:00Z",
+                        },
+                    ],
+                )
+            if "search_pricecharting_catalog" in str(request.url):
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.search("air jordan 1", limit=10)
+
+        self.assertEqual(response.count, 1)
+        self.assertEqual(response.results[0].id, "kdb-1")
+        self.assertEqual(response.results[0].source, "KicksDB")
+        self.assertEqual(
+            response.results[0].imageUrl, "https://images.kicks.dev/air-jordan-1.png"
+        )
+        self.assertEqual(response.results[0].pricing.marketValue, 310)
+        self.assertEqual(response.results[0].pricing.lowEstimate, 220)
+        self.assertEqual(response.results[0].pricing.highEstimate, 410)
+        self.assertTrue(
+            any("search_kicksdb_catalog" in str(r.url) for r in requests)
+        )
+
+    def test_detail_falls_back_to_kicksdb_catalog_with_image(self) -> None:
+        # When a catalog id isn't a pricecharting_catalog row at all, detail()
+        # must try kicksdb_catalog before raising not-found — this is the
+        # path that lets a sneaker catalog detail page show a real photo.
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if "kicksdb_catalog_history" in str(request.url):
+                return httpx.Response(200, json=[])
+            if "kicksdb_catalog" in str(request.url):
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "kicksdb_id": "kdb-1",
+                            "title": "Air Jordan 1 Retro High OG",
+                            "brand": "Jordan",
+                            "category": "Sneakers",
+                            "image_url": "https://images.kicks.dev/air-jordan-1.png",
+                            "currency": "USD",
+                            "min_price_cents": 22000,
+                            "max_price_cents": 41000,
+                            "avg_price_cents": 31000,
+                            "product_url": "https://kicks.dev/air-jordan-1",
+                            "sku": "555088-134",
+                            "updated_at": "2026-08-10T00:00:00Z",
+                        },
+                    ],
+                )
+            # pricecharting_catalog lookup: no matching row
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.detail("kdb-1")
+
+        self.assertEqual(response.result.id, "kdb-1")
+        self.assertEqual(response.result.source, "KicksDB")
+        self.assertEqual(
+            response.result.imageUrl, "https://images.kicks.dev/air-jordan-1.png"
+        )
+        self.assertEqual(response.history, [])
 
     def test_short_query_returns_empty_without_supabase(self) -> None:
         service = CatalogSearchService(
