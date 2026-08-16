@@ -16,6 +16,11 @@ class PushNotificationError(RuntimeError):
     """Raised when the push notification job cannot run safely."""
 
 
+# A device with no last_seen_at, or one that hasn't checked in for this many
+# days, counts as part of the "inactive" broadcast audience segment.
+INACTIVE_DEVICE_DAYS = 30
+
+
 @dataclass(frozen=True)
 class PushDeliverySummary:
     success: bool
@@ -33,6 +38,29 @@ class PushDeliverySummary:
             "sentDeliveries": self.sent_deliveries,
             "failedDeliveries": self.failed_deliveries,
             "skippedDeliveries": self.skipped_deliveries,
+        }
+
+
+@dataclass(frozen=True)
+class TargetedPushSummary:
+    success: bool
+    segment: str
+    audience_devices: int
+    attempted_deliveries: int
+    sent_deliveries: int
+    failed_deliveries: int
+    dry_run: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "segment": self.segment,
+            "audienceDevices": self.audience_devices,
+            "attemptedDeliveries": self.attempted_deliveries,
+            "sentDeliveries": self.sent_deliveries,
+            "failedDeliveries": self.failed_deliveries,
+            "skippedDeliveries": self.attempted_deliveries if self.dry_run else 0,
+            "dryRun": self.dry_run,
         }
 
 
@@ -203,6 +231,132 @@ class PriceAlertPushService:
             skipped_deliveries=skipped,
         )
 
+    def audience_counts(self) -> dict[str, Any]:
+        self._ensure_configured(require_firebase=False)
+        devices = self._fetch_all_enabled_devices()
+        pro_user_ids = self._fetch_pro_user_ids()
+        now = datetime.now(timezone.utc)
+        return {
+            "all": len(devices),
+            "pro": sum(1 for d in devices if d.get("user_id") in pro_user_ids),
+            "inactive": sum(1 for d in devices if self._is_inactive_device(d, now)),
+            "inactiveDays": INACTIVE_DEVICE_DAYS,
+        }
+
+    def dispatch_broadcast(
+        self,
+        *,
+        segment: str,
+        title: str,
+        body: str,
+        dry_run: bool = True,
+        limit: int = 2000,
+    ) -> TargetedPushSummary:
+        self._ensure_configured(require_firebase=not dry_run)
+        title = title.strip()
+        body = body.strip()
+        if not title or not body:
+            raise PushNotificationError("Broadcast title and message are required.")
+        if not dry_run:
+            last = self._last_broadcast_today()
+            if last:
+                raise PushNotificationError(
+                    "Only one live broadcast is allowed per day — one was "
+                    f"already sent at {last.get('created_at')}."
+                )
+        devices = self._fetch_segment_devices(segment)[:limit]
+
+        attempted = sent = failed = 0
+        for device in devices:
+            attempted += 1
+            if dry_run:
+                continue
+            status, provider_message_id, error_message = self._send_generic_fcm(
+                title, body, device, data={"type": "broadcast", "segment": segment}
+            )
+            if status == "sent":
+                sent += 1
+            else:
+                failed += 1
+            self._log_generic_delivery(
+                user_id=device.get("user_id"),
+                device=device,
+                status=status,
+                title=title,
+                body=body,
+                kind="broadcast",
+                provider_message_id=provider_message_id,
+                error_message=error_message,
+                extra={"segment": segment},
+            )
+
+        return TargetedPushSummary(
+            success=failed == 0,
+            segment=segment,
+            audience_devices=len(devices),
+            attempted_deliveries=attempted,
+            sent_deliveries=sent,
+            failed_deliveries=failed,
+            dry_run=dry_run,
+        )
+
+    def dispatch_to_user(
+        self,
+        *,
+        user_id: str,
+        title: str,
+        body: str,
+        device_id: str | None = None,
+        dry_run: bool = True,
+    ) -> TargetedPushSummary:
+        self._ensure_configured(require_firebase=not dry_run)
+        title = title.strip()
+        body = body.strip()
+        if not title or not body:
+            raise PushNotificationError("Message title and body are required.")
+        if not user_id:
+            raise PushNotificationError("A user is required.")
+        devices = self._fetch_devices(user_id)
+        if device_id:
+            devices = [d for d in devices if str(d.get("id")) == str(device_id)]
+            if not devices:
+                raise PushNotificationError(
+                    "That device is not enabled/registered for this user."
+                )
+
+        attempted = sent = failed = 0
+        for device in devices:
+            attempted += 1
+            if dry_run:
+                continue
+            status, provider_message_id, error_message = self._send_generic_fcm(
+                title, body, device, data={"type": "admin_direct"}
+            )
+            if status == "sent":
+                sent += 1
+            else:
+                failed += 1
+            self._log_generic_delivery(
+                user_id=user_id,
+                device=device,
+                status=status,
+                title=title,
+                body=body,
+                kind="admin_direct",
+                provider_message_id=provider_message_id,
+                error_message=error_message,
+            )
+
+        return TargetedPushSummary(
+            success=failed == 0,
+            segment="user",
+            audience_devices=len(devices),
+            attempted_deliveries=attempted,
+            sent_deliveries=sent,
+            failed_deliveries=failed,
+            dry_run=dry_run,
+        )
+
     def delivery_history(self, *, limit: int = 25) -> dict[str, Any]:
         self._ensure_configured(require_firebase=False)
         response = self._supabase_request(
@@ -234,9 +388,13 @@ class PriceAlertPushService:
     def _normalize_delivery(self, row: dict[str, Any]) -> dict[str, Any]:
         raw_json = row.get("raw_json") if isinstance(row.get("raw_json"), dict) else {}
         device = raw_json.get("device") if isinstance(raw_json.get("device"), dict) else {}
+        kind = {
+            "broadcast": "Broadcast",
+            "admin_direct": "Admin direct message",
+        }.get(raw_json.get("kind"), "Price-alert delivery")
         return {
             "id": row.get("id"),
-            "kind": "Price-alert delivery",
+            "kind": kind,
             "status": row.get("status") or "unknown",
             "createdAt": row.get("created_at") or row.get("sent_at"),
             "sentAt": row.get("sent_at"),
@@ -342,6 +500,67 @@ class PriceAlertPushService:
         data = response.json()
         return data if isinstance(data, list) else []
 
+    def _fetch_all_enabled_devices(self) -> list[dict[str, Any]]:
+        response = self._supabase_request(
+            "GET",
+            "/rest/v1/push_device_registrations",
+            params={"select": "*", "enabled": "eq.true"},
+        )
+        data = response.json()
+        return data if isinstance(data, list) else []
+
+    def _fetch_pro_user_ids(self) -> set[str]:
+        response = self._supabase_request(
+            "GET",
+            "/rest/v1/user_subscriptions",
+            params={"select": "user_id", "plan": "eq.pro", "status": "eq.active"},
+        )
+        data = response.json()
+        if not isinstance(data, list):
+            return set()
+        return {row.get("user_id") for row in data if row.get("user_id")}
+
+    @staticmethod
+    def _is_inactive_device(device: dict[str, Any], now: datetime) -> bool:
+        last_seen_at = device.get("last_seen_at")
+        if not last_seen_at:
+            return True
+        try:
+            seen = datetime.fromisoformat(str(last_seen_at).replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        return (now - seen).days >= INACTIVE_DEVICE_DAYS
+
+    def _fetch_segment_devices(self, segment: str) -> list[dict[str, Any]]:
+        devices = self._fetch_all_enabled_devices()
+        if segment == "all":
+            return devices
+        if segment == "pro":
+            pro_user_ids = self._fetch_pro_user_ids()
+            return [d for d in devices if d.get("user_id") in pro_user_ids]
+        if segment == "inactive":
+            now = datetime.now(timezone.utc)
+            return [d for d in devices if self._is_inactive_device(d, now)]
+        raise PushNotificationError(f"Unknown audience segment: {segment!r}")
+
+    def _last_broadcast_today(self) -> dict[str, Any] | None:
+        since = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0,
+        ).isoformat()
+        response = self._supabase_request(
+            "GET",
+            "/rest/v1/push_notification_deliveries",
+            params={
+                "select": "id,created_at",
+                "raw_json->>kind": "eq.broadcast",
+                "created_at": f"gte.{since}",
+                "order": "created_at.desc",
+                "limit": "1",
+            },
+        )
+        rows = response.json()
+        return rows[0] if isinstance(rows, list) and rows else None
+
     def _fetch_enabled_devices(
         self,
         *,
@@ -433,6 +652,74 @@ class PriceAlertPushService:
             payload = response.json()
             return "sent", str(payload.get("name") or ""), None
         return "failed", None, response.text[:500]
+
+    def _send_generic_fcm(
+        self,
+        title: str,
+        body: str,
+        device: dict[str, Any],
+        *,
+        data: dict[str, str] | None = None,
+    ) -> tuple[str, str | None, str | None]:
+        token = str(device.get("device_token") or "").strip()
+        if not token:
+            return "failed", None, "Device token is empty."
+
+        response = self._client.post(
+            f"https://fcm.googleapis.com/v1/projects/{self._firebase_project_id}/messages:send",
+            headers={
+                "Authorization": f"Bearer {self._firebase_bearer_token()}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "message": {
+                    "token": token,
+                    "notification": {"title": title, "body": body},
+                    "data": data or {},
+                }
+            },
+        )
+        if 200 <= response.status_code < 300:
+            payload = response.json()
+            return "sent", str(payload.get("name") or ""), None
+        return "failed", None, response.text[:500]
+
+    def _log_generic_delivery(
+        self,
+        *,
+        user_id: str | None,
+        device: dict[str, Any] | None,
+        status: str,
+        title: str,
+        body: str,
+        kind: str,
+        provider_message_id: str | None = None,
+        error_message: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        self._supabase_request(
+            "POST",
+            "/rest/v1/push_notification_deliveries",
+            headers={"Prefer": "return=minimal"},
+            json=[
+                {
+                    "user_id": user_id,
+                    "price_alert_id": None,
+                    "portfolio_item_id": None,
+                    "provider": (device or {}).get("provider") or "fcm",
+                    "platform": (device or {}).get("platform"),
+                    "title": title,
+                    "body": body,
+                    "status": status,
+                    "provider_message_id": provider_message_id,
+                    "error_message": error_message,
+                    "sent_at": datetime.now(timezone.utc).isoformat()
+                    if status == "sent"
+                    else None,
+                    "raw_json": {"kind": kind, "device": device, **(extra or {})},
+                }
+            ],
+        )
 
     def _firebase_bearer_token(self) -> str:
         if self._firebase_access_token:
