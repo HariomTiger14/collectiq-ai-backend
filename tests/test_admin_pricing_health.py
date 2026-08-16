@@ -48,8 +48,72 @@ class AdminPricingHealthEndpointTest(unittest.TestCase):
         self.assertTrue(response.json()["success"])
         self.assertEqual(response.json()["status"], "healthy")
 
+    def test_quick_health_returns_providers_and_currency_only(self) -> None:
+        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+            "app.routers.admin_pricing.PricingHealthService",
+        ) as service_factory:
+            auth_settings.admin_import_token = "secret-token"
+            service_factory.return_value.quick_health.return_value = {
+                "success": True,
+                "generatedAt": "2026-08-16T00:00:00+00:00",
+                "providers": [{"name": "KicksDB", "configured": True}],
+                "currency": {"defaultDisplayCurrency": "AUD"},
+            }
+
+            response = self.client.get(
+                "/admin/pricing/health/quick",
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["providers"][0]["name"], "KicksDB")
+        self.assertEqual(payload["currency"]["defaultDisplayCurrency"], "AUD")
+        self.assertNotIn("pricecharting", payload)
+        self.assertNotIn("summary", payload)
+
 
 class PricingHealthServiceTest(unittest.TestCase):
+    def test_quick_health_makes_zero_network_calls(self) -> None:
+        def _fail_on_any_request(request: httpx.Request) -> httpx.Response:
+            raise AssertionError(
+                f"quick_health() should never make a network call, got: {request.url}"
+            )
+
+        client = httpx.Client(transport=httpx.MockTransport(_fail_on_any_request))
+        service = PricingHealthService(
+            supabase_url="https://packlox.supabase.co",
+            service_role_key="service-role-key",
+            client=client,
+        )
+
+        with patch("app.services.pricing.admin_health_service.settings") as settings:
+            settings.pricecharting_api_key = ""
+            settings.ebay_access_token = ""
+            settings.ebay_client_id = ""
+            settings.ebay_client_secret = ""
+            settings.ebay_marketplace_id = "EBAY_AU"
+            settings.ebay_marketplace_insights_api_url = ""
+            settings.ebay_partner_access_granted = False
+            settings.tcgplayer_client_id = ""
+            settings.tcgplayer_client_secret = ""
+            settings.kicksdb_api_key = "kicks-key"
+            settings.kicksdb_api_base = "https://api.kicks.dev"
+            settings.default_display_currency = "AUD"
+            settings.fx_usd_to_aud = 1.52
+            settings.fx_usd_to_cad = 1.37
+            settings.fx_usd_to_gbp = 0.78
+
+            payload = service.quick_health()
+
+        self.assertTrue(payload["success"])
+        self.assertIn("providers", payload)
+        self.assertIn("currency", payload)
+        kicksdb = next(p for p in payload["providers"] if p["key"] == "kicksdb")
+        self.assertTrue(kicksdb["configured"])
+        self.assertEqual(payload["currency"]["defaultDisplayCurrency"], "AUD")
+
     def test_uses_pricecharting_summary_rpc_for_large_sources(self) -> None:
         client = httpx.Client(transport=httpx.MockTransport(_supabase_summary_handler))
         service = PricingHealthService(
