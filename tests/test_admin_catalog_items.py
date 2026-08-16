@@ -310,6 +310,68 @@ class AdminCatalogListItemsTest(unittest.TestCase):
         funko_requests = [r for r in requests if "funko_pop_catalog" in str(r.url)]
         self.assertEqual(len(funko_requests), 1)
 
+    def test_service_enriches_mapped_pokemon_set_via_tcgdex(self) -> None:
+        # Mirrors CatalogSearchService's Pokemon enrichment (same verified
+        # 5-set English mapping) so the admin browse table shows the same
+        # images the mobile/public search does.
+        def supabase_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "pricecharting_id": "7096109",
+                        "product_name": "Charizard [1999-2000] #4",
+                        "category": "Pokemon Card",
+                        "console_name": "Pokemon Base Set",
+                        "loose_price_cents": 16100,
+                        "currency": "USD",
+                        "updated_at": "2026-08-13T00:00:00Z",
+                    },
+                    {
+                        "pricecharting_id": "3438352",
+                        "product_name": "Charizard [1st Edition] #103",
+                        "category": "Pokemon Card",
+                        "console_name": "Pokemon Japanese Expedition Expansion Pack",
+                        "loose_price_cents": 5000,
+                        "currency": "USD",
+                        "updated_at": "2026-08-13T00:00:00Z",
+                    },
+                ],
+            )
+
+        tcgdex_requests: list[httpx.Request] = []
+
+        def tcgdex_handler(request: httpx.Request) -> httpx.Response:
+            tcgdex_requests.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "base1-4",
+                    "name": "Charizard",
+                    "image": "https://assets.tcgdex.net/en/base/base1/4",
+                },
+            )
+
+        service = AdminCatalogService(
+            repository=SupabaseAdminCatalogRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=httpx.Client(transport=httpx.MockTransport(supabase_handler)),
+            ),
+            tcgdex_client=httpx.Client(transport=httpx.MockTransport(tcgdex_handler)),
+        )
+
+        payload = service.list_items(source="pricecharting", limit=100, offset=0)
+
+        items_by_id = {item["id"]: item for item in payload["items"]}
+        self.assertEqual(
+            items_by_id["7096109"]["imageUrl"],
+            "https://assets.tcgdex.net/en/base/base1/4/high.png",
+        )
+        # Unmapped set (Japanese Expedition) never even attempts a TCGdex call.
+        self.assertIsNone(items_by_id["3438352"]["imageUrl"])
+        self.assertEqual(len(tcgdex_requests), 1)
+
     def test_service_compacts_kicksdb_rows(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
