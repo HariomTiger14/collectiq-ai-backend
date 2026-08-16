@@ -207,6 +207,14 @@ class Settings:
     firebase_service_account_json: str = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "")
     firebase_access_token: str = os.getenv("FIREBASE_ACCESS_TOKEN", "")
 
+    # ---- Resend (support ticket reply notifications) ----
+    # Separate from whatever SMTP provider Supabase Auth uses for its own
+    # emails (password reset etc, configured in the Supabase dashboard, not
+    # here) -- this is a direct application-level integration for arbitrary
+    # transactional email the backend triggers itself.
+    resend_api_key: str = os.getenv("RESEND_API_KEY", "")
+    resend_from_address: str = os.getenv("RESEND_FROM_ADDRESS", "PackLox Support <info@packlox.com>")
+
     # ---- Google Play (real subscription verification) ----
     google_play_package_name: str = os.getenv("GOOGLE_PLAY_PACKAGE_NAME", "com.collectiq.ai")
     # Same raw-JSON-in-env-var convention as firebase_service_account_json above

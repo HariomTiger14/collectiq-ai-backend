@@ -28,6 +28,7 @@ from app.routers import (
     scanner,
     search,
     subscription_webhooks,
+    support,
 )
 
 
@@ -65,6 +66,7 @@ app.include_router(admin_reports.router)
 app.include_router(admin_scans.router)
 app.include_router(admin_users.router)
 app.include_router(data_requests.router)
+app.include_router(support.router)
 app.include_router(push.router)
 app.include_router(api_analyze.root_router)
 app.include_router(api_analyze.router)
