@@ -54,6 +54,16 @@ def pricing_health(
         ) from error
 
 
+@router.get("/health/quick")
+def pricing_health_quick(
+    _admin: None = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    """Providers + currency only, no catalog RPC -- see
+    PricingHealthService.quick_health for why this exists separately from
+    the full /health."""
+    return PricingHealthService().quick_health()
+
+
 @router.post("/reprice-all")
 def reprice_all_portfolio_items(
     dry_run: bool = Query(False, alias="dryRun"),
