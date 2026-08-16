@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -69,6 +70,7 @@ class CatalogSearchService:
             else _kicksdb_row_to_result(row, normalized_query)
             for _, _, source, row in top
         ]
+        results = [self._enrich_with_funko_image(result) for result in results]
         return CatalogSearchResponse(
             query=normalized_query,
             count=len(results),
@@ -86,11 +88,12 @@ class CatalogSearchService:
         row = self._fetch_catalog_row(normalized_id)
         if row is not None:
             history_rows = self._fetch_history_rows(normalized_id, bounded_history_limit)
+            result = _row_to_result(
+                row,
+                _normalize_query(str(row.get("product_name") or "")),
+            )
             return CatalogDetailResponse(
-                result=_row_to_result(
-                    row,
-                    _normalize_query(str(row.get("product_name") or "")),
-                ),
+                result=self._enrich_with_funko_image(result),
                 history=[_history_row_to_point(row) for row in history_rows],
             )
 
@@ -207,6 +210,47 @@ class CatalogSearchService:
         if not isinstance(payload, list):
             return []
         return [row for row in payload if isinstance(row, dict)]
+
+    def _enrich_with_funko_image(self, result: CatalogSearchResult) -> CatalogSearchResult:
+        # Funko Pop rows come from PriceCharting (real pricing, no image
+        # field at all — see docs/GLOBAL_CATALOG_ARCHITECTURE.md). This
+        # attaches a real photo from the static funko_pop_catalog reference
+        # table (imported from the open-source funko-pop-data dataset) when
+        # a confident exact-title match exists. Never overwrites an image a
+        # result already has (e.g. KicksDB rows), and never guesses — no
+        # match means no image, same as before.
+        if result.imageUrl or not result.setName or "funko" not in result.setName.lower():
+            return result
+        image_url = self._fetch_funko_image(result.title)
+        if image_url is None:
+            return result
+        return result.model_copy(update={"imageUrl": image_url})
+
+    def _fetch_funko_image(self, product_title: str) -> str | None:
+        lookup_title = _funko_lookup_title(product_title)
+        if not lookup_title:
+            return None
+        params = {
+            "select": "image_url,series",
+            "normalized_title": f"eq.{lookup_title}",
+            "limit": "10",
+        }
+        payload = self._request("GET", "/rest/v1/funko_pop_catalog", params=params)
+        if not isinstance(payload, list) or not payload:
+            return None
+        candidates = [row for row in payload if isinstance(row, dict) and row.get("image_url")]
+        if not candidates:
+            return None
+        # Prefer an actual Pop! vinyl figure entry over pins/apparel/other
+        # merch that happens to share the same character name.
+        for row in candidates:
+            series = row.get("series") or []
+            series_text = " ".join(str(s) for s in series).lower()
+            if "pop!" in series_text and not any(
+                bad in series_text for bad in ("pin", "apparel", "tee", "sticker", "keychain")
+            ):
+                return str(row["image_url"])
+        return str(candidates[0]["image_url"])
 
     def _fetch_kicksdb_rows(self, query: str, limit: int) -> list[dict[str, Any]]:
         # Mirrors _fetch_rows()'s RPC-based ranking (see that method's
@@ -474,6 +518,26 @@ def _match_score(row: dict[str, Any], query: str) -> int:
 
 def _normalize_query(query: str) -> str:
     return " ".join(query.strip().lower().split())
+
+
+_FUNKO_BRACKET_TAG_RE = re.compile(r"\[[^\]]*\]")
+_FUNKO_FIGURE_NUMBER_RE = re.compile(r"#\S+")
+_FUNKO_YEAR_RE = re.compile(r"\(\d{4}\)")
+_FUNKO_SMART_QUOTES = str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"})
+
+
+def _funko_lookup_title(product_title: str) -> str:
+    # Conservative, deterministic normalization only — no fuzzy matching.
+    # PriceCharting names look like "13th Battalion Trooper #645" or
+    # "Guardians Of The Galaxy [Funko Pop] #12 (2019)"; the community
+    # dataset's titles are the bare character/product name ("13th Battalion
+    # Trooper"). Anything that doesn't reduce to an exact match after this
+    # normalization is left without an image rather than guessed at.
+    text = product_title.translate(_FUNKO_SMART_QUOTES)
+    text = _FUNKO_BRACKET_TAG_RE.sub("", text)
+    text = _FUNKO_FIGURE_NUMBER_RE.sub("", text)
+    text = _FUNKO_YEAR_RE.sub("", text)
+    return " ".join(text.strip().lower().split())
 
 
 def _cents_to_units(value: Any) -> float | None:

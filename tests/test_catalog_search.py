@@ -9,6 +9,7 @@ from app.main import app
 from app.services.pricing.catalog_search_service import (
     CatalogItemNotFoundError,
     CatalogSearchService,
+    _funko_lookup_title,
 )
 
 
@@ -359,6 +360,154 @@ class CatalogSearchServiceTest(unittest.TestCase):
             service.detail("missing")
 
         self.assertIn("not found", str(context.exception).lower())
+
+    def test_search_enriches_funko_result_with_real_image(self) -> None:
+        # PriceCharting has real pricing for Funko Pop rows but no image
+        # field at all (confirmed live, zero image data in raw_payload for
+        # any category). funko_pop_catalog is a static reference table
+        # (imported from the open-source funko-pop-data dataset) used only
+        # to attach a real photo when a confident exact-title match exists.
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "funko_pop_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "image_url": "https://images.hobbydb.com/1950-batmobile.png",
+                            "series": ["Funko Vinyl Art Toys"],
+                        }
+                    ],
+                )
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "7531531",
+                            "product_name": "1950 Batmobile #277",
+                            "console_name": "Funko POP Rides",
+                            "category": "Batman: 80th Anniversary, Amazon Exclusive",
+                            "loose_price_cents": 4500,
+                            "currency": "USD",
+                            "normalized_identity": "1950 batmobile funko pop rides",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.search("1950 batmobile", limit=10)
+
+        self.assertEqual(response.results[0].id, "7531531")
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://images.hobbydb.com/1950-batmobile.png",
+        )
+        self.assertTrue(
+            any("funko_pop_catalog" in str(r.url) for r in requests)
+        )
+
+    def test_search_leaves_funko_result_unenriched_when_no_match(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])  # no match found
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "99999",
+                            "product_name": "Some Obscure Figure #1",
+                            "console_name": "Funko POP Rides",
+                            "category": "Misc",
+                            "loose_price_cents": 1000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.search("some obscure figure", limit=10)
+
+        self.assertIsNone(response.results[0].imageUrl)
+
+    def test_search_skips_funko_lookup_for_non_funko_results(self) -> None:
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "999",
+                            "product_name": "Charizard #4 Base Set",
+                            "console_name": "Pokemon Cards",
+                            "category": "Pokemon Cards",
+                            "loose_price_cents": 16100,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        service.search("charizard", limit=10)
+
+        self.assertFalse(
+            any("funko_pop_catalog" in str(r.url) for r in requests)
+        )
+
+
+class FunkoLookupTitleTest(unittest.TestCase):
+    def test_strips_figure_number(self) -> None:
+        self.assertEqual(
+            _funko_lookup_title("13th Battalion Trooper #645"), "13th battalion trooper"
+        )
+
+    def test_strips_bracket_tag_and_year_and_number(self) -> None:
+        self.assertEqual(
+            _funko_lookup_title("Guardians Of The Galaxy [Funko Pop] #12 (2019)"),
+            "guardians of the galaxy",
+        )
+
+    def test_normalizes_smart_quotes_and_case(self) -> None:
+        self.assertEqual(
+            _funko_lookup_title("“The American Nightmare” Cody Rhodes #198"),
+            '"the american nightmare" cody rhodes',
+        )
+
+    def test_passthrough_when_no_special_tokens(self) -> None:
+        self.assertEqual(_funko_lookup_title("12th Man Freddy Funko"), "12th man freddy funko")
 
 
 class CatalogSearchEndpointTest(unittest.TestCase):
