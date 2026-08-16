@@ -8,7 +8,9 @@ import httpx
 from app.core.config import settings
 from app.services.pricing.admin_review_queue_service import _total_from_content_range
 from app.services.pricing.catalog_search_service import (
+    _POKEMON_SET_TCGDEX_IDS,
     _funko_lookup_title,
+    _pokemon_card_number,
     select_best_funko_image,
 )
 
@@ -22,8 +24,12 @@ class AdminCatalogService:
         self,
         *,
         repository: "SupabaseAdminCatalogRepository | None" = None,
+        tcgdex_client: httpx.Client | None = None,
+        tcgdex_timeout_seconds: float = 3,
     ) -> None:
         self._repository = repository or SupabaseAdminCatalogRepository()
+        self._tcgdex_client = tcgdex_client
+        self._tcgdex_timeout_seconds = tcgdex_timeout_seconds
 
     def update_item(self, catalog_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not self._repository.is_configured:
@@ -59,6 +65,7 @@ class AdminCatalogService:
         items = [_compact_catalog_row(row, source=normalized_source) for row in rows]
         if normalized_source == "pricecharting":
             items = self._enrich_funko_images(items)
+            items = self._enrich_pokemon_images(items)
         return {
             "success": True,
             "source": normalized_source,
@@ -89,6 +96,47 @@ class AdminCatalogService:
             image_url = images_by_title.get(lookup_title)
             if image_url:
                 items[index]["imageUrl"] = image_url
+        return items
+
+    def _enrich_pokemon_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mirrors CatalogSearchService._enrich_with_pokemon_image -- same
+        # small, verified _POKEMON_SET_TCGDEX_IDS mapping, so the admin
+        # browse table shows the same images the mobile/public search does.
+        # TCGdex has no batch-by-id endpoint, so this is one live call per
+        # matched row, but the set mapping is narrow enough that this stays
+        # a handful of calls per page, not one per row on the page.
+        targets = [
+            (index, item)
+            for index, item in enumerate(items)
+            if not item.get("imageUrl")
+            and item.get("setName")
+            and str(item["setName"]).strip().lower() in _POKEMON_SET_TCGDEX_IDS
+        ]
+        if not targets:
+            return items
+        client = self._tcgdex_client or httpx.Client(timeout=self._tcgdex_timeout_seconds)
+        should_close = self._tcgdex_client is None
+        try:
+            for index, item in targets:
+                set_id = _POKEMON_SET_TCGDEX_IDS[str(item["setName"]).strip().lower()]
+                card_number = _pokemon_card_number(str(item.get("title") or ""))
+                if not card_number:
+                    continue
+                try:
+                    response = client.get(
+                        f"https://api.tcgdex.net/v2/en/cards/{set_id}-{card_number}"
+                    )
+                    if response.status_code != 200:
+                        continue
+                    payload = response.json()
+                except (httpx.HTTPError, ValueError):
+                    continue
+                image_base = payload.get("image") if isinstance(payload, dict) else None
+                if image_base:
+                    items[index]["imageUrl"] = f"{image_base}/high.png"
+        finally:
+            if should_close:
+                client.close()
         return items
 
 

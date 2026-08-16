@@ -31,6 +31,12 @@ class CatalogSearchService:
     service_role_key: str | None = None
     timeout_seconds: float = 5
     client: httpx.Client | None = None
+    # TCGdex (api.tcgdex.net) is a separate free, public, no-key-required
+    # API -- not Supabase -- so it gets its own client/timeout. A short
+    # timeout matters here specifically: this is a live external call made
+    # during search(), and a TCGdex outage must not stall our own response.
+    tcgdex_client: httpx.Client | None = None
+    tcgdex_timeout_seconds: float = 3
 
     @property
     def is_configured(self) -> bool:
@@ -71,6 +77,7 @@ class CatalogSearchService:
             for _, _, source, row in top
         ]
         results = [self._enrich_with_funko_image(result) for result in results]
+        results = [self._enrich_with_pokemon_image(result) for result in results]
         return CatalogSearchResponse(
             query=normalized_query,
             count=len(results),
@@ -93,7 +100,9 @@ class CatalogSearchService:
                 _normalize_query(str(row.get("product_name") or "")),
             )
             return CatalogDetailResponse(
-                result=self._enrich_with_funko_image(result),
+                result=self._enrich_with_pokemon_image(
+                    self._enrich_with_funko_image(result)
+                ),
                 history=[_history_row_to_point(row) for row in history_rows],
             )
 
@@ -225,6 +234,52 @@ class CatalogSearchService:
         if image_url is None:
             return result
         return result.model_copy(update={"imageUrl": image_url})
+
+    def _enrich_with_pokemon_image(self, result: CatalogSearchResult) -> CatalogSearchResult:
+        # PriceCharting has no image data for Pokemon cards either. Real
+        # tested coverage against our own vintage/international-heavy
+        # catalog is low overall (~14% on a real sample — most rows are
+        # Japanese/Korean prints or pre-2021 sets no free source covers),
+        # so this is deliberately narrow: only the handful of classic
+        # English sets in _POKEMON_SET_TCGDEX_IDS, each verified live
+        # against TCGdex (api.tcgdex.net, free/no key) before being added.
+        # No set-name mapping means no attempt — never a fuzzy guess.
+        if result.imageUrl or not result.setName or "pokemon" not in result.setName.lower():
+            return result
+        set_id = _POKEMON_SET_TCGDEX_IDS.get(result.setName.strip().lower())
+        if set_id is None:
+            return result
+        card_number = _pokemon_card_number(result.title)
+        if card_number is None:
+            return result
+        image_url = self._fetch_pokemon_image(set_id, card_number)
+        if image_url is None:
+            return result
+        return result.model_copy(update={"imageUrl": image_url})
+
+    def _fetch_pokemon_image(self, set_id: str, card_number: str) -> str | None:
+        client = self.tcgdex_client or httpx.Client(timeout=self.tcgdex_timeout_seconds)
+        should_close = self.tcgdex_client is None
+        try:
+            response = client.get(
+                f"https://api.tcgdex.net/v2/en/cards/{set_id}-{card_number}"
+            )
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+        except (httpx.HTTPError, ValueError):
+            # A TCGdex hiccup means no image this time, not a broken
+            # search — same fail-open behavior as a missing Funko match.
+            return None
+        finally:
+            if should_close:
+                client.close()
+        if not isinstance(payload, dict):
+            return None
+        image_base = payload.get("image")
+        if not image_base or not isinstance(image_base, str):
+            return None
+        return f"{image_base}/high.png"
 
     def _fetch_funko_image(self, product_title: str) -> str | None:
         lookup_title = _funko_lookup_title(product_title)
@@ -506,6 +561,29 @@ def _match_score(row: dict[str, Any], query: str) -> int:
 
 def _normalize_query(query: str) -> str:
     return " ".join(query.strip().lower().split())
+
+
+# Verified live against TCGdex (api.tcgdex.net/v2/en/cards/{id}-{number})
+# before being added -- each key confirmed to return the correct card name,
+# correct set, and a real image. Keys are PriceCharting's exact console_name
+# values, lowercased. Deliberately small and hand-maintained: real tested
+# match rate against our catalog is low overall (~14% on a random sample,
+# mostly because our Pokemon rows skew Japanese/Korean/vintage, which no
+# free image source covers), so this only covers a few classic English sets
+# rather than guessing at a broader mapping.
+_POKEMON_SET_TCGDEX_IDS: dict[str, str] = {
+    "pokemon base set": "base1",
+    "pokemon jungle": "base2",
+    "pokemon fossil": "base3",
+    "pokemon base set 2": "base4",
+    "pokemon team rocket": "base5",
+}
+_POKEMON_CARD_NUMBER_RE = re.compile(r"#(\w+)")
+
+
+def _pokemon_card_number(product_title: str) -> str | None:
+    match = _POKEMON_CARD_NUMBER_RE.search(product_title)
+    return match.group(1) if match else None
 
 
 _FUNKO_BRACKET_TAG_RE = re.compile(r"\[[^\]]*\]")

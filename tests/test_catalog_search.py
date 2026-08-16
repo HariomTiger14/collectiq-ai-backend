@@ -10,6 +10,7 @@ from app.services.pricing.catalog_search_service import (
     CatalogItemNotFoundError,
     CatalogSearchService,
     _funko_lookup_title,
+    _pokemon_card_number,
 )
 
 
@@ -486,6 +487,143 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertFalse(
             any("funko_pop_catalog" in str(r.url) for r in requests)
         )
+
+
+class PokemonImageEnrichmentTest(unittest.TestCase):
+    def test_search_enriches_mapped_english_set_with_tcgdex_image(self) -> None:
+        # base1-4 (Charizard, Base Set) verified live against the real
+        # TCGdex API before this mapping was added.
+        pc_requests: list[httpx.Request] = []
+
+        def pc_handler(request: httpx.Request) -> httpx.Response:
+            pc_requests.append(request)
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "7096109",
+                            "product_name": "Charizard [1999-2000] #4",
+                            "console_name": "Pokemon Base Set",
+                            "category": "Pokemon Card",
+                            "loose_price_cents": 16100,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        def tcgdex_handler(request: httpx.Request) -> httpx.Response:
+            self.assertIn("base1-4", str(request.url))
+            return httpx.Response(
+                200,
+                json={"id": "base1-4", "name": "Charizard", "image": "https://assets.tcgdex.net/en/base/base1/4"},
+            )
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
+            tcgdex_client=httpx.Client(transport=httpx.MockTransport(tcgdex_handler)),
+        )
+
+        response = service.search("charizard base set", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://assets.tcgdex.net/en/base/base1/4/high.png",
+        )
+
+    def test_search_skips_unmapped_pokemon_set(self) -> None:
+        tcgdex_requests: list[httpx.Request] = []
+
+        def pc_handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "3438352",
+                            "product_name": "Charizard [1st Edition] #103",
+                            "console_name": "Pokemon Japanese Expedition Expansion Pack",
+                            "category": "Pokemon Card",
+                            "loose_price_cents": 5000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        def tcgdex_handler(request: httpx.Request) -> httpx.Response:
+            tcgdex_requests.append(request)
+            return httpx.Response(200, json={})
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
+            tcgdex_client=httpx.Client(transport=httpx.MockTransport(tcgdex_handler)),
+        )
+
+        response = service.search("charizard expedition", limit=10)
+
+        self.assertIsNone(response.results[0].imageUrl)
+        self.assertEqual(len(tcgdex_requests), 0)
+
+    def test_search_fails_open_when_tcgdex_errors(self) -> None:
+        def pc_handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "7096109",
+                            "product_name": "Charizard [1999-2000] #4",
+                            "console_name": "Pokemon Base Set",
+                            "category": "Pokemon Card",
+                            "loose_price_cents": 16100,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        def tcgdex_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500)
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
+            tcgdex_client=httpx.Client(transport=httpx.MockTransport(tcgdex_handler)),
+        )
+
+        response = service.search("charizard base set", limit=10)
+
+        self.assertIsNone(response.results[0].imageUrl)
+
+
+class PokemonCardNumberTest(unittest.TestCase):
+    def test_extracts_number_after_hash(self) -> None:
+        self.assertEqual(_pokemon_card_number("Charizard [1999-2000] #4"), "4")
+
+    def test_returns_none_without_hash(self) -> None:
+        self.assertIsNone(_pokemon_card_number("Charizard"))
 
 
 class FunkoLookupTitleTest(unittest.TestCase):
