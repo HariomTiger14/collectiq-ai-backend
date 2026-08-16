@@ -43,11 +43,32 @@ class CatalogSearchService:
         if not self.is_configured:
             raise CatalogSearchError("Catalog search is not configured.")
 
-        rows = self._fetch_rows(normalized_query, bounded_limit)
+        # Two sources, merged and re-ranked together: pricecharting_catalog
+        # (cards/games/comics/coins/etc.) and kicksdb_catalog (sneakers/
+        # streetwear — the only source with real product images today).
+        # Each source's own RPC does its own indexed filter+sort; the
+        # combined list below just needs a single comparable score per row
+        # to interleave the two sources correctly, so results aren't
+        # PriceCharting-first / KicksDB-second regardless of relevance.
+        pc_rows = self._fetch_rows(normalized_query, bounded_limit)
+        kicksdb_rows = self._fetch_kicksdb_rows(normalized_query, bounded_limit)
+
+        scored: list[tuple[int, str, str, dict[str, Any]]] = [
+            (_match_score(row, normalized_query), str(row.get("product_name") or ""), "pricecharting", row)
+            for row in pc_rows
+        ] + [
+            (_kicksdb_match_score(row, normalized_query), str(row.get("title") or ""), "kicksdb", row)
+            for row in kicksdb_rows
+        ]
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        top = scored[:bounded_limit]
+
         results = [
             _row_to_result(row, normalized_query)
-            for row in _rank_rows(rows, normalized_query)
-        ][:bounded_limit]
+            if source == "pricecharting"
+            else _kicksdb_row_to_result(row, normalized_query)
+            for _, _, source, row in top
+        ]
         return CatalogSearchResponse(
             query=normalized_query,
             count=len(results),
@@ -63,17 +84,35 @@ class CatalogSearchService:
             raise CatalogSearchError("Catalog search is not configured.")
 
         row = self._fetch_catalog_row(normalized_id)
-        if row is None:
-            raise CatalogItemNotFoundError("Catalog item was not found.")
+        if row is not None:
+            history_rows = self._fetch_history_rows(normalized_id, bounded_history_limit)
+            return CatalogDetailResponse(
+                result=_row_to_result(
+                    row,
+                    _normalize_query(str(row.get("product_name") or "")),
+                ),
+                history=[_history_row_to_point(row) for row in history_rows],
+            )
 
-        history_rows = self._fetch_history_rows(normalized_id, bounded_history_limit)
-        return CatalogDetailResponse(
-            result=_row_to_result(
-                row,
-                _normalize_query(str(row.get("product_name") or "")),
-            ),
-            history=[_history_row_to_point(row) for row in history_rows],
-        )
+        # Not a pricecharting_catalog row — try kicksdb_catalog before
+        # giving up. The two tables have independent id spaces (no
+        # collision risk), so this is a safe fallback, not a guess.
+        kicksdb_row = self._fetch_kicksdb_catalog_row(normalized_id)
+        if kicksdb_row is not None:
+            kicksdb_history_rows = self._fetch_kicksdb_history_rows(
+                normalized_id, bounded_history_limit
+            )
+            return CatalogDetailResponse(
+                result=_kicksdb_row_to_result(
+                    kicksdb_row,
+                    _normalize_query(str(kicksdb_row.get("title") or "")),
+                ),
+                history=[
+                    _kicksdb_history_row_to_point(row) for row in kicksdb_history_rows
+                ],
+            )
+
+        raise CatalogItemNotFoundError("Catalog item was not found.")
 
     @property
     def _supabase_url(self) -> str:
@@ -163,6 +202,59 @@ class CatalogSearchService:
         payload = self._request(
             "GET",
             "/rest/v1/pricecharting_catalog_history",
+            params=params,
+        )
+        if not isinstance(payload, list):
+            return []
+        return [row for row in payload if isinstance(row, dict)]
+
+    def _fetch_kicksdb_rows(self, query: str, limit: int) -> list[dict[str, Any]]:
+        # Mirrors _fetch_rows()'s RPC-based ranking (see that method's
+        # comment for why a plain REST ORDER BY isn't safe here either).
+        # kicksdb_catalog is ~11K rows, well under the size where the
+        # adaptive broad-query fallback used for pricecharting_catalog
+        # becomes necessary.
+        payload = self._request(
+            "POST",
+            "/rest/v1/rpc/search_kicksdb_catalog",
+            json_payload={"search_query": query, "result_limit": limit},
+        )
+        if not isinstance(payload, list):
+            return []
+        return [row for row in payload if isinstance(row, dict)]
+
+    def _fetch_kicksdb_catalog_row(self, catalog_id: str) -> dict[str, Any] | None:
+        params = {
+            "select": (
+                "kicksdb_id,title,brand,model,gender,product_type,category,"
+                "secondary_category,image_url,rank,release_date,currency,"
+                "min_price_cents,max_price_cents,avg_price_cents,product_url,"
+                "sku,updated_at"
+            ),
+            "kicksdb_id": f"eq.{catalog_id}",
+            "limit": "1",
+        }
+        payload = self._request("GET", "/rest/v1/kicksdb_catalog", params=params)
+        if not isinstance(payload, list) or not payload:
+            return None
+        row = payload[0]
+        return row if isinstance(row, dict) else None
+
+    def _fetch_kicksdb_history_rows(
+        self, catalog_id: str, limit: int
+    ) -> list[dict[str, Any]]:
+        params = {
+            "select": (
+                "valid_from,valid_to,is_current,source_downloaded_at,"
+                "min_price_cents,max_price_cents,avg_price_cents,currency"
+            ),
+            "kicksdb_id": f"eq.{catalog_id}",
+            "order": "valid_from.desc",
+            "limit": str(limit),
+        }
+        payload = self._request(
+            "GET",
+            "/rest/v1/kicksdb_catalog_history",
             params=params,
         )
         if not isinstance(payload, list):
@@ -266,6 +358,72 @@ def _pricing_from_row(row: dict[str, Any]) -> CatalogSearchPricing:
         cibPrice=cib,
         newPrice=new,
         gradedPrice=graded,
+    )
+
+
+def _kicksdb_row_to_result(row: dict[str, Any], query: str) -> CatalogSearchResult:
+    pricing = _kicksdb_pricing_from_row(row)
+    return CatalogSearchResult(
+        id=str(row.get("kicksdb_id") or ""),
+        title=str(row.get("title") or "Catalog item"),
+        category=str(row.get("category") or row.get("product_type") or "Sneakers"),
+        source="KicksDB",
+        setName=_clean(row.get("brand")),
+        identifier=_clean(row.get("sku")),
+        productUrl=_clean(row.get("product_url")),
+        sourceFile=None,
+        confidence=_kicksdb_match_confidence(row, query),
+        attribution="Pricing data by KicksDB",
+        lastUpdated=_clean(row.get("updated_at")) or (datetime.utcnow().isoformat() + "Z"),
+        imageUrl=_clean(row.get("image_url")),
+        pricing=pricing,
+    )
+
+
+def _kicksdb_pricing_from_row(row: dict[str, Any]) -> CatalogSearchPricing:
+    return CatalogSearchPricing(
+        currency=str(row.get("currency") or "USD").upper(),
+        marketValue=_cents_to_units(row.get("avg_price_cents")),
+        lowEstimate=_cents_to_units(row.get("min_price_cents")),
+        highEstimate=_cents_to_units(row.get("max_price_cents")),
+    )
+
+
+def _kicksdb_match_confidence(row: dict[str, Any], query: str) -> float:
+    score = _kicksdb_match_score(row, query)
+    if score >= 100:
+        return 0.96
+    if score >= 80:
+        return 0.90
+    if score >= 55:
+        return 0.78
+    return 0.62
+
+
+def _kicksdb_match_score(row: dict[str, Any], query: str) -> int:
+    title = str(row.get("title") or "").lower()
+    brand = str(row.get("brand") or "").lower()
+    model = str(row.get("model") or "").lower()
+    sku = str(row.get("sku") or "").lower()
+    if query == title or (sku and query == sku):
+        return 110
+    if title.startswith(query):
+        return 95
+    if query in title:
+        return 80
+    if query in brand or query in model:
+        return 55
+    return 25
+
+
+def _kicksdb_history_row_to_point(row: dict[str, Any]) -> CatalogHistoryPoint:
+    return CatalogHistoryPoint(
+        validFrom=str(row.get("valid_from") or ""),
+        validTo=_clean(row.get("valid_to")),
+        isCurrent=bool(row.get("is_current")),
+        sourceFile=None,
+        sourceDownloadedAt=_clean(row.get("source_downloaded_at")),
+        pricing=_kicksdb_pricing_from_row(row),
     )
 
 

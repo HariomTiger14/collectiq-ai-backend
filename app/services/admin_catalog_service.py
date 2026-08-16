@@ -303,6 +303,7 @@ def _compact_catalog_row(row: dict[str, Any], *, source: str) -> dict[str, Any]:
             "setName": row.get("brand"),
             "source": "KicksDB",
             "lastUpdated": row.get("updated_at"),
+            "imageUrl": row.get("image_url"),
             "pricing": {"marketValue": market_value, "currency": (row.get("currency") or "USD").upper()},
         }
     loose = _cents_to_units(row.get("loose_price_cents"))
