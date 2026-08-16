@@ -308,6 +308,8 @@ class PriceAlertPushService:
         body: str,
         device_id: str | None = None,
         dry_run: bool = True,
+        notification_data: dict[str, str] | None = None,
+        kind: str = "admin_direct",
     ) -> TargetedPushSummary:
         self._ensure_configured(require_firebase=not dry_run)
         title = title.strip()
@@ -324,13 +326,14 @@ class PriceAlertPushService:
                     "That device is not enabled/registered for this user."
                 )
 
+        data = notification_data or {"type": "admin_direct"}
         attempted = sent = failed = 0
         for device in devices:
             attempted += 1
             if dry_run:
                 continue
             status, provider_message_id, error_message = self._send_generic_fcm(
-                title, body, device, data={"type": "admin_direct"}
+                title, body, device, data=data
             )
             if status == "sent":
                 sent += 1
@@ -342,7 +345,7 @@ class PriceAlertPushService:
                 status=status,
                 title=title,
                 body=body,
-                kind="admin_direct",
+                kind=kind,
                 provider_message_id=provider_message_id,
                 error_message=error_message,
             )
@@ -391,6 +394,7 @@ class PriceAlertPushService:
         kind = {
             "broadcast": "Broadcast",
             "admin_direct": "Admin direct message",
+            "support_ticket_reply": "Support ticket reply",
         }.get(raw_json.get("kind"), "Price-alert delivery")
         return {
             "id": row.get("id"),
