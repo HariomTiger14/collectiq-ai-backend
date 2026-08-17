@@ -11,6 +11,7 @@ from app.services.pricing.catalog_search_service import (
     CatalogSearchService,
     _funko_lookup_title,
     _pokemon_card_number,
+    _pokemon_variant_token,
 )
 
 
@@ -490,60 +491,214 @@ class CatalogSearchServiceTest(unittest.TestCase):
 
 
 class PokemonImageEnrichmentTest(unittest.TestCase):
-    def test_search_enriches_mapped_english_set_with_tcgdex_image(self) -> None:
-        # base1-4 (Charizard, Base Set) verified live against the real
-        # TCGdex API before this mapping was added.
-        pc_requests: list[httpx.Request] = []
+    # tcgplayer_pokemon_catalog (imported from TCGCSV — see
+    # scripts/import_tcgplayer_pokemon_catalog.py) is our own Supabase
+    # table, so every scenario below routes through the same `client`
+    # mock as the pricecharting_catalog/funko lookups, keyed off the
+    # request path/method rather than a separate external client.
 
-        def pc_handler(request: httpx.Request) -> httpx.Response:
-            pc_requests.append(request)
+    def _handler(self, *, search_row: dict, tcgplayer_rows: dict, sibling_rows: dict):
+        def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if "search_kicksdb_catalog" in url:
                 return httpx.Response(200, json=[])
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
             if "search_pricecharting_catalog" in url:
+                return httpx.Response(200, json=[search_row])
+            if "tcgplayer_pokemon_catalog" in url:
+                group_name = request.url.params.get("group_name", "").removeprefix("eq.")
+                card_number = request.url.params.get("card_number", "").removeprefix("eq.")
                 return httpx.Response(
-                    200,
-                    json=[
-                        {
-                            "pricecharting_id": "7096109",
-                            "product_name": "Charizard [1999-2000] #4",
-                            "console_name": "Pokemon Base Set",
-                            "category": "Pokemon Card",
-                            "loose_price_cents": 16100,
-                            "currency": "USD",
-                        },
-                    ],
+                    200, json=tcgplayer_rows.get((group_name, card_number), [])
                 )
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                console_name = request.url.params.get("console_name", "").removeprefix("eq.")
+                return httpx.Response(200, json=sibling_rows.get(console_name, []))
             return httpx.Response(200, json=[])
 
-        def tcgdex_handler(request: httpx.Request) -> httpx.Response:
-            self.assertIn("base1-4", str(request.url))
-            return httpx.Response(
-                200,
-                json={"id": "base1-4", "name": "Charizard", "image": "https://assets.tcgdex.net/en/base/base1/4"},
-            )
+        return handler
+
+    def test_search_uses_plain_image_when_no_sibling_variant_rows(self) -> None:
+        search_row = {
+            "pricecharting_id": "630417",
+            "product_name": "Charizard #4",
+            "console_name": "Pokemon Base Set",
+            "category": "Pokemon Card",
+            "loose_price_cents": 16100,
+            "currency": "USD",
+        }
+        tcgplayer_rows = {
+            ("Base Set", "4"): [
+                {
+                    "product_name": "Charizard",
+                    "image_url": "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
+                    "variant_tag": None,
+                },
+            ],
+        }
+        # Only this one row shares Base Set + #4 -- no siblings.
+        sibling_rows = {"Pokemon Base Set": [{"pricecharting_id": "630417"}]}
 
         service = CatalogSearchService(
             supabase_url="https://example.supabase.co",
             service_role_key="service-role",
-            client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
-            tcgdex_client=httpx.Client(transport=httpx.MockTransport(tcgdex_handler)),
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(
+                        search_row=search_row,
+                        tcgplayer_rows=tcgplayer_rows,
+                        sibling_rows=sibling_rows,
+                    )
+                )
+            ),
         )
 
         response = service.search("charizard base set", limit=10)
 
         self.assertEqual(
             response.results[0].imageUrl,
-            "https://assets.tcgdex.net/en/base/base1/4/high.png",
+            "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
+        )
+
+    def test_search_suppresses_generic_image_when_sibling_variant_rows_exist(self) -> None:
+        # Real production shape: Base Set Charizard #4 has 5 PriceCharting
+        # rows (plain, [1999-2000], [1st Edition], [Shadowless], [Black
+        # Dot Error]). This one has no bracket tag of its own and no
+        # exact TCGCSV match, but its siblings exist -- so even the
+        # "plain" generic image must be suppressed, not just the tagged
+        # rows, since TCGplayer's one photo can't be trusted to represent
+        # whichever specific print this untagged row actually is.
+        search_row = {
+            "pricecharting_id": "630417",
+            "product_name": "Charizard #4",
+            "console_name": "Pokemon Base Set",
+            "category": "Pokemon Card",
+            "loose_price_cents": 16100,
+            "currency": "USD",
+        }
+        tcgplayer_rows = {
+            ("Base Set", "4"): [
+                {
+                    "product_name": "Charizard",
+                    "image_url": "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
+                    "variant_tag": None,
+                },
+            ],
+        }
+        sibling_rows = {
+            "Pokemon Base Set": [
+                {"pricecharting_id": "630417"},
+                {"pricecharting_id": "7096109"},  # [1999-2000]
+            ]
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(
+                        search_row=search_row,
+                        tcgplayer_rows=tcgplayer_rows,
+                        sibling_rows=sibling_rows,
+                    )
+                )
+            ),
+        )
+
+        response = service.search("charizard base set", limit=10)
+
+        self.assertIsNone(response.results[0].imageUrl)
+
+    def test_search_uses_exact_shadowless_image(self) -> None:
+        search_row = {
+            "pricecharting_id": "715695",
+            "product_name": "Charizard [Shadowless] #4",
+            "console_name": "Pokemon Base Set",
+            "category": "Pokemon Card",
+            "loose_price_cents": 300000,
+            "currency": "USD",
+        }
+        tcgplayer_rows = {
+            ("Base Set (Shadowless)", "4"): [
+                {
+                    "product_name": "Charizard",
+                    "image_url": "https://tcgplayer-cdn.tcgplayer.com/product/106999_200w.jpg",
+                    "variant_tag": "shadowless",
+                },
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(
+                        search_row=search_row, tcgplayer_rows=tcgplayer_rows, sibling_rows={}
+                    )
+                )
+            ),
+        )
+
+        response = service.search("charizard shadowless", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://tcgplayer-cdn.tcgplayer.com/product/106999_200w.jpg",
+        )
+
+    def test_search_uses_exact_error_variant_image(self) -> None:
+        search_row = {
+            "pricecharting_id": "7307451",
+            "product_name": "Charizard [Black Dot Error] #4",
+            "console_name": "Pokemon Base Set",
+            "category": "Pokemon Card",
+            "loose_price_cents": 495000,
+            "currency": "USD",
+        }
+        tcgplayer_rows = {
+            ("Base Set", "4"): [
+                {
+                    "product_name": "Charizard",
+                    "image_url": "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
+                    "variant_tag": None,
+                },
+                {
+                    "product_name": "Charizard (Black Dot Error)",
+                    "image_url": "https://tcgplayer-cdn.tcgplayer.com/product/657516_200w.jpg",
+                    "variant_tag": "error",
+                },
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(
+                        search_row=search_row, tcgplayer_rows=tcgplayer_rows, sibling_rows={}
+                    )
+                )
+            ),
+        )
+
+        response = service.search("charizard black dot error", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://tcgplayer-cdn.tcgplayer.com/product/657516_200w.jpg",
         )
 
     def test_search_skips_unmapped_pokemon_set(self) -> None:
-        tcgdex_requests: list[httpx.Request] = []
+        tcgplayer_requests: list[httpx.Request] = []
 
         def pc_handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
+            if "tcgplayer_pokemon_catalog" in url:
+                tcgplayer_requests.append(request)
             if "search_kicksdb_catalog" in url:
                 return httpx.Response(200, json=[])
             if "funko_pop_catalog" in url:
@@ -564,58 +719,24 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
                 )
             return httpx.Response(200, json=[])
 
-        def tcgdex_handler(request: httpx.Request) -> httpx.Response:
-            tcgdex_requests.append(request)
-            return httpx.Response(200, json={})
-
         service = CatalogSearchService(
             supabase_url="https://example.supabase.co",
             service_role_key="service-role",
             client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
-            tcgdex_client=httpx.Client(transport=httpx.MockTransport(tcgdex_handler)),
         )
 
         response = service.search("charizard expedition", limit=10)
 
         self.assertIsNone(response.results[0].imageUrl)
-        self.assertEqual(len(tcgdex_requests), 0)
+        self.assertEqual(len(tcgplayer_requests), 0)
 
-    def test_search_fails_open_when_tcgdex_errors(self) -> None:
-        def pc_handler(request: httpx.Request) -> httpx.Response:
-            url = str(request.url)
-            if "search_kicksdb_catalog" in url:
-                return httpx.Response(200, json=[])
-            if "funko_pop_catalog" in url:
-                return httpx.Response(200, json=[])
-            if "search_pricecharting_catalog" in url:
-                return httpx.Response(
-                    200,
-                    json=[
-                        {
-                            "pricecharting_id": "7096109",
-                            "product_name": "Charizard [1999-2000] #4",
-                            "console_name": "Pokemon Base Set",
-                            "category": "Pokemon Card",
-                            "loose_price_cents": 16100,
-                            "currency": "USD",
-                        },
-                    ],
-                )
-            return httpx.Response(200, json=[])
 
-        def tcgdex_handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(500)
+class PokemonVariantTokenTest(unittest.TestCase):
+    def test_extracts_bracket_tag(self) -> None:
+        self.assertEqual(_pokemon_variant_token("Charizard [Shadowless] #4"), "shadowless")
 
-        service = CatalogSearchService(
-            supabase_url="https://example.supabase.co",
-            service_role_key="service-role",
-            client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
-            tcgdex_client=httpx.Client(transport=httpx.MockTransport(tcgdex_handler)),
-        )
-
-        response = service.search("charizard base set", limit=10)
-
-        self.assertIsNone(response.results[0].imageUrl)
+    def test_returns_none_without_brackets(self) -> None:
+        self.assertIsNone(_pokemon_variant_token("Charizard #4"))
 
 
 class PokemonCardNumberTest(unittest.TestCase):
