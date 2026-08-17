@@ -884,6 +884,105 @@ class AdminCatalogListItemsTest(unittest.TestCase):
         )
         self.assertEqual(len(lorcana_requests), 2)
 
+    def test_service_matches_onepiece_plain_row(self) -> None:
+        list_rows = [
+            {
+                "pricecharting_id": "1",
+                "product_name": "Captain John OP07-082",
+                "category": "One Piece 500 Years in the Future",
+                "console_name": "One Piece 500 Years in the Future",
+                "loose_price_cents": 100,
+                "currency": "USD",
+                "updated_at": "2026-08-13T00:00:00Z",
+            },
+        ]
+        onepiece_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "one_piece_catalog" in url:
+                onepiece_requests.append(request)
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "card_set_id": "OP07-082",
+                            "card_name": "Captain John",
+                            "is_plain": True,
+                            "image_url": "https://optcgapi.com/media/static/Card_Images/OP07-082.jpg",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=list_rows)
+
+        service = AdminCatalogService(
+            repository=SupabaseAdminCatalogRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=httpx.Client(transport=httpx.MockTransport(handler)),
+            ),
+        )
+
+        payload = service.list_items(source="pricecharting", limit=100, offset=0)
+
+        items_by_id = {item["id"]: item for item in payload["items"]}
+        self.assertEqual(
+            items_by_id["1"]["imageUrl"],
+            "https://optcgapi.com/media/static/Card_Images/OP07-082.jpg",
+        )
+        self.assertEqual(len(onepiece_requests), 1)
+
+    def test_service_matches_onepiece_exact_variant(self) -> None:
+        list_rows = [
+            {
+                "pricecharting_id": "1",
+                "product_name": "Perona [Box Topper] OP01-077",
+                "category": "One Piece Romance Dawn",
+                "console_name": "One Piece Romance Dawn",
+                "loose_price_cents": 500,
+                "currency": "USD",
+                "updated_at": "2026-08-13T00:00:00Z",
+            },
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "one_piece_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "card_set_id": "OP01-077",
+                            "card_name": "Perona",
+                            "is_plain": True,
+                            "image_url": "https://optcgapi.com/media/static/Card_Images/OP01-077.jpg",
+                        },
+                        {
+                            "card_set_id": "OP01-077",
+                            "card_name": "Perona (Box Topper)",
+                            "is_plain": False,
+                            "image_url": "https://optcgapi.com/media/static/Card_Images/OP01-077_p1.jpg",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=list_rows)
+
+        service = AdminCatalogService(
+            repository=SupabaseAdminCatalogRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=httpx.Client(transport=httpx.MockTransport(handler)),
+            ),
+        )
+
+        payload = service.list_items(source="pricecharting", limit=100, offset=0)
+
+        items_by_id = {item["id"]: item for item in payload["items"]}
+        self.assertEqual(
+            items_by_id["1"]["imageUrl"],
+            "https://optcgapi.com/media/static/Card_Images/OP01-077_p1.jpg",
+        )
+
     def test_service_compacts_kicksdb_rows(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
