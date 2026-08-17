@@ -75,6 +75,7 @@ class CatalogSearchService:
         results = [self._enrich_with_lego_image(result) for result in results]
         results = [self._enrich_with_magic_image(result) for result in results]
         results = [self._enrich_with_yugioh_image(result) for result in results]
+        results = [self._enrich_with_lorcana_image(result) for result in results]
         return CatalogSearchResponse(
             query=normalized_query,
             count=len(results),
@@ -97,11 +98,13 @@ class CatalogSearchService:
                 _normalize_query(str(row.get("product_name") or "")),
             )
             return CatalogDetailResponse(
-                result=self._enrich_with_yugioh_image(
-                    self._enrich_with_magic_image(
-                        self._enrich_with_lego_image(
-                            self._enrich_with_pokemon_image(
-                                self._enrich_with_funko_image(result)
+                result=self._enrich_with_lorcana_image(
+                    self._enrich_with_yugioh_image(
+                        self._enrich_with_magic_image(
+                            self._enrich_with_lego_image(
+                                self._enrich_with_pokemon_image(
+                                    self._enrich_with_funko_image(result)
+                                )
                             )
                         )
                     )
@@ -519,6 +522,50 @@ class CatalogSearchService:
         image_url = row.get("image_url") if isinstance(row, dict) else None
         return str(image_url) if image_url else None
 
+    def _enrich_with_lorcana_image(self, result: CatalogSearchResult) -> CatalogSearchResult:
+        # PriceCharting has no image data for Lorcana cards either. Images
+        # come from lorcana_catalog, our own table imported from two free,
+        # public, no-key sources -- lorcana-api.com (primary; images
+        # hosted on the official Ravensburger publisher CDN, verified
+        # live) and Lorcast (fallback) -- see scripts/import_lorcana_
+        # api_catalog.py and scripts/import_lorcast_catalog.py.
+        #
+        # Lorcana card numbers are unique only within a set (not globally,
+        # unlike Yu-Gi-Oh's set codes), so the lookup key is normalized
+        # set name + card number -- same shape as Magic's number-based
+        # match, and safe the same way: no reused-number risk was found
+        # for Lorcana (unlike LEGO), verified live against a real 500-row
+        # sample (99%+ of numbered rows matched). The one confirmed real
+        # gap is PriceCharting's "Lorcana Promo" console_name, which
+        # doesn't resolve to one specific promo set (Lorcana has several)
+        # -- left unmatched rather than guessed at.
+        if result.imageUrl or not result.setName or "lorcana" not in result.setName.lower():
+            return result
+        set_name = _lorcana_set_name_from_console(result.setName)
+        if set_name is None:
+            return result
+        card_number = _lego_set_number(result.title)
+        if card_number is None:
+            return result
+        image_url = self._fetch_lorcana_image(_normalize_magic_text(set_name), card_number)
+        if image_url is None:
+            return result
+        return result.model_copy(update={"imageUrl": image_url})
+
+    def _fetch_lorcana_image(self, normalized_set_name: str, card_number: str) -> str | None:
+        params = {
+            "select": "image_url",
+            "normalized_set_name": f"eq.{normalized_set_name}",
+            "card_number": f"eq.{card_number}",
+            "limit": "1",
+        }
+        payload = self._request("GET", "/rest/v1/lorcana_catalog", params=params)
+        if not isinstance(payload, list) or not payload:
+            return None
+        row = payload[0]
+        image_url = row.get("image_url") if isinstance(row, dict) else None
+        return str(image_url) if image_url else None
+
     def _fetch_funko_image(self, product_title: str) -> str | None:
         lookup_title = _funko_lookup_title(product_title)
         if not lookup_title:
@@ -883,6 +930,16 @@ _YUGIOH_SET_CODE_RE = re.compile(r"\b([A-Z0-9]{2,6}-[A-Z]{0,3}\d{2,4})\s*$")
 def _yugioh_set_code(product_title: str) -> str | None:
     match = _YUGIOH_SET_CODE_RE.search(product_title)
     return match.group(1) if match else None
+
+
+def _lorcana_set_name_from_console(console_name: str) -> str | None:
+    # PriceCharting's Lorcana console_name is always "Lorcana <set name>"
+    # (e.g. "Lorcana Attack of the Vine") -- verified against a real
+    # 500-row sample, no exceptions found.
+    text = console_name.strip()
+    if not text.lower().startswith("lorcana "):
+        return None
+    return text[len("Lorcana "):].strip() or None
 
 
 # Verified live against real TCGCSV data (tcgcsv.com/tcgplayer/3/groups)

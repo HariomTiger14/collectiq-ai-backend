@@ -17,6 +17,7 @@ from app.services.pricing.catalog_search_service import (
     _magic_card_number,
     _magic_set_name_from_console,
     _normalize_magic_text,
+    _lorcana_set_name_from_console,
     _yugioh_set_code,
     _normalize_variant_words,
     _pokemon_card_number,
@@ -75,6 +76,7 @@ class AdminCatalogService:
             items = self._enrich_lego_images(items)
             items = self._enrich_magic_images(items)
             items = self._enrich_yugioh_images(items)
+            items = self._enrich_lorcana_images(items)
         return {
             "success": True,
             "source": normalized_source,
@@ -250,6 +252,35 @@ class AdminCatalogService:
             image_url = images_by_code.get(set_code)
             if image_url:
                 items[index]["imageUrl"] = image_url
+        return items
+
+    def _enrich_lorcana_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mirrors CatalogSearchService._enrich_with_lorcana_image -- same
+        # normalized-set-name + card-number lookup, so the admin browse
+        # table shows the same images the mobile/public search does.
+        # Batched once per distinct Lorcana set on the page (card numbers
+        # are set-scoped, so the lookup naturally groups by set), not one
+        # request per row.
+        by_set: dict[str, list[tuple[int, str]]] = {}
+        for index, item in enumerate(items):
+            if item.get("imageUrl") or not item.get("setName"):
+                continue
+            if "lorcana" not in str(item["setName"]).lower():
+                continue
+            set_name = _lorcana_set_name_from_console(str(item["setName"]))
+            if set_name is None:
+                continue
+            card_number = _lego_set_number(str(item.get("title") or ""))
+            if card_number is None:
+                continue
+            by_set.setdefault(_normalize_magic_text(set_name), []).append((index, card_number))
+        for normalized_set_name, entries in by_set.items():
+            numbers = sorted({number for _, number in entries})
+            images_by_number = self._repository.fetch_lorcana_images(normalized_set_name, numbers)
+            for index, card_number in entries:
+                image_url = images_by_number.get(card_number)
+                if image_url:
+                    items[index]["imageUrl"] = image_url
         return items
 
 
@@ -513,6 +544,36 @@ class SupabaseAdminCatalogRepository:
             if code and image_url:
                 images_by_code[code] = str(image_url)
         return images_by_code
+
+    def fetch_lorcana_images(self, normalized_set_name: str, numbers: list[str]) -> dict[str, str]:
+        # One batched request per distinct Lorcana set on the page -- see
+        # AdminCatalogService._enrich_lorcana_images. (normalized_set_name,
+        # card_number) is the table's primary key, so no ambiguity check
+        # is needed here the way Magic/LEGO need one.
+        unique_numbers = sorted({number for number in numbers if number})
+        if not unique_numbers:
+            return {}
+        quoted = ",".join(f'"{number}"' for number in unique_numbers)
+        payload = self._request(
+            "GET",
+            "/rest/v1/lorcana_catalog",
+            params={
+                "select": "card_number,image_url",
+                "normalized_set_name": f"eq.{normalized_set_name}",
+                "card_number": f"in.({quoted})",
+            },
+        )
+        if not isinstance(payload, list):
+            return {}
+        images_by_number: dict[str, str] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            number = str(row.get("card_number") or "")
+            image_url = row.get("image_url")
+            if number and image_url:
+                images_by_number[number] = str(image_url)
+        return images_by_number
 
     def _fetch_tcgplayer_rows(self, group_name: str, card_number: str) -> list[dict[str, Any]]:
         payload = self._request(

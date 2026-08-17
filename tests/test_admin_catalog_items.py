@@ -809,6 +809,81 @@ class AdminCatalogListItemsTest(unittest.TestCase):
         )
         self.assertEqual(len(yugioh_requests), 1)
 
+    def test_service_batches_lorcana_lookup_across_page(self) -> None:
+        # One batched request per distinct Lorcana set on the page, not
+        # one request per row -- see AdminCatalogService.
+        # _enrich_lorcana_images.
+        list_rows = [
+            {
+                "pricecharting_id": "1",
+                "product_name": "Ink Geyser [Foil] #119",
+                "category": "Lorcana Archazia's Island",
+                "console_name": "Lorcana Archazia's Island",
+                "loose_price_cents": 200,
+                "currency": "USD",
+                "updated_at": "2026-08-13T00:00:00Z",
+            },
+            {
+                "pricecharting_id": "2",
+                "product_name": "Broken Pod #70",
+                "category": "Lorcana Attack of the Vine",
+                "console_name": "Lorcana Attack of the Vine",
+                "loose_price_cents": 100,
+                "currency": "USD",
+                "updated_at": "2026-08-13T00:00:00Z",
+            },
+        ]
+        lorcana_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "lorcana_catalog" in url:
+                lorcana_requests.append(request)
+                params = request.url.params
+                set_name = params.get("normalized_set_name", "").removeprefix("eq.")
+                if set_name == "archazias island":
+                    return httpx.Response(
+                        200,
+                        json=[
+                            {
+                                "card_number": "119",
+                                "image_url": "https://cards.lorcast.io/card/digital/normal/1.avif",
+                            },
+                        ],
+                    )
+                if set_name == "attack of the vine":
+                    return httpx.Response(
+                        200,
+                        json=[
+                            {
+                                "card_number": "70",
+                                "image_url": "https://api.lorcana.ravensburger.com/images/en/set13/70.jpg",
+                            },
+                        ],
+                    )
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=list_rows)
+
+        service = AdminCatalogService(
+            repository=SupabaseAdminCatalogRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=httpx.Client(transport=httpx.MockTransport(handler)),
+            ),
+        )
+
+        payload = service.list_items(source="pricecharting", limit=100, offset=0)
+
+        items_by_id = {item["id"]: item for item in payload["items"]}
+        self.assertEqual(
+            items_by_id["1"]["imageUrl"], "https://cards.lorcast.io/card/digital/normal/1.avif"
+        )
+        self.assertEqual(
+            items_by_id["2"]["imageUrl"],
+            "https://api.lorcana.ravensburger.com/images/en/set13/70.jpg",
+        )
+        self.assertEqual(len(lorcana_requests), 2)
+
     def test_service_compacts_kicksdb_rows(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(

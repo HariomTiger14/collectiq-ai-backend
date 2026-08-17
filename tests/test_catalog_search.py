@@ -15,6 +15,7 @@ from app.services.pricing.catalog_search_service import (
     _magic_card_number,
     _normalize_magic_text,
     _pokemon_card_number,
+    _lorcana_set_name_from_console,
     _pokemon_variant_token,
     _yugioh_set_code,
 )
@@ -1218,6 +1219,165 @@ class YugiohSetCodeTest(unittest.TestCase):
 
     def test_returns_none_for_sealed_product(self) -> None:
         self.assertIsNone(_yugioh_set_code("Booster Pack"))
+
+
+class LorcanaImageEnrichmentTest(unittest.TestCase):
+    # lorcana_catalog (imported from lorcana-api.com primary + Lorcast
+    # fallback -- see scripts/import_lorcana_api_catalog.py and
+    # scripts/import_lorcast_catalog.py) is our own Supabase table, so
+    # this routes through the same `client` mock as every other lookup,
+    # keyed off the request path/params.
+
+    def _handler(self, *, search_row: dict, catalog_rows: dict):
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "tcgplayer_pokemon_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "rebrickable_lego_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "scryfall_magic_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "yugioh_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "lorcana_catalog" in url:
+                params = request.url.params
+                set_name = params.get("normalized_set_name", "").removeprefix("eq.")
+                number = params.get("card_number", "").removeprefix("eq.")
+                return httpx.Response(200, json=catalog_rows.get((set_name, number), []))
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(200, json=[search_row])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        return handler
+
+    def test_search_matches_by_set_and_number(self) -> None:
+        search_row = {
+            "pricecharting_id": "1",
+            "product_name": "Ink Geyser [Foil] #119",
+            "console_name": "Lorcana Archazia's Island",
+            "category": "Lorcana Archazia's Island",
+            "loose_price_cents": 200,
+            "currency": "USD",
+        }
+        catalog_rows = {
+            ("archazias island", "119"): [
+                {"image_url": "https://cards.lorcast.io/card/digital/normal/ink-geyser.avif"},
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(search_row=search_row, catalog_rows=catalog_rows)
+                )
+            ),
+        )
+
+        response = service.search("ink geyser", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://cards.lorcast.io/card/digital/normal/ink-geyser.avif",
+        )
+
+    def test_search_normalizes_punctuation_in_set_name(self) -> None:
+        # Real production case: PriceCharting's "Lorcana Attack of the
+        # Vine" vs Lorcast/lorcana-api.com's "Attack of the Vine!" --
+        # must still match after normalization strips the "!".
+        search_row = {
+            "pricecharting_id": "2",
+            "product_name": "Broken Pod #70",
+            "console_name": "Lorcana Attack of the Vine",
+            "category": "Lorcana Attack of the Vine",
+            "loose_price_cents": 100,
+            "currency": "USD",
+        }
+        catalog_rows = {
+            ("attack of the vine", "70"): [
+                {"image_url": "https://api.lorcana.ravensburger.com/images/en/set13/70.jpg"},
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(search_row=search_row, catalog_rows=catalog_rows)
+                )
+            ),
+        )
+
+        response = service.search("broken pod", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://api.lorcana.ravensburger.com/images/en/set13/70.jpg",
+        )
+
+    def test_search_skips_non_lorcana_set(self) -> None:
+        lorcana_requests: list[httpx.Request] = []
+
+        def pc_handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "lorcana_catalog" in url:
+                lorcana_requests.append(request)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "tcgplayer_pokemon_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "rebrickable_lego_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "scryfall_magic_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "yugioh_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "999",
+                            "product_name": "Some Game #70",
+                            "console_name": "Nintendo 64",
+                            "category": "Nintendo 64",
+                            "loose_price_cents": 2000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
+        )
+
+        response = service.search("some game", limit=10)
+
+        self.assertIsNone(response.results[0].imageUrl)
+        self.assertEqual(len(lorcana_requests), 0)
+
+
+class LorcanaSetNameTest(unittest.TestCase):
+    def test_strips_lorcana_prefix(self) -> None:
+        self.assertEqual(
+            _lorcana_set_name_from_console("Lorcana Attack of the Vine"), "Attack of the Vine"
+        )
+
+    def test_returns_none_for_non_lorcana_console(self) -> None:
+        self.assertIsNone(_lorcana_set_name_from_console("Pokemon Base Set"))
 
 
 class PokemonCardNumberTest(unittest.TestCase):
