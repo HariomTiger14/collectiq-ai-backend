@@ -8,9 +8,11 @@ import httpx
 from app.core.config import settings
 from app.services.pricing.admin_review_queue_service import _total_from_content_range
 from app.services.pricing.catalog_search_service import (
-    _POKEMON_SET_TCGDEX_IDS,
+    _POKEMON_SET_TCGPLAYER_GROUPS,
     _funko_lookup_title,
+    _normalize_variant_words,
     _pokemon_card_number,
+    _pokemon_variant_token,
     select_best_funko_image,
 )
 
@@ -24,12 +26,8 @@ class AdminCatalogService:
         self,
         *,
         repository: "SupabaseAdminCatalogRepository | None" = None,
-        tcgdex_client: httpx.Client | None = None,
-        tcgdex_timeout_seconds: float = 3,
     ) -> None:
         self._repository = repository or SupabaseAdminCatalogRepository()
-        self._tcgdex_client = tcgdex_client
-        self._tcgdex_timeout_seconds = tcgdex_timeout_seconds
 
     def update_item(self, catalog_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not self._repository.is_configured:
@@ -100,43 +98,43 @@ class AdminCatalogService:
 
     def _enrich_pokemon_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # Mirrors CatalogSearchService._enrich_with_pokemon_image -- same
-        # small, verified _POKEMON_SET_TCGDEX_IDS mapping, so the admin
-        # browse table shows the same images the mobile/public search does.
-        # TCGdex has no batch-by-id endpoint, so this is one live call per
-        # matched row, but the set mapping is narrow enough that this stays
-        # a handful of calls per page, not one per row on the page.
+        # small, verified _POKEMON_SET_TCGPLAYER_GROUPS mapping and the
+        # same print-variant safety rules (exact match first, suppress
+        # rather than guess when sibling variant rows exist, plain match
+        # otherwise), so the admin browse table shows the same images
+        # -- and the same gaps -- the mobile/public search does. See that
+        # method's comment for the full reasoning. tcgplayer_pokemon_
+        # catalog is our own small Supabase table (imported from TCGCSV),
+        # so this is one cheap indexed query per matched row, not a live
+        # third-party call.
         targets = [
             (index, item)
             for index, item in enumerate(items)
             if not item.get("imageUrl")
             and item.get("setName")
-            and str(item["setName"]).strip().lower() in _POKEMON_SET_TCGDEX_IDS
+            and str(item["setName"]).strip().lower() in _POKEMON_SET_TCGPLAYER_GROUPS
         ]
-        if not targets:
-            return items
-        client = self._tcgdex_client or httpx.Client(timeout=self._tcgdex_timeout_seconds)
-        should_close = self._tcgdex_client is None
-        try:
-            for index, item in targets:
-                set_id = _POKEMON_SET_TCGDEX_IDS[str(item["setName"]).strip().lower()]
-                card_number = _pokemon_card_number(str(item.get("title") or ""))
-                if not card_number:
-                    continue
-                try:
-                    response = client.get(
-                        f"https://api.tcgdex.net/v2/en/cards/{set_id}-{card_number}"
-                    )
-                    if response.status_code != 200:
-                        continue
-                    payload = response.json()
-                except (httpx.HTTPError, ValueError):
-                    continue
-                image_base = payload.get("image") if isinstance(payload, dict) else None
-                if image_base:
-                    items[index]["imageUrl"] = f"{image_base}/high.png"
-        finally:
-            if should_close:
-                client.close()
+        for index, item in targets:
+            group_name = _POKEMON_SET_TCGPLAYER_GROUPS[str(item["setName"]).strip().lower()]
+            card_number = _pokemon_card_number(str(item.get("title") or ""))
+            if not card_number:
+                continue
+            variant_token = _pokemon_variant_token(str(item.get("title") or ""))
+            image_url = self._repository.fetch_tcgplayer_exact_variant_image(
+                group_name, card_number, variant_token
+            )
+            if image_url:
+                items[index]["imageUrl"] = image_url
+                continue
+            if self._repository.has_sibling_pokemon_rows(
+                str(item["setName"]), card_number, exclude_id=str(item.get("id") or "")
+            ):
+                continue
+            generic_image_url = self._repository.fetch_tcgplayer_generic_image(
+                group_name, card_number
+            )
+            if generic_image_url:
+                items[index]["imageUrl"] = generic_image_url
         return items
 
 
@@ -296,6 +294,79 @@ class SupabaseAdminCatalogRepository:
             if image_url:
                 images_by_title[title] = image_url
         return images_by_title
+
+    def _fetch_tcgplayer_rows(self, group_name: str, card_number: str) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            "/rest/v1/tcgplayer_pokemon_catalog",
+            params={
+                "select": "product_name,image_url,variant_tag",
+                "group_name": f"eq.{group_name}",
+                "card_number": f"eq.{card_number}",
+            },
+        )
+        if not isinstance(payload, list):
+            return []
+        return [row for row in payload if isinstance(row, dict)]
+
+    def fetch_tcgplayer_exact_variant_image(
+        self, group_name: str, card_number: str, variant_token: str | None
+    ) -> str | None:
+        # Mirrors CatalogSearchService._fetch_tcgplayer_exact_variant_image
+        # -- see that method for why Shadowless (a separate TCGCSV group)
+        # and named error products (variant_tag='error', matched by full
+        # word-overlap with the PriceCharting bracket tag) are the only
+        # two patterns treated as an exact print-variant match.
+        if not variant_token:
+            return None
+        if "shadowless" in variant_token:
+            for row in self._fetch_tcgplayer_rows(f"{group_name} (Shadowless)", card_number):
+                image_url = row.get("image_url")
+                if image_url:
+                    return str(image_url)
+            return None
+        variant_words = _normalize_variant_words(variant_token)
+        if not variant_words:
+            return None
+        for row in self._fetch_tcgplayer_rows(group_name, card_number):
+            if row.get("variant_tag") != "error":
+                continue
+            product_words = _normalize_variant_words(str(row.get("product_name") or ""))
+            if variant_words.issubset(product_words) and row.get("image_url"):
+                return str(row["image_url"])
+        return None
+
+    def fetch_tcgplayer_generic_image(self, group_name: str, card_number: str) -> str | None:
+        rows = [
+            row
+            for row in self._fetch_tcgplayer_rows(group_name, card_number)
+            if not row.get("variant_tag")
+        ]
+        if len(rows) != 1:
+            return None
+        image_url = rows[0].get("image_url")
+        return str(image_url) if image_url else None
+
+    def has_sibling_pokemon_rows(
+        self, set_name: str, card_number: str, *, exclude_id: str
+    ) -> bool:
+        payload = self._request(
+            "GET",
+            "/rest/v1/pricecharting_catalog",
+            params={
+                "select": "pricecharting_id",
+                "console_name": f"eq.{set_name}",
+                "product_name": f"ilike.*#{card_number}",
+                "limit": "3",
+            },
+        )
+        if not isinstance(payload, list):
+            return False
+        return any(
+            str(row.get("pricecharting_id")) != str(exclude_id)
+            for row in payload
+            if isinstance(row, dict)
+        )
 
     def _request(
         self,
