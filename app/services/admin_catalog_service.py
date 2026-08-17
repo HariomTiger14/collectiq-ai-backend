@@ -18,6 +18,8 @@ from app.services.pricing.catalog_search_service import (
     _magic_set_name_from_console,
     _normalize_magic_text,
     _lorcana_set_name_from_console,
+    _onepiece_meaningful_words,
+    _onepiece_set_code,
     _yugioh_set_code,
     _normalize_variant_words,
     _pokemon_card_number,
@@ -77,6 +79,7 @@ class AdminCatalogService:
             items = self._enrich_magic_images(items)
             items = self._enrich_yugioh_images(items)
             items = self._enrich_lorcana_images(items)
+            items = self._enrich_onepiece_images(items)
         return {
             "success": True,
             "source": normalized_source,
@@ -281,6 +284,57 @@ class AdminCatalogService:
                 image_url = images_by_number.get(card_number)
                 if image_url:
                     items[index]["imageUrl"] = image_url
+        return items
+
+    def _enrich_onepiece_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mirrors CatalogSearchService._enrich_with_onepiece_image -- same
+        # is_plain / word-overlap disambiguation, so the admin browse
+        # table shows the same images -- and the same conservative gaps
+        # -- the mobile/public search does. Batched once per distinct set
+        # code on the page, not one request per row.
+        lookup_by_index: dict[int, tuple[str, str | None]] = {}
+        for index, item in enumerate(items):
+            if item.get("imageUrl") or not item.get("setName"):
+                continue
+            if "one piece" not in str(item["setName"]).lower():
+                continue
+            title = str(item.get("title") or "")
+            set_code = _onepiece_set_code(title)
+            if set_code is None:
+                continue
+            lookup_by_index[index] = (set_code, _pokemon_variant_token(title))
+        set_codes = sorted({code for code, _ in lookup_by_index.values()})
+        if not set_codes:
+            return items
+        rows_by_code = self._repository.fetch_onepiece_rows(set_codes)
+        for index, (set_code, variant_token) in lookup_by_index.items():
+            rows = rows_by_code.get(set_code, [])
+            if not rows:
+                continue
+            if variant_token is None:
+                plain_rows = [row for row in rows if row.get("is_plain")]
+                if len(plain_rows) == 1:
+                    image_url = plain_rows[0].get("image_url")
+                    if image_url:
+                        items[index]["imageUrl"] = str(image_url)
+                continue
+            variant_words = _onepiece_meaningful_words(variant_token)
+            if not variant_words:
+                continue
+            # Strict subset, and only when it uniquely identifies one
+            # candidate -- see CatalogSearchService._enrich_with_
+            # onepiece_image for why "any word in common" produced real
+            # wrong matches.
+            matches = [
+                row
+                for row in rows
+                if not row.get("is_plain")
+                and variant_words.issubset(_onepiece_meaningful_words(str(row.get("card_name") or "")))
+            ]
+            if len(matches) == 1:
+                image_url = matches[0].get("image_url")
+                if image_url:
+                    items[index]["imageUrl"] = str(image_url)
         return items
 
 
@@ -574,6 +628,32 @@ class SupabaseAdminCatalogRepository:
             if number and image_url:
                 images_by_number[number] = str(image_url)
         return images_by_number
+
+    def fetch_onepiece_rows(self, set_codes: list[str]) -> dict[str, list[dict[str, Any]]]:
+        # One batched request for every distinct One Piece set code on a
+        # page -- see AdminCatalogService._enrich_onepiece_images. The
+        # is_plain / word-overlap disambiguation itself happens in the
+        # caller, against whichever rows share a card_set_id.
+        unique_codes = sorted({code for code in set_codes if code})
+        if not unique_codes:
+            return {}
+        quoted = ",".join(f'"{code}"' for code in unique_codes)
+        payload = self._request(
+            "GET",
+            "/rest/v1/one_piece_catalog",
+            params={
+                "select": "card_set_id,card_name,is_plain,image_url",
+                "card_set_id": f"in.({quoted})",
+            },
+        )
+        if not isinstance(payload, list):
+            return {}
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            grouped.setdefault(str(row.get("card_set_id") or ""), []).append(row)
+        return grouped
 
     def _fetch_tcgplayer_rows(self, group_name: str, card_number: str) -> list[dict[str, Any]]:
         payload = self._request(

@@ -16,6 +16,7 @@ from app.services.pricing.catalog_search_service import (
     _normalize_magic_text,
     _pokemon_card_number,
     _lorcana_set_name_from_console,
+    _onepiece_set_code,
     _pokemon_variant_token,
     _yugioh_set_code,
 )
@@ -1378,6 +1379,274 @@ class LorcanaSetNameTest(unittest.TestCase):
 
     def test_returns_none_for_non_lorcana_console(self) -> None:
         self.assertIsNone(_lorcana_set_name_from_console("Pokemon Base Set"))
+
+
+class OnePieceImageEnrichmentTest(unittest.TestCase):
+    # one_piece_catalog (imported from optcgapi.com -- see
+    # scripts/import_onepiece_catalog.py) is our own Supabase table, so
+    # this routes through the same `client` mock as every other lookup,
+    # keyed off the request path/params.
+
+    def _handler(self, *, search_row: dict, code_rows: dict):
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "tcgplayer_pokemon_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "rebrickable_lego_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "scryfall_magic_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "yugioh_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "lorcana_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "one_piece_catalog" in url:
+                code = request.url.params.get("card_set_id", "").removeprefix("eq.")
+                return httpx.Response(200, json=code_rows.get(code, []))
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(200, json=[search_row])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        return handler
+
+    def test_search_matches_unambiguous_plain_row(self) -> None:
+        search_row = {
+            "pricecharting_id": "1",
+            "product_name": "Captain John OP07-082",
+            "console_name": "One Piece 500 Years in the Future",
+            "category": "One Piece 500 Years in the Future",
+            "loose_price_cents": 100,
+            "currency": "USD",
+        }
+        code_rows = {
+            "OP07-082": [
+                {
+                    "card_name": "Captain John",
+                    "is_plain": True,
+                    "image_url": "https://optcgapi.com/media/static/Card_Images/OP07-082.jpg",
+                },
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(search_row=search_row, code_rows=code_rows)
+                )
+            ),
+        )
+
+        response = service.search("captain john", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://optcgapi.com/media/static/Card_Images/OP07-082.jpg",
+        )
+
+    def test_search_suppresses_plain_row_when_multiple_plain_entries_exist(self) -> None:
+        # Real production case: optcgapi.com's own data has cards with
+        # TWO identical, indistinguishable "plain" entries for the same
+        # code (e.g. real "Izo" OP01-033 -- an unlabeled reprint sharing
+        # both code and name with the original) -- must not guess which
+        # one a plain, untagged PriceCharting row refers to.
+        search_row = {
+            "pricecharting_id": "2",
+            "product_name": "Izo OP01-033",
+            "console_name": "One Piece Romance Dawn",
+            "category": "One Piece Romance Dawn",
+            "loose_price_cents": 50,
+            "currency": "USD",
+        }
+        code_rows = {
+            "OP01-033": [
+                {
+                    "card_name": "Izo",
+                    "is_plain": True,
+                    "image_url": "https://optcgapi.com/media/static/Card_Images/OP01-033.jpg",
+                },
+                {
+                    "card_name": "Izo",
+                    "is_plain": True,
+                    "image_url": "https://optcgapi.com/media/static/Card_Images/OP01-033_r1.jpg",
+                },
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(search_row=search_row, code_rows=code_rows)
+                )
+            ),
+        )
+
+        response = service.search("izo", limit=10)
+
+        self.assertIsNone(response.results[0].imageUrl)
+
+    def test_search_matches_exact_variant_by_word_subset(self) -> None:
+        search_row = {
+            "pricecharting_id": "3",
+            "product_name": "Perona [Box Topper] OP01-077",
+            "console_name": "One Piece Romance Dawn",
+            "category": "One Piece Romance Dawn",
+            "loose_price_cents": 500,
+            "currency": "USD",
+        }
+        code_rows = {
+            "OP01-077": [
+                {
+                    "card_name": "Perona",
+                    "is_plain": True,
+                    "image_url": "https://optcgapi.com/media/static/Card_Images/OP01-077.jpg",
+                },
+                {
+                    "card_name": "Perona (Box Topper)",
+                    "is_plain": False,
+                    "image_url": "https://optcgapi.com/media/static/Card_Images/OP01-077_p1.jpg",
+                },
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(search_row=search_row, code_rows=code_rows)
+                )
+            ),
+        )
+
+        response = service.search("perona box topper", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://optcgapi.com/media/static/Card_Images/OP01-077_p1.jpg",
+        )
+
+    def test_search_does_not_cross_match_similarly_named_variants(self) -> None:
+        # Real production bug, caught live: "[Championship 2024 Top
+        # Player]" and "[Championship 2024 Finalist]" share the words
+        # "championship"/"2024" -- an earlier "any word in common"
+        # matching rule matched both to the SAME (wrong, for one of them)
+        # candidate. Requiring every tag word to be a subset of the
+        # candidate's name, and requiring that subset match to be unique,
+        # fixes this: "Top Player" only fully matches the "Top Player
+        # Pack" candidate.
+        search_row = {
+            "pricecharting_id": "4",
+            "product_name": "Perona [Championship 2024 Top Player] OP01-077",
+            "console_name": "One Piece Romance Dawn",
+            "category": "One Piece Romance Dawn",
+            "loose_price_cents": 500,
+            "currency": "USD",
+        }
+        code_rows = {
+            "OP01-077": [
+                {
+                    "card_name": "Perona",
+                    "is_plain": True,
+                    "image_url": "https://optcgapi.com/media/static/Card_Images/OP01-077.jpg",
+                },
+                {
+                    "card_name": "Perona (Championship 2024 Finalist Card Set)",
+                    "is_plain": False,
+                    "image_url": "https://optcgapi.com/media/static/Card_Images/finalist.jpg",
+                },
+                {
+                    "card_name": "Perona (Championship 2024 Top Player Pack)",
+                    "is_plain": False,
+                    "image_url": "https://optcgapi.com/media/static/Card_Images/top_player.jpg",
+                },
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(search_row=search_row, code_rows=code_rows)
+                )
+            ),
+        )
+
+        response = service.search("perona top player", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://optcgapi.com/media/static/Card_Images/top_player.jpg",
+        )
+
+    def test_search_skips_non_onepiece_set(self) -> None:
+        onepiece_requests: list[httpx.Request] = []
+
+        def pc_handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "one_piece_catalog" in url:
+                onepiece_requests.append(request)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "tcgplayer_pokemon_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "rebrickable_lego_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "scryfall_magic_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "yugioh_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "lorcana_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "999",
+                            "product_name": "Some Game OP07-082",
+                            "console_name": "Nintendo 64",
+                            "category": "Nintendo 64",
+                            "loose_price_cents": 2000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
+        )
+
+        response = service.search("some game", limit=10)
+
+        self.assertIsNone(response.results[0].imageUrl)
+        self.assertEqual(len(onepiece_requests), 0)
+
+
+class OnePieceSetCodeTest(unittest.TestCase):
+    def test_extracts_code(self) -> None:
+        self.assertEqual(_onepiece_set_code("Captain John OP07-082"), "OP07-082")
+
+    def test_extracts_single_letter_promo_code(self) -> None:
+        self.assertEqual(_onepiece_set_code("Bartolomeo [Promotion Pack] P-029"), "P-029")
+
+    def test_returns_none_without_code(self) -> None:
+        self.assertIsNone(_onepiece_set_code("DON!! Card [Nico Robin]"))
 
 
 class PokemonCardNumberTest(unittest.TestCase):
