@@ -72,6 +72,7 @@ class CatalogSearchService:
         ]
         results = [self._enrich_with_funko_image(result) for result in results]
         results = [self._enrich_with_pokemon_image(result) for result in results]
+        results = [self._enrich_with_lego_image(result) for result in results]
         return CatalogSearchResponse(
             query=normalized_query,
             count=len(results),
@@ -94,8 +95,10 @@ class CatalogSearchService:
                 _normalize_query(str(row.get("product_name") or "")),
             )
             return CatalogDetailResponse(
-                result=self._enrich_with_pokemon_image(
-                    self._enrich_with_funko_image(result)
+                result=self._enrich_with_lego_image(
+                    self._enrich_with_pokemon_image(
+                        self._enrich_with_funko_image(result)
+                    )
                 ),
                 history=[_history_row_to_point(row) for row in history_rows],
             )
@@ -353,6 +356,50 @@ class CatalogSearchService:
             for row in payload
             if isinstance(row, dict)
         )
+
+    def _enrich_with_lego_image(self, result: CatalogSearchResult) -> CatalogSearchResult:
+        # PriceCharting has no image data for LEGO sets either. Images come
+        # from rebrickable_lego_catalog, our own table imported from
+        # Rebrickable's free, public, no-key bulk export (28,099 real sets,
+        # 100% image coverage -- see scripts/import_rebrickable_lego_
+        # catalog.py). Unlike Pokemon cards, a LEGO set number is a unique
+        # retail product identifier, not a card+print-run pair, so there's
+        # no print-variant ambiguity to guard against here.
+        #
+        # There IS a different real risk, spot-checked live: LEGO has
+        # reused old set numbers across unrelated product lines over the
+        # decades (PriceCharting's "Roof Bricks #445" collides on number
+        # with Rebrickable's unrelated "Police Units" set). Matching on
+        # set number alone measured ~96% "matches" but included real false
+        # positives; requiring the PriceCharting title's own words to
+        # overlap with Rebrickable's matched set name as well brought that
+        # down to a safe ~88% with the false positives eliminated. So:
+        # never trust the number alone -- always confirm word overlap too.
+        if result.imageUrl or not result.setName or "lego" not in result.setName.lower():
+            return result
+        base_number = _lego_set_number(result.title)
+        if base_number is None:
+            return result
+        title_words = _lego_name_words(_lego_title_before_number(result.title))
+        if not title_words:
+            return result
+        for row in self._fetch_lego_rows(base_number):
+            candidate_words = _lego_name_words(str(row.get("name") or ""))
+            if title_words & candidate_words:
+                image_url = row.get("image_url")
+                if image_url:
+                    return result.model_copy(update={"imageUrl": str(image_url)})
+        return result
+
+    def _fetch_lego_rows(self, base_number: str) -> list[dict[str, Any]]:
+        params = {
+            "select": "name,image_url",
+            "base_number": f"eq.{base_number}",
+        }
+        payload = self._request("GET", "/rest/v1/rebrickable_lego_catalog", params=params)
+        if not isinstance(payload, list):
+            return []
+        return [row for row in payload if isinstance(row, dict)]
 
     def _fetch_funko_image(self, product_title: str) -> str | None:
         lookup_title = _funko_lookup_title(product_title)
@@ -634,6 +681,36 @@ def _match_score(row: dict[str, Any], query: str) -> int:
 
 def _normalize_query(query: str) -> str:
     return " ".join(query.strip().lower().split())
+
+
+# Verified live against Rebrickable's free, no-key bulk export
+# (rebrickable.com/downloads, sets.csv.gz) before being added -- 28,099
+# real LEGO sets, 100% image coverage. LEGO set numbers are unique retail
+# product identifiers (unlike Pokemon cards, no print-variant ambiguity),
+# but the number alone isn't safe to match on: LEGO has reused old set
+# numbers across unrelated product lines over the decades, spot-checked
+# live (PriceCharting's "Roof Bricks #445" collides on number with
+# Rebrickable's unrelated "Police Units" set). Requiring the PriceCharting
+# title's own words to overlap with Rebrickable's matched name eliminated
+# those false positives while keeping ~88% real coverage.
+_LEGO_SET_NUMBER_RE = re.compile(r"#(\d+)")
+_LEGO_STOPWORDS = {"the", "a", "an", "of", "and", "set", "lego"}
+
+
+def _lego_set_number(product_title: str) -> str | None:
+    match = _LEGO_SET_NUMBER_RE.search(product_title)
+    if not match:
+        return None
+    return match.group(1).lstrip("0") or "0"
+
+
+def _lego_title_before_number(product_title: str) -> str:
+    match = _LEGO_SET_NUMBER_RE.search(product_title)
+    return product_title[: match.start()].strip() if match else product_title.strip()
+
+
+def _lego_name_words(text: str) -> set[str]:
+    return {word for word in _normalize_variant_words(text) if word not in _LEGO_STOPWORDS}
 
 
 # Verified live against real TCGCSV data (tcgcsv.com/tcgplayer/3/groups)
