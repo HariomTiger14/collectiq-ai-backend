@@ -658,6 +658,93 @@ class AdminCatalogListItemsTest(unittest.TestCase):
         )
         self.assertEqual(len(lego_requests), 1)
 
+    def test_service_uses_magic_image_matched_by_collector_number(self) -> None:
+        list_rows = [
+            {
+                "pricecharting_id": "3773958",
+                "product_name": "Cabaretti Charm [Gilded Foil] #365",
+                "category": "Magic Streets of New Capenna",
+                "console_name": "Magic Streets of New Capenna",
+                "loose_price_cents": 5000,
+                "currency": "USD",
+                "updated_at": "2026-08-13T00:00:00Z",
+            },
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "scryfall_magic_catalog" in url:
+                params = request.url.params
+                if "collector_number" in params and "365" in params.get("collector_number", ""):
+                    return httpx.Response(
+                        200,
+                        json=[
+                            {
+                                "collector_number": "365",
+                                "image_url": "https://cards.scryfall.io/normal/gilded-charm.jpg",
+                            },
+                        ],
+                    )
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=list_rows)
+
+        service = AdminCatalogService(
+            repository=SupabaseAdminCatalogRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=httpx.Client(transport=httpx.MockTransport(handler)),
+            ),
+        )
+
+        payload = service.list_items(source="pricecharting", limit=100, offset=0)
+
+        items_by_id = {item["id"]: item for item in payload["items"]}
+        self.assertEqual(
+            items_by_id["3773958"]["imageUrl"],
+            "https://cards.scryfall.io/normal/gilded-charm.jpg",
+        )
+
+    def test_service_suppresses_ambiguous_magic_name_match(self) -> None:
+        list_rows = [
+            {
+                "pricecharting_id": "1",
+                "product_name": "Forest",
+                "category": "Magic Starter 1999",
+                "console_name": "Magic Starter 1999",
+                "loose_price_cents": 50,
+                "currency": "USD",
+                "updated_at": "2026-08-13T00:00:00Z",
+            },
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "scryfall_magic_catalog" in url:
+                params = request.url.params
+                if "normalized_name" in params and "forest" in params.get("normalized_name", ""):
+                    return httpx.Response(
+                        200,
+                        json=[
+                            {"normalized_name": "forest", "image_url": "https://cards.scryfall.io/normal/forest-1.jpg"},
+                            {"normalized_name": "forest", "image_url": "https://cards.scryfall.io/normal/forest-2.jpg"},
+                        ],
+                    )
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=list_rows)
+
+        service = AdminCatalogService(
+            repository=SupabaseAdminCatalogRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=httpx.Client(transport=httpx.MockTransport(handler)),
+            ),
+        )
+
+        payload = service.list_items(source="pricecharting", limit=100, offset=0)
+
+        items_by_id = {item["id"]: item for item in payload["items"]}
+        self.assertIsNone(items_by_id["1"]["imageUrl"])
+
     def test_service_compacts_kicksdb_rows(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(

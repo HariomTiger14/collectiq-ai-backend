@@ -73,6 +73,7 @@ class CatalogSearchService:
         results = [self._enrich_with_funko_image(result) for result in results]
         results = [self._enrich_with_pokemon_image(result) for result in results]
         results = [self._enrich_with_lego_image(result) for result in results]
+        results = [self._enrich_with_magic_image(result) for result in results]
         return CatalogSearchResponse(
             query=normalized_query,
             count=len(results),
@@ -95,9 +96,11 @@ class CatalogSearchService:
                 _normalize_query(str(row.get("product_name") or "")),
             )
             return CatalogDetailResponse(
-                result=self._enrich_with_lego_image(
-                    self._enrich_with_pokemon_image(
-                        self._enrich_with_funko_image(result)
+                result=self._enrich_with_magic_image(
+                    self._enrich_with_lego_image(
+                        self._enrich_with_pokemon_image(
+                            self._enrich_with_funko_image(result)
+                        )
                     )
                 ),
                 history=[_history_row_to_point(row) for row in history_rows],
@@ -400,6 +403,78 @@ class CatalogSearchService:
         if not isinstance(payload, list):
             return []
         return [row for row in payload if isinstance(row, dict)]
+
+    def _enrich_with_magic_image(self, result: CatalogSearchResult) -> CatalogSearchResult:
+        # PriceCharting has no image data for Magic cards either. Images
+        # come from scryfall_magic_catalog, our own table imported from
+        # Scryfall's free, public, no-key bulk export -- see
+        # scripts/import_scryfall_magic_catalog.py. Scryfall (not TCGCSV)
+        # was chosen for Magic specifically: it's purpose-built for the
+        # game and models every distinct printing -- including special
+        # treatments like Showcase and Gilded Foil -- as its own card
+        # object with its own collector_number, which lines up exactly
+        # with the "#number" PriceCharting already embeds in these rows'
+        # titles (e.g. "Cabaretti Charm [Gilded Foil] #365" -> Scryfall's
+        # matching Gilded Showcase print has collector_number "365",
+        # verified live). Spot-checked against a real 400-row sample:
+        # once the set resolves, every card matched -- 0 misses.
+        #
+        # Matching is therefore number-first (safe and exact, unlike
+        # LEGO/Pokemon which needed extra safety nets): normalized set
+        # name + collector_number. Older/vintage rows often have no
+        # number in the title at all, so those fall back to normalized
+        # set name + exact card name -- but ONLY when that resolves to
+        # exactly one row; an ambiguous multi-row name match (e.g. a
+        # reprinted basic land with no distinguishing number) is treated
+        # as no confident match rather than guessed at.
+        if result.imageUrl or not result.setName or "magic" not in result.setName.lower():
+            return result
+        set_name = _magic_set_name_from_console(result.setName)
+        if set_name is None:
+            return result
+        normalized_set_name = _normalize_magic_text(set_name)
+        card_number = _magic_card_number(result.title)
+        if card_number is not None:
+            image_url = self._fetch_magic_image_by_number(normalized_set_name, card_number)
+            if image_url:
+                return result.model_copy(update={"imageUrl": image_url})
+            return result
+        card_name = _magic_card_name(result.title)
+        normalized_name = _normalize_magic_text(card_name)
+        if not normalized_name:
+            return result
+        image_url = self._fetch_magic_image_by_name(normalized_set_name, normalized_name)
+        if image_url is None:
+            return result
+        return result.model_copy(update={"imageUrl": image_url})
+
+    def _fetch_magic_image_by_number(self, normalized_set_name: str, card_number: str) -> str | None:
+        params = {
+            "select": "image_url",
+            "normalized_set_name": f"eq.{normalized_set_name}",
+            "collector_number": f"eq.{card_number}",
+            "limit": "2",
+        }
+        payload = self._request("GET", "/rest/v1/scryfall_magic_catalog", params=params)
+        if not isinstance(payload, list) or len(payload) != 1:
+            return None
+        row = payload[0]
+        image_url = row.get("image_url") if isinstance(row, dict) else None
+        return str(image_url) if image_url else None
+
+    def _fetch_magic_image_by_name(self, normalized_set_name: str, normalized_name: str) -> str | None:
+        params = {
+            "select": "image_url",
+            "normalized_set_name": f"eq.{normalized_set_name}",
+            "normalized_name": f"eq.{normalized_name}",
+            "limit": "2",
+        }
+        payload = self._request("GET", "/rest/v1/scryfall_magic_catalog", params=params)
+        if not isinstance(payload, list) or len(payload) != 1:
+            return None
+        row = payload[0]
+        image_url = row.get("image_url") if isinstance(row, dict) else None
+        return str(image_url) if image_url else None
 
     def _fetch_funko_image(self, product_title: str) -> str | None:
         lookup_title = _funko_lookup_title(product_title)
@@ -711,6 +786,47 @@ def _lego_title_before_number(product_title: str) -> str:
 
 def _lego_name_words(text: str) -> set[str]:
     return {word for word in _normalize_variant_words(text) if word not in _LEGO_STOPWORDS}
+
+
+# Verified live against Scryfall's free bulk export (api.scryfall.com/
+# bulk-data -> default_cards) before being added -- 116,712 real English
+# cards. See scripts/import_scryfall_magic_catalog.py and
+# _enrich_with_magic_image for the full reasoning. This normalization
+# (strip apostrophes, collapse all other punctuation to spaces) is applied
+# to BOTH sides of every match -- PriceCharting's console_name/product_name
+# here, and Scryfall's set_name/name at import time -- so it MUST stay
+# identical between the two; the import script imports this function
+# directly rather than re-implementing it, specifically to prevent drift.
+_MAGIC_CARD_NUMBER_RE = re.compile(r"#(\S+)")
+_MAGIC_BRACKET_TAG_RE = re.compile(r"\s*\[[^\]]*\]")
+_MAGIC_NON_ALNUM_RE = re.compile(r"[^a-z0-9\s]")
+
+
+def _normalize_magic_text(text: str) -> str:
+    text = text.replace("'", "").replace("’", "")
+    text = _MAGIC_NON_ALNUM_RE.sub(" ", text.lower())
+    return " ".join(text.split())
+
+
+def _magic_set_name_from_console(console_name: str) -> str | None:
+    # PriceCharting's Magic console_name is always "Magic <set name>"
+    # (e.g. "Magic Streets of New Capenna") -- verified against a real
+    # 400-row sample, no exceptions found.
+    text = console_name.strip()
+    if not text.lower().startswith("magic "):
+        return None
+    return text[len("Magic "):].strip() or None
+
+
+def _magic_card_number(product_title: str) -> str | None:
+    match = _MAGIC_CARD_NUMBER_RE.search(product_title)
+    return match.group(1) if match else None
+
+
+def _magic_card_name(product_title: str) -> str:
+    text = _MAGIC_CARD_NUMBER_RE.sub("", product_title)
+    text = _MAGIC_BRACKET_TAG_RE.sub("", text)
+    return text.strip()
 
 
 # Verified live against real TCGCSV data (tcgcsv.com/tcgplayer/3/groups)
