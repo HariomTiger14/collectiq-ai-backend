@@ -10,6 +10,7 @@ from app.services.pricing.catalog_search_service import (
     CatalogItemNotFoundError,
     CatalogSearchService,
     _funko_lookup_title,
+    _lego_set_number,
     _pokemon_card_number,
     _pokemon_variant_token,
 )
@@ -737,6 +738,150 @@ class PokemonVariantTokenTest(unittest.TestCase):
 
     def test_returns_none_without_brackets(self) -> None:
         self.assertIsNone(_pokemon_variant_token("Charizard #4"))
+
+
+class LegoImageEnrichmentTest(unittest.TestCase):
+    # rebrickable_lego_catalog (imported from Rebrickable's free bulk
+    # export -- see scripts/import_rebrickable_lego_catalog.py) is our own
+    # Supabase table, so this routes through the same `client` mock as
+    # every other lookup, keyed off the request path.
+
+    def _handler(self, *, search_row: dict, lego_rows: dict):
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "tcgplayer_pokemon_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "rebrickable_lego_catalog" in url:
+                base_number = request.url.params.get("base_number", "").removeprefix("eq.")
+                return httpx.Response(200, json=lego_rows.get(base_number, []))
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(200, json=[search_row])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        return handler
+
+    def test_search_uses_image_when_title_words_overlap(self) -> None:
+        search_row = {
+            "pricecharting_id": "5873213",
+            "product_name": "Altair #7322",
+            "console_name": "LEGO Space",
+            "category": "LEGO Space",
+            "loose_price_cents": 4500,
+            "currency": "USD",
+        }
+        lego_rows = {
+            "7322": [
+                {
+                    "name": "Altair",
+                    "image_url": "https://cdn.rebrickable.com/media/sets/7322-1.jpg",
+                },
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(self._handler(search_row=search_row, lego_rows=lego_rows))
+            ),
+        )
+
+        response = service.search("altair lego", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://cdn.rebrickable.com/media/sets/7322-1.jpg",
+        )
+
+    def test_search_rejects_number_match_without_word_overlap(self) -> None:
+        # Real production case: PriceCharting's "Roof Bricks #445" collides
+        # on set number with Rebrickable's unrelated "Police Units" --
+        # matching on number alone would show a completely wrong photo.
+        search_row = {
+            "pricecharting_id": "111",
+            "product_name": "Roof Bricks #445",
+            "console_name": "LEGO Classic",
+            "category": "LEGO Classic",
+            "loose_price_cents": 2000,
+            "currency": "USD",
+        }
+        lego_rows = {
+            "445": [
+                {
+                    "name": "Police Units",
+                    "image_url": "https://cdn.rebrickable.com/media/sets/445-1.jpg",
+                },
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(self._handler(search_row=search_row, lego_rows=lego_rows))
+            ),
+        )
+
+        response = service.search("roof bricks lego", limit=10)
+
+        self.assertIsNone(response.results[0].imageUrl)
+
+    def test_search_skips_non_lego_set(self) -> None:
+        lego_requests: list[httpx.Request] = []
+
+        def pc_handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "rebrickable_lego_catalog" in url:
+                lego_requests.append(request)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "tcgplayer_pokemon_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "999",
+                            "product_name": "Some Game #445",
+                            "console_name": "Nintendo 64",
+                            "category": "Nintendo 64",
+                            "loose_price_cents": 2000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
+        )
+
+        response = service.search("some game", limit=10)
+
+        self.assertIsNone(response.results[0].imageUrl)
+        self.assertEqual(len(lego_requests), 0)
+
+
+class LegoSetNumberTest(unittest.TestCase):
+    def test_extracts_number_after_hash(self) -> None:
+        self.assertEqual(_lego_set_number("Altair #7322"), "7322")
+
+    def test_strips_leading_zeros(self) -> None:
+        self.assertEqual(_lego_set_number("Town Mini-Figures #0011"), "11")
+
+    def test_returns_none_without_hash(self) -> None:
+        self.assertIsNone(_lego_set_number("Altair"))
 
 
 class PokemonCardNumberTest(unittest.TestCase):

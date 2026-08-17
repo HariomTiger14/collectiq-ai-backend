@@ -505,6 +505,159 @@ class AdminCatalogListItemsTest(unittest.TestCase):
         self.assertIsNone(items_by_id["3438352"]["imageUrl"])
         self.assertEqual(len(tcgplayer_requests), 0)
 
+    def test_service_uses_lego_image_when_words_overlap(self) -> None:
+        list_rows = [
+            {
+                "pricecharting_id": "5873213",
+                "product_name": "Altair #7322",
+                "category": "LEGO Space",
+                "console_name": "LEGO Space",
+                "loose_price_cents": 4500,
+                "currency": "USD",
+                "updated_at": "2026-08-13T00:00:00Z",
+            },
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "rebrickable_lego_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "base_number": "7322",
+                            "name": "Altair",
+                            "image_url": "https://cdn.rebrickable.com/media/sets/7322-1.jpg",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=list_rows)
+
+        service = AdminCatalogService(
+            repository=SupabaseAdminCatalogRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=httpx.Client(transport=httpx.MockTransport(handler)),
+            ),
+        )
+
+        payload = service.list_items(source="pricecharting", limit=100, offset=0)
+
+        items_by_id = {item["id"]: item for item in payload["items"]}
+        self.assertEqual(
+            items_by_id["5873213"]["imageUrl"],
+            "https://cdn.rebrickable.com/media/sets/7322-1.jpg",
+        )
+
+    def test_service_rejects_lego_number_match_without_word_overlap(self) -> None:
+        # Real production case: "Roof Bricks #445" collides on set number
+        # with Rebrickable's unrelated "Police Units" -- must not show it.
+        list_rows = [
+            {
+                "pricecharting_id": "111",
+                "product_name": "Roof Bricks #445",
+                "category": "LEGO Classic",
+                "console_name": "LEGO Classic",
+                "loose_price_cents": 2000,
+                "currency": "USD",
+                "updated_at": "2026-08-13T00:00:00Z",
+            },
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "rebrickable_lego_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "base_number": "445",
+                            "name": "Police Units",
+                            "image_url": "https://cdn.rebrickable.com/media/sets/445-1.jpg",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=list_rows)
+
+        service = AdminCatalogService(
+            repository=SupabaseAdminCatalogRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=httpx.Client(transport=httpx.MockTransport(handler)),
+            ),
+        )
+
+        payload = service.list_items(source="pricecharting", limit=100, offset=0)
+
+        items_by_id = {item["id"]: item for item in payload["items"]}
+        self.assertIsNone(items_by_id["111"]["imageUrl"])
+
+    def test_service_batches_lego_lookup_across_page(self) -> None:
+        # One batched request for the whole page's distinct set numbers,
+        # not one request per LEGO row -- see AdminCatalogService.
+        # _enrich_lego_images.
+        list_rows = [
+            {
+                "pricecharting_id": "1",
+                "product_name": "Altair #7322",
+                "category": "LEGO Space",
+                "console_name": "LEGO Space",
+                "loose_price_cents": 4500,
+                "currency": "USD",
+                "updated_at": "2026-08-13T00:00:00Z",
+            },
+            {
+                "pricecharting_id": "2",
+                "product_name": "Circus #1672",
+                "category": "LEGO",
+                "console_name": "LEGO",
+                "loose_price_cents": 3000,
+                "currency": "USD",
+                "updated_at": "2026-08-13T00:00:00Z",
+            },
+        ]
+        lego_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "rebrickable_lego_catalog" in url:
+                lego_requests.append(request)
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "base_number": "7322",
+                            "name": "Altair",
+                            "image_url": "https://cdn.rebrickable.com/media/sets/7322-1.jpg",
+                        },
+                        {
+                            "base_number": "1672",
+                            "name": "Circus",
+                            "image_url": "https://cdn.rebrickable.com/media/sets/1672-1.jpg",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=list_rows)
+
+        service = AdminCatalogService(
+            repository=SupabaseAdminCatalogRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=httpx.Client(transport=httpx.MockTransport(handler)),
+            ),
+        )
+
+        payload = service.list_items(source="pricecharting", limit=100, offset=0)
+
+        items_by_id = {item["id"]: item for item in payload["items"]}
+        self.assertEqual(
+            items_by_id["1"]["imageUrl"], "https://cdn.rebrickable.com/media/sets/7322-1.jpg"
+        )
+        self.assertEqual(
+            items_by_id["2"]["imageUrl"], "https://cdn.rebrickable.com/media/sets/1672-1.jpg"
+        )
+        self.assertEqual(len(lego_requests), 1)
+
     def test_service_compacts_kicksdb_rows(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(

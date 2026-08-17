@@ -10,6 +10,9 @@ from app.services.pricing.admin_review_queue_service import _total_from_content_
 from app.services.pricing.catalog_search_service import (
     _POKEMON_SET_TCGPLAYER_GROUPS,
     _funko_lookup_title,
+    _lego_name_words,
+    _lego_set_number,
+    _lego_title_before_number,
     _normalize_variant_words,
     _pokemon_card_number,
     _pokemon_variant_token,
@@ -64,6 +67,7 @@ class AdminCatalogService:
         if normalized_source == "pricecharting":
             items = self._enrich_funko_images(items)
             items = self._enrich_pokemon_images(items)
+            items = self._enrich_lego_images(items)
         return {
             "success": True,
             "source": normalized_source,
@@ -135,6 +139,45 @@ class AdminCatalogService:
             )
             if generic_image_url:
                 items[index]["imageUrl"] = generic_image_url
+        return items
+
+    def _enrich_lego_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mirrors CatalogSearchService._enrich_with_lego_image -- same
+        # Rebrickable-backed base-number-plus-word-overlap safety check,
+        # so the admin browse table shows the same images -- and avoids
+        # the same false-number-match risk -- the mobile/public search
+        # does. One batched lookup per page covers every distinct LEGO
+        # set number on it, not one request per row (same pattern as the
+        # Funko enrichment above).
+        targets = [
+            (index, item)
+            for index, item in enumerate(items)
+            if not item.get("imageUrl")
+            and item.get("setName")
+            and "lego" in str(item["setName"]).lower()
+        ]
+        lookup_by_index: dict[int, tuple[str, set[str]]] = {}
+        for index, item in targets:
+            title = str(item.get("title") or "")
+            base_number = _lego_set_number(title)
+            if base_number is None:
+                continue
+            title_words = _lego_name_words(_lego_title_before_number(title))
+            if not title_words:
+                continue
+            lookup_by_index[index] = (base_number, title_words)
+        base_numbers = sorted({base_number for base_number, _ in lookup_by_index.values()})
+        if not base_numbers:
+            return items
+        candidates_by_number = self._repository.fetch_lego_candidates(base_numbers)
+        for index, (base_number, title_words) in lookup_by_index.items():
+            for candidate in candidates_by_number.get(base_number, []):
+                candidate_words = _lego_name_words(str(candidate.get("name") or ""))
+                if title_words & candidate_words:
+                    image_url = candidate.get("image_url")
+                    if image_url:
+                        items[index]["imageUrl"] = str(image_url)
+                    break
         return items
 
 
@@ -294,6 +337,32 @@ class SupabaseAdminCatalogRepository:
             if image_url:
                 images_by_title[title] = image_url
         return images_by_title
+
+    def fetch_lego_candidates(self, base_numbers: list[str]) -> dict[str, list[dict[str, Any]]]:
+        # One batched request for every distinct LEGO set number on a
+        # page -- see AdminCatalogService._enrich_lego_images. The word-
+        # overlap safety check itself happens in the caller, against
+        # whichever candidates share a base_number.
+        unique_numbers = sorted({number for number in base_numbers if number})
+        if not unique_numbers:
+            return {}
+        quoted = ",".join(f'"{number}"' for number in unique_numbers)
+        payload = self._request(
+            "GET",
+            "/rest/v1/rebrickable_lego_catalog",
+            params={
+                "select": "base_number,name,image_url",
+                "base_number": f"in.({quoted})",
+            },
+        )
+        if not isinstance(payload, list):
+            return {}
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            grouped.setdefault(str(row.get("base_number") or ""), []).append(row)
+        return grouped
 
     def _fetch_tcgplayer_rows(self, group_name: str, card_number: str) -> list[dict[str, Any]]:
         payload = self._request(
