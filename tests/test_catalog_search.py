@@ -16,6 +16,7 @@ from app.services.pricing.catalog_search_service import (
     _normalize_magic_text,
     _pokemon_card_number,
     _pokemon_variant_token,
+    _yugioh_set_code,
 )
 
 
@@ -1076,6 +1077,147 @@ class MagicTextHelpersTest(unittest.TestCase):
         self.assertEqual(
             _magic_card_name("Cabaretti Charm [Gilded Foil] #365"), "Cabaretti Charm"
         )
+
+
+class YugiohImageEnrichmentTest(unittest.TestCase):
+    # yugioh_catalog (imported from YGOPRODeck primary + TCGCSV fallback
+    # -- see scripts/import_ygoprodeck_catalog.py and
+    # scripts/import_tcgcsv_yugioh_catalog.py) is our own Supabase table,
+    # so this routes through the same `client` mock as every other
+    # lookup, keyed off the request path/params.
+
+    def _handler(self, *, search_row: dict, code_rows: dict):
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "tcgplayer_pokemon_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "rebrickable_lego_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "scryfall_magic_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "yugioh_catalog" in url:
+                code = request.url.params.get("set_code", "").removeprefix("eq.")
+                return httpx.Response(200, json=code_rows.get(code, []))
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(200, json=[search_row])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        return handler
+
+    def test_search_matches_by_set_code(self) -> None:
+        search_row = {
+            "pricecharting_id": "1",
+            "product_name": "Where Arf Thou? SD40-JP033",
+            "console_name": "YuGiOh Japanese Structure Deck: Ice Barrier of the Frozen Prison",
+            "category": "YuGiOh Japanese Structure Deck: Ice Barrier of the Frozen Prison",
+            "loose_price_cents": 500,
+            "currency": "USD",
+        }
+        code_rows = {
+            "SD40-JP033": [
+                {"image_url": "https://images.ygoprodeck.com/images/cards/12345.jpg"},
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(self._handler(search_row=search_row, code_rows=code_rows))
+            ),
+        )
+
+        response = service.search("where arf thou", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://images.ygoprodeck.com/images/cards/12345.jpg",
+        )
+
+    def test_search_skips_row_without_set_code(self) -> None:
+        search_row = {
+            "pricecharting_id": "2",
+            "product_name": "Booster Pack",
+            "console_name": "YuGiOh OTS Tournament Pack 14",
+            "category": "YuGiOh OTS Tournament Pack 14",
+            "loose_price_cents": 500,
+            "currency": "USD",
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(self._handler(search_row=search_row, code_rows={}))
+            ),
+        )
+
+        response = service.search("booster pack", limit=10)
+
+        self.assertIsNone(response.results[0].imageUrl)
+
+    def test_search_skips_non_yugioh_set(self) -> None:
+        yugioh_requests: list[httpx.Request] = []
+
+        def pc_handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "yugioh_catalog" in url:
+                yugioh_requests.append(request)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "tcgplayer_pokemon_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "rebrickable_lego_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "scryfall_magic_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "999",
+                            "product_name": "Some Game LOB-006",
+                            "console_name": "Nintendo 64",
+                            "category": "Nintendo 64",
+                            "loose_price_cents": 2000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
+        )
+
+        response = service.search("some game", limit=10)
+
+        self.assertIsNone(response.results[0].imageUrl)
+        self.assertEqual(len(yugioh_requests), 0)
+
+
+class YugiohSetCodeTest(unittest.TestCase):
+    def test_extracts_set_code(self) -> None:
+        self.assertEqual(_yugioh_set_code("Where Arf Thou? SD40-JP033"), "SD40-JP033")
+
+    def test_extracts_code_after_bracket_tag(self) -> None:
+        self.assertEqual(
+            _yugioh_set_code("Hieracosphinx [Ultimate Rare] TLM-JP012"), "TLM-JP012"
+        )
+
+    def test_returns_none_for_sealed_product(self) -> None:
+        self.assertIsNone(_yugioh_set_code("Booster Pack"))
 
 
 class PokemonCardNumberTest(unittest.TestCase):
