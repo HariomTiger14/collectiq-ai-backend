@@ -13,6 +13,10 @@ from app.services.pricing.catalog_search_service import (
     _lego_name_words,
     _lego_set_number,
     _lego_title_before_number,
+    _magic_card_name,
+    _magic_card_number,
+    _magic_set_name_from_console,
+    _normalize_magic_text,
     _normalize_variant_words,
     _pokemon_card_number,
     _pokemon_variant_token,
@@ -68,6 +72,7 @@ class AdminCatalogService:
             items = self._enrich_funko_images(items)
             items = self._enrich_pokemon_images(items)
             items = self._enrich_lego_images(items)
+            items = self._enrich_magic_images(items)
         return {
             "success": True,
             "source": normalized_source,
@@ -178,6 +183,45 @@ class AdminCatalogService:
                     if image_url:
                         items[index]["imageUrl"] = str(image_url)
                     break
+        return items
+
+    def _enrich_magic_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mirrors CatalogSearchService._enrich_with_magic_image -- same
+        # Scryfall-backed number-first / name-fallback matching, so the
+        # admin browse table shows the same images the mobile/public
+        # search does. Batched once per distinct Magic set on the page
+        # (collector numbers and names are set-scoped, so the lookup
+        # naturally groups by set), not one request per row.
+        targets = [
+            (index, item)
+            for index, item in enumerate(items)
+            if not item.get("imageUrl")
+            and item.get("setName")
+            and "magic" in str(item["setName"]).lower()
+        ]
+        by_set: dict[str, list[tuple[int, str | None, str]]] = {}
+        for index, item in targets:
+            set_name = _magic_set_name_from_console(str(item["setName"]))
+            if set_name is None:
+                continue
+            title = str(item.get("title") or "")
+            card_number = _magic_card_number(title)
+            normalized_name = "" if card_number is not None else _normalize_magic_text(_magic_card_name(title))
+            if card_number is None and not normalized_name:
+                continue
+            by_set.setdefault(_normalize_magic_text(set_name), []).append(
+                (index, card_number, normalized_name)
+            )
+        for normalized_set_name, entries in by_set.items():
+            numbers = sorted({number for _, number, _ in entries if number is not None})
+            names = sorted({name for _, number, name in entries if number is None and name})
+            by_number, by_name = self._repository.fetch_magic_candidates(
+                normalized_set_name, numbers=numbers, names=names
+            )
+            for index, card_number, normalized_name in entries:
+                image_url = by_number.get(card_number) if card_number is not None else by_name.get(normalized_name)
+                if image_url:
+                    items[index]["imageUrl"] = image_url
         return items
 
 
@@ -363,6 +407,54 @@ class SupabaseAdminCatalogRepository:
                 continue
             grouped.setdefault(str(row.get("base_number") or ""), []).append(row)
         return grouped
+
+    def fetch_magic_candidates(
+        self, normalized_set_name: str, *, numbers: list[str], names: list[str]
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        # One batched request per lookup type (number-based, name-based)
+        # for a whole Magic set on the page -- see AdminCatalogService.
+        # _enrich_magic_images. Collector numbers are guaranteed unique
+        # within a Scryfall set, but names are not (a reprinted basic
+        # land with no distinguishing number can appear more than once)
+        # -- either way, more than one row for the same key means no
+        # confident single image, so it's dropped rather than guessed.
+        by_number = self._fetch_magic_unique_matches(
+            normalized_set_name, column="collector_number", values=numbers
+        )
+        by_name = self._fetch_magic_unique_matches(
+            normalized_set_name, column="normalized_name", values=names
+        )
+        return by_number, by_name
+
+    def _fetch_magic_unique_matches(
+        self, normalized_set_name: str, *, column: str, values: list[str]
+    ) -> dict[str, str]:
+        unique_values = sorted({value for value in values if value})
+        if not unique_values:
+            return {}
+        quoted = ",".join(f'"{value}"' for value in unique_values)
+        payload = self._request(
+            "GET",
+            "/rest/v1/scryfall_magic_catalog",
+            params={
+                "select": f"{column},image_url",
+                "normalized_set_name": f"eq.{normalized_set_name}",
+                column: f"in.({quoted})",
+            },
+        )
+        if not isinstance(payload, list):
+            return {}
+        counts: dict[str, int] = {}
+        images: dict[str, str] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get(column) or "")
+            counts[key] = counts.get(key, 0) + 1
+            image_url = row.get("image_url")
+            if image_url:
+                images[key] = str(image_url)
+        return {key: url for key, url in images.items() if counts.get(key) == 1}
 
     def _fetch_tcgplayer_rows(self, group_name: str, card_number: str) -> list[dict[str, Any]]:
         payload = self._request(

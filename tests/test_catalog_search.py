@@ -11,6 +11,9 @@ from app.services.pricing.catalog_search_service import (
     CatalogSearchService,
     _funko_lookup_title,
     _lego_set_number,
+    _magic_card_name,
+    _magic_card_number,
+    _normalize_magic_text,
     _pokemon_card_number,
     _pokemon_variant_token,
 )
@@ -882,6 +885,197 @@ class LegoSetNumberTest(unittest.TestCase):
 
     def test_returns_none_without_hash(self) -> None:
         self.assertIsNone(_lego_set_number("Altair"))
+
+
+class MagicImageEnrichmentTest(unittest.TestCase):
+    # scryfall_magic_catalog (imported from Scryfall's free bulk export --
+    # see scripts/import_scryfall_magic_catalog.py) is our own Supabase
+    # table, so this routes through the same `client` mock as every other
+    # lookup, keyed off the request path/params.
+
+    def _handler(self, *, search_row: dict, number_rows: dict, name_rows: dict):
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "tcgplayer_pokemon_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "rebrickable_lego_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "scryfall_magic_catalog" in url:
+                params = request.url.params
+                set_name = params.get("normalized_set_name", "").removeprefix("eq.")
+                if "collector_number" in params:
+                    number = params.get("collector_number", "").removeprefix("eq.")
+                    return httpx.Response(200, json=number_rows.get((set_name, number), []))
+                if "normalized_name" in params:
+                    name = params.get("normalized_name", "").removeprefix("eq.")
+                    return httpx.Response(200, json=name_rows.get((set_name, name), []))
+                return httpx.Response(200, json=[])
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(200, json=[search_row])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        return handler
+
+    def test_search_matches_by_collector_number(self) -> None:
+        # Real production case: Scryfall's Gilded Showcase print of this
+        # card has collector_number "365", matching PriceCharting's own
+        # numbering exactly.
+        search_row = {
+            "pricecharting_id": "3773958",
+            "product_name": "Cabaretti Charm [Gilded Foil] #365",
+            "console_name": "Magic Streets of New Capenna",
+            "category": "Magic Streets of New Capenna",
+            "loose_price_cents": 5000,
+            "currency": "USD",
+        }
+        number_rows = {
+            ("streets of new capenna", "365"): [
+                {"image_url": "https://cards.scryfall.io/normal/gilded-charm.jpg"},
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(search_row=search_row, number_rows=number_rows, name_rows={})
+                )
+            ),
+        )
+
+        response = service.search("cabaretti charm gilded", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl, "https://cards.scryfall.io/normal/gilded-charm.jpg"
+        )
+
+    def test_search_falls_back_to_name_when_no_number(self) -> None:
+        search_row = {
+            "pricecharting_id": "2244134",
+            "product_name": "Angel of Mercy",
+            "console_name": "Magic Starter 1999",
+            "category": "Magic Starter 1999",
+            "loose_price_cents": 200,
+            "currency": "USD",
+        }
+        name_rows = {
+            ("starter 1999", "angel of mercy"): [
+                {"image_url": "https://cards.scryfall.io/normal/angel-of-mercy.jpg"},
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(search_row=search_row, number_rows={}, name_rows=name_rows)
+                )
+            ),
+        )
+
+        response = service.search("angel of mercy", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl, "https://cards.scryfall.io/normal/angel-of-mercy.jpg"
+        )
+
+    def test_search_suppresses_ambiguous_name_match(self) -> None:
+        # More than one row for the same set+name (e.g. a reprinted basic
+        # land with no distinguishing number) is never guessed at.
+        search_row = {
+            "pricecharting_id": "1",
+            "product_name": "Forest",
+            "console_name": "Magic Starter 1999",
+            "category": "Magic Starter 1999",
+            "loose_price_cents": 50,
+            "currency": "USD",
+        }
+        name_rows = {
+            ("starter 1999", "forest"): [
+                {"image_url": "https://cards.scryfall.io/normal/forest-1.jpg"},
+                {"image_url": "https://cards.scryfall.io/normal/forest-2.jpg"},
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(search_row=search_row, number_rows={}, name_rows=name_rows)
+                )
+            ),
+        )
+
+        response = service.search("forest", limit=10)
+
+        self.assertIsNone(response.results[0].imageUrl)
+
+    def test_search_skips_non_magic_set(self) -> None:
+        magic_requests: list[httpx.Request] = []
+
+        def pc_handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "scryfall_magic_catalog" in url:
+                magic_requests.append(request)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "tcgplayer_pokemon_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "rebrickable_lego_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "999",
+                            "product_name": "Some Game",
+                            "console_name": "Nintendo 64",
+                            "category": "Nintendo 64",
+                            "loose_price_cents": 2000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
+        )
+
+        response = service.search("some game", limit=10)
+
+        self.assertIsNone(response.results[0].imageUrl)
+        self.assertEqual(len(magic_requests), 0)
+
+
+class MagicTextHelpersTest(unittest.TestCase):
+    def test_normalizes_apostrophes_and_punctuation(self) -> None:
+        self.assertEqual(_normalize_magic_text("Urza's Saga"), "urzas saga")
+
+    def test_extracts_card_number(self) -> None:
+        self.assertEqual(_magic_card_number("Cabaretti Charm [Gilded Foil] #365"), "365")
+
+    def test_returns_none_without_number(self) -> None:
+        self.assertIsNone(_magic_card_number("Angel of Mercy"))
+
+    def test_strips_bracket_and_number_from_card_name(self) -> None:
+        self.assertEqual(
+            _magic_card_name("Cabaretti Charm [Gilded Foil] #365"), "Cabaretti Charm"
+        )
 
 
 class PokemonCardNumberTest(unittest.TestCase):
