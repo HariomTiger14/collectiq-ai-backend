@@ -745,6 +745,70 @@ class AdminCatalogListItemsTest(unittest.TestCase):
         items_by_id = {item["id"]: item for item in payload["items"]}
         self.assertIsNone(items_by_id["1"]["imageUrl"])
 
+    def test_service_batches_yugioh_lookup_across_page(self) -> None:
+        # One batched request for the whole page's distinct set codes,
+        # not one request per Yu-Gi-Oh row -- see AdminCatalogService.
+        # _enrich_yugioh_images.
+        list_rows = [
+            {
+                "pricecharting_id": "1",
+                "product_name": "Where Arf Thou? SD40-JP033",
+                "category": "YuGiOh Japanese Structure Deck",
+                "console_name": "YuGiOh Japanese Structure Deck",
+                "loose_price_cents": 500,
+                "currency": "USD",
+                "updated_at": "2026-08-13T00:00:00Z",
+            },
+            {
+                "pricecharting_id": "2",
+                "product_name": "Aqua Madoor LOB-027",
+                "category": "YuGiOh Legend of Blue Eyes White Dragon",
+                "console_name": "YuGiOh Legend of Blue Eyes White Dragon",
+                "loose_price_cents": 100,
+                "currency": "USD",
+                "updated_at": "2026-08-13T00:00:00Z",
+            },
+        ]
+        yugioh_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "yugioh_catalog" in url:
+                yugioh_requests.append(request)
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "set_code": "SD40-JP033",
+                            "image_url": "https://images.ygoprodeck.com/images/cards/1.jpg",
+                        },
+                        {
+                            "set_code": "LOB-027",
+                            "image_url": "https://images.ygoprodeck.com/images/cards/2.jpg",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=list_rows)
+
+        service = AdminCatalogService(
+            repository=SupabaseAdminCatalogRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=httpx.Client(transport=httpx.MockTransport(handler)),
+            ),
+        )
+
+        payload = service.list_items(source="pricecharting", limit=100, offset=0)
+
+        items_by_id = {item["id"]: item for item in payload["items"]}
+        self.assertEqual(
+            items_by_id["1"]["imageUrl"], "https://images.ygoprodeck.com/images/cards/1.jpg"
+        )
+        self.assertEqual(
+            items_by_id["2"]["imageUrl"], "https://images.ygoprodeck.com/images/cards/2.jpg"
+        )
+        self.assertEqual(len(yugioh_requests), 1)
+
     def test_service_compacts_kicksdb_rows(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(

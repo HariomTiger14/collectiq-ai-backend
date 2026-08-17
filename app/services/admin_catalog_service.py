@@ -17,6 +17,7 @@ from app.services.pricing.catalog_search_service import (
     _magic_card_number,
     _magic_set_name_from_console,
     _normalize_magic_text,
+    _yugioh_set_code,
     _normalize_variant_words,
     _pokemon_card_number,
     _pokemon_variant_token,
@@ -73,6 +74,7 @@ class AdminCatalogService:
             items = self._enrich_pokemon_images(items)
             items = self._enrich_lego_images(items)
             items = self._enrich_magic_images(items)
+            items = self._enrich_yugioh_images(items)
         return {
             "success": True,
             "source": normalized_source,
@@ -222,6 +224,32 @@ class AdminCatalogService:
                 image_url = by_number.get(card_number) if card_number is not None else by_name.get(normalized_name)
                 if image_url:
                     items[index]["imageUrl"] = image_url
+        return items
+
+    def _enrich_yugioh_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mirrors CatalogSearchService._enrich_with_yugioh_image -- same
+        # global set_code lookup (no per-set resolution needed), so the
+        # admin browse table shows the same images the mobile/public
+        # search does. One batched lookup per page covers every distinct
+        # set code on it, not one request per row (same pattern as the
+        # Funko/LEGO enrichment above).
+        lookup_by_index: dict[int, str] = {}
+        for index, item in enumerate(items):
+            if item.get("imageUrl") or not item.get("setName"):
+                continue
+            if "yugioh" not in str(item["setName"]).lower():
+                continue
+            set_code = _yugioh_set_code(str(item.get("title") or ""))
+            if set_code:
+                lookup_by_index[index] = set_code
+        set_codes = sorted(set(lookup_by_index.values()))
+        if not set_codes:
+            return items
+        images_by_code = self._repository.fetch_yugioh_images(set_codes)
+        for index, set_code in lookup_by_index.items():
+            image_url = images_by_code.get(set_code)
+            if image_url:
+                items[index]["imageUrl"] = image_url
         return items
 
 
@@ -455,6 +483,36 @@ class SupabaseAdminCatalogRepository:
             if image_url:
                 images[key] = str(image_url)
         return {key: url for key, url in images.items() if counts.get(key) == 1}
+
+    def fetch_yugioh_images(self, set_codes: list[str]) -> dict[str, str]:
+        # One batched request for every distinct Yu-Gi-Oh set code on a
+        # page -- see AdminCatalogService._enrich_yugioh_images. set_code
+        # is the table's primary key, so no ambiguity check is needed
+        # here the way Magic/LEGO need one -- import time already
+        # resolved that (see yugioh_catalog's migration comment).
+        unique_codes = sorted({code for code in set_codes if code})
+        if not unique_codes:
+            return {}
+        quoted = ",".join(f'"{code}"' for code in unique_codes)
+        payload = self._request(
+            "GET",
+            "/rest/v1/yugioh_catalog",
+            params={
+                "select": "set_code,image_url",
+                "set_code": f"in.({quoted})",
+            },
+        )
+        if not isinstance(payload, list):
+            return {}
+        images_by_code: dict[str, str] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            code = str(row.get("set_code") or "")
+            image_url = row.get("image_url")
+            if code and image_url:
+                images_by_code[code] = str(image_url)
+        return images_by_code
 
     def _fetch_tcgplayer_rows(self, group_name: str, card_number: str) -> list[dict[str, Any]]:
         payload = self._request(
