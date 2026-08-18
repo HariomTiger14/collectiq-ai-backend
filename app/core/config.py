@@ -192,6 +192,12 @@ class Settings:
         "PRICECHARTING_SHARED_THROTTLE_ENABLED",
         "true",
     )
+    rawg_api_key: str = os.getenv("RAWG_API_KEY", "")
+    rawg_api_base: str = os.getenv(
+        "RAWG_API_BASE",
+        "https://api.rawg.io/api",
+    )
+    rawg_timeout_seconds: float = float(os.getenv("RAWG_TIMEOUT_SECONDS", "5"))
     pricing_cache_ttl_seconds: int = int(os.getenv("PRICING_CACHE_TTL_SECONDS", "900"))
     pricing_provider_min_interval_ms: int = int(
         os.getenv("PRICING_PROVIDER_MIN_INTERVAL_MS", "250")
