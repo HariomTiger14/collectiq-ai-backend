@@ -125,6 +125,18 @@ class CatalogSearchService:
                 result = self._enrich_with_lorcana_image(result)
             if "onepiece" in enabled:
                 result = self._enrich_with_onepiece_image(result)
+            if "videogames" in enabled:
+                # Positioned last, deliberately: this is the only
+                # enrichment in the chain that makes a live network call
+                # to a third party (RAWG) rather than only ever hitting
+                # our own DB -- see _enrich_with_video_games_image. It
+                # only ever runs here in detail(), never from search()'s
+                # _resolve_external_image_url path, so a live RAWG call
+                # is bounded to one specific item view, not fired on
+                # every keystroke of an open catalog search across all
+                # users (RAWG's free tier is capped at 20,000 requests/
+                # month).
+                result = self._enrich_with_video_games_image(result)
             return CatalogDetailResponse(
                 result=result,
                 history=[_history_row_to_point(row) for row in history_rows],
@@ -243,6 +255,7 @@ class CatalogSearchService:
             "yugioh",
             "lorcana",
             "onepiece",
+            "videogames",
         }
         try:
             payload = self._request(
@@ -716,6 +729,150 @@ class CatalogSearchService:
             return []
         return [row for row in payload if isinstance(row, dict)]
 
+    def _enrich_with_video_games_image(
+        self, result: CatalogSearchResult
+    ) -> CatalogSearchResult:
+        # Unlike every other category above, PriceCharting's video-games
+        # rows have no distinguishing "video games" keyword anywhere in
+        # category/setName to gate on the same way "pokemon" in setName
+        # etc. works elsewhere -- verified against real PriceCharting CSV
+        # data (scripts/import_pricecharting_catalog.py): the video-games
+        # export has no genre/category column at all, so `category` falls
+        # back to `console_name` (e.g. "Nintendo 64", "Playstation 4"),
+        # same as setName. So the gate here IS the platform mapping
+        # itself: _video_game_rawg_platform only recognizes real console
+        # names, and returns None for every other category's setName
+        # (e.g. "Magic Streets of New Capenna", "LEGO Space") -- no
+        # mapping means no attempt, same "no match beats a wrong match"
+        # philosophy as every other category's unmapped-set/unmapped-
+        # platform behavior.
+        #
+        # Also unlike every other category, RAWG's 500,000+ game catalog
+        # is far too large to bulk-import, so this is a live lookup +
+        # write-through cache (rawg_video_game_cache -- see
+        # database/migrations/20260819_create_rawg_video_game_cache.sql)
+        # instead of a pre-imported reference table: a cache hit (match
+        # or confirmed no-match) never calls RAWG again; a cache miss
+        # calls RAWG's search endpoint once, applies the same
+        # exact-title + exact-platform matching discipline as every
+        # other category (zero or ambiguous matches -> suppress, never
+        # guess), and writes the outcome back so the same item is never
+        # re-queried.
+        if result.imageUrl or not result.setName:
+            return result
+        rawg_platform = _video_game_rawg_platform(result.setName)
+        if rawg_platform is None:
+            return result
+        base_title = _video_game_base_title(result.title)
+        if not base_title:
+            return result
+
+        lookup_key = _video_game_cache_key(base_title, rawg_platform)
+        cached = self._fetch_video_game_cache(lookup_key)
+        if cached is not None:
+            image_url = cached.get("image_url") if cached.get("matched") else None
+            return (
+                result.model_copy(update={"imageUrl": str(image_url)})
+                if image_url
+                else result
+            )
+
+        payload = self._fetch_rawg_search(base_title)
+        if payload is None:
+            # Network/HTTP failure talking to RAWG -- never cached as a
+            # negative match, just try again on the next lookup.
+            return result
+
+        raw_results = payload.get("results") if isinstance(payload, dict) else None
+        candidates = [row for row in raw_results or [] if isinstance(row, dict)]
+        platform_matches = [
+            row for row in candidates if _rawg_row_has_platform(row, rawg_platform)
+        ]
+        exact_matches = [
+            row
+            for row in platform_matches
+            if str(row.get("name") or "").strip().lower() == base_title.lower()
+        ]
+
+        if len(exact_matches) == 1:
+            game = exact_matches[0]
+            image_url = _clean(game.get("background_image"))
+            slug = _clean(game.get("slug"))
+        else:
+            image_url = None
+            slug = None
+
+        self._write_video_game_cache(
+            lookup_key,
+            matched=bool(image_url),
+            image_url=image_url,
+            rawg_slug=slug,
+        )
+        if image_url is None:
+            return result
+        return result.model_copy(update={"imageUrl": image_url})
+
+    def _fetch_video_game_cache(self, lookup_key: str) -> dict[str, Any] | None:
+        params = {
+            "select": "matched,image_url,rawg_slug",
+            "lookup_key": f"eq.{lookup_key}",
+            "limit": "1",
+        }
+        payload = self._request("GET", "/rest/v1/rawg_video_game_cache", params=params)
+        if not isinstance(payload, list) or not payload:
+            return None
+        row = payload[0]
+        return row if isinstance(row, dict) else None
+
+    def _write_video_game_cache(
+        self,
+        lookup_key: str,
+        *,
+        matched: bool,
+        image_url: str | None,
+        rawg_slug: str | None,
+    ) -> None:
+        try:
+            self._request(
+                "POST",
+                "/rest/v1/rawg_video_game_cache",
+                params={"on_conflict": "lookup_key"},
+                json_payload={
+                    "lookup_key": lookup_key,
+                    "matched": matched,
+                    "image_url": image_url,
+                    "rawg_slug": rawg_slug,
+                    "checked_at": datetime.utcnow().isoformat() + "Z",
+                },
+                extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+            )
+        except CatalogSearchError:
+            # A failed cache write just means we ask RAWG again next
+            # time -- never let it break the response the user is
+            # waiting on.
+            pass
+
+    def _fetch_rawg_search(self, title: str) -> dict[str, Any] | None:
+        api_key = settings.rawg_api_key.strip()
+        if not api_key:
+            return None
+        client = self.client or httpx.Client(timeout=self.timeout_seconds)
+        should_close = self.client is None
+        try:
+            response = client.get(
+                f"{settings.rawg_api_base.rstrip('/')}/games",
+                params={"search": title, "key": api_key, "page_size": "5"},
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError):
+            return None
+        finally:
+            if should_close:
+                client.close()
+        return payload if isinstance(payload, dict) else None
+
     def _fetch_funko_image(self, product_title: str) -> str | None:
         lookup_title = _funko_lookup_title(product_title)
         if not lookup_title:
@@ -790,6 +947,7 @@ class CatalogSearchService:
         *,
         params: dict[str, str] | None = None,
         json_payload: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> Any:
         headers = {
             "apikey": self._service_role_key,
@@ -797,6 +955,8 @@ class CatalogSearchService:
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
+        if extra_headers:
+            headers.update(extra_headers)
         client = self.client or httpx.Client(timeout=self.timeout_seconds)
         should_close = self.client is None
         try:
@@ -1195,6 +1355,83 @@ def select_best_funko_image(candidate_rows: list[dict[str, Any]]) -> str | None:
         ):
             return str(row["image_url"])
     return str(candidates[0]["image_url"])
+
+
+# Hand-verified against RAWG's own platform names (api.rawg.io/api/platforms)
+# before being added -- deliberately small, mainstream-only, same reasoning
+# as _POKEMON_SET_TCGPLAYER_GROUPS: no mapping means no RAWG attempt at all
+# for that row, never a fuzzy platform guess. Keys are PriceCharting's
+# console_name values (region prefix stripped, lowercased); values are
+# RAWG's exact platform display names.
+_VIDEO_GAME_PLATFORM_RAWG_MAP: dict[str, str] = {
+    "playstation 5": "PlayStation 5",
+    "playstation 4": "PlayStation 4",
+    "playstation 3": "PlayStation 3",
+    "playstation 2": "PlayStation 2",
+    "playstation vita": "PlayStation Vita",
+    "playstation": "PlayStation",
+    "xbox series x": "Xbox Series S/X",
+    "xbox one": "Xbox One",
+    "xbox 360": "Xbox 360",
+    "xbox": "Xbox",
+    "nintendo switch": "Nintendo Switch",
+    "wii u": "Wii U",
+    "wii": "Wii",
+    "gamecube": "GameCube",
+    "nintendo 64": "Nintendo 64",
+    "super nintendo": "SNES",
+    "snes": "SNES",
+    "nintendo": "NES",
+    "nes": "NES",
+    "nintendo 3ds": "3DS",
+    "nintendo ds": "DS",
+    "gameboy advance": "Game Boy Advance",
+    "gameboy color": "Game Boy Color",
+    "gameboy": "Game Boy",
+    "psp": "PSP",
+    "pc": "PC",
+}
+
+# PriceCharting console_name values carry an optional region prefix ahead of
+# the platform name itself (e.g. "PAL Playstation 3", "JP Playstation") --
+# stripped defensively (case-insensitively) before the platform lookup
+# above, covering every region tag observed plus the common
+# NTSC-J/NTSC-U/AU/EU variants.
+_VIDEO_GAME_REGION_PREFIX_RE = re.compile(
+    r"^(?:PAL|JP|NTSC-J|NTSC-U|AU|EU|US)\s+", re.IGNORECASE
+)
+_VIDEO_GAME_BRACKET_TAG_RE = re.compile(r"\s*\[[^\]]*\]")
+
+
+def _video_game_rawg_platform(console_name: str) -> str | None:
+    stripped = _VIDEO_GAME_REGION_PREFIX_RE.sub("", console_name.strip())
+    return _VIDEO_GAME_PLATFORM_RAWG_MAP.get(stripped.strip().lower())
+
+
+def _video_game_base_title(product_title: str) -> str:
+    # Strip a trailing bracket tag (e.g. "[Collector's Edition]",
+    # "[Demonstration Disc]") the same way other categories handle bracket
+    # variants -- RAWG doesn't carry "special edition" as its own title, so
+    # the base title is what's searched and matched against.
+    text = _VIDEO_GAME_BRACKET_TAG_RE.sub("", product_title)
+    return " ".join(text.strip().split())
+
+
+def _video_game_cache_key(base_title: str, rawg_platform: str) -> str:
+    return f"{base_title.strip().lower()}::{rawg_platform.strip().lower()}"
+
+
+def _rawg_row_has_platform(row: dict[str, Any], rawg_platform: str) -> bool:
+    platforms = row.get("platforms")
+    if not isinstance(platforms, list):
+        return False
+    for entry in platforms:
+        if not isinstance(entry, dict):
+            continue
+        platform = entry.get("platform")
+        if isinstance(platform, dict) and str(platform.get("name") or "") == rawg_platform:
+            return True
+    return False
 
 
 def _cents_to_units(value: Any) -> float | None:

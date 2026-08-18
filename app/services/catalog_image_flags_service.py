@@ -15,6 +15,7 @@ KNOWN_CATEGORIES: tuple[str, ...] = (
     "yugioh",
     "lorcana",
     "onepiece",
+    "videogames",
 )
 
 
