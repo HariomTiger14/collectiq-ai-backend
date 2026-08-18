@@ -126,16 +126,6 @@ class CatalogSearchService:
             if "onepiece" in enabled:
                 result = self._enrich_with_onepiece_image(result)
             if "videogames" in enabled:
-                # Positioned last, deliberately: this is the only
-                # enrichment in the chain that makes a live network call
-                # to a third party (RAWG) rather than only ever hitting
-                # our own DB -- see _enrich_with_video_games_image. It
-                # only ever runs here in detail(), never from search()'s
-                # _resolve_external_image_url path, so a live RAWG call
-                # is bounded to one specific item view, not fired on
-                # every keystroke of an open catalog search across all
-                # users (RAWG's free tier is capped at 20,000 requests/
-                # month).
                 result = self._enrich_with_video_games_image(result)
             return CatalogDetailResponse(
                 result=result,
@@ -747,17 +737,18 @@ class CatalogSearchService:
         # philosophy as every other category's unmapped-set/unmapped-
         # platform behavior.
         #
-        # Also unlike every other category, RAWG's 500,000+ game catalog
-        # is far too large to bulk-import, so this is a live lookup +
-        # write-through cache (rawg_video_game_cache -- see
-        # database/migrations/20260819_create_rawg_video_game_cache.sql)
-        # instead of a pre-imported reference table: a cache hit (match
-        # or confirmed no-match) never calls RAWG again; a cache miss
-        # calls RAWG's search endpoint once, applies the same
-        # exact-title + exact-platform matching discipline as every
-        # other category (zero or ambiguous matches -> suppress, never
-        # guess), and writes the outcome back so the same item is never
-        # re-queried.
+        # Images come from rawg_video_game_catalog, our own table bulk-
+        # imported from RAWG's API (53,890 real game+platform rows across
+        # the same ~24 mainstream platforms in
+        # _VIDEO_GAME_PLATFORM_RAWG_MAP -- see scripts/import_rawg_
+        # video_game_catalog.py). This used to be a live RAWG lookup +
+        # write-through cache, but with the real bulk data local there's
+        # no reason left to call RAWG at request time. Same conservative
+        # discipline as every other category: normalized_name +
+        # rawg_platform must resolve to exactly one row (RAWG can have
+        # more than one entry for the same normalized name + platform,
+        # e.g. remasters/re-releases) -- zero or ambiguous matches ->
+        # suppress, never guess.
         if result.imageUrl or not result.setName:
             return result
         rawg_platform = _video_game_rawg_platform(result.setName)
@@ -767,111 +758,29 @@ class CatalogSearchService:
         if not base_title:
             return result
 
-        lookup_key = _video_game_cache_key(base_title, rawg_platform)
-        cached = self._fetch_video_game_cache(lookup_key)
-        if cached is not None:
-            image_url = cached.get("image_url") if cached.get("matched") else None
-            return (
-                result.model_copy(update={"imageUrl": str(image_url)})
-                if image_url
-                else result
-            )
-
-        payload = self._fetch_rawg_search(base_title)
-        if payload is None:
-            # Network/HTTP failure talking to RAWG -- never cached as a
-            # negative match, just try again on the next lookup.
+        normalized_name = _video_game_normalize_name(base_title)
+        if not normalized_name:
             return result
-
-        raw_results = payload.get("results") if isinstance(payload, dict) else None
-        candidates = [row for row in raw_results or [] if isinstance(row, dict)]
-        platform_matches = [
-            row for row in candidates if _rawg_row_has_platform(row, rawg_platform)
-        ]
-        exact_matches = [
-            row
-            for row in platform_matches
-            if str(row.get("name") or "").strip().lower() == base_title.lower()
-        ]
-
-        if len(exact_matches) == 1:
-            game = exact_matches[0]
-            image_url = _clean(game.get("background_image"))
-            slug = _clean(game.get("slug"))
-        else:
-            image_url = None
-            slug = None
-
-        self._write_video_game_cache(
-            lookup_key,
-            matched=bool(image_url),
-            image_url=image_url,
-            rawg_slug=slug,
-        )
+        image_url = self._fetch_video_game_image(normalized_name, rawg_platform)
         if image_url is None:
             return result
         return result.model_copy(update={"imageUrl": image_url})
 
-    def _fetch_video_game_cache(self, lookup_key: str) -> dict[str, Any] | None:
+    def _fetch_video_game_image(
+        self, normalized_name: str, rawg_platform: str
+    ) -> str | None:
         params = {
-            "select": "matched,image_url,rawg_slug",
-            "lookup_key": f"eq.{lookup_key}",
-            "limit": "1",
+            "select": "image_url",
+            "normalized_name": f"eq.{normalized_name}",
+            "rawg_platform": f"eq.{rawg_platform}",
+            "limit": "2",
         }
-        payload = self._request("GET", "/rest/v1/rawg_video_game_cache", params=params)
-        if not isinstance(payload, list) or not payload:
+        payload = self._request("GET", "/rest/v1/rawg_video_game_catalog", params=params)
+        if not isinstance(payload, list) or len(payload) != 1:
             return None
         row = payload[0]
-        return row if isinstance(row, dict) else None
-
-    def _write_video_game_cache(
-        self,
-        lookup_key: str,
-        *,
-        matched: bool,
-        image_url: str | None,
-        rawg_slug: str | None,
-    ) -> None:
-        try:
-            self._request(
-                "POST",
-                "/rest/v1/rawg_video_game_cache",
-                params={"on_conflict": "lookup_key"},
-                json_payload={
-                    "lookup_key": lookup_key,
-                    "matched": matched,
-                    "image_url": image_url,
-                    "rawg_slug": rawg_slug,
-                    "checked_at": datetime.utcnow().isoformat() + "Z",
-                },
-                extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
-            )
-        except CatalogSearchError:
-            # A failed cache write just means we ask RAWG again next
-            # time -- never let it break the response the user is
-            # waiting on.
-            pass
-
-    def _fetch_rawg_search(self, title: str) -> dict[str, Any] | None:
-        api_key = settings.rawg_api_key.strip()
-        if not api_key:
-            return None
-        client = self.client or httpx.Client(timeout=self.timeout_seconds)
-        should_close = self.client is None
-        try:
-            response = client.get(
-                f"{settings.rawg_api_base.rstrip('/')}/games",
-                params={"search": title, "key": api_key, "page_size": "5"},
-                timeout=self.timeout_seconds,
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except (httpx.HTTPError, ValueError):
-            return None
-        finally:
-            if should_close:
-                client.close()
-        return payload if isinstance(payload, dict) else None
+        image_url = row.get("image_url") if isinstance(row, dict) else None
+        return str(image_url) if image_url else None
 
     def _fetch_funko_image(self, product_title: str) -> str | None:
         lookup_title = _funko_lookup_title(product_title)
@@ -1417,21 +1326,17 @@ def _video_game_base_title(product_title: str) -> str:
     return " ".join(text.strip().split())
 
 
-def _video_game_cache_key(base_title: str, rawg_platform: str) -> str:
-    return f"{base_title.strip().lower()}::{rawg_platform.strip().lower()}"
+_VIDEO_GAME_WHITESPACE_RE = re.compile(r"\s+")
 
 
-def _rawg_row_has_platform(row: dict[str, Any], rawg_platform: str) -> bool:
-    platforms = row.get("platforms")
-    if not isinstance(platforms, list):
-        return False
-    for entry in platforms:
-        if not isinstance(entry, dict):
-            continue
-        platform = entry.get("platform")
-        if isinstance(platform, dict) and str(platform.get("name") or "") == rawg_platform:
-            return True
-    return False
+def _video_game_normalize_name(name: str) -> str:
+    # MUST stay identical to normalize_name() in scripts/import_rawg_
+    # video_game_catalog.py -- that's the normalization applied to every
+    # row's normalized_name column at import time, and this side of the
+    # match has to produce byte-identical output or nothing will ever
+    # match.
+    return _VIDEO_GAME_WHITESPACE_RE.sub(" ", name).strip().lower()
+
 
 
 def _cents_to_units(value: Any) -> float | None:
