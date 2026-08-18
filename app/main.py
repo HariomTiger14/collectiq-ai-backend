@@ -6,6 +6,7 @@ from app.core.config import UPLOAD_DIR, settings
 from app.routers import (
     admin_audit,
     admin_catalog,
+    admin_catalog_image_flags,
     admin_catalog_promotion,
     admin_notes,
     admin_ops,
@@ -55,6 +56,7 @@ app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(admin_audit.router)
 app.include_router(admin_catalog.router)
+app.include_router(admin_catalog_image_flags.router)
 app.include_router(admin_catalog_promotion.router)
 app.include_router(admin_notes.router)
 app.include_router(admin_ops.router)

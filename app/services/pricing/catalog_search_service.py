@@ -70,13 +70,25 @@ class CatalogSearchService:
             else _kicksdb_row_to_result(row, normalized_query)
             for _, _, source, row in top
         ]
-        results = [self._enrich_with_funko_image(result) for result in results]
-        results = [self._enrich_with_pokemon_image(result) for result in results]
-        results = [self._enrich_with_lego_image(result) for result in results]
-        results = [self._enrich_with_magic_image(result) for result in results]
-        results = [self._enrich_with_yugioh_image(result) for result in results]
-        results = [self._enrich_with_lorcana_image(result) for result in results]
-        results = [self._enrich_with_onepiece_image(result) for result in results]
+        # Deliberately no inline imageUrl enrichment here: this is the open,
+        # free-to-everyone catalog browse/search surface. Publisher-sourced
+        # card/product art (Pokemon/Magic/Yu-Gi-Oh/Lorcana/One Piece/LEGO/
+        # Funko) is only rendered inline in detail(), reached by tapping
+        # into a specific item to confirm and save it to a portfolio -- a
+        # bounded, per-item identification use, not an open image database.
+        # We DO still resolve the same match here and expose it as
+        # externalImageUrl (see _resolve_external_image_url) -- link-only,
+        # opened in an external/in-app browser tab by the client, never
+        # rendered inline, which is the lower-risk hyperlink pattern rather
+        # than hosting the image inside our own app layout.
+        # KicksDB (sneakers) images are unaffected; they come from
+        # _kicksdb_row_to_result above, not this enrichment chain.
+        if any(not result.imageUrl for result in results):
+            enabled_image_categories = self._fetch_enabled_image_categories()
+            results = [
+                self._resolve_external_image_url(result, enabled_image_categories)
+                for result in results
+            ]
         return CatalogSearchResponse(
             query=normalized_query,
             count=len(results),
@@ -98,20 +110,23 @@ class CatalogSearchService:
                 row,
                 _normalize_query(str(row.get("product_name") or "")),
             )
+            enabled = self._fetch_enabled_image_categories()
+            if "funko" in enabled:
+                result = self._enrich_with_funko_image(result)
+            if "pokemon" in enabled:
+                result = self._enrich_with_pokemon_image(result)
+            if "lego" in enabled:
+                result = self._enrich_with_lego_image(result)
+            if "magic" in enabled:
+                result = self._enrich_with_magic_image(result)
+            if "yugioh" in enabled:
+                result = self._enrich_with_yugioh_image(result)
+            if "lorcana" in enabled:
+                result = self._enrich_with_lorcana_image(result)
+            if "onepiece" in enabled:
+                result = self._enrich_with_onepiece_image(result)
             return CatalogDetailResponse(
-                result=self._enrich_with_onepiece_image(
-                    self._enrich_with_lorcana_image(
-                        self._enrich_with_yugioh_image(
-                            self._enrich_with_magic_image(
-                                self._enrich_with_lego_image(
-                                    self._enrich_with_pokemon_image(
-                                        self._enrich_with_funko_image(result)
-                                    )
-                                )
-                            )
-                        )
-                    )
-                ),
+                result=result,
                 history=[_history_row_to_point(row) for row in history_rows],
             )
 
@@ -187,6 +202,64 @@ class CatalogSearchService:
         if not isinstance(payload, list):
             return []
         return [row for row in payload if isinstance(row, dict)]
+
+    def _resolve_external_image_url(
+        self, result: CatalogSearchResult, enabled: set[str]
+    ) -> CatalogSearchResult:
+        if result.imageUrl:
+            # KicksDB rows already carry a real imageUrl (rendered inline
+            # today, a separate/already-accepted risk profile) -- nothing
+            # to add here.
+            return result
+        scratch = result
+        if "funko" in enabled:
+            scratch = self._enrich_with_funko_image(scratch)
+        if "pokemon" in enabled:
+            scratch = self._enrich_with_pokemon_image(scratch)
+        if "lego" in enabled:
+            scratch = self._enrich_with_lego_image(scratch)
+        if "magic" in enabled:
+            scratch = self._enrich_with_magic_image(scratch)
+        if "yugioh" in enabled:
+            scratch = self._enrich_with_yugioh_image(scratch)
+        if "lorcana" in enabled:
+            scratch = self._enrich_with_lorcana_image(scratch)
+        if "onepiece" in enabled:
+            scratch = self._enrich_with_onepiece_image(scratch)
+        if not scratch.imageUrl:
+            return result
+        return result.model_copy(update={"externalImageUrl": scratch.imageUrl})
+
+    def _fetch_enabled_image_categories(self) -> set[str]:
+        # Admin-portal-controlled kill switch per image category (see
+        # catalog_image_flags_service.py). Fails open to "all enabled" on
+        # any error -- a flags-table hiccup should never blank out images
+        # that would otherwise display fine.
+        all_categories = {
+            "funko",
+            "pokemon",
+            "lego",
+            "magic",
+            "yugioh",
+            "lorcana",
+            "onepiece",
+        }
+        try:
+            payload = self._request(
+                "GET",
+                "/rest/v1/catalog_image_source_flags",
+                params={"select": "category,enabled"},
+            )
+        except Exception:
+            return all_categories
+        if not isinstance(payload, list):
+            return all_categories
+        disabled = {
+            str(row.get("category"))
+            for row in payload
+            if isinstance(row, dict) and row.get("enabled") is False
+        }
+        return all_categories - disabled
 
     def _fetch_catalog_row(self, catalog_id: str) -> dict[str, Any] | None:
         params = {
