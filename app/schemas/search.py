@@ -25,6 +25,12 @@ class CatalogSearchResult(BaseModel):
     attribution: str = "Pricing data by PriceCharting"
     lastUpdated: str | None = None
     imageUrl: str | None = None
+    # Link-only, never rendered inline: the same publisher-sourced image
+    # URL detail() attaches as imageUrl, but exposed here strictly so the
+    # client can open it in an external/in-app browser tab from the open
+    # catalog search surface -- never as an <img>/Image.network source. See
+    # CatalogSearchService.search()'s enrichment pass.
+    externalImageUrl: str | None = None
     pricing: CatalogSearchPricing = Field(default_factory=CatalogSearchPricing)
 
 

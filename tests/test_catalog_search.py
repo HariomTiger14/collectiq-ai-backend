@@ -352,8 +352,13 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertEqual(response.history[0].pricing.highEstimate, 800)
         self.assertEqual(response.history[1].validTo, "2026-07-26T00:00:00Z")
         self.assertIn("pricecharting_id=eq.999", str(requests[0].url))
-        self.assertIn("pricecharting_catalog_history", str(requests[-1].url))
-        self.assertIn("limit=10", str(requests[-1].url))
+        history_requests = [
+            request
+            for request in requests
+            if "pricecharting_catalog_history" in str(request.url)
+        ]
+        self.assertEqual(len(history_requests), 1)
+        self.assertIn("limit=10", str(history_requests[0].url))
 
     def test_detail_missing_catalog_item_raises_not_found(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -370,18 +375,158 @@ class CatalogSearchServiceTest(unittest.TestCase):
 
         self.assertIn("not found", str(context.exception).lower())
 
-    def test_search_enriches_funko_result_with_real_image(self) -> None:
+    def test_detail_enriches_funko_result_with_real_image(self) -> None:
         # PriceCharting has real pricing for Funko Pop rows but no image
         # field at all (confirmed live, zero image data in raw_payload for
         # any category). funko_pop_catalog is a static reference table
         # (imported from the open-source funko-pop-data dataset) used only
         # to attach a real photo when a confident exact-title match exists.
+        # This enrichment only runs in detail() (a bounded per-item
+        # identification use, reached when a user taps into a specific
+        # catalog item to confirm it before saving to their portfolio) --
+        # not in the open, free-to-everyone search() browse surface.
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            url = str(request.url)
+            if "funko_pop_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "image_url": "https://images.hobbydb.com/1950-batmobile.png",
+                            "series": ["Funko Vinyl Art Toys"],
+                        }
+                    ],
+                )
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "7531531",
+                            "product_name": "1950 Batmobile #277",
+                            "console_name": "Funko POP Rides",
+                            "category": "Batman: 80th Anniversary, Amazon Exclusive",
+                            "loose_price_cents": 4500,
+                            "currency": "USD",
+                            "normalized_identity": "1950 batmobile funko pop rides",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.detail("7531531")
+
+        self.assertEqual(response.result.id, "7531531")
+        self.assertEqual(
+            response.result.imageUrl,
+            "https://images.hobbydb.com/1950-batmobile.png",
+        )
+        self.assertTrue(
+            any("funko_pop_catalog" in str(r.url) for r in requests)
+        )
+
+    def test_detail_leaves_funko_result_unenriched_when_no_match(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])  # no match found
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "99999",
+                            "product_name": "Some Obscure Figure #1",
+                            "console_name": "Funko POP Rides",
+                            "category": "Misc",
+                            "loose_price_cents": 1000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.detail("99999")
+
+        self.assertIsNone(response.result.imageUrl)
+
+    def test_detail_skips_funko_lookup_for_non_funko_results(self) -> None:
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            url = str(request.url)
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "999",
+                            "product_name": "Charizard #4 Base Set",
+                            "console_name": "Pokemon Cards",
+                            "category": "Pokemon Cards",
+                            "loose_price_cents": 16100,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        service.detail("999")
+
+        self.assertFalse(
+            any("funko_pop_catalog" in str(r.url) for r in requests)
+        )
+
+    def test_search_never_attaches_publisher_card_images_inline(self) -> None:
+        # Regression test locking in the risk-reduction decision made in
+        # search(): it is the open, free-to-everyone catalog browse
+        # surface, so it must never set imageUrl (safe-to-render-inline)
+        # from any of the _enrich_with_*_image methods -- even when a
+        # matching reference-table row exists. Publisher-sourced card/
+        # product images (Funko/Pokemon/LEGO/Magic/Yu-Gi-Oh/Lorcana/One
+        # Piece) are only ever rendered inline via detail(), a bounded
+        # per-item identification use reached by tapping into one specific
+        # catalog item. search() DOES still resolve the same match and
+        # expose it as externalImageUrl -- link-only, opened externally by
+        # the client, never rendered inline. See _resolve_external_image_url.
         requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             requests.append(request)
             url = str(request.url)
             if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "catalog_image_source_flags" in url:
                 return httpx.Response(200, json=[])
             if "funko_pop_catalog" in url:
                 return httpx.Response(
@@ -419,32 +564,50 @@ class CatalogSearchServiceTest(unittest.TestCase):
         response = service.search("1950 batmobile", limit=10)
 
         self.assertEqual(response.results[0].id, "7531531")
+        self.assertIsNone(response.results[0].imageUrl)
         self.assertEqual(
-            response.results[0].imageUrl,
+            response.results[0].externalImageUrl,
             "https://images.hobbydb.com/1950-batmobile.png",
         )
         self.assertTrue(
             any("funko_pop_catalog" in str(r.url) for r in requests)
         )
 
-    def test_search_leaves_funko_result_unenriched_when_no_match(self) -> None:
+    def test_search_gates_external_image_url_by_admin_flag(self) -> None:
+        # Same flag-gating contract as CatalogImageFlagsGatingTest's
+        # detail() coverage, but for the externalImageUrl path in
+        # search(): a disabled category must suppress externalImageUrl
+        # exactly like it suppresses imageUrl in detail().
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if "search_kicksdb_catalog" in url:
                 return httpx.Response(200, json=[])
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(
+                    200, json=[{"category": "funko", "enabled": False}]
+                )
             if "funko_pop_catalog" in url:
-                return httpx.Response(200, json=[])  # no match found
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "image_url": "https://images.hobbydb.com/1950-batmobile.png",
+                            "series": ["Funko Vinyl Art Toys"],
+                        }
+                    ],
+                )
             if "search_pricecharting_catalog" in url:
                 return httpx.Response(
                     200,
                     json=[
                         {
-                            "pricecharting_id": "99999",
-                            "product_name": "Some Obscure Figure #1",
+                            "pricecharting_id": "7531531",
+                            "product_name": "1950 Batmobile #277",
                             "console_name": "Funko POP Rides",
-                            "category": "Misc",
-                            "loose_price_cents": 1000,
+                            "category": "Batman: 80th Anniversary, Amazon Exclusive",
+                            "loose_price_cents": 4500,
                             "currency": "USD",
+                            "normalized_identity": "1950 batmobile funko pop rides",
                         },
                     ],
                 )
@@ -456,28 +619,35 @@ class CatalogSearchServiceTest(unittest.TestCase):
             client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
 
-        response = service.search("some obscure figure", limit=10)
+        response = service.search("1950 batmobile", limit=10)
 
         self.assertIsNone(response.results[0].imageUrl)
+        self.assertIsNone(response.results[0].externalImageUrl)
 
-    def test_search_skips_funko_lookup_for_non_funko_results(self) -> None:
-        requests: list[httpx.Request] = []
-
+    def test_search_does_not_set_external_image_url_when_kicksdb_already_has_image(
+        self,
+    ) -> None:
+        # KicksDB (sneaker) rows already carry a real imageUrl assigned
+        # directly by _kicksdb_row_to_result, not via the publisher-image
+        # enrichment chain. _resolve_external_image_url must leave those
+        # alone -- imageUrl already covers the "show the user a picture"
+        # need, so externalImageUrl should stay unset.
         def handler(request: httpx.Request) -> httpx.Response:
-            requests.append(request)
             url = str(request.url)
-            if "search_kicksdb_catalog" in url:
-                return httpx.Response(200, json=[])
             if "search_pricecharting_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "search_kicksdb_catalog" in url:
                 return httpx.Response(
                     200,
                     json=[
                         {
-                            "pricecharting_id": "999",
-                            "product_name": "Charizard #4 Base Set",
-                            "console_name": "Pokemon Cards",
-                            "category": "Pokemon Cards",
-                            "loose_price_cents": 16100,
+                            "kicksdb_id": "sneaker-1",
+                            "title": "Air Jordan 1 Retro High",
+                            "brand": "Nike",
+                            "image_url": "https://kicksdb.example.com/aj1.jpg",
+                            "lowest_ask_cents": 20000,
                             "currency": "USD",
                         },
                     ],
@@ -490,11 +660,13 @@ class CatalogSearchServiceTest(unittest.TestCase):
             client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
 
-        service.search("charizard", limit=10)
+        response = service.search("air jordan 1", limit=10)
 
-        self.assertFalse(
-            any("funko_pop_catalog" in str(r.url) for r in requests)
+        self.assertEqual(len(response.results), 1)
+        self.assertEqual(
+            response.results[0].imageUrl, "https://kicksdb.example.com/aj1.jpg"
         )
+        self.assertIsNone(response.results[0].externalImageUrl)
 
 
 class PokemonImageEnrichmentTest(unittest.TestCase):
@@ -502,17 +674,18 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
     # scripts/import_tcgplayer_pokemon_catalog.py) is our own Supabase
     # table, so every scenario below routes through the same `client`
     # mock as the pricecharting_catalog/funko lookups, keyed off the
-    # request path/method rather than a separate external client.
+    # request path/method rather than a separate external client. This
+    # enrichment only runs in detail() now, so the row fetch goes through
+    # _fetch_catalog_row's GET /rest/v1/pricecharting_catalog?pricecharting_id=eq.<id>
+    # shape, not the search_pricecharting_catalog RPC.
 
     def _handler(self, *, search_row: dict, tcgplayer_rows: dict, sibling_rows: dict):
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "search_kicksdb_catalog" in url:
-                return httpx.Response(200, json=[])
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "search_pricecharting_catalog" in url:
-                return httpx.Response(200, json=[search_row])
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
             if "tcgplayer_pokemon_catalog" in url:
                 group_name = request.url.params.get("group_name", "").removeprefix("eq.")
                 card_number = request.url.params.get("card_number", "").removeprefix("eq.")
@@ -520,13 +693,15 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
                     200, json=tcgplayer_rows.get((group_name, card_number), [])
                 )
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                if "pricecharting_id" in request.url.params:
+                    return httpx.Response(200, json=[search_row])
                 console_name = request.url.params.get("console_name", "").removeprefix("eq.")
                 return httpx.Response(200, json=sibling_rows.get(console_name, []))
             return httpx.Response(200, json=[])
 
         return handler
 
-    def test_search_uses_plain_image_when_no_sibling_variant_rows(self) -> None:
+    def test_detail_uses_plain_image_when_no_sibling_variant_rows(self) -> None:
         search_row = {
             "pricecharting_id": "630417",
             "product_name": "Charizard #4",
@@ -561,14 +736,14 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("charizard base set", limit=10)
+        response = service.detail("630417")
 
         self.assertEqual(
-            response.results[0].imageUrl,
+            response.result.imageUrl,
             "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
         )
 
-    def test_search_suppresses_generic_image_when_sibling_variant_rows_exist(self) -> None:
+    def test_detail_suppresses_generic_image_when_sibling_variant_rows_exist(self) -> None:
         # Real production shape: Base Set Charizard #4 has 5 PriceCharting
         # rows (plain, [1999-2000], [1st Edition], [Shadowless], [Black
         # Dot Error]). This one has no bracket tag of its own and no
@@ -614,11 +789,11 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("charizard base set", limit=10)
+        response = service.detail("630417")
 
-        self.assertIsNone(response.results[0].imageUrl)
+        self.assertIsNone(response.result.imageUrl)
 
-    def test_search_uses_exact_shadowless_image(self) -> None:
+    def test_detail_uses_exact_shadowless_image(self) -> None:
         search_row = {
             "pricecharting_id": "715695",
             "product_name": "Charizard [Shadowless] #4",
@@ -649,14 +824,14 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("charizard shadowless", limit=10)
+        response = service.detail("715695")
 
         self.assertEqual(
-            response.results[0].imageUrl,
+            response.result.imageUrl,
             "https://tcgplayer-cdn.tcgplayer.com/product/106999_200w.jpg",
         )
 
-    def test_search_uses_exact_error_variant_image(self) -> None:
+    def test_detail_uses_exact_error_variant_image(self) -> None:
         search_row = {
             "pricecharting_id": "7307451",
             "product_name": "Charizard [Black Dot Error] #4",
@@ -692,25 +867,25 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("charizard black dot error", limit=10)
+        response = service.detail("7307451")
 
         self.assertEqual(
-            response.results[0].imageUrl,
+            response.result.imageUrl,
             "https://tcgplayer-cdn.tcgplayer.com/product/657516_200w.jpg",
         )
 
-    def test_search_skips_unmapped_pokemon_set(self) -> None:
+    def test_detail_skips_unmapped_pokemon_set(self) -> None:
         tcgplayer_requests: list[httpx.Request] = []
 
         def pc_handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if "tcgplayer_pokemon_catalog" in url:
                 tcgplayer_requests.append(request)
-            if "search_kicksdb_catalog" in url:
-                return httpx.Response(200, json=[])
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "search_pricecharting_catalog" in url:
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
                     200,
                     json=[
@@ -732,10 +907,138 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
             client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
         )
 
-        response = service.search("charizard expedition", limit=10)
+        response = service.detail("3438352")
 
-        self.assertIsNone(response.results[0].imageUrl)
+        self.assertIsNone(response.result.imageUrl)
         self.assertEqual(len(tcgplayer_requests), 0)
+
+
+class CatalogImageFlagsGatingTest(unittest.TestCase):
+    # Covers detail()'s admin-controlled per-category kill switch
+    # (_fetch_enabled_image_categories in catalog_search_service.py),
+    # reusing the same Pokemon/Base-Set fixture shape as
+    # PokemonImageEnrichmentTest above since it's the simplest enrichment
+    # path with a single, unambiguous match.
+
+    def _handler(self, *, search_row: dict, tcgplayer_rows: dict, flags_response: httpx.Response):
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "catalog_image_source_flags" in url:
+                return flags_response
+            if "funko_pop_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if "tcgplayer_pokemon_catalog" in url:
+                group_name = request.url.params.get("group_name", "").removeprefix("eq.")
+                card_number = request.url.params.get("card_number", "").removeprefix("eq.")
+                return httpx.Response(
+                    200, json=tcgplayer_rows.get((group_name, card_number), [])
+                )
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                if "pricecharting_id" in request.url.params:
+                    return httpx.Response(200, json=[search_row])
+                # No sibling variant rows for this fixture -- keeps the
+                # plain match unambiguous, same as the "no siblings" case
+                # in PokemonImageEnrichmentTest.
+                return httpx.Response(200, json=[{"pricecharting_id": search_row["pricecharting_id"]}])
+            return httpx.Response(200, json=[])
+
+        return handler
+
+    def _search_and_tcgplayer_rows(self) -> tuple[dict, dict]:
+        search_row = {
+            "pricecharting_id": "630417",
+            "product_name": "Charizard #4",
+            "console_name": "Pokemon Base Set",
+            "category": "Pokemon Card",
+            "loose_price_cents": 16100,
+            "currency": "USD",
+        }
+        tcgplayer_rows = {
+            ("Base Set", "4"): [
+                {
+                    "product_name": "Charizard",
+                    "image_url": "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
+                    "variant_tag": None,
+                },
+            ],
+        }
+        return search_row, tcgplayer_rows
+
+    def test_detail_skips_enrichment_when_category_disabled_via_flags(self) -> None:
+        search_row, tcgplayer_rows = self._search_and_tcgplayer_rows()
+        flags_response = httpx.Response(
+            200, json=[{"category": "pokemon", "enabled": False}]
+        )
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(
+                        search_row=search_row,
+                        tcgplayer_rows=tcgplayer_rows,
+                        flags_response=flags_response,
+                    )
+                )
+            ),
+        )
+
+        response = service.detail("630417")
+
+        self.assertIsNone(response.result.imageUrl)
+
+    def test_detail_fails_open_and_still_enriches_when_flags_fetch_errors(self) -> None:
+        search_row, tcgplayer_rows = self._search_and_tcgplayer_rows()
+        flags_response = httpx.Response(500, json={"message": "boom"})
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(
+                        search_row=search_row,
+                        tcgplayer_rows=tcgplayer_rows,
+                        flags_response=flags_response,
+                    )
+                )
+            ),
+        )
+
+        response = service.detail("630417")
+
+        self.assertEqual(
+            response.result.imageUrl,
+            "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
+        )
+
+    def test_detail_fails_open_and_still_enriches_when_flags_table_empty(self) -> None:
+        search_row, tcgplayer_rows = self._search_and_tcgplayer_rows()
+        flags_response = httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(
+                        search_row=search_row,
+                        tcgplayer_rows=tcgplayer_rows,
+                        flags_response=flags_response,
+                    )
+                )
+            ),
+        )
+
+        response = service.detail("630417")
+
+        self.assertEqual(
+            response.result.imageUrl,
+            "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
+        )
 
 
 class PokemonVariantTokenTest(unittest.TestCase):
@@ -750,13 +1053,14 @@ class LegoImageEnrichmentTest(unittest.TestCase):
     # rebrickable_lego_catalog (imported from Rebrickable's free bulk
     # export -- see scripts/import_rebrickable_lego_catalog.py) is our own
     # Supabase table, so this routes through the same `client` mock as
-    # every other lookup, keyed off the request path.
+    # every other lookup, keyed off the request path. This enrichment
+    # only runs in detail() now, so the row fetch goes through
+    # _fetch_catalog_row's GET /rest/v1/pricecharting_catalog?pricecharting_id=eq.<id>
+    # shape, not the search_pricecharting_catalog RPC.
 
     def _handler(self, *, search_row: dict, lego_rows: dict):
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "search_kicksdb_catalog" in url:
-                return httpx.Response(200, json=[])
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
             if "tcgplayer_pokemon_catalog" in url:
@@ -764,15 +1068,15 @@ class LegoImageEnrichmentTest(unittest.TestCase):
             if "rebrickable_lego_catalog" in url:
                 base_number = request.url.params.get("base_number", "").removeprefix("eq.")
                 return httpx.Response(200, json=lego_rows.get(base_number, []))
-            if "search_pricecharting_catalog" in url:
-                return httpx.Response(200, json=[search_row])
-            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+            if "pricecharting_catalog_history" in url:
                 return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(200, json=[search_row])
             return httpx.Response(200, json=[])
 
         return handler
 
-    def test_search_uses_image_when_title_words_overlap(self) -> None:
+    def test_detail_uses_image_when_title_words_overlap(self) -> None:
         search_row = {
             "pricecharting_id": "5873213",
             "product_name": "Altair #7322",
@@ -798,14 +1102,14 @@ class LegoImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("altair lego", limit=10)
+        response = service.detail("5873213")
 
         self.assertEqual(
-            response.results[0].imageUrl,
+            response.result.imageUrl,
             "https://cdn.rebrickable.com/media/sets/7322-1.jpg",
         )
 
-    def test_search_rejects_number_match_without_word_overlap(self) -> None:
+    def test_detail_rejects_number_match_without_word_overlap(self) -> None:
         # Real production case: PriceCharting's "Roof Bricks #445" collides
         # on set number with Rebrickable's unrelated "Police Units" --
         # matching on number alone would show a completely wrong photo.
@@ -834,24 +1138,24 @@ class LegoImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("roof bricks lego", limit=10)
+        response = service.detail("111")
 
-        self.assertIsNone(response.results[0].imageUrl)
+        self.assertIsNone(response.result.imageUrl)
 
-    def test_search_skips_non_lego_set(self) -> None:
+    def test_detail_skips_non_lego_set(self) -> None:
         lego_requests: list[httpx.Request] = []
 
         def pc_handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if "rebrickable_lego_catalog" in url:
                 lego_requests.append(request)
-            if "search_kicksdb_catalog" in url:
-                return httpx.Response(200, json=[])
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
             if "tcgplayer_pokemon_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "search_pricecharting_catalog" in url:
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
                     200,
                     json=[
@@ -873,9 +1177,9 @@ class LegoImageEnrichmentTest(unittest.TestCase):
             client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
         )
 
-        response = service.search("some game", limit=10)
+        response = service.detail("999")
 
-        self.assertIsNone(response.results[0].imageUrl)
+        self.assertIsNone(response.result.imageUrl)
         self.assertEqual(len(lego_requests), 0)
 
 
@@ -894,13 +1198,14 @@ class MagicImageEnrichmentTest(unittest.TestCase):
     # scryfall_magic_catalog (imported from Scryfall's free bulk export --
     # see scripts/import_scryfall_magic_catalog.py) is our own Supabase
     # table, so this routes through the same `client` mock as every other
-    # lookup, keyed off the request path/params.
+    # lookup, keyed off the request path/params. This enrichment only runs
+    # in detail() now, so the row fetch goes through _fetch_catalog_row's
+    # GET /rest/v1/pricecharting_catalog?pricecharting_id=eq.<id> shape,
+    # not the search_pricecharting_catalog RPC.
 
     def _handler(self, *, search_row: dict, number_rows: dict, name_rows: dict):
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "search_kicksdb_catalog" in url:
-                return httpx.Response(200, json=[])
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
             if "tcgplayer_pokemon_catalog" in url:
@@ -917,15 +1222,15 @@ class MagicImageEnrichmentTest(unittest.TestCase):
                     name = params.get("normalized_name", "").removeprefix("eq.")
                     return httpx.Response(200, json=name_rows.get((set_name, name), []))
                 return httpx.Response(200, json=[])
-            if "search_pricecharting_catalog" in url:
-                return httpx.Response(200, json=[search_row])
-            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+            if "pricecharting_catalog_history" in url:
                 return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(200, json=[search_row])
             return httpx.Response(200, json=[])
 
         return handler
 
-    def test_search_matches_by_collector_number(self) -> None:
+    def test_detail_matches_by_collector_number(self) -> None:
         # Real production case: Scryfall's Gilded Showcase print of this
         # card has collector_number "365", matching PriceCharting's own
         # numbering exactly.
@@ -953,13 +1258,13 @@ class MagicImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("cabaretti charm gilded", limit=10)
+        response = service.detail("3773958")
 
         self.assertEqual(
-            response.results[0].imageUrl, "https://cards.scryfall.io/normal/gilded-charm.jpg"
+            response.result.imageUrl, "https://cards.scryfall.io/normal/gilded-charm.jpg"
         )
 
-    def test_search_falls_back_to_name_when_no_number(self) -> None:
+    def test_detail_falls_back_to_name_when_no_number(self) -> None:
         search_row = {
             "pricecharting_id": "2244134",
             "product_name": "Angel of Mercy",
@@ -984,13 +1289,13 @@ class MagicImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("angel of mercy", limit=10)
+        response = service.detail("2244134")
 
         self.assertEqual(
-            response.results[0].imageUrl, "https://cards.scryfall.io/normal/angel-of-mercy.jpg"
+            response.result.imageUrl, "https://cards.scryfall.io/normal/angel-of-mercy.jpg"
         )
 
-    def test_search_suppresses_ambiguous_name_match(self) -> None:
+    def test_detail_suppresses_ambiguous_name_match(self) -> None:
         # More than one row for the same set+name (e.g. a reprinted basic
         # land with no distinguishing number) is never guessed at.
         search_row = {
@@ -1018,26 +1323,26 @@ class MagicImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("forest", limit=10)
+        response = service.detail("1")
 
-        self.assertIsNone(response.results[0].imageUrl)
+        self.assertIsNone(response.result.imageUrl)
 
-    def test_search_skips_non_magic_set(self) -> None:
+    def test_detail_skips_non_magic_set(self) -> None:
         magic_requests: list[httpx.Request] = []
 
         def pc_handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if "scryfall_magic_catalog" in url:
                 magic_requests.append(request)
-            if "search_kicksdb_catalog" in url:
-                return httpx.Response(200, json=[])
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
             if "tcgplayer_pokemon_catalog" in url:
                 return httpx.Response(200, json=[])
             if "rebrickable_lego_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "search_pricecharting_catalog" in url:
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
                     200,
                     json=[
@@ -1059,9 +1364,9 @@ class MagicImageEnrichmentTest(unittest.TestCase):
             client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
         )
 
-        response = service.search("some game", limit=10)
+        response = service.detail("999")
 
-        self.assertIsNone(response.results[0].imageUrl)
+        self.assertIsNone(response.result.imageUrl)
         self.assertEqual(len(magic_requests), 0)
 
 
@@ -1086,13 +1391,14 @@ class YugiohImageEnrichmentTest(unittest.TestCase):
     # -- see scripts/import_ygoprodeck_catalog.py and
     # scripts/import_tcgcsv_yugioh_catalog.py) is our own Supabase table,
     # so this routes through the same `client` mock as every other
-    # lookup, keyed off the request path/params.
+    # lookup, keyed off the request path/params. This enrichment only
+    # runs in detail() now, so the row fetch goes through
+    # _fetch_catalog_row's GET /rest/v1/pricecharting_catalog?pricecharting_id=eq.<id>
+    # shape, not the search_pricecharting_catalog RPC.
 
     def _handler(self, *, search_row: dict, code_rows: dict):
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "search_kicksdb_catalog" in url:
-                return httpx.Response(200, json=[])
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
             if "tcgplayer_pokemon_catalog" in url:
@@ -1104,15 +1410,15 @@ class YugiohImageEnrichmentTest(unittest.TestCase):
             if "yugioh_catalog" in url:
                 code = request.url.params.get("set_code", "").removeprefix("eq.")
                 return httpx.Response(200, json=code_rows.get(code, []))
-            if "search_pricecharting_catalog" in url:
-                return httpx.Response(200, json=[search_row])
-            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+            if "pricecharting_catalog_history" in url:
                 return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(200, json=[search_row])
             return httpx.Response(200, json=[])
 
         return handler
 
-    def test_search_matches_by_set_code(self) -> None:
+    def test_detail_matches_by_set_code(self) -> None:
         search_row = {
             "pricecharting_id": "1",
             "product_name": "Where Arf Thou? SD40-JP033",
@@ -1135,14 +1441,14 @@ class YugiohImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("where arf thou", limit=10)
+        response = service.detail("1")
 
         self.assertEqual(
-            response.results[0].imageUrl,
+            response.result.imageUrl,
             "https://images.ygoprodeck.com/images/cards/12345.jpg",
         )
 
-    def test_search_skips_row_without_set_code(self) -> None:
+    def test_detail_skips_row_without_set_code(self) -> None:
         search_row = {
             "pricecharting_id": "2",
             "product_name": "Booster Pack",
@@ -1160,19 +1466,17 @@ class YugiohImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("booster pack", limit=10)
+        response = service.detail("2")
 
-        self.assertIsNone(response.results[0].imageUrl)
+        self.assertIsNone(response.result.imageUrl)
 
-    def test_search_skips_non_yugioh_set(self) -> None:
+    def test_detail_skips_non_yugioh_set(self) -> None:
         yugioh_requests: list[httpx.Request] = []
 
         def pc_handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if "yugioh_catalog" in url:
                 yugioh_requests.append(request)
-            if "search_kicksdb_catalog" in url:
-                return httpx.Response(200, json=[])
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
             if "tcgplayer_pokemon_catalog" in url:
@@ -1181,7 +1485,9 @@ class YugiohImageEnrichmentTest(unittest.TestCase):
                 return httpx.Response(200, json=[])
             if "scryfall_magic_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "search_pricecharting_catalog" in url:
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
                     200,
                     json=[
@@ -1203,9 +1509,9 @@ class YugiohImageEnrichmentTest(unittest.TestCase):
             client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
         )
 
-        response = service.search("some game", limit=10)
+        response = service.detail("999")
 
-        self.assertIsNone(response.results[0].imageUrl)
+        self.assertIsNone(response.result.imageUrl)
         self.assertEqual(len(yugioh_requests), 0)
 
 
@@ -1227,13 +1533,14 @@ class LorcanaImageEnrichmentTest(unittest.TestCase):
     # fallback -- see scripts/import_lorcana_api_catalog.py and
     # scripts/import_lorcast_catalog.py) is our own Supabase table, so
     # this routes through the same `client` mock as every other lookup,
-    # keyed off the request path/params.
+    # keyed off the request path/params. This enrichment only runs in
+    # detail() now, so the row fetch goes through _fetch_catalog_row's
+    # GET /rest/v1/pricecharting_catalog?pricecharting_id=eq.<id> shape,
+    # not the search_pricecharting_catalog RPC.
 
     def _handler(self, *, search_row: dict, catalog_rows: dict):
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "search_kicksdb_catalog" in url:
-                return httpx.Response(200, json=[])
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
             if "tcgplayer_pokemon_catalog" in url:
@@ -1249,15 +1556,15 @@ class LorcanaImageEnrichmentTest(unittest.TestCase):
                 set_name = params.get("normalized_set_name", "").removeprefix("eq.")
                 number = params.get("card_number", "").removeprefix("eq.")
                 return httpx.Response(200, json=catalog_rows.get((set_name, number), []))
-            if "search_pricecharting_catalog" in url:
-                return httpx.Response(200, json=[search_row])
-            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+            if "pricecharting_catalog_history" in url:
                 return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(200, json=[search_row])
             return httpx.Response(200, json=[])
 
         return handler
 
-    def test_search_matches_by_set_and_number(self) -> None:
+    def test_detail_matches_by_set_and_number(self) -> None:
         search_row = {
             "pricecharting_id": "1",
             "product_name": "Ink Geyser [Foil] #119",
@@ -1282,14 +1589,14 @@ class LorcanaImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("ink geyser", limit=10)
+        response = service.detail("1")
 
         self.assertEqual(
-            response.results[0].imageUrl,
+            response.result.imageUrl,
             "https://cards.lorcast.io/card/digital/normal/ink-geyser.avif",
         )
 
-    def test_search_normalizes_punctuation_in_set_name(self) -> None:
+    def test_detail_normalizes_punctuation_in_set_name(self) -> None:
         # Real production case: PriceCharting's "Lorcana Attack of the
         # Vine" vs Lorcast/lorcana-api.com's "Attack of the Vine!" --
         # must still match after normalization strips the "!".
@@ -1317,22 +1624,20 @@ class LorcanaImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("broken pod", limit=10)
+        response = service.detail("2")
 
         self.assertEqual(
-            response.results[0].imageUrl,
+            response.result.imageUrl,
             "https://api.lorcana.ravensburger.com/images/en/set13/70.jpg",
         )
 
-    def test_search_skips_non_lorcana_set(self) -> None:
+    def test_detail_skips_non_lorcana_set(self) -> None:
         lorcana_requests: list[httpx.Request] = []
 
         def pc_handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if "lorcana_catalog" in url:
                 lorcana_requests.append(request)
-            if "search_kicksdb_catalog" in url:
-                return httpx.Response(200, json=[])
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
             if "tcgplayer_pokemon_catalog" in url:
@@ -1343,7 +1648,9 @@ class LorcanaImageEnrichmentTest(unittest.TestCase):
                 return httpx.Response(200, json=[])
             if "yugioh_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "search_pricecharting_catalog" in url:
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
                     200,
                     json=[
@@ -1365,11 +1672,10 @@ class LorcanaImageEnrichmentTest(unittest.TestCase):
             client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
         )
 
-        response = service.search("some game", limit=10)
+        response = service.detail("999")
 
-        self.assertIsNone(response.results[0].imageUrl)
+        self.assertIsNone(response.result.imageUrl)
         self.assertEqual(len(lorcana_requests), 0)
-
 
 class LorcanaSetNameTest(unittest.TestCase):
     def test_strips_lorcana_prefix(self) -> None:
@@ -1385,13 +1691,14 @@ class OnePieceImageEnrichmentTest(unittest.TestCase):
     # one_piece_catalog (imported from optcgapi.com -- see
     # scripts/import_onepiece_catalog.py) is our own Supabase table, so
     # this routes through the same `client` mock as every other lookup,
-    # keyed off the request path/params.
+    # keyed off the request path/params. This enrichment only runs in
+    # detail() now, so the row fetch goes through _fetch_catalog_row's
+    # GET /rest/v1/pricecharting_catalog?pricecharting_id=eq.<id> shape,
+    # not the search_pricecharting_catalog RPC.
 
     def _handler(self, *, search_row: dict, code_rows: dict):
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "search_kicksdb_catalog" in url:
-                return httpx.Response(200, json=[])
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
             if "tcgplayer_pokemon_catalog" in url:
@@ -1407,15 +1714,15 @@ class OnePieceImageEnrichmentTest(unittest.TestCase):
             if "one_piece_catalog" in url:
                 code = request.url.params.get("card_set_id", "").removeprefix("eq.")
                 return httpx.Response(200, json=code_rows.get(code, []))
-            if "search_pricecharting_catalog" in url:
-                return httpx.Response(200, json=[search_row])
-            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+            if "pricecharting_catalog_history" in url:
                 return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(200, json=[search_row])
             return httpx.Response(200, json=[])
 
         return handler
 
-    def test_search_matches_unambiguous_plain_row(self) -> None:
+    def test_detail_matches_unambiguous_plain_row(self) -> None:
         search_row = {
             "pricecharting_id": "1",
             "product_name": "Captain John OP07-082",
@@ -1444,14 +1751,14 @@ class OnePieceImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("captain john", limit=10)
+        response = service.detail("1")
 
         self.assertEqual(
-            response.results[0].imageUrl,
+            response.result.imageUrl,
             "https://optcgapi.com/media/static/Card_Images/OP07-082.jpg",
         )
 
-    def test_search_suppresses_plain_row_when_multiple_plain_entries_exist(self) -> None:
+    def test_detail_suppresses_plain_row_when_multiple_plain_entries_exist(self) -> None:
         # Real production case: optcgapi.com's own data has cards with
         # TWO identical, indistinguishable "plain" entries for the same
         # code (e.g. real "Izo" OP01-033 -- an unlabeled reprint sharing
@@ -1490,11 +1797,11 @@ class OnePieceImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("izo", limit=10)
+        response = service.detail("2")
 
-        self.assertIsNone(response.results[0].imageUrl)
+        self.assertIsNone(response.result.imageUrl)
 
-    def test_search_matches_exact_variant_by_word_subset(self) -> None:
+    def test_detail_matches_exact_variant_by_word_subset(self) -> None:
         search_row = {
             "pricecharting_id": "3",
             "product_name": "Perona [Box Topper] OP01-077",
@@ -1528,14 +1835,14 @@ class OnePieceImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("perona box topper", limit=10)
+        response = service.detail("3")
 
         self.assertEqual(
-            response.results[0].imageUrl,
+            response.result.imageUrl,
             "https://optcgapi.com/media/static/Card_Images/OP01-077_p1.jpg",
         )
 
-    def test_search_does_not_cross_match_similarly_named_variants(self) -> None:
+    def test_detail_does_not_cross_match_similarly_named_variants(self) -> None:
         # Real production bug, caught live: "[Championship 2024 Top
         # Player]" and "[Championship 2024 Finalist]" share the words
         # "championship"/"2024" -- an earlier "any word in common"
@@ -1582,22 +1889,20 @@ class OnePieceImageEnrichmentTest(unittest.TestCase):
             ),
         )
 
-        response = service.search("perona top player", limit=10)
+        response = service.detail("4")
 
         self.assertEqual(
-            response.results[0].imageUrl,
+            response.result.imageUrl,
             "https://optcgapi.com/media/static/Card_Images/top_player.jpg",
         )
 
-    def test_search_skips_non_onepiece_set(self) -> None:
+    def test_detail_skips_non_onepiece_set(self) -> None:
         onepiece_requests: list[httpx.Request] = []
 
         def pc_handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if "one_piece_catalog" in url:
                 onepiece_requests.append(request)
-            if "search_kicksdb_catalog" in url:
-                return httpx.Response(200, json=[])
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
             if "tcgplayer_pokemon_catalog" in url:
@@ -1610,7 +1915,9 @@ class OnePieceImageEnrichmentTest(unittest.TestCase):
                 return httpx.Response(200, json=[])
             if "lorcana_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "search_pricecharting_catalog" in url:
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
                     200,
                     json=[
@@ -1632,9 +1939,9 @@ class OnePieceImageEnrichmentTest(unittest.TestCase):
             client=httpx.Client(transport=httpx.MockTransport(pc_handler)),
         )
 
-        response = service.search("some game", limit=10)
+        response = service.detail("999")
 
-        self.assertIsNone(response.results[0].imageUrl)
+        self.assertIsNone(response.result.imageUrl)
         self.assertEqual(len(onepiece_requests), 0)
 
 
