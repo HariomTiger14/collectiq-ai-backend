@@ -2037,10 +2037,8 @@ class CatalogSearchEndpointTest(unittest.TestCase):
 
 
 class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
-    def _build_handler(self, *, rawg_json: dict | None = None):
-        cache_store: dict[str, dict] = {}
-        rawg_requests: list[httpx.Request] = []
-        cache_writes: list[dict] = []
+    def _build_handler(self, *, catalog_rows: list[dict] | None = None):
+        catalog_requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
@@ -2062,26 +2060,12 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
                 )
             if "catalog_image_source_flags" in url:
                 return httpx.Response(200, json=[])
-            if "rawg_video_game_cache" in url and request.method == "GET":
-                query = dict(request.url.params)
-                lookup_key = query.get("lookup_key", "").removeprefix("eq.")
-                cached = cache_store.get(lookup_key)
-                return httpx.Response(200, json=[cached] if cached else [])
-            if "rawg_video_game_cache" in url and request.method == "POST":
-                payload = json.loads(request.content)
-                cache_writes.append(payload)
-                cache_store[payload["lookup_key"]] = {
-                    "matched": payload["matched"],
-                    "image_url": payload["image_url"],
-                    "rawg_slug": payload["rawg_slug"],
-                }
-                return httpx.Response(201, json=[payload])
-            if "api.rawg.io" in url:
-                rawg_requests.append(request)
-                return httpx.Response(200, json=rawg_json or {"results": []})
+            if "rawg_video_game_catalog" in url:
+                catalog_requests.append(request)
+                return httpx.Response(200, json=catalog_rows or [])
             return httpx.Response(200, json=[])
 
-        return handler, rawg_requests, cache_writes
+        return handler, catalog_requests
 
     def _build_service(self, handler) -> CatalogSearchService:
         return CatalogSearchService(
@@ -2090,100 +2074,45 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
             client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
 
-    def test_detail_enriches_video_game_with_rawg_image(self) -> None:
-        handler, rawg_requests, cache_writes = self._build_handler(
-            rawg_json={
-                "results": [
-                    {
-                        "name": "Super Mario 64",
-                        "background_image": "https://img.example/mario64.jpg",
-                        "slug": "super-mario-64",
-                        "platforms": [{"platform": {"name": "Nintendo 64"}}],
-                    },
-                    {
-                        "name": "Super Mario 64 DS",
-                        "background_image": "https://img.example/mario64ds.jpg",
-                        "slug": "super-mario-64-ds",
-                        "platforms": [{"platform": {"name": "Nintendo DS"}}],
-                    },
-                ]
-            }
+    def test_detail_enriches_video_game_with_confirmed_single_match(self) -> None:
+        handler, catalog_requests = self._build_handler(
+            catalog_rows=[{"image_url": "https://img.example/mario64.jpg"}]
         )
-        with patch(
-            "app.services.pricing.catalog_search_service.settings"
-        ) as settings_mock:
-            settings_mock.rawg_api_key = "test-rawg-key"
-            settings_mock.rawg_api_base = "https://api.rawg.io/api"
-            service = self._build_service(handler)
-            response = service.detail("555")
+        service = self._build_service(handler)
+
+        response = service.detail("555")
 
         self.assertEqual(response.result.imageUrl, "https://img.example/mario64.jpg")
-        self.assertEqual(len(rawg_requests), 1)
-        self.assertEqual(len(cache_writes), 1)
-        self.assertTrue(cache_writes[0]["matched"])
+        self.assertEqual(len(catalog_requests), 1)
+        query = dict(catalog_requests[0].url.params)
+        self.assertEqual(query.get("normalized_name"), "eq.super mario 64")
+        self.assertEqual(query.get("rawg_platform"), "eq.Nintendo 64")
 
-    def test_detail_video_game_cache_hit_does_not_recall_rawg(self) -> None:
-        handler, rawg_requests, cache_writes = self._build_handler(
-            rawg_json={
-                "results": [
-                    {
-                        "name": "Super Mario 64",
-                        "background_image": "https://img.example/mario64.jpg",
-                        "slug": "super-mario-64",
-                        "platforms": [{"platform": {"name": "Nintendo 64"}}],
-                    },
-                ]
-            }
-        )
-        with patch(
-            "app.services.pricing.catalog_search_service.settings"
-        ) as settings_mock:
-            settings_mock.rawg_api_key = "test-rawg-key"
-            settings_mock.rawg_api_base = "https://api.rawg.io/api"
-            service = self._build_service(handler)
+    def test_detail_suppresses_when_no_match(self) -> None:
+        handler, catalog_requests = self._build_handler(catalog_rows=[])
+        service = self._build_service(handler)
 
-            first = service.detail("555")
-            second = service.detail("555")
-
-        self.assertEqual(first.result.imageUrl, "https://img.example/mario64.jpg")
-        self.assertEqual(second.result.imageUrl, "https://img.example/mario64.jpg")
-        self.assertEqual(len(rawg_requests), 1)
-        self.assertEqual(len(cache_writes), 1)
-
-    def test_detail_suppresses_ambiguous_rawg_matches(self) -> None:
-        handler, rawg_requests, cache_writes = self._build_handler(
-            rawg_json={
-                "results": [
-                    {
-                        "name": "Super Mario 64",
-                        "background_image": "https://img.example/mario64-a.jpg",
-                        "slug": "super-mario-64-a",
-                        "platforms": [{"platform": {"name": "Nintendo 64"}}],
-                    },
-                    {
-                        "name": "Super Mario 64",
-                        "background_image": "https://img.example/mario64-b.jpg",
-                        "slug": "super-mario-64-b",
-                        "platforms": [{"platform": {"name": "Nintendo 64"}}],
-                    },
-                ]
-            }
-        )
-        with patch(
-            "app.services.pricing.catalog_search_service.settings"
-        ) as settings_mock:
-            settings_mock.rawg_api_key = "test-rawg-key"
-            settings_mock.rawg_api_base = "https://api.rawg.io/api"
-            service = self._build_service(handler)
-            response = service.detail("555")
+        response = service.detail("555")
 
         self.assertIsNone(response.result.imageUrl)
-        self.assertEqual(len(rawg_requests), 1)
-        self.assertEqual(len(cache_writes), 1)
-        self.assertFalse(cache_writes[0]["matched"])
+        self.assertEqual(len(catalog_requests), 1)
+
+    def test_detail_suppresses_ambiguous_matches(self) -> None:
+        handler, catalog_requests = self._build_handler(
+            catalog_rows=[
+                {"image_url": "https://img.example/mario64-a.jpg"},
+                {"image_url": "https://img.example/mario64-b.jpg"},
+            ]
+        )
+        service = self._build_service(handler)
+
+        response = service.detail("555")
+
+        self.assertIsNone(response.result.imageUrl)
+        self.assertEqual(len(catalog_requests), 1)
 
     def test_detail_skips_unmapped_video_game_platform(self) -> None:
-        rawg_requests: list[httpx.Request] = []
+        catalog_requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
@@ -2205,41 +2134,56 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
                 )
             if "catalog_image_source_flags" in url:
                 return httpx.Response(200, json=[])
-            if "api.rawg.io" in url:
-                rawg_requests.append(request)
-                return httpx.Response(200, json={"results": []})
+            if "rawg_video_game_catalog" in url:
+                catalog_requests.append(request)
+                return httpx.Response(200, json=[])
             return httpx.Response(200, json=[])
 
-        with patch(
-            "app.services.pricing.catalog_search_service.settings"
-        ) as settings_mock:
-            settings_mock.rawg_api_key = "test-rawg-key"
-            settings_mock.rawg_api_base = "https://api.rawg.io/api"
-            service = self._build_service(handler)
-            response = service.detail("556")
+        service = self._build_service(handler)
+
+        response = service.detail("556")
 
         self.assertIsNone(response.result.imageUrl)
-        self.assertEqual(len(rawg_requests), 0)
+        self.assertEqual(len(catalog_requests), 0)
 
-    def test_detail_negative_cache_does_not_recall_rawg(self) -> None:
-        handler, rawg_requests, cache_writes = self._build_handler(
-            rawg_json={"results": []}
-        )
-        with patch(
-            "app.services.pricing.catalog_search_service.settings"
-        ) as settings_mock:
-            settings_mock.rawg_api_key = "test-rawg-key"
-            settings_mock.rawg_api_base = "https://api.rawg.io/api"
-            service = self._build_service(handler)
+    def test_detail_strips_bracket_tag_before_lookup(self) -> None:
+        catalog_requests: list[httpx.Request] = []
 
-            first = service.detail("555")
-            second = service.detail("555")
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "557",
+                            "product_name": "Super Mario 64 [Collector's Edition]",
+                            "console_name": "Nintendo 64",
+                            "category": "Nintendo 64",
+                            "loose_price_cents": 3000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "rawg_video_game_catalog" in url:
+                catalog_requests.append(request)
+                return httpx.Response(
+                    200, json=[{"image_url": "https://img.example/mario64.jpg"}]
+                )
+            return httpx.Response(200, json=[])
 
-        self.assertIsNone(first.result.imageUrl)
-        self.assertIsNone(second.result.imageUrl)
-        self.assertEqual(len(rawg_requests), 1)
-        self.assertEqual(len(cache_writes), 1)
-        self.assertFalse(cache_writes[0]["matched"])
+        service = self._build_service(handler)
+
+        response = service.detail("557")
+
+        self.assertEqual(response.result.imageUrl, "https://img.example/mario64.jpg")
+        self.assertEqual(len(catalog_requests), 1)
+        query = dict(catalog_requests[0].url.params)
+        self.assertEqual(query.get("normalized_name"), "eq.super mario 64")
 
 
 if __name__ == "__main__":
