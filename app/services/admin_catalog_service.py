@@ -25,6 +25,7 @@ from app.services.pricing.catalog_search_service import (
     _pokemon_card_number,
     _pokemon_variant_token,
     _video_game_base_title,
+    _video_game_like_escape,
     _video_game_normalize_name,
     _video_game_rawg_platform,
     _video_game_resolve_normalized_name,
@@ -396,6 +397,16 @@ class AdminCatalogService:
             return items
         pairs = sorted({(normalized_name, rawg_platform) for _, normalized_name, rawg_platform in targets})
         images_by_pair = self._repository.fetch_video_game_images(pairs)
+        # Prefix fallback for whatever exact match missed -- mirrors
+        # CatalogSearchService._fetch_video_game_image_by_prefix (see its
+        # comment for why: RAWG's own title is usually just longer than
+        # PriceCharting's, not a different game, and this is index-backed
+        # via rawg_video_game_catalog_lookup_idx, not a repeat of the
+        # unindexed console_name filter that had to be reverted elsewhere
+        # in this file).
+        unmatched_pairs = [pair for pair in pairs if pair not in images_by_pair]
+        if unmatched_pairs:
+            images_by_pair.update(self._repository.fetch_video_game_images_by_prefix(unmatched_pairs))
         for index, normalized_name, rawg_platform in targets:
             image_url = images_by_pair.get((normalized_name, rawg_platform))
             if image_url:
@@ -740,6 +751,55 @@ class SupabaseAdminCatalogRepository:
             if image_url:
                 images[key] = str(image_url)
         return {key: url for key, url in images.items() if counts.get(key) == 1}
+
+    def fetch_video_game_images_by_prefix(
+        self, pairs: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], str]:
+        # Prefix fallback for whatever fetch_video_game_images's exact
+        # match missed -- mirrors CatalogSearchService.
+        # _fetch_video_game_image_by_prefix (see its comment for why: RAWG's
+        # own title is usually just longer than PriceCharting's, not a
+        # different game -- a trailing "!"/"DX"/edition suffix, or a
+        # subtitle PriceCharting's listing omits). Index-backed via
+        # rawg_video_game_catalog_lookup_idx (normalized_name, rawg_platform),
+        # not the unindexed console_name filter that had to be reverted
+        # elsewhere in this file.
+        #
+        # One OR-filtered LIKE request across every unmatched pair, same
+        # shape as fetch_video_game_images's exact-match batch -- but since
+        # a LIKE prefix match doesn't return which literal search key it
+        # satisfied the way an eq match does, matching returned rows back
+        # to search keys (and counting real ambiguity per key, not just per
+        # returned row) happens locally below.
+        unique_pairs = sorted(set(pairs))
+        if not unique_pairs:
+            return {}
+        or_filter = ",".join(
+            f'and(normalized_name.like."{_video_game_like_escape(name)}*",rawg_platform.eq."{platform}")'
+            for name, platform in unique_pairs
+        )
+        payload = self._request(
+            "GET",
+            "/rest/v1/rawg_video_game_catalog",
+            params={
+                "select": "normalized_name,rawg_platform,image_url",
+                "or": f"({or_filter})",
+            },
+        )
+        rows = [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
+        images: dict[tuple[str, str], str] = {}
+        for name, platform in unique_pairs:
+            matches = [
+                row
+                for row in rows
+                if str(row.get("rawg_platform") or "") == platform
+                and str(row.get("normalized_name") or "").startswith(name)
+            ]
+            if len(matches) == 1:
+                image_url = matches[0].get("image_url")
+                if image_url:
+                    images[(name, platform)] = str(image_url)
+        return images
 
     def fetch_lorcana_images(self, normalized_set_name: str, numbers: list[str]) -> dict[str, str]:
         # One batched request per distinct Lorcana set on the page -- see

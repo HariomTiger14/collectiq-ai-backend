@@ -2095,7 +2095,11 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
         response = service.detail("555")
 
         self.assertIsNone(response.result.imageUrl)
-        self.assertEqual(len(catalog_requests), 1)
+        # Exact match (0 rows) falls through to the prefix fallback
+        # (_fetch_video_game_image_by_prefix) -- also 0 rows here since the
+        # mock handler serves the same empty fixture regardless of query,
+        # so still correctly suppressed, just via 2 requests now.
+        self.assertEqual(len(catalog_requests), 2)
 
     def test_detail_suppresses_ambiguous_matches(self) -> None:
         handler, catalog_requests = self._build_handler(
@@ -2109,7 +2113,109 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
         response = service.detail("555")
 
         self.assertIsNone(response.result.imageUrl)
-        self.assertEqual(len(catalog_requests), 1)
+        # Exact match (2 ambiguous rows) falls through to the prefix
+        # fallback, which the mock handler also serves the same 2 rows for
+        # -- still ambiguous, still correctly suppressed, just via 2
+        # requests now.
+        self.assertEqual(len(catalog_requests), 2)
+
+    def test_detail_enriches_via_prefix_fallback_when_rawg_title_is_longer(self) -> None:
+        # "Brothers" (PriceCharting) -> "Brothers: A Tale of Two Sons"
+        # (RAWG) -- the far more common real-world gap than a franchise
+        # reboot sharing an identical title: RAWG's title is simply longer.
+        # The exact eq. request finds nothing; the like. prefix request
+        # finds exactly one row and is used.
+        catalog_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "557",
+                            "product_name": "Brothers",
+                            "console_name": "Playstation 4",
+                            "category": "Adventure",
+                            "loose_price_cents": 1500,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "rawg_video_game_catalog" in url:
+                catalog_requests.append(request)
+                query = dict(request.url.params)
+                if query.get("normalized_name", "").startswith("like."):
+                    return httpx.Response(
+                        200,
+                        json=[{"image_url": "https://img.example/brothers.jpg"}],
+                    )
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        service = self._build_service(handler)
+
+        response = service.detail("557")
+
+        self.assertEqual(response.result.imageUrl, "https://img.example/brothers.jpg")
+        self.assertEqual(len(catalog_requests), 2)
+        exact_query = dict(catalog_requests[0].url.params)
+        self.assertEqual(exact_query.get("normalized_name"), "eq.brothers")
+        prefix_query = dict(catalog_requests[1].url.params)
+        self.assertEqual(prefix_query.get("normalized_name"), "like.brothers*")
+        self.assertEqual(prefix_query.get("rawg_platform"), "eq.PlayStation 4")
+
+    def test_detail_prefix_fallback_suppresses_multiple_candidates(self) -> None:
+        # "Doom" prefix-matches DOOM (2016), DOOM Eternal, Doom 3, etc. --
+        # genuinely different games, not just a longer spelling of the same
+        # one, so this must stay suppressed rather than guess.
+        catalog_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "558",
+                            "product_name": "Doom",
+                            "console_name": "Playstation 4",
+                            "category": "FPS",
+                            "loose_price_cents": 1200,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "rawg_video_game_catalog" in url:
+                catalog_requests.append(request)
+                query = dict(request.url.params)
+                if query.get("normalized_name", "").startswith("like."):
+                    return httpx.Response(
+                        200,
+                        json=[
+                            {"image_url": "https://img.example/doom-2016.jpg"},
+                            {"image_url": "https://img.example/doom-eternal.jpg"},
+                        ],
+                    )
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        service = self._build_service(handler)
+
+        response = service.detail("558")
+
+        self.assertIsNone(response.result.imageUrl)
+        self.assertEqual(len(catalog_requests), 2)
 
     def test_detail_skips_unmapped_video_game_platform(self) -> None:
         catalog_requests: list[httpx.Request] = []
