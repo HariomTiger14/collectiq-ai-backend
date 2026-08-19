@@ -811,10 +811,62 @@ class CatalogSearchService:
             "limit": "2",
         }
         payload = self._request("GET", "/rest/v1/rawg_video_game_catalog", params=params)
-        if not isinstance(payload, list) or len(payload) != 1:
+        if isinstance(payload, list) and len(payload) == 1:
+            row = payload[0]
+            image_url = row.get("image_url") if isinstance(row, dict) else None
+            return str(image_url) if image_url else None
+        return self._fetch_video_game_image_by_loose_match(normalized_name, rawg_platform)
+
+    def _fetch_video_game_image_by_loose_match(
+        self, normalized_name: str, rawg_platform: str
+    ) -> str | None:
+        # Fallback for the gap neither exact nor prefix matching can catch:
+        # a punctuation difference in the MIDDLE of the title, not just a
+        # trailing suffix. Live-confirmed real case: PriceCharting's
+        # "Uncharted 4 A Thief's End" (straight apostrophe, no colon) vs.
+        # RAWG's "Uncharted 4: A Thief's End" (curly apostrophe, colon
+        # after the number) -- the colon alone breaks a leading-prefix
+        # match immediately after "Uncharted 4", regardless of the
+        # apostrophe difference.
+        #
+        # Can't be a SQL-side filter without a new stripped-punctuation
+        # column (normalized_name still has the original punctuation) --
+        # so this fetches a small, cheap, still index-backed candidate set
+        # (a leading-prefix match on just the title's FIRST word, e.g.
+        # "uncharted", confirmed live to return single digits of rows per
+        # platform even for a common word) and does the real comparison
+        # locally: both sides stripped to bare alphanumerics before
+        # comparing, so "Uncharted 4: A Thief's End" (curly ’) and
+        # "Uncharted 4 A Thief's End" (straight ') both reduce to
+        # "uncharted 4 a thiefs end" and match. Same uniqueness
+        # requirement as every other tier -- a shared first word among
+        # genuinely different games (e.g. "Doom" -> DOOM 2016 / Eternal /
+        # 3 / II) will never loosely-equal each other once compared, so
+        # this can't accidentally resolve an ambiguous title.
+        first_word = normalized_name.split(" ", 1)[0] if normalized_name else ""
+        if not first_word:
             return None
-        row = payload[0]
-        image_url = row.get("image_url") if isinstance(row, dict) else None
+        stripped_target = _video_game_strip_punctuation(normalized_name)
+        if not stripped_target:
+            return None
+        params = {
+            "select": "normalized_name,image_url",
+            "normalized_name": f"like.{_video_game_like_escape(first_word)}*",
+            "rawg_platform": f"eq.{rawg_platform}",
+            "limit": "50",
+        }
+        payload = self._request("GET", "/rest/v1/rawg_video_game_catalog", params=params)
+        if not isinstance(payload, list):
+            return None
+        matches = [
+            row
+            for row in payload
+            if isinstance(row, dict)
+            and _video_game_strip_punctuation(str(row.get("normalized_name") or "")) == stripped_target
+        ]
+        if len(matches) != 1:
+            return None
+        image_url = matches[0].get("image_url")
         return str(image_url) if image_url else None
 
     def _fetch_funko_image(self, product_title: str) -> str | None:
@@ -1381,6 +1433,21 @@ def _video_game_like_escape(normalized_name: str) -> str:
     # backslash itself must be escaped first, or escaping "%"/"_" after
     # would double-escape their own inserted backslashes.
     return normalized_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+_VIDEO_GAME_NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]")
+
+
+def _video_game_strip_punctuation(normalized_name: str) -> str:
+    # For the loose-match fallback only (_fetch_video_game_image_by_
+    # loose_match) -- reduces a title to bare alphanumerics + single
+    # spaces, so colon-vs-no-colon and straight-vs-curly-apostrophe
+    # differences between PriceCharting's and RAWG's titles for the same
+    # game (e.g. "Uncharted 4 A Thief's End" vs "Uncharted 4: A Thief's
+    # End") stop mattering. Never used to build the actual SQL filter
+    # (normalized_name in the database still has real punctuation) --
+    # only for the local equality comparison against fetched candidates.
+    return _VIDEO_GAME_WHITESPACE_RE.sub(" ", _VIDEO_GAME_NON_ALNUM_RE.sub("", normalized_name)).strip()
 
 
 # RAWG disambiguates same-named franchise entries with a suffix RAWG itself
