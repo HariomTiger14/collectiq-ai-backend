@@ -761,6 +761,7 @@ class CatalogSearchService:
         normalized_name = _video_game_normalize_name(base_title)
         if not normalized_name:
             return result
+        normalized_name = _video_game_resolve_normalized_name(normalized_name, rawg_platform)
         image_url = self._fetch_video_game_image(normalized_name, rawg_platform)
         if image_url is None:
             return result
@@ -1336,6 +1337,31 @@ def _video_game_normalize_name(name: str) -> str:
     # match has to produce byte-identical output or nothing will ever
     # match.
     return _VIDEO_GAME_WHITESPACE_RE.sub(" ", name).strip().lower()
+
+
+# RAWG disambiguates same-named franchise entries with a suffix RAWG itself
+# chose (roman numeral, subtitle, or release year) -- e.g. the 2005 PS2
+# original is "God of War I" and the 2018 PS4 reboot is "God of War
+# (2018)", but PriceCharting's title for both is literally just "God of
+# War", with no disambiguator at all. An exact normalized-name match can
+# never bridge that gap on its own (nor should it guess -- picking the
+# wrong entry would hand the 2005 original's cover to the 2018 reboot's
+# listing or vice versa), so this is a small, hand-verified allowlist of
+# (product normalized_name, rawg_platform) -> RAWG's own normalized_name,
+# each confirmed live against rawg_video_game_catalog before being added.
+# Keyed by platform (not guessed some other way) because a console only
+# ever had one disc literally titled "God of War" with nothing else on
+# it -- PS2 only ever shipped the 2005 original that way, PS4 only ever
+# shipped the 2018 reboot that way, so the platform alone disambiguates
+# which real game a bare "God of War" listing on that console actually is.
+_VIDEO_GAME_TITLE_ALIASES: dict[tuple[str, str], str] = {
+    ("god of war", "PlayStation 2"): "god of war i",
+    ("god of war", "PlayStation 4"): "god of war (2018)",
+}
+
+
+def _video_game_resolve_normalized_name(normalized_name: str, rawg_platform: str) -> str:
+    return _VIDEO_GAME_TITLE_ALIASES.get((normalized_name, rawg_platform), normalized_name)
 
 
 
