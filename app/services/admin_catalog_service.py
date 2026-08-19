@@ -24,6 +24,9 @@ from app.services.pricing.catalog_search_service import (
     _normalize_variant_words,
     _pokemon_card_number,
     _pokemon_variant_token,
+    _video_game_base_title,
+    _video_game_normalize_name,
+    _video_game_rawg_platform,
     select_best_funko_image,
 )
 
@@ -80,6 +83,7 @@ class AdminCatalogService:
             items = self._enrich_yugioh_images(items)
             items = self._enrich_lorcana_images(items)
             items = self._enrich_onepiece_images(items)
+            items = self._enrich_videogames_images(items)
         return {
             "success": True,
             "source": normalized_source,
@@ -335,6 +339,42 @@ class AdminCatalogService:
                 image_url = matches[0].get("image_url")
                 if image_url:
                     items[index]["imageUrl"] = str(image_url)
+        return items
+
+    def _enrich_videogames_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mirrors CatalogSearchService._enrich_with_video_games_image --
+        # same rawg_video_game_catalog lookup, so the admin browse table
+        # shows the same images the mobile/public search does. Unlike
+        # every other category above, there's no "video games" keyword to
+        # gate on in setName/category (PriceCharting's video-games export
+        # has none) -- the gate here IS the platform mapping itself, same
+        # as the mobile/public path. Each item's (normalized_name,
+        # rawg_platform) pair is its own lookup key rather than a shared
+        # per-set key, so this batches across the whole page as one
+        # OR-filtered request instead of grouping by set the way the
+        # Magic/Lorcana/One Piece lookups above do.
+        targets: list[tuple[int, str, str]] = []
+        for index, item in enumerate(items):
+            if item.get("imageUrl") or not item.get("setName"):
+                continue
+            rawg_platform = _video_game_rawg_platform(str(item["setName"]))
+            if rawg_platform is None:
+                continue
+            base_title = _video_game_base_title(str(item.get("title") or ""))
+            if not base_title:
+                continue
+            normalized_name = _video_game_normalize_name(base_title)
+            if not normalized_name:
+                continue
+            targets.append((index, normalized_name, rawg_platform))
+        if not targets:
+            return items
+        pairs = sorted({(normalized_name, rawg_platform) for _, normalized_name, rawg_platform in targets})
+        images_by_pair = self._repository.fetch_video_game_images(pairs)
+        for index, normalized_name, rawg_platform in targets:
+            image_url = images_by_pair.get((normalized_name, rawg_platform))
+            if image_url:
+                items[index]["imageUrl"] = image_url
         return items
 
 
@@ -598,6 +638,45 @@ class SupabaseAdminCatalogRepository:
             if code and image_url:
                 images_by_code[code] = str(image_url)
         return images_by_code
+
+    def fetch_video_game_images(
+        self, pairs: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], str]:
+        # One batched OR-filtered request for every distinct
+        # (normalized_name, rawg_platform) pair on the page -- see
+        # AdminCatalogService._enrich_videogames_images. Same "exactly
+        # one row or suppress" discipline as CatalogSearchService.
+        # _fetch_video_game_image: RAWG can have more than one entry for
+        # the same normalized name + platform (remasters/re-releases),
+        # so ambiguous pairs are dropped rather than guessed.
+        unique_pairs = sorted(set(pairs))
+        if not unique_pairs:
+            return {}
+        or_filter = ",".join(
+            f'and(normalized_name.eq."{name}",rawg_platform.eq."{platform}")'
+            for name, platform in unique_pairs
+        )
+        payload = self._request(
+            "GET",
+            "/rest/v1/rawg_video_game_catalog",
+            params={
+                "select": "normalized_name,rawg_platform,image_url",
+                "or": f"({or_filter})",
+            },
+        )
+        if not isinstance(payload, list):
+            return {}
+        counts: dict[tuple[str, str], int] = {}
+        images: dict[tuple[str, str], str] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            key = (str(row.get("normalized_name") or ""), str(row.get("rawg_platform") or ""))
+            counts[key] = counts.get(key, 0) + 1
+            image_url = row.get("image_url")
+            if image_url:
+                images[key] = str(image_url)
+        return {key: url for key, url in images.items() if counts.get(key) == 1}
 
     def fetch_lorcana_images(self, normalized_set_name: str, numbers: list[str]) -> dict[str, str]:
         # One batched request per distinct Lorcana set on the page -- see
