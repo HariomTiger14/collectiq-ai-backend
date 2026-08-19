@@ -43,12 +43,14 @@ def list_catalog_items(
     categoryGroup: str | None = Query(default=None, min_length=1),
     minPrice: float | None = Query(default=None, ge=0),
     maxPrice: float | None = Query(default=None, ge=0),
+    q: str | None = Query(default=None, max_length=120),
     _admin: None = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     try:
         return AdminCatalogService().list_items(
             source=source, limit=limit, offset=offset,
             category=category, category_group=categoryGroup, min_price=minPrice, max_price=maxPrice,
+            query=q,
         )
     except AdminCatalogError as error:
         raise HTTPException(
