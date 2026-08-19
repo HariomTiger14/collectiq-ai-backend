@@ -27,6 +27,7 @@ from app.services.pricing.catalog_search_service import (
     _video_game_base_title,
     _video_game_normalize_name,
     _video_game_rawg_platform,
+    _video_game_resolve_normalized_name,
     select_best_funko_image,
 )
 
@@ -366,6 +367,7 @@ class AdminCatalogService:
             normalized_name = _video_game_normalize_name(base_title)
             if not normalized_name:
                 continue
+            normalized_name = _video_game_resolve_normalized_name(normalized_name, rawg_platform)
             targets.append((index, normalized_name, rawg_platform))
         if not targets:
             return items
