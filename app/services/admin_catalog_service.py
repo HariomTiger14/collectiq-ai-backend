@@ -85,9 +85,12 @@ class AdminCatalogService:
         # (see list_catalog_rows), so a query is only honored for
         # PriceCharting -- same "browse only" behavior the admin portal's
         # own KicksDB tab already enforces client-side.
+        has_more: bool | None = None
         if normalized_query and len(normalized_query) >= 2 and normalized_source == "pricecharting":
-            rows = self._repository.search_catalog_rows(normalized_query, limit=bounded_limit)
-            total_count = len(rows)
+            rows, has_more = self._repository.search_catalog_rows(
+                normalized_query, limit=bounded_limit, offset=max(0, offset)
+            )
+            total_count = None
         else:
             rows = self._repository.list_catalog_rows(
                 source=normalized_source, limit=bounded_limit, offset=max(0, offset),
@@ -112,6 +115,7 @@ class AdminCatalogService:
             "source": normalized_source,
             "count": len(rows),
             "totalCount": total_count,
+            "hasMore": has_more,
             "items": items,
         }
 
@@ -475,7 +479,9 @@ class SupabaseAdminCatalogRepository:
             raise AdminCatalogError("Supabase catalog response shape was invalid.")
         return [row for row in payload if isinstance(row, dict)]
 
-    def search_catalog_rows(self, query: str, *, limit: int) -> list[dict[str, Any]]:
+    def search_catalog_rows(
+        self, query: str, *, limit: int, offset: int = 0
+    ) -> tuple[list[dict[str, Any]], bool]:
         # Mirrors CatalogSearchService._fetch_rows -- same relevance-ranked
         # search_pricecharting_catalog RPC (filter + score + sort + limit
         # done in SQL, backed by the pg_trgm GIN indexes that RPC's own
@@ -483,14 +489,33 @@ class SupabaseAdminCatalogRepository:
         # the same rows the public/mobile search would, just run through
         # this service's own image enrichment afterward instead of the
         # public path's deliberate no-inline-images restriction.
+        #
+        # result_offset (20260819_add_offset_to_search_pricecharting_catalog
+        # .sql) lets this page through the full ranked result set instead
+        # of only ever returning the first page -- without it, a franchise
+        # with many editions/reprints ranking ahead of a specific title
+        # (e.g. "Uncharted 2" variants outranking "Uncharted 4") could push
+        # a real match past the fixed cutoff with no way to reach it.
+        #
+        # Fetches limit+1 rows to detect whether a next page exists, rather
+        # than a real COUNT(*) -- this RPC's own adaptive design exists
+        # specifically because a real count over a broad ilike match is
+        # exactly the expensive-query risk it was built to avoid (see the
+        # adaptive migration's own comment on why 'pokemon'-style broad
+        # queries can't afford that), so an exact search total isn't worth
+        # the same risk for a pager.
         payload = self._request(
             "POST",
             "/rest/v1/rpc/search_pricecharting_catalog",
-            json_payload={"search_query": query, "result_limit": limit},
+            json_payload={
+                "search_query": query,
+                "result_limit": limit + 1,
+                "result_offset": offset,
+            },
         )
-        if not isinstance(payload, list):
-            return []
-        return [row for row in payload if isinstance(row, dict)]
+        rows = [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
+        has_more = len(rows) > limit
+        return rows[:limit], has_more
 
     def count_catalog_rows(
         self,
@@ -894,6 +919,23 @@ class SupabaseAdminCatalogRepository:
 # present in the raw data but aren't one of that panel's pipeline buckets.
 # KicksDB has no equivalent taxonomy defined anywhere in this system, so
 # it isn't included here -- its category filter stays free text.
+#
+# video-games is deliberately absent from this dict, not an oversight:
+# PriceCharting's video-games rows use `category` for a real per-game genre
+# ("Action & Adventure", "FPS", "RPG", ...), not a fixed small taxonomy like
+# every other group here -- confirmed live against real rows (31 distinct
+# genre values on Playstation 4 alone), with no shared substring across
+# them the way "Baseball"/"Funko"/"Lego"/"Coin" work for their groups. A
+# console_name-based filter (~24 known platform names) was tried instead
+# and reverted: a substring version had a real collision bug ("nes" matched
+# inside "Finest", pulling sports cards into the results), and even after
+# fixing that, the real list_catalog_rows query shape (select=*, ordered,
+# paginated) reliably timed out or took several seconds against this
+# table's ~12M rows and current indexes -- the same class of production
+# incident this table has already had (see 20260808_drop_unused_
+# pricecharting_catalog_indexes.sql). Needs a proper index (or a
+# precomputed platform-group column) before this is safe to ship, not a
+# keyword list against an unindexed filter shape.
 PRICECHARTING_CATEGORY_GROUPS: dict[str, list[str]] = {
     "sports-cards": ["Baseball", "Basketball", "Football", "Hockey", "Soccer"],
     "trading-card-games": ["Magic", "Pokemon", "Yugioh", "Lorcana"],
