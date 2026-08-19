@@ -1055,6 +1055,7 @@ class AdminCatalogListItemsTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         service.return_value.list_items.assert_called_once_with(
             source="kicksdb", limit=50, offset=100, category=None, category_group=None, min_price=None, max_price=None,
+            query=None,
         )
 
 

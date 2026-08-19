@@ -66,15 +66,37 @@ class AdminCatalogService:
         category_group: str | None = None,
         min_price: float | None = None,
         max_price: float | None = None,
+        query: str | None = None,
     ) -> dict[str, Any]:
         if not self._repository.is_configured:
             raise AdminCatalogError("Supabase catalog configuration is missing.")
         normalized_source = source if source in ("pricecharting", "kicksdb") else "pricecharting"
         bounded_limit = max(1, min(limit, 100))
-        rows = self._repository.list_catalog_rows(
-            source=normalized_source, limit=bounded_limit, offset=max(0, offset),
-            category=category, category_group=category_group, min_price=min_price, max_price=max_price,
-        )
+        normalized_query = (query or "").strip()
+        # A typed search reuses the same relevance-ranked RPC the public
+        # catalog search runs (search_pricecharting_catalog), instead of
+        # the plain paginated browse below -- so the admin table can show
+        # publisher-sourced images on a text search too, not just on the
+        # empty-query browse list. (The public /api/pricing/catalog/search
+        # endpoint deliberately never renders images inline -- that's the
+        # right call for the open, unauthenticated consumer surface, but
+        # there's no reason for this internal, admin-token-gated tool to
+        # inherit the same restriction.) KicksDB has no search RPC yet
+        # (see list_catalog_rows), so a query is only honored for
+        # PriceCharting -- same "browse only" behavior the admin portal's
+        # own KicksDB tab already enforces client-side.
+        if normalized_query and len(normalized_query) >= 2 and normalized_source == "pricecharting":
+            rows = self._repository.search_catalog_rows(normalized_query, limit=bounded_limit)
+            total_count = len(rows)
+        else:
+            rows = self._repository.list_catalog_rows(
+                source=normalized_source, limit=bounded_limit, offset=max(0, offset),
+                category=category, category_group=category_group, min_price=min_price, max_price=max_price,
+            )
+            total_count = self._repository.count_catalog_rows(
+                source=normalized_source, category=category, category_group=category_group,
+                min_price=min_price, max_price=max_price,
+            )
         items = [_compact_catalog_row(row, source=normalized_source) for row in rows]
         if normalized_source == "pricecharting":
             items = self._enrich_funko_images(items)
@@ -89,10 +111,7 @@ class AdminCatalogService:
             "success": True,
             "source": normalized_source,
             "count": len(rows),
-            "totalCount": self._repository.count_catalog_rows(
-                source=normalized_source, category=category, category_group=category_group,
-                min_price=min_price, max_price=max_price,
-            ),
+            "totalCount": total_count,
             "items": items,
         }
 
@@ -454,6 +473,23 @@ class SupabaseAdminCatalogRepository:
         payload = self._request("GET", f"/rest/v1/{table_name}", params=params)
         if not isinstance(payload, list):
             raise AdminCatalogError("Supabase catalog response shape was invalid.")
+        return [row for row in payload if isinstance(row, dict)]
+
+    def search_catalog_rows(self, query: str, *, limit: int) -> list[dict[str, Any]]:
+        # Mirrors CatalogSearchService._fetch_rows -- same relevance-ranked
+        # search_pricecharting_catalog RPC (filter + score + sort + limit
+        # done in SQL, backed by the pg_trgm GIN indexes that RPC's own
+        # comment documents), so a text search in the admin portal returns
+        # the same rows the public/mobile search would, just run through
+        # this service's own image enrichment afterward instead of the
+        # public path's deliberate no-inline-images restriction.
+        payload = self._request(
+            "POST",
+            "/rest/v1/rpc/search_pricecharting_catalog",
+            json_payload={"search_query": query, "result_limit": limit},
+        )
+        if not isinstance(payload, list):
+            return []
         return [row for row in payload if isinstance(row, dict)]
 
     def count_catalog_rows(
