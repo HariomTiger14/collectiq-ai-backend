@@ -777,6 +777,40 @@ class CatalogSearchService:
             "limit": "2",
         }
         payload = self._request("GET", "/rest/v1/rawg_video_game_catalog", params=params)
+        if isinstance(payload, list) and len(payload) == 1:
+            row = payload[0]
+            image_url = row.get("image_url") if isinstance(row, dict) else None
+            return str(image_url) if image_url else None
+        return self._fetch_video_game_image_by_prefix(normalized_name, rawg_platform)
+
+    def _fetch_video_game_image_by_prefix(
+        self, normalized_name: str, rawg_platform: str
+    ) -> str | None:
+        # Fallback for the far more common gap than a franchise reboot
+        # sharing a title (_VIDEO_GAME_TITLE_ALIASES): RAWG's own title is
+        # simply longer than PriceCharting's -- a trailing "!"/"DX"/
+        # "Remastered"/edition suffix, or a subtitle PriceCharting's
+        # listing omits (e.g. "Brothers" -> "Brothers: A Tale of Two
+        # Sons"). A leading-prefix match on normalized_name is backed by
+        # rawg_video_game_catalog_lookup_idx (a btree index on
+        # (normalized_name, rawg_platform), confirmed live: ~0.2-0.6s per
+        # lookup) -- a real index-supported prefix scan, not the kind of
+        # unindexed filter that has caused real production timeouts on
+        # pricecharting_catalog elsewhere in this codebase.
+        #
+        # Same conservative discipline as everywhere else: a title like
+        # "Doom" prefix-matches DOOM (2016), DOOM Eternal, Doom 3, DOOM II,
+        # and Doom 3: BFG Edition on PS4 alone -- multiple genuinely
+        # different games, not just longer spellings of the same one, so
+        # this correctly suppresses rather than guessing. Only a title
+        # that prefix-matches exactly one row is used.
+        params = {
+            "select": "image_url",
+            "normalized_name": f"like.{_video_game_like_escape(normalized_name)}*",
+            "rawg_platform": f"eq.{rawg_platform}",
+            "limit": "2",
+        }
+        payload = self._request("GET", "/rest/v1/rawg_video_game_catalog", params=params)
         if not isinstance(payload, list) or len(payload) != 1:
             return None
         row = payload[0]
@@ -1337,6 +1371,16 @@ def _video_game_normalize_name(name: str) -> str:
     # match has to produce byte-identical output or nothing will ever
     # match.
     return _VIDEO_GAME_WHITESPACE_RE.sub(" ", name).strip().lower()
+
+
+def _video_game_like_escape(normalized_name: str) -> str:
+    # Postgres's default LIKE escape char is backslash -- a literal "%" or
+    # "_" in a game title (rare, but not impossible) would otherwise act
+    # as a SQL wildcard instead of a literal character once appended with
+    # our own trailing "*" (-> "%") for the prefix match. Order matters:
+    # backslash itself must be escaped first, or escaping "%"/"_" after
+    # would double-escape their own inserted backslashes.
+    return normalized_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 # RAWG disambiguates same-named franchise entries with a suffix RAWG itself
