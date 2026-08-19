@@ -2095,11 +2095,11 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
         response = service.detail("555")
 
         self.assertIsNone(response.result.imageUrl)
-        # Exact match (0 rows) falls through to the prefix fallback
-        # (_fetch_video_game_image_by_prefix) -- also 0 rows here since the
-        # mock handler serves the same empty fixture regardless of query,
-        # so still correctly suppressed, just via 2 requests now.
-        self.assertEqual(len(catalog_requests), 2)
+        # Exact match (0 rows) falls through to prefix, then loose-match --
+        # both also 0 rows here since the mock handler serves the same
+        # empty fixture regardless of query, so still correctly suppressed,
+        # just via all 3 tiers now.
+        self.assertEqual(len(catalog_requests), 3)
 
     def test_detail_suppresses_ambiguous_matches(self) -> None:
         handler, catalog_requests = self._build_handler(
@@ -2113,11 +2113,11 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
         response = service.detail("555")
 
         self.assertIsNone(response.result.imageUrl)
-        # Exact match (2 ambiguous rows) falls through to the prefix
-        # fallback, which the mock handler also serves the same 2 rows for
-        # -- still ambiguous, still correctly suppressed, just via 2
-        # requests now.
-        self.assertEqual(len(catalog_requests), 2)
+        # Exact match (2 ambiguous rows) falls through to prefix, then
+        # loose-match, both of which the mock handler also serves the
+        # same 2 rows for -- still ambiguous, still correctly suppressed,
+        # just via all 3 tiers now.
+        self.assertEqual(len(catalog_requests), 3)
 
     def test_detail_enriches_via_prefix_fallback_when_rawg_title_is_longer(self) -> None:
         # "Brothers" (PriceCharting) -> "Brothers: A Tale of Two Sons"
@@ -2215,7 +2215,69 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
         response = service.detail("558")
 
         self.assertIsNone(response.result.imageUrl)
-        self.assertEqual(len(catalog_requests), 2)
+        self.assertEqual(len(catalog_requests), 3)
+
+    def test_detail_enriches_via_loose_match_for_mid_title_punctuation(self) -> None:
+        # Real, live-confirmed case: PriceCharting's "Uncharted 4 A Thief's
+        # End" (straight apostrophe, no colon) vs RAWG's "Uncharted 4: A
+        # Thief's End" (curly apostrophe, colon after the number). The
+        # colon breaks a leading-prefix match immediately after
+        # "Uncharted 4" regardless of the apostrophe difference, so this
+        # needs the loose-match tier specifically (both tiers before it
+        # correctly find nothing).
+        catalog_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "559",
+                            "product_name": "Uncharted 4 A Thief's End",
+                            "console_name": "Playstation 4",
+                            "category": "Action & Adventure",
+                            "loose_price_cents": 1300,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "rawg_video_game_catalog" in url:
+                catalog_requests.append(request)
+                query = dict(request.url.params)
+                normalized_name_param = query.get("normalized_name", "")
+                if normalized_name_param.startswith("like.uncharted 4"):
+                    # 3rd tier's first-word anchor ("like.uncharted*") is a
+                    # superset match of the 2nd tier's full-title prefix
+                    # ("like.uncharted 4 a thiefs end*") -- distinguish by
+                    # checking for the full phrase vs. just the bare word.
+                    return httpx.Response(200, json=[])
+                if normalized_name_param == "like.uncharted*":
+                    return httpx.Response(
+                        200,
+                        json=[
+                            {
+                                "normalized_name": "uncharted 4: a thief’s end",
+                                "image_url": "https://img.example/uncharted4.jpg",
+                            },
+                        ],
+                    )
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        service = self._build_service(handler)
+
+        response = service.detail("559")
+
+        self.assertEqual(response.result.imageUrl, "https://img.example/uncharted4.jpg")
+        self.assertEqual(len(catalog_requests), 3)
+        loose_query = dict(catalog_requests[2].url.params)
+        self.assertEqual(loose_query.get("normalized_name"), "like.uncharted*")
 
     def test_detail_skips_unmapped_video_game_platform(self) -> None:
         catalog_requests: list[httpx.Request] = []

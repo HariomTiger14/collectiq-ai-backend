@@ -29,6 +29,7 @@ from app.services.pricing.catalog_search_service import (
     _video_game_normalize_name,
     _video_game_rawg_platform,
     _video_game_resolve_normalized_name,
+    _video_game_strip_punctuation,
     select_best_funko_image,
 )
 
@@ -407,6 +408,17 @@ class AdminCatalogService:
         unmatched_pairs = [pair for pair in pairs if pair not in images_by_pair]
         if unmatched_pairs:
             images_by_pair.update(self._repository.fetch_video_game_images_by_prefix(unmatched_pairs))
+        # Loose-match fallback for whatever prefix match still missed --
+        # mirrors CatalogSearchService._fetch_video_game_image_by_
+        # loose_match (see its comment: a mid-title punctuation difference,
+        # e.g. "Uncharted 4 A Thief's End" vs RAWG's "Uncharted 4: A
+        # Thief's End", breaks a leading-prefix match even though it's
+        # clearly the same game).
+        still_unmatched_pairs = [pair for pair in unmatched_pairs if pair not in images_by_pair]
+        if still_unmatched_pairs:
+            images_by_pair.update(
+                self._repository.fetch_video_game_images_by_loose_match(still_unmatched_pairs)
+            )
         for index, normalized_name, rawg_platform in targets:
             image_url = images_by_pair.get((normalized_name, rawg_platform))
             if image_url:
@@ -794,6 +806,62 @@ class SupabaseAdminCatalogRepository:
                 for row in rows
                 if str(row.get("rawg_platform") or "") == platform
                 and str(row.get("normalized_name") or "").startswith(name)
+            ]
+            if len(matches) == 1:
+                image_url = matches[0].get("image_url")
+                if image_url:
+                    images[(name, platform)] = str(image_url)
+        return images
+
+    def fetch_video_game_images_by_loose_match(
+        self, pairs: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], str]:
+        # Loose-match fallback for whatever fetch_video_game_images_by_
+        # prefix still missed -- mirrors CatalogSearchService._fetch_
+        # video_game_image_by_loose_match (see its comment for why: a
+        # mid-title punctuation difference, not just a trailing one,
+        # breaks a leading-prefix match even for the same game).
+        #
+        # One OR-filtered request per page, anchored on each pair's first
+        # word (small, cheap, still index-backed candidate set -- live-
+        # confirmed single digits of rows per platform even for a common
+        # first word like "uncharted"). Real comparison happens locally:
+        # both sides stripped to bare alphanumerics, requiring exactly one
+        # match per pair, same discipline as every other tier.
+        unique_pairs = sorted(set(pairs))
+        if not unique_pairs:
+            return {}
+        first_words: dict[tuple[str, str], str] = {}
+        for name, platform in unique_pairs:
+            first_word = name.split(" ", 1)[0] if name else ""
+            if first_word:
+                first_words[(name, platform)] = first_word
+        if not first_words:
+            return {}
+        or_filter = ",".join(
+            f'and(normalized_name.like."{_video_game_like_escape(first_word)}*",rawg_platform.eq."{platform}")'
+            for (_, platform), first_word in first_words.items()
+        )
+        payload = self._request(
+            "GET",
+            "/rest/v1/rawg_video_game_catalog",
+            params={
+                "select": "normalized_name,rawg_platform,image_url",
+                "or": f"({or_filter})",
+            },
+        )
+        rows = [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
+        images: dict[tuple[str, str], str] = {}
+        for (name, platform), first_word in first_words.items():
+            stripped_target = _video_game_strip_punctuation(name)
+            if not stripped_target:
+                continue
+            matches = [
+                row
+                for row in rows
+                if str(row.get("rawg_platform") or "") == platform
+                and str(row.get("normalized_name") or "").startswith(first_word)
+                and _video_game_strip_punctuation(str(row.get("normalized_name") or "")) == stripped_target
             ]
             if len(matches) == 1:
                 image_url = matches[0].get("image_url")
