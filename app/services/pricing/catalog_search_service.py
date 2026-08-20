@@ -395,7 +395,7 @@ class CatalogSearchService:
             # independent client here bypassed that entirely and made
             # every detail() test attempt a real eBay OAuth call.
             raw_listings = EbayListingService(client=self.client).search_listings(
-                query, marketplace_id=marketplace_id, limit=3, upc=upc
+                query, marketplace_id=marketplace_id, limit=8, upc=upc
             )
         except Exception:
             # eBay being unavailable must never break the rest of the
@@ -412,7 +412,7 @@ class CatalogSearchService:
         if cached is None:
             try:
                 raw_listings = PriceChartingListingService(client=self.client).get_offers(
-                    catalog_id, catalog_title=query, limit=3
+                    catalog_id, catalog_title=query, limit=8
                 )
             except Exception:
                 raw_listings = []
