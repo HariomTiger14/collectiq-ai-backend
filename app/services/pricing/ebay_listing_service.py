@@ -25,7 +25,11 @@ CURRENCY_TO_EBAY_MARKETPLACE: dict[str, str] = {
     "CAD": "EBAY_CA",
     "GBP": "EBAY_GB",
 }
-DEFAULT_EBAY_MARKETPLACE = "EBAY_AU"
+# USD/EBAY_US, not EBAY_AU -- this must match detail()'s own "no currency
+# requested" default of leaving pricing/history unconverted in their raw
+# USD source currency. Defaulting to AUD here would silently show AUD
+# listings alongside a USD headline price whenever currency is omitted.
+DEFAULT_EBAY_MARKETPLACE = "EBAY_US"
 
 
 def ebay_marketplace_for_currency(currency: str | None) -> str:
