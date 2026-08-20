@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
@@ -13,10 +13,15 @@ from app.services.pricing.currency_conversion import (
     _exchange_rate,
     normalize_display_currency,
 )
+from app.services.pricing.ebay_listing_service import (
+    EbayListingService,
+    ebay_marketplace_for_currency,
+)
 from app.schemas.search import (
     CatalogDetailResponse,
     CatalogHistoryPoint,
     CatalogSearchPricing,
+    MarketplaceListing,
     CatalogSearchResponse,
     CatalogSearchResult,
 )
@@ -161,9 +166,16 @@ class CatalogSearchService:
                     )
                     for point in history_points
                 ]
+            marketplace_listings = self._fetch_marketplace_listings(
+                catalog_id=normalized_id,
+                product_name=str(row.get("product_name") or ""),
+                console_name=str(row.get("console_name") or ""),
+                currency=currency,
+            )
             return CatalogDetailResponse(
                 result=result,
                 history=history_points,
+                marketplaceListings=marketplace_listings,
             )
 
         # Not a pricecharting_catalog row — try kicksdb_catalog before
@@ -317,6 +329,111 @@ class CatalogSearchService:
             if isinstance(row, dict) and row.get("enabled") is False
         }
         return all_categories - disabled
+
+    def _fetch_enabled_marketplace_sources(self) -> set[str]:
+        # Same fail-open kill-switch pattern as _fetch_enabled_image_
+        # categories, against catalog_marketplace_source_flags -- a
+        # separate table from catalog_image_source_flags since this gates
+        # live marketplace-listing data, not static publisher art.
+        all_sources = {"ebay"}
+        try:
+            payload = self._request(
+                "GET",
+                "/rest/v1/catalog_marketplace_source_flags",
+                params={"select": "source,enabled"},
+            )
+        except Exception:
+            return all_sources
+        if not isinstance(payload, list):
+            return all_sources
+        disabled = {
+            str(row.get("source"))
+            for row in payload
+            if isinstance(row, dict) and row.get("enabled") is False
+        }
+        return all_sources - disabled
+
+    def _fetch_marketplace_listings(
+        self, *, catalog_id: str, product_name: str, console_name: str, currency: str | None
+    ) -> list[MarketplaceListing]:
+        if "ebay" not in self._fetch_enabled_marketplace_sources():
+            return []
+        marketplace_id = ebay_marketplace_for_currency(currency)
+        cached = self._fetch_ebay_listing_cache(catalog_id, marketplace_id)
+        if cached is not None:
+            return cached
+        query = " ".join(part for part in (product_name, console_name) if part).strip()
+        if not query:
+            return []
+        try:
+            # Reuses this service's own injected client (see the class's
+            # `client` field) rather than constructing a bare, real
+            # httpx.Client() -- critical for tests: every existing test in
+            # this file injects a MockTransport-backed client and relies on
+            # nothing here ever reaching the real network. Constructing an
+            # independent client here bypassed that entirely and made
+            # every detail() test attempt a real eBay OAuth call.
+            raw_listings = EbayListingService(client=self.client).search_listings(
+                query, marketplace_id=marketplace_id, limit=3
+            )
+        except Exception:
+            # eBay being unavailable must never break the rest of the
+            # catalog detail response -- same resilience as every other
+            # enrichment source in this file.
+            raw_listings = []
+        self._write_ebay_listing_cache(catalog_id, marketplace_id, raw_listings)
+        return [MarketplaceListing(**row) for row in raw_listings]
+
+    def _fetch_ebay_listing_cache(
+        self, catalog_id: str, marketplace_id: str
+    ) -> list[MarketplaceListing] | None:
+        # A row only comes back if it's both present AND fresher than 24h
+        # -- older than that is treated identically to "never cached" (a
+        # live refetch), same staleness window as the rest of this
+        # codebase's tracked-item refresh crons.
+        cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat() + "Z"
+        try:
+            payload = self._request(
+                "GET",
+                "/rest/v1/ebay_listing_cache",
+                params={
+                    "select": "listings",
+                    "catalog_id": f"eq.{catalog_id}",
+                    "marketplace_id": f"eq.{marketplace_id}",
+                    "fetched_at": f"gt.{cutoff}",
+                    "limit": "1",
+                },
+            )
+        except Exception:
+            return None
+        if not isinstance(payload, list) or not payload:
+            return None
+        row = payload[0]
+        listings = row.get("listings") if isinstance(row, dict) else None
+        if not isinstance(listings, list):
+            return None
+        return [MarketplaceListing(**item) for item in listings if isinstance(item, dict)]
+
+    def _write_ebay_listing_cache(
+        self, catalog_id: str, marketplace_id: str, listings: list[dict[str, Any]]
+    ) -> None:
+        try:
+            self._request(
+                "POST",
+                "/rest/v1/ebay_listing_cache",
+                params={"on_conflict": "catalog_id,marketplace_id"},
+                json_payload={
+                    "catalog_id": catalog_id,
+                    "marketplace_id": marketplace_id,
+                    "listings": listings,
+                    "fetched_at": datetime.utcnow().isoformat() + "Z",
+                },
+                extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+            )
+        except Exception:
+            # Caching is an optimization, not a correctness requirement --
+            # a failed write just means the next view refetches live too.
+            return
 
     def _fetch_catalog_row(self, catalog_id: str) -> dict[str, Any] | None:
         params = {
