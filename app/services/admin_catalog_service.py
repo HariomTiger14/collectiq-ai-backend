@@ -69,6 +69,7 @@ class AdminCatalogService:
         min_price: float | None = None,
         max_price: float | None = None,
         query: str | None = None,
+        sort: str | None = None,
     ) -> dict[str, Any]:
         if not self._repository.is_configured:
             raise AdminCatalogError("Supabase catalog configuration is missing.")
@@ -87,16 +88,25 @@ class AdminCatalogService:
         # (see list_catalog_rows), so a query is only honored for
         # PriceCharting -- same "browse only" behavior the admin portal's
         # own KicksDB tab already enforces client-side.
+        #
+        # category/category_group/min_price/max_price now flow into the
+        # search branch too (previously dropped the moment a query was
+        # typed -- see search_catalog_rows' own comment). Sort has no
+        # meaning here: the RPC already orders by relevance, and combining
+        # that with a price/recency sort isn't a coherent ask -- sort only
+        # applies to the plain-browse branch below.
         has_more: bool | None = None
         if normalized_query and len(normalized_query) >= 2 and normalized_source == "pricecharting":
             rows, has_more = self._repository.search_catalog_rows(
-                normalized_query, limit=bounded_limit, offset=max(0, offset)
+                normalized_query, limit=bounded_limit, offset=max(0, offset),
+                category_group=category_group, min_price=min_price, max_price=max_price,
             )
             total_count = None
         else:
             rows = self._repository.list_catalog_rows(
                 source=normalized_source, limit=bounded_limit, offset=max(0, offset),
                 category=category, category_group=category_group, min_price=min_price, max_price=max_price,
+                sort=sort,
             )
             total_count = self._repository.count_catalog_rows(
                 source=normalized_source, category=category, category_group=category_group,
@@ -474,6 +484,7 @@ class SupabaseAdminCatalogRepository:
         category_group: str | None = None,
         min_price: float | None = None,
         max_price: float | None = None,
+        sort: str | None = None,
     ) -> list[dict[str, Any]]:
         # Independent of self._table_name (which stays scoped to
         # pricecharting_catalog for writes) -- this is read-only browsing
@@ -484,15 +495,23 @@ class SupabaseAdminCatalogRepository:
         # indexes.sql after an unrelated unindexed sort (product_name.asc)
         # caused production write timeouts, and that migration's own history
         # says a naive column choice here already broke things once. Primary
-        # keys are always index-backed, so pricecharting_id.asc is safe.
+        # keys are always index-backed, so pricecharting_id.asc is the safe
+        # default. price_asc/price_desc are backed by the dedicated indexes
+        # from 20260820_add_price_sort_index_step{1,2}_*.sql (loose_price_
+        # cents / avg_price_cents) -- deliberately no "sort by recency"
+        # option: updated_at changes on every write to this table, making an
+        # index on it the single most expensive kind to maintain here (see
+        # that migration's own comment on the 2026-08-08 incident).
         # kicksdb_catalog's rank column has its own dedicated partial index
         # (kicksdb_catalog_rank_idx) and doubles as a meaningful "most
         # popular first" ordering, not just a safe one.
-        table_name, order = (
-            ("kicksdb_catalog", "rank.asc.nullslast")
-            if source == "kicksdb"
-            else ("pricecharting_catalog", "pricecharting_id.asc")
-        )
+        price_column = "avg_price_cents" if source == "kicksdb" else "loose_price_cents"
+        default_order = "rank.asc.nullslast" if source == "kicksdb" else "pricecharting_id.asc"
+        order = {
+            "price_asc": f"{price_column}.asc.nullslast",
+            "price_desc": f"{price_column}.desc.nullslast",
+        }.get(sort or "", default_order)
+        table_name = "kicksdb_catalog" if source == "kicksdb" else "pricecharting_catalog"
         params = {"select": "*", "order": order, "limit": str(limit), "offset": str(offset)}
         params.update(_catalog_filter_params(
             source, category=category, category_group=category_group, min_price=min_price, max_price=max_price,
@@ -503,7 +522,14 @@ class SupabaseAdminCatalogRepository:
         return [row for row in payload if isinstance(row, dict)]
 
     def search_catalog_rows(
-        self, query: str, *, limit: int, offset: int = 0
+        self,
+        query: str,
+        *,
+        limit: int,
+        offset: int = 0,
+        category_group: str | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
         # Mirrors CatalogSearchService._fetch_rows -- same relevance-ranked
         # search_pricecharting_catalog RPC (filter + score + sort + limit
@@ -527,6 +553,19 @@ class SupabaseAdminCatalogRepository:
         # adaptive migration's own comment on why 'pokemon'-style broad
         # queries can't afford that), so an exact search total isn't worth
         # the same risk for a pager.
+        #
+        # category/category_group/min_price/max_price (added in
+        # 20260820_add_filters_to_search_pricecharting_catalog.sql) let a
+        # typed search combine with the same filters browse mode already
+        # supports -- previously these were silently dropped the moment an
+        # admin typed anything into the search box, category is resolved to
+        # either a platform_group exact match (video-games platforms) or a
+        # category_keywords list, mirroring _catalog_filter_params exactly
+        # so the two code paths can't drift.
+        is_platform_group = category_group in PRICECHARTING_PLATFORM_GROUPS
+        category_keywords = (
+            None if is_platform_group else PRICECHARTING_CATEGORY_GROUPS.get(category_group or "")
+        )
         payload = self._request(
             "POST",
             "/rest/v1/rpc/search_pricecharting_catalog",
@@ -534,6 +573,10 @@ class SupabaseAdminCatalogRepository:
                 "search_query": query,
                 "result_limit": limit + 1,
                 "result_offset": offset,
+                "category_keywords": category_keywords,
+                "min_price_cents": int(min_price * 100) if min_price is not None else None,
+                "max_price_cents": int(max_price * 100) if max_price is not None else None,
+                "platform_group_filter": category_group if is_platform_group else None,
             },
         )
         rows = [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
@@ -1054,16 +1097,14 @@ class SupabaseAdminCatalogRepository:
 # every other group here -- confirmed live against real rows (31 distinct
 # genre values on Playstation 4 alone), with no shared substring across
 # them the way "Baseball"/"Funko"/"Lego"/"Coin" work for their groups. A
-# console_name-based filter (~24 known platform names) was tried instead
-# and reverted: a substring version had a real collision bug ("nes" matched
-# inside "Finest", pulling sports cards into the results), and even after
-# fixing that, the real list_catalog_rows query shape (select=*, ordered,
-# paginated) reliably timed out or took several seconds against this
-# table's ~12M rows and current indexes -- the same class of production
-# incident this table has already had (see 20260808_drop_unused_
-# pricecharting_catalog_indexes.sql). Needs a proper index (or a
-# precomputed platform-group column) before this is safe to ship, not a
-# keyword list against an unindexed filter shape.
+# console_name-based ilike-OR filter (~24 known platform names) was tried
+# and reverted for exactly this reason, and re-confirmed live (57014
+# statement timeout, 8.3s) even with console_name's trigram index in
+# place -- not viable at this scale via ilike regardless of indexing.
+# Video Games is filtered separately, via PRICECHARTING_PLATFORM_GROUPS
+# below, against the precomputed platform_group column instead (see
+# 20260820_add_platform_group_step1_schema.sql) -- an exact-match filter
+# on an indexed column, not a runtime ilike-OR.
 PRICECHARTING_CATEGORY_GROUPS: dict[str, list[str]] = {
     "sports-cards": ["Baseball", "Basketball", "Football", "Hockey", "Soccer"],
     "trading-card-games": ["Magic", "Pokemon", "Yugioh", "Lorcana"],
@@ -1071,6 +1112,24 @@ PRICECHARTING_CATEGORY_GROUPS: dict[str, list[str]] = {
     "funko-pops": ["Funko"],
     "lego-sets": ["Lego"],
     "coins": ["Coin"],
+}
+
+# Video Games platform buckets -- a SEPARATE dict from
+# PRICECHARTING_CATEGORY_GROUPS because the filtering mechanism differs:
+# these match the precomputed platform_group column (exact equality, see
+# compute_platform_group() in 20260820_add_platform_group_step1_schema.sql
+# and its Python mirror in scripts/import_pricecharting_catalog.py), not an
+# ilike-OR against `category`. Keys double as the category_group value the
+# admin portal sends and the values here are display labels only (the
+# actual matching logic lives in the SQL function, kept in one place).
+PRICECHARTING_PLATFORM_GROUPS: dict[str, str] = {
+    "playstation": "PlayStation",
+    "xbox": "Xbox",
+    "nintendo": "Nintendo",
+    "sega": "Sega",
+    "atari": "Atari",
+    "pc": "PC",
+    "retro-other": "Other retro",
 }
 
 
@@ -1083,8 +1142,16 @@ def _catalog_filter_params(
     max_price: float | None,
 ) -> dict[str, str]:
     params: dict[str, str] = {}
-    keywords = PRICECHARTING_CATEGORY_GROUPS.get(category_group or "") if source != "kicksdb" else None
-    if keywords:
+    is_platform_group = source != "kicksdb" and category_group in PRICECHARTING_PLATFORM_GROUPS
+    keywords = (
+        None if is_platform_group
+        else PRICECHARTING_CATEGORY_GROUPS.get(category_group or "") if source != "kicksdb" else None
+    )
+    if is_platform_group:
+        # Exact match against the precomputed, indexed column -- not an
+        # ilike-OR (see PRICECHARTING_PLATFORM_GROUPS' own comment on why).
+        params["platform_group"] = f"eq.{category_group}"
+    elif keywords:
         params["or"] = "(" + ",".join(f"category.ilike.*{kw}*" for kw in keywords) + ")"
     elif category:
         params["category"] = f"ilike.*{category}*"

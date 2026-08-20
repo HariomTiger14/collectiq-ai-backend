@@ -48,6 +48,7 @@ CATALOG_COLUMNS = (
     "product_name",
     "console_name",
     "category",
+    "platform_group",
     "upc",
     "asin",
     "epid",
@@ -66,6 +67,42 @@ CATALOG_COLUMNS = (
     "source_downloaded_at",
     "content_hash",
 )
+
+# Mirrors public.compute_platform_group() in
+# 20260820_add_platform_group_step1_schema.sql exactly -- keep both in sync
+# if this mapping changes. console_name is reused across every category
+# (sports cards, comics, funko, etc all store their set name here too, not
+# just video games), so this only matches real platform names; every other
+# row gets None, which is correct -- they're not filterable by platform
+# because they aren't one.
+#
+# Word-boundary matching (\b) rather than plain substring matching, so
+# short platform codes (ds, wii, pc) are safe to include here -- a bare
+# substring match previously had a real collision bug ("nes" matched
+# inside "Finest", pulling sports cards into a video-games filter); \b
+# only matches whole tokens, so that can't happen.
+PLATFORM_GROUP_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("playstation", re.compile(r"\b(playstation|ps1|ps2|ps3|ps4|ps5|psp|vita)\b", re.IGNORECASE)),
+    ("xbox", re.compile(r"\bxbox\b", re.IGNORECASE)),
+    ("nintendo", re.compile(
+        r"\b(nintendo|gamecube|wii|switch|gameboy|nes|snes|n64|3ds|ds)\b", re.IGNORECASE
+    )),
+    ("sega", re.compile(r"\b(sega|genesis|saturn|dreamcast|32x)\b", re.IGNORECASE)),
+    ("atari", re.compile(r"\b(atari|jaguar|lynx|2600|5200|7800)\b", re.IGNORECASE)),
+    ("pc", re.compile(r"\b(pc|windows|commodore|amiga|msx|trs-80|apple)\b", re.IGNORECASE)),
+    ("retro-other", re.compile(
+        r"\b(3do|neo\s*geo|colecovision|intellivision|vectrex|turbo\s*grafx)\b", re.IGNORECASE
+    )),
+]
+
+
+def compute_platform_group(console_name: str | None) -> str | None:
+    if not console_name:
+        return None
+    for group, pattern in PLATFORM_GROUP_PATTERNS:
+        if pattern.search(console_name):
+            return group
+    return None
 
 CATALOG_HISTORY_COLUMNS = (
     "pricecharting_id",
@@ -295,6 +332,7 @@ def to_catalog_row(
         "product_name": product_name,
         "console_name": console_name,
         "category": pick_text(row, TEXT_FIELDS["category"]) or console_name,
+        "platform_group": compute_platform_group(console_name),
         "upc": pick_text(row, TEXT_FIELDS["upc"]),
         "asin": pick_text(row, TEXT_FIELDS["asin"]),
         "epid": pick_text(row, TEXT_FIELDS["epid"]),
