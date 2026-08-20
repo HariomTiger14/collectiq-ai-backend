@@ -49,6 +49,15 @@ class CatalogSearchResponse(BaseModel):
     results: list[CatalogSearchResult]
 
 
+class MarketplaceListing(BaseModel):
+    title: str
+    price: float
+    currency: str
+    condition: str = ""
+    url: str
+    source: str = "eBay"
+
+
 class CatalogHistoryPoint(BaseModel):
     validFrom: str
     validTo: str | None = None
@@ -62,3 +71,4 @@ class CatalogDetailResponse(BaseModel):
     success: bool = True
     result: CatalogSearchResult
     history: list[CatalogHistoryPoint] = Field(default_factory=list)
+    marketplaceListings: list[MarketplaceListing] = Field(default_factory=list)
