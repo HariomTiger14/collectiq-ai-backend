@@ -17,6 +17,9 @@ from app.services.pricing.ebay_listing_service import (
     EbayListingService,
     ebay_marketplace_for_currency,
 )
+from app.services.pricing.pricecharting_listing_service import (
+    PriceChartingListingService,
+)
 from app.schemas.search import (
     CatalogDetailResponse,
     CatalogHistoryPoint,
@@ -171,6 +174,7 @@ class CatalogSearchService:
                 product_name=str(row.get("product_name") or ""),
                 console_name=str(row.get("console_name") or ""),
                 currency=currency,
+                upc=_clean(row.get("upc")),
             )
             return CatalogDetailResponse(
                 result=result,
@@ -335,7 +339,7 @@ class CatalogSearchService:
         # categories, against catalog_marketplace_source_flags -- a
         # separate table from catalog_image_source_flags since this gates
         # live marketplace-listing data, not static publisher art.
-        all_sources = {"ebay"}
+        all_sources = {"ebay", "pricecharting"}
         try:
             payload = self._request(
                 "GET",
@@ -354,17 +358,34 @@ class CatalogSearchService:
         return all_sources - disabled
 
     def _fetch_marketplace_listings(
-        self, *, catalog_id: str, product_name: str, console_name: str, currency: str | None
+        self,
+        *,
+        catalog_id: str,
+        product_name: str,
+        console_name: str,
+        currency: str | None,
+        upc: str | None = None,
     ) -> list[MarketplaceListing]:
-        if "ebay" not in self._fetch_enabled_marketplace_sources():
-            return []
+        enabled_sources = self._fetch_enabled_marketplace_sources()
+        query = " ".join(part for part in (product_name, console_name) if part).strip()
+        listings: list[MarketplaceListing] = []
+        if "ebay" in enabled_sources and query:
+            listings.extend(
+                self._fetch_ebay_listings(catalog_id, query=query, currency=currency, upc=upc)
+            )
+        if "pricecharting" in enabled_sources and query:
+            listings.extend(
+                self._fetch_pricecharting_listings(catalog_id, query=query, currency=currency)
+            )
+        return listings
+
+    def _fetch_ebay_listings(
+        self, catalog_id: str, *, query: str, currency: str | None, upc: str | None
+    ) -> list[MarketplaceListing]:
         marketplace_id = ebay_marketplace_for_currency(currency)
         cached = self._fetch_ebay_listing_cache(catalog_id, marketplace_id)
         if cached is not None:
             return cached
-        query = " ".join(part for part in (product_name, console_name) if part).strip()
-        if not query:
-            return []
         try:
             # Reuses this service's own injected client (see the class's
             # `client` field) rather than constructing a bare, real
@@ -374,7 +395,7 @@ class CatalogSearchService:
             # independent client here bypassed that entirely and made
             # every detail() test attempt a real eBay OAuth call.
             raw_listings = EbayListingService(client=self.client).search_listings(
-                query, marketplace_id=marketplace_id, limit=3
+                query, marketplace_id=marketplace_id, limit=3, upc=upc
             )
         except Exception:
             # eBay being unavailable must never break the rest of the
@@ -383,6 +404,83 @@ class CatalogSearchService:
             raw_listings = []
         self._write_ebay_listing_cache(catalog_id, marketplace_id, raw_listings)
         return [MarketplaceListing(**row) for row in raw_listings]
+
+    def _fetch_pricecharting_listings(
+        self, catalog_id: str, *, query: str, currency: str | None
+    ) -> list[MarketplaceListing]:
+        cached = self._fetch_pricecharting_listing_cache(catalog_id)
+        if cached is None:
+            try:
+                raw_listings = PriceChartingListingService(client=self.client).get_offers(
+                    catalog_id, catalog_title=query, limit=3
+                )
+            except Exception:
+                raw_listings = []
+            self._write_pricecharting_listing_cache(catalog_id, raw_listings)
+            cached = [MarketplaceListing(**row) for row in raw_listings]
+        # PriceCharting's Marketplace API is always USD (a single, US-based
+        # marketplace, no per-region selection like eBay) -- converted here
+        # at read time using the same static-rate FX logic as the main
+        # pricing, rather than caching a separate copy per display
+        # currency the way eBay's per-marketplace cache does.
+        target_currency = normalize_display_currency(currency) if currency else None
+        if not target_currency or target_currency == "USD":
+            return cached
+        rate = _exchange_rate("USD", target_currency)
+        return [
+            listing.model_copy(
+                update={
+                    "price": round(listing.price * rate, 2),
+                    "currency": target_currency,
+                }
+            )
+            for listing in cached
+        ]
+
+    def _fetch_pricecharting_listing_cache(
+        self, catalog_id: str
+    ) -> list[MarketplaceListing] | None:
+        cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat() + "Z"
+        try:
+            payload = self._request(
+                "GET",
+                "/rest/v1/pricecharting_listing_cache",
+                params={
+                    "select": "listings",
+                    "catalog_id": f"eq.{catalog_id}",
+                    "fetched_at": f"gt.{cutoff}",
+                    "limit": "1",
+                },
+            )
+        except Exception:
+            return None
+        if not isinstance(payload, list) or not payload:
+            return None
+        row = payload[0]
+        listings = row.get("listings") if isinstance(row, dict) else None
+        if not isinstance(listings, list):
+            return None
+        return [MarketplaceListing(**item) for item in listings if isinstance(item, dict)]
+
+    def _write_pricecharting_listing_cache(
+        self, catalog_id: str, listings: list[dict[str, Any]]
+    ) -> None:
+        try:
+            self._request(
+                "POST",
+                "/rest/v1/pricecharting_listing_cache",
+                params={"on_conflict": "catalog_id"},
+                json_payload={
+                    "catalog_id": catalog_id,
+                    "listings": listings,
+                    "fetched_at": datetime.utcnow().isoformat() + "Z",
+                },
+                extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+            )
+        except Exception:
+            # Caching is an optimization, not a correctness requirement --
+            # a failed write just means the next view refetches live too.
+            return
 
     def _fetch_ebay_listing_cache(
         self, catalog_id: str, marketplace_id: str
