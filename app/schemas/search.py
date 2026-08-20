@@ -3,6 +3,14 @@ from pydantic import BaseModel, Field
 
 class CatalogSearchPricing(BaseModel):
     currency: str = "USD"
+    # Set only when a non-USD display currency was requested and conversion
+    # was actually applied -- None means these values are already in their
+    # native/source currency (the common case: PriceCharting/KicksDB data
+    # is USD, and no conversion was requested). Mirrors the same "honesty
+    # first, no fabricated FX unless asked for" pattern already established
+    # for scan pricing (see currency_conversion.py's convert_pricing_result
+    # and originalCurrency on PricingResult).
+    originalCurrency: str | None = None
     marketValue: float | None = None
     lowEstimate: float | None = None
     highEstimate: float | None = None

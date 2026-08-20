@@ -33,11 +33,13 @@ async def search_catalog(
 async def get_catalog_detail(
     catalog_id: str,
     history_limit: int = Query(30, alias="historyLimit", ge=1, le=90),
+    currency: str | None = Query(default=None, max_length=8),
 ) -> CatalogDetailResponse:
     try:
         return CatalogSearchService().detail(
             catalog_id=catalog_id,
             history_limit=history_limit,
+            currency=currency,
         )
     except CatalogItemNotFoundError as error:
         raise HTTPException(
