@@ -1,0 +1,15 @@
+-- STEP 2 of 3 -- run this statement ALONE, after step 1 has finished. The
+-- procedure it calls issues COMMIT internally between batches, which only
+-- works when CALL itself isn't nested inside another transaction block --
+-- batching this with other statements in one submission would fail with
+-- "invalid transaction termination".
+--
+-- Bounded to max_batches=200 (~1M rows per call) so it returns well before
+-- Supabase's SQL editor gateway timeout (confirmed live: an unbounded call
+-- got killed by an upstream timeout partway through ~12M rows). Every
+-- batch it already committed stays committed even when a call gets cut
+-- off, so just click Run on this SAME statement again -- it resumes from
+-- wherever it left off. Check the SQL editor's message/notice log after
+-- each run: it prints progress, and prints "DONE" once nothing is left to
+-- update. Repeat until you see DONE.
+call public.backfill_pricecharting_platform_group();

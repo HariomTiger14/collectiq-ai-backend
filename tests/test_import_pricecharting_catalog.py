@@ -9,6 +9,7 @@ from scripts.import_pricecharting_catalog import (
     PartialCatalogWriteError,
     SupabaseCatalogClient,
     catalog_history_change_hash,
+    compute_platform_group,
     dedupe_catalog_rows,
     download_env_sources,
     load_rows_from_text,
@@ -66,7 +67,44 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
         self.assertIsNone(row["asin"])
         self.assertEqual(row["release_date"], "2017-04-28")
         self.assertEqual(row["normalized_identity"], "mario kart 8 deluxe nintendo switch")
+        self.assertEqual(row["platform_group"], "nintendo")
         self.assertEqual(len(row["content_hash"]), 64)
+
+    def test_compute_platform_group_matches_real_observed_naming(self) -> None:
+        # Values sampled live from pricecharting_catalog -- region-prefixed
+        # variants ("JP Playstation 4", "PAL Playstation 5") must match the
+        # same group as the bare name.
+        self.assertEqual(compute_platform_group("Playstation 4"), "playstation")
+        self.assertEqual(compute_platform_group("JP Playstation 4"), "playstation")
+        self.assertEqual(compute_platform_group("PAL Playstation 5"), "playstation")
+        self.assertEqual(compute_platform_group("PSP"), "playstation")
+        self.assertEqual(compute_platform_group("JP Xbox 360"), "xbox")
+        self.assertEqual(compute_platform_group("Nintendo 64"), "nintendo")
+        self.assertEqual(compute_platform_group("JP Nintendo Switch"), "nintendo")
+        self.assertEqual(compute_platform_group("GameBoy Advance"), "nintendo")
+        self.assertEqual(compute_platform_group("Sega Dreamcast"), "sega")
+        self.assertEqual(compute_platform_group("Atari 400"), "atari")
+        self.assertEqual(compute_platform_group("Atari ST"), "atari")
+        self.assertEqual(compute_platform_group("Commodore 64"), "pc")
+        self.assertEqual(compute_platform_group("Apple II"), "pc")
+
+    def test_compute_platform_group_does_not_match_non_video_game_sets(self) -> None:
+        # console_name is reused across every category -- a sports/comic/
+        # funko set name must never be misclassified as a platform.
+        self.assertIsNone(compute_platform_group("Baseball Cards 2019 Panini Donruss Optic"))
+        self.assertIsNone(compute_platform_group("Comic Books Superman"))
+        self.assertIsNone(compute_platform_group("Funko POP NFL"))
+        self.assertIsNone(compute_platform_group(None))
+        self.assertIsNone(compute_platform_group(""))
+
+    def test_compute_platform_group_word_boundary_avoids_prior_collision_bug(self) -> None:
+        # Regression: a bare substring "nes" match against console_name
+        # once matched inside "Finest" (a card-set name), pulling sports
+        # cards into a video-games filter. Word-boundary matching must not
+        # repeat that.
+        self.assertIsNone(compute_platform_group("Finest"))
+        self.assertIsNone(compute_platform_group("Baseball Cards 2000 Finest Refractors"))
+        self.assertEqual(compute_platform_group("NES"), "nintendo")
 
     def test_to_catalog_history_row_creates_current_scd2_version(self) -> None:
         catalog_row = to_catalog_row(

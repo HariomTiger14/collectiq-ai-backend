@@ -170,6 +170,150 @@ class AdminCatalogListItemsTest(unittest.TestCase):
         self.assertEqual(captured["params"]["avg_price_cents"], "gte.10000")
         self.assertNotIn("and", captured["params"])
 
+    def test_repository_filters_by_platform_group_as_exact_match(self) -> None:
+        # Video Games has no coarse category taxonomy (category holds a
+        # real per-game genre) -- platform groups filter the precomputed
+        # platform_group column via exact equality instead of an ilike-OR
+        # against category, unlike every other category_group.
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabaseAdminCatalogRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.list_catalog_rows(source="pricecharting", limit=50, offset=0, category_group="playstation")
+
+        self.assertEqual(captured["params"]["platform_group"], "eq.playstation")
+        self.assertNotIn("or", captured["params"])
+        self.assertNotIn("category", captured["params"])
+
+    def test_repository_platform_group_ignored_for_kicksdb(self) -> None:
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabaseAdminCatalogRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.list_catalog_rows(source="kicksdb", limit=50, offset=0, category_group="playstation")
+
+        self.assertNotIn("platform_group", captured["params"])
+
+    def test_repository_sorts_pricecharting_by_price(self) -> None:
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabaseAdminCatalogRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.list_catalog_rows(source="pricecharting", limit=50, offset=0, sort="price_asc")
+        self.assertEqual(captured["params"]["order"], "loose_price_cents.asc.nullslast")
+
+        repository.list_catalog_rows(source="kicksdb", limit=50, offset=0, sort="price_desc")
+        self.assertEqual(captured["params"]["order"], "avg_price_cents.desc.nullslast")
+
+    def test_repository_unrecognized_sort_falls_back_to_default_order(self) -> None:
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["params"] = dict(request.url.params)
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabaseAdminCatalogRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.list_catalog_rows(source="pricecharting", limit=50, offset=0, sort="not-a-real-sort")
+        self.assertEqual(captured["params"]["order"], "pricecharting_id.asc")
+
+    def test_repository_search_passes_category_and_price_filters_to_rpc(self) -> None:
+        # Regression: a typed search used to silently drop whatever
+        # category/price filter was selected -- these must now ride along
+        # in the RPC call body.
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["json"] = request.read()
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabaseAdminCatalogRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.search_catalog_rows(
+            "pikachu", limit=20, offset=0, category_group="sports-cards", min_price=10, max_price=50,
+        )
+
+        import json as _json
+        payload = _json.loads(captured["json"])
+        self.assertEqual(payload["category_keywords"], ["Baseball", "Basketball", "Football", "Hockey", "Soccer"])
+        self.assertEqual(payload["min_price_cents"], 1000)
+        self.assertEqual(payload["max_price_cents"], 5000)
+        self.assertIsNone(payload["platform_group_filter"])
+
+    def test_repository_search_passes_platform_group_filter_to_rpc(self) -> None:
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["json"] = request.read()
+            return httpx.Response(200, json=[])
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabaseAdminCatalogRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.search_catalog_rows("zelda", limit=20, offset=0, category_group="nintendo")
+
+        import json as _json
+        payload = _json.loads(captured["json"])
+        self.assertIsNone(payload["category_keywords"])
+        self.assertEqual(payload["platform_group_filter"], "nintendo")
+
+    def test_service_search_branch_forwards_filters_to_repository(self) -> None:
+        # AdminCatalogService.list_items() must not drop the filters when
+        # routing a typed query through the search branch.
+        from unittest.mock import MagicMock
+
+        repository = MagicMock()
+        repository.is_configured = True
+        repository.search_catalog_rows.return_value = ([], False)
+        service = AdminCatalogService(repository=repository)
+
+        service.list_items(source="pricecharting", limit=20, offset=0, query="pikachu", category_group="coins", min_price=5, max_price=25)
+
+        repository.search_catalog_rows.assert_called_once_with(
+            "pikachu", limit=20, offset=0, category_group="coins", min_price=5, max_price=25,
+        )
+
     def test_repository_counts_pricecharting_rows_via_content_range(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             self.assertEqual(request.headers.get("prefer"), "count=estimated")
@@ -1055,7 +1199,7 @@ class AdminCatalogListItemsTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         service.return_value.list_items.assert_called_once_with(
             source="kicksdb", limit=50, offset=100, category=None, category_group=None, min_price=None, max_price=None,
-            query=None,
+            query=None, sort=None,
         )
 
 
