@@ -524,6 +524,70 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertEqual(listing.url, "https://www.ebay.com/itm/12345")
         self.assertEqual(len(write_payloads), 1)
 
+    def test_detail_fetches_usd_ebay_listings_when_no_currency_requested(self) -> None:
+        # Regression: when the caller omits currency, pricing/history stay
+        # in their raw USD source currency (no conversion). The eBay
+        # marketplace picked for listings must match that -- EBAY_US, not
+        # the AU-flavored fallback -- otherwise the response shows a USD
+        # headline price alongside AUD "where to buy" listings.
+        requested_marketplace_ids: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if "catalog_marketplace_source_flags" in url:
+                return httpx.Response(200, json=[{"source": "ebay", "enabled": True}])
+            if "ebay_listing_cache" in url and request.method == "GET":
+                return httpx.Response(200, json=[])  # cache miss
+            if "ebay_listing_cache" in url and request.method == "POST":
+                return httpx.Response(201, json=None)
+            if "identity/v1/oauth2/token" in url:
+                return httpx.Response(200, json={"access_token": "fake-token", "expires_in": 7200})
+            if "buy/browse/v1/item_summary/search" in url:
+                requested_marketplace_ids.append(request.headers.get("X-EBAY-C-MARKETPLACE-ID", ""))
+                return httpx.Response(
+                    200,
+                    json={
+                        "itemSummaries": [
+                            {
+                                "title": "God of War PS4 Brand New",
+                                "price": {"value": "12.99", "currency": "USD"},
+                                "condition": "New",
+                                "itemWebUrl": "https://www.ebay.com/itm/12345",
+                            },
+                        ]
+                    },
+                )
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "45800",
+                            "product_name": "God of War",
+                            "console_name": "Playstation 4",
+                            "category": "Action & Adventure",
+                            "loose_price_cents": 1299,
+                            "currency": "USD",
+                            "normalized_identity": "god of war playstation 4",
+                        }
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.detail("45800")
+
+        self.assertEqual(response.result.pricing.currency, "USD")
+        self.assertEqual(requested_marketplace_ids, ["EBAY_US"])
+        self.assertEqual(response.marketplaceListings[0].currency, "USD")
+
     def test_detail_uses_cached_ebay_listings_without_live_fetch(self) -> None:
         live_ebay_requests: list[httpx.Request] = []
 
