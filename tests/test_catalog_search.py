@@ -360,6 +360,104 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertEqual(len(history_requests), 1)
         self.assertIn("limit=10", str(history_requests[0].url))
 
+    def test_detail_converts_pricing_and_history_when_currency_requested(self) -> None:
+        # PriceCharting data is always USD-sourced -- requesting a non-USD
+        # display currency must convert both the headline pricing AND every
+        # history point consistently, using the same static FX rate
+        # (settings.fx_usd_to_aud, default 1.52) currency_conversion.py
+        # already uses for scan pricing. Without this, the chart and the
+        # headline price would show different currencies on the same
+        # screen.
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "pricecharting_catalog_history" in str(request.url):
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "valid_from": "2026-07-26T00:00:00Z",
+                            "valid_to": None,
+                            "is_current": True,
+                            "source_file": "pokemon.csv",
+                            "source_downloaded_at": "2026-07-26T00:00:00Z",
+                            "loose_price_cents": 16100,
+                            "cib_price_cents": 20000,
+                            "graded_price_cents": 80000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "pricecharting_id": "999",
+                        "product_name": "Charizard #4 Base Set",
+                        "console_name": "Pokemon Cards",
+                        "category": "Pokemon Cards",
+                        "upc": "",
+                        "loose_price_cents": 16100,
+                        "cib_price_cents": 20000,
+                        "graded_price_cents": 80000,
+                        "currency": "USD",
+                        "product_url": "https://www.pricecharting.com/game/pokemon/charizard",
+                        "source_file": "pokemon.csv",
+                        "source_downloaded_at": "2026-07-26T00:00:00Z",
+                        "updated_at": "2026-07-26T00:00:00Z",
+                        "normalized_identity": "charizard #4 base set pokemon cards",
+                    }
+                ],
+            )
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.detail("999", history_limit=10, currency="AUD")
+
+        self.assertEqual(response.result.pricing.currency, "AUD")
+        self.assertEqual(response.result.pricing.originalCurrency, "USD")
+        self.assertEqual(response.result.pricing.marketValue, round(161 * 1.52, 2))
+        self.assertEqual(response.history[0].pricing.currency, "AUD")
+        self.assertEqual(response.history[0].pricing.highEstimate, round(800 * 1.52, 2))
+
+    def test_detail_does_not_convert_when_no_currency_requested(self) -> None:
+        # Backward compatibility: omitting the currency param (existing
+        # callers, and the admin catalog browse table which never sends
+        # one) must behave exactly as before -- no conversion, no
+        # originalCurrency stamped.
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "pricecharting_catalog_history" in str(request.url):
+                return httpx.Response(200, json=[])
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "pricecharting_id": "999",
+                        "product_name": "Charizard #4 Base Set",
+                        "console_name": "Pokemon Cards",
+                        "category": "Pokemon Cards",
+                        "upc": "",
+                        "loose_price_cents": 16100,
+                        "currency": "USD",
+                        "normalized_identity": "charizard #4 base set pokemon cards",
+                    }
+                ],
+            )
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.detail("999")
+
+        self.assertEqual(response.result.pricing.currency, "USD")
+        self.assertIsNone(response.result.pricing.originalCurrency)
+        self.assertEqual(response.result.pricing.marketValue, 161)
+
     def test_detail_missing_catalog_item_raises_not_found(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json=[])

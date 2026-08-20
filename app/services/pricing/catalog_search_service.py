@@ -8,6 +8,11 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.services.pricing.currency_conversion import (
+    SUPPORTED_DISPLAY_CURRENCIES,
+    _exchange_rate,
+    normalize_display_currency,
+)
 from app.schemas.search import (
     CatalogDetailResponse,
     CatalogHistoryPoint,
@@ -95,9 +100,19 @@ class CatalogSearchService:
             results=results,
         )
 
-    def detail(self, catalog_id: str, history_limit: int = 30) -> CatalogDetailResponse:
+    def detail(
+        self, catalog_id: str, history_limit: int = 30, currency: str | None = None
+    ) -> CatalogDetailResponse:
         normalized_id = str(catalog_id or "").strip()
         bounded_history_limit = max(1, min(history_limit, 90))
+        # None (not "USD") means "no conversion requested" -- distinct from
+        # normalize_display_currency(None), which would default to AUD and
+        # force a conversion no caller asked for. Only convert when the
+        # caller (the mobile app, from CollectorProfile.preferredCurrency)
+        # actually sent a currency and it differs from the source.
+        target_currency = (
+            normalize_display_currency(currency) if currency else None
+        )
         if not normalized_id:
             raise CatalogItemNotFoundError("Catalog item was not found.")
         if not self.is_configured:
@@ -127,9 +142,28 @@ class CatalogSearchService:
                 result = self._enrich_with_onepiece_image(result)
             if "videogames" in enabled:
                 result = self._enrich_with_video_games_image(result)
+            history_points = [_history_row_to_point(row) for row in history_rows]
+            if target_currency:
+                result = result.model_copy(
+                    update={
+                        "pricing": _convert_catalog_pricing(
+                            result.pricing, target_currency=target_currency
+                        )
+                    }
+                )
+                history_points = [
+                    point.model_copy(
+                        update={
+                            "pricing": _convert_catalog_pricing(
+                                point.pricing, target_currency=target_currency
+                            )
+                        }
+                    )
+                    for point in history_points
+                ]
             return CatalogDetailResponse(
                 result=result,
-                history=[_history_row_to_point(row) for row in history_rows],
+                history=history_points,
             )
 
         # Not a pricecharting_catalog row — try kicksdb_catalog before
@@ -140,14 +174,34 @@ class CatalogSearchService:
             kicksdb_history_rows = self._fetch_kicksdb_history_rows(
                 normalized_id, bounded_history_limit
             )
+            kicksdb_result = _kicksdb_row_to_result(
+                kicksdb_row,
+                _normalize_query(str(kicksdb_row.get("title") or "")),
+            )
+            kicksdb_history_points = [
+                _kicksdb_history_row_to_point(row) for row in kicksdb_history_rows
+            ]
+            if target_currency:
+                kicksdb_result = kicksdb_result.model_copy(
+                    update={
+                        "pricing": _convert_catalog_pricing(
+                            kicksdb_result.pricing, target_currency=target_currency
+                        )
+                    }
+                )
+                kicksdb_history_points = [
+                    point.model_copy(
+                        update={
+                            "pricing": _convert_catalog_pricing(
+                                point.pricing, target_currency=target_currency
+                            )
+                        }
+                    )
+                    for point in kicksdb_history_points
+                ]
             return CatalogDetailResponse(
-                result=_kicksdb_row_to_result(
-                    kicksdb_row,
-                    _normalize_query(str(kicksdb_row.get("title") or "")),
-                ),
-                history=[
-                    _kicksdb_history_row_to_point(row) for row in kicksdb_history_rows
-                ],
+                result=kicksdb_result,
+                history=kicksdb_history_points,
             )
 
         raise CatalogItemNotFoundError("Catalog item was not found.")
@@ -1114,6 +1168,41 @@ def _history_row_to_point(row: dict[str, Any]) -> CatalogHistoryPoint:
         sourceDownloadedAt=_clean(row.get("source_downloaded_at")),
         pricing=_pricing_from_row(row),
     )
+
+
+def _convert_catalog_pricing(
+    pricing: CatalogSearchPricing, *, target_currency: str
+) -> CatalogSearchPricing:
+    # Reuses the same static-rate FX logic currency_conversion.py already
+    # uses for scan pricing (_exchange_rate/settings.fx_usd_to_*) -- one
+    # source of truth for exchange rates, not a second one invented here.
+    # PriceCharting/KicksDB data is always sourced in USD, so this only
+    # ever converts FROM USD, but _exchange_rate itself is general (handles
+    # same-currency as a 1.0 no-op).
+    source_currency = pricing.currency or "USD"
+    normalized_target = normalize_display_currency(target_currency)
+    if normalized_target == source_currency:
+        return pricing
+    rate = _exchange_rate(source_currency, normalized_target)
+    return pricing.model_copy(
+        update={
+            "currency": normalized_target,
+            "originalCurrency": source_currency,
+            "marketValue": _convert_catalog_amount(pricing.marketValue, rate),
+            "lowEstimate": _convert_catalog_amount(pricing.lowEstimate, rate),
+            "highEstimate": _convert_catalog_amount(pricing.highEstimate, rate),
+            "loosePrice": _convert_catalog_amount(pricing.loosePrice, rate),
+            "cibPrice": _convert_catalog_amount(pricing.cibPrice, rate),
+            "newPrice": _convert_catalog_amount(pricing.newPrice, rate),
+            "gradedPrice": _convert_catalog_amount(pricing.gradedPrice, rate),
+        }
+    )
+
+
+def _convert_catalog_amount(value: float | None, rate: float) -> float | None:
+    if value is None:
+        return None
+    return round(value * rate, 2)
 
 
 def _rank_rows(rows: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
