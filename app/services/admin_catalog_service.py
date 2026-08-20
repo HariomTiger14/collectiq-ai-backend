@@ -8,6 +8,9 @@ import httpx
 from app.core.config import settings
 from app.services.pricing.admin_review_queue_service import _total_from_content_range
 from app.services.pricing.catalog_search_service import (
+    PRICECHARTING_CATEGORY_GROUPS,
+    PRICECHARTING_PLATFORM_GROUPS,
+    resolve_category_group_filters,
     _POKEMON_SET_TCGPLAYER_GROUPS,
     _funko_lookup_title,
     _lego_name_words,
@@ -562,10 +565,7 @@ class SupabaseAdminCatalogRepository:
         # either a platform_group exact match (video-games platforms) or a
         # category_keywords list, mirroring _catalog_filter_params exactly
         # so the two code paths can't drift.
-        is_platform_group = category_group in PRICECHARTING_PLATFORM_GROUPS
-        category_keywords = (
-            None if is_platform_group else PRICECHARTING_CATEGORY_GROUPS.get(category_group or "")
-        )
+        category_keywords, platform_group_filter = resolve_category_group_filters(category_group)
         payload = self._request(
             "POST",
             "/rest/v1/rpc/search_pricecharting_catalog",
@@ -576,7 +576,7 @@ class SupabaseAdminCatalogRepository:
                 "category_keywords": category_keywords,
                 "min_price_cents": int(min_price * 100) if min_price is not None else None,
                 "max_price_cents": int(max_price * 100) if max_price is not None else None,
-                "platform_group_filter": category_group if is_platform_group else None,
+                "platform_group_filter": platform_group_filter,
             },
         )
         rows = [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
@@ -1079,58 +1079,9 @@ class SupabaseAdminCatalogRepository:
                 client.close()
 
 
-# pricecharting_catalog's raw `category` column is far too granular for a
-# dropdown ("Basketball Cards 2019 Panini Donruss Optic", not "Sports
-# Cards") -- there's no separate coarse-category column, so these groups
-# are keyword sets or'd together against the same raw column. Directly
-# grounded in the taxonomy this codebase already tracks elsewhere (the
-# Catalog page's own "PriceCharting set backfill" panel groups sets into
-# exactly coins/comic-books/funko-pops/lego-sets/lorcana-cards/*-cards),
-# plus trading-card-games for Magic/Pokemon/Yugioh, which are clearly
-# present in the raw data but aren't one of that panel's pipeline buckets.
-# KicksDB has no equivalent taxonomy defined anywhere in this system, so
-# it isn't included here -- its category filter stays free text.
-#
-# video-games is deliberately absent from this dict, not an oversight:
-# PriceCharting's video-games rows use `category` for a real per-game genre
-# ("Action & Adventure", "FPS", "RPG", ...), not a fixed small taxonomy like
-# every other group here -- confirmed live against real rows (31 distinct
-# genre values on Playstation 4 alone), with no shared substring across
-# them the way "Baseball"/"Funko"/"Lego"/"Coin" work for their groups. A
-# console_name-based ilike-OR filter (~24 known platform names) was tried
-# and reverted for exactly this reason, and re-confirmed live (57014
-# statement timeout, 8.3s) even with console_name's trigram index in
-# place -- not viable at this scale via ilike regardless of indexing.
-# Video Games is filtered separately, via PRICECHARTING_PLATFORM_GROUPS
-# below, against the precomputed platform_group column instead (see
-# 20260820_add_platform_group_step1_schema.sql) -- an exact-match filter
-# on an indexed column, not a runtime ilike-OR.
-PRICECHARTING_CATEGORY_GROUPS: dict[str, list[str]] = {
-    "sports-cards": ["Baseball", "Basketball", "Football", "Hockey", "Soccer"],
-    "trading-card-games": ["Magic", "Pokemon", "Yugioh", "Lorcana"],
-    "comics": ["Comic"],
-    "funko-pops": ["Funko"],
-    "lego-sets": ["Lego"],
-    "coins": ["Coin"],
-}
-
-# Video Games platform buckets -- a SEPARATE dict from
-# PRICECHARTING_CATEGORY_GROUPS because the filtering mechanism differs:
-# these match the precomputed platform_group column (exact equality, see
-# compute_platform_group() in 20260820_add_platform_group_step1_schema.sql
-# and its Python mirror in scripts/import_pricecharting_catalog.py), not an
-# ilike-OR against `category`. Keys double as the category_group value the
-# admin portal sends and the values here are display labels only (the
-# actual matching logic lives in the SQL function, kept in one place).
-PRICECHARTING_PLATFORM_GROUPS: dict[str, str] = {
-    "playstation": "PlayStation",
-    "xbox": "Xbox",
-    "nintendo": "Nintendo",
-    "sega": "Sega",
-    "atari": "Atari",
-    "pc": "PC",
-    "retro-other": "Other retro",
-}
+# PRICECHARTING_CATEGORY_GROUPS / PRICECHARTING_PLATFORM_GROUPS now live in
+# catalog_search_service.py (imported above) -- shared with the public/
+# mobile Discover search, which needs the exact same taxonomy.
 
 
 def _catalog_filter_params(

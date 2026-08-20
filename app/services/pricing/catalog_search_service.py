@@ -38,6 +38,76 @@ class CatalogItemNotFoundError(CatalogSearchError):
     """Raised when a catalog item cannot be found."""
 
 
+# Single source of truth for pricecharting_catalog's category-group
+# taxonomy -- shared by the admin Catalog products screen
+# (admin_catalog_service.py, which imports these) and the public/mobile
+# Discover search below. Moved here (rather than defined in
+# admin_catalog_service.py) because admin_catalog_service already imports
+# FROM this module -- keeping the taxonomy here avoids a circular import.
+#
+# pricecharting_catalog's raw `category` column is far too granular for a
+# dropdown ("Basketball Cards 2019 Panini Donruss Optic", not "Sports
+# Cards") -- there's no separate coarse-category column, so these groups
+# are keyword sets or'd together against the same raw column. KicksDB has
+# no equivalent taxonomy defined anywhere in this system.
+#
+# video-games is deliberately absent from this dict: PriceCharting's
+# video-games rows use `category` for a real per-game genre ("Action &
+# Adventure", "FPS", "RPG", ...), not a fixed small taxonomy like every
+# other group here -- confirmed live against real rows (31 distinct genre
+# values on Playstation 4 alone). Video Games is filtered separately, via
+# PRICECHARTING_PLATFORM_GROUPS below, against the precomputed
+# platform_group column instead (see
+# 20260820_add_platform_group_step1_schema.sql) -- an exact-match filter
+# on an indexed column, not a runtime ilike-OR (a console_name-based
+# ilike-OR filter was tried and reverted for timing out at this scale,
+# re-confirmed live: 57014 statement timeout even with an index on
+# console_name).
+PRICECHARTING_CATEGORY_GROUPS: dict[str, list[str]] = {
+    "sports-cards": ["Baseball", "Basketball", "Football", "Hockey", "Soccer"],
+    "trading-card-games": ["Magic", "Pokemon", "Yugioh", "Lorcana"],
+    "comics": ["Comic"],
+    "funko-pops": ["Funko"],
+    "lego-sets": ["Lego"],
+    "coins": ["Coin"],
+}
+
+# Video Games platform buckets -- a SEPARATE dict from
+# PRICECHARTING_CATEGORY_GROUPS because the filtering mechanism differs:
+# these match the precomputed platform_group column (exact equality, see
+# compute_platform_group() in 20260820_add_platform_group_step1_schema.sql
+# and its Python mirror in scripts/import_pricecharting_catalog.py), not an
+# ilike-OR against `category`. Keys double as the category_group value
+# callers send; the values here are display labels only (the actual
+# matching logic lives in the SQL function, kept in one place).
+PRICECHARTING_PLATFORM_GROUPS: dict[str, str] = {
+    "playstation": "PlayStation",
+    "xbox": "Xbox",
+    "nintendo": "Nintendo",
+    "sega": "Sega",
+    "atari": "Atari",
+    "pc": "PC",
+    "retro-other": "Other retro",
+}
+
+
+def resolve_category_group_filters(
+    category_group: str | None,
+) -> tuple[list[str] | None, str | None]:
+    """Resolves a category_group key into RPC-ready filter args.
+
+    Returns (category_keywords, platform_group_filter) -- exactly one is
+    ever non-None (or both None for an unrecognized/absent group), matching
+    search_pricecharting_catalog()'s two mutually-exclusive filter
+    mechanisms. Shared by admin's search_catalog_rows and the public
+    Discover search below so the two can't drift apart.
+    """
+    if category_group in PRICECHARTING_PLATFORM_GROUPS:
+        return None, category_group
+    keywords = PRICECHARTING_CATEGORY_GROUPS.get(category_group or "")
+    return (keywords if keywords else None), None
+
+
 @dataclass(frozen=True)
 class CatalogSearchService:
     supabase_url: str | None = None
@@ -49,7 +119,16 @@ class CatalogSearchService:
     def is_configured(self) -> bool:
         return bool(self._supabase_url and self._service_role_key)
 
-    def search(self, query: str, limit: int = 20) -> CatalogSearchResponse:
+    def search(
+        self,
+        query: str,
+        limit: int = 20,
+        *,
+        category_group: str | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+        source: str | None = None,
+    ) -> CatalogSearchResponse:
         normalized_query = _normalize_query(query)
         bounded_limit = max(1, min(limit, 50))
         if len(normalized_query) < 2:
@@ -64,8 +143,28 @@ class CatalogSearchService:
         # combined list below just needs a single comparable score per row
         # to interleave the two sources correctly, so results aren't
         # PriceCharting-first / KicksDB-second regardless of relevance.
-        pc_rows = self._fetch_rows(normalized_query, bounded_limit)
-        kicksdb_rows = self._fetch_kicksdb_rows(normalized_query, bounded_limit)
+        #
+        # category_group only prunes the PriceCharting side -- KicksDB has
+        # no category/platform taxonomy (same limitation as the admin
+        # Catalog screen). min_price/max_price apply to whichever source(s)
+        # are actually queried. source, when given, skips fetching the
+        # other source entirely rather than fetching-then-discarding.
+        normalized_source = source if source in ("pricecharting", "kicksdb") else None
+        pc_rows = (
+            self._fetch_rows(
+                normalized_query, bounded_limit,
+                category_group=category_group, min_price=min_price, max_price=max_price,
+            )
+            if normalized_source != "kicksdb"
+            else []
+        )
+        kicksdb_rows = (
+            self._fetch_kicksdb_rows(
+                normalized_query, bounded_limit, min_price=min_price, max_price=max_price,
+            )
+            if normalized_source != "pricecharting"
+            else []
+        )
 
         scored: list[tuple[int, str, str, dict[str, Any]]] = [
             (_match_score(row, normalized_query), str(row.get("product_name") or ""), "pricecharting", row)
@@ -236,7 +335,15 @@ class CatalogSearchService:
         )
         return value.strip()
 
-    def _fetch_rows(self, query: str, limit: int) -> list[dict[str, Any]]:
+    def _fetch_rows(
+        self,
+        query: str,
+        limit: int,
+        *,
+        category_group: str | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+    ) -> list[dict[str, Any]]:
         # Calls search_pricecharting_catalog(), a Postgres function
         # (20260806_create_search_pricecharting_catalog_rpc.sql) that does
         # the filter + relevance scoring + sort + limit entirely in SQL.
@@ -266,10 +373,18 @@ class CatalogSearchService:
         # pricecharting_catalog_search_idx GIN/tsvector index), a separate,
         # larger, unscoped change. This was very likely already slow before
         # today, unrelated to anything changed here.
+        category_keywords, platform_group_filter = resolve_category_group_filters(category_group)
         payload = self._request(
             "POST",
             "/rest/v1/rpc/search_pricecharting_catalog",
-            json_payload={"search_query": query, "result_limit": limit},
+            json_payload={
+                "search_query": query,
+                "result_limit": limit,
+                "category_keywords": category_keywords,
+                "min_price_cents": int(min_price * 100) if min_price is not None else None,
+                "max_price_cents": int(max_price * 100) if max_price is not None else None,
+                "platform_group_filter": platform_group_filter,
+            },
         )
         if not isinstance(payload, list):
             return []
@@ -1152,16 +1267,30 @@ class CatalogSearchService:
             return None
         return select_best_funko_image(payload)
 
-    def _fetch_kicksdb_rows(self, query: str, limit: int) -> list[dict[str, Any]]:
+    def _fetch_kicksdb_rows(
+        self,
+        query: str,
+        limit: int,
+        *,
+        min_price: float | None = None,
+        max_price: float | None = None,
+    ) -> list[dict[str, Any]]:
         # Mirrors _fetch_rows()'s RPC-based ranking (see that method's
         # comment for why a plain REST ORDER BY isn't safe here either).
         # kicksdb_catalog is ~11K rows, well under the size where the
         # adaptive broad-query fallback used for pricecharting_catalog
-        # becomes necessary.
+        # becomes necessary. No category_group here -- KicksDB has no
+        # category/platform taxonomy (see resolve_category_group_filters'
+        # own module).
         payload = self._request(
             "POST",
             "/rest/v1/rpc/search_kicksdb_catalog",
-            json_payload={"search_query": query, "result_limit": limit},
+            json_payload={
+                "search_query": query,
+                "result_limit": limit,
+                "min_price_cents": int(min_price * 100) if min_price is not None else None,
+                "max_price_cents": int(max_price * 100) if max_price is not None else None,
+            },
         )
         if not isinstance(payload, list):
             return []

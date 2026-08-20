@@ -118,6 +118,103 @@ class CatalogSearchServiceTest(unittest.TestCase):
             "/rest/v1/rpc/search_pricecharting_catalog", str(requests[0].url)
         )
 
+    def test_search_forwards_category_group_and_price_filters_to_pricecharting_rpc(
+        self,
+    ) -> None:
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "search_pricecharting_catalog" in str(request.url):
+                captured["json"] = json.loads(request.read())
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        service.search("card", limit=10, category_group="coins", min_price=5, max_price=50)
+
+        self.assertEqual(captured["json"]["category_keywords"], ["Coin"])
+        self.assertEqual(captured["json"]["min_price_cents"], 500)
+        self.assertEqual(captured["json"]["max_price_cents"], 5000)
+        self.assertIsNone(captured["json"]["platform_group_filter"])
+
+    def test_search_forwards_platform_group_to_pricecharting_rpc(self) -> None:
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "search_pricecharting_catalog" in str(request.url):
+                captured["json"] = json.loads(request.read())
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        service.search("mario", limit=10, category_group="nintendo")
+
+        self.assertIsNone(captured["json"]["category_keywords"])
+        self.assertEqual(captured["json"]["platform_group_filter"], "nintendo")
+
+    def test_search_forwards_price_filters_to_kicksdb_rpc(self) -> None:
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "search_kicksdb_catalog" in str(request.url):
+                captured["json"] = json.loads(request.read())
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        service.search("jordan", limit=10, min_price=20, max_price=200)
+
+        self.assertEqual(captured["json"]["min_price_cents"], 2000)
+        self.assertEqual(captured["json"]["max_price_cents"], 20000)
+
+    def test_search_source_pricecharting_skips_kicksdb_fetch_entirely(self) -> None:
+        kicksdb_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "search_kicksdb_catalog" in str(request.url):
+                kicksdb_requests.append(request)
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        service.search("card", limit=10, source="pricecharting")
+
+        self.assertEqual(kicksdb_requests, [])
+
+    def test_search_source_kicksdb_skips_pricecharting_fetch_entirely(self) -> None:
+        pricecharting_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "search_pricecharting_catalog" in str(request.url):
+                pricecharting_requests.append(request)
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        service.search("jordan", limit=10, source="kicksdb")
+
+        self.assertEqual(pricecharting_requests, [])
+
     def test_search_falls_back_to_generic_price_for_scan_derived_rows(self) -> None:
         # Scan-derived rows (source_kind='scan_derived', promoted from
         # pricing_cache_entries) never populate the PriceCharting-specific
