@@ -7,6 +7,10 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.services.pricing.marketplace_listing_filters import (
+    has_meaningful_title_overlap,
+    is_junk_listing_title,
+)
 
 
 # Maps PackLox's 4 supported display currencies (CollectorProfile.
@@ -76,7 +80,12 @@ class EbayListingService:
         return bool(self._client_id and self._client_secret and self._oauth_token_url)
 
     def search_listings(
-        self, query: str, *, marketplace_id: str, limit: int = 3
+        self,
+        query: str,
+        *,
+        marketplace_id: str,
+        limit: int = 3,
+        upc: str | None = None,
     ) -> list[dict[str, Any]]:
         normalized_query = query.strip()
         if not normalized_query or not self.is_configured:
@@ -84,6 +93,19 @@ class EbayListingService:
         token = self._access_token()
         if not token:
             return []
+        # GTIN (UPC) search when the catalog row has one -- a real product
+        # identifier instead of free-text keyword matching, confirmed live
+        # to surface better candidates. Still not a strict filter on eBay's
+        # side though (live-confirmed: a UPC-scoped "God of War" search
+        # still returned a bare PS4 console and a multi-game lot) -- so
+        # this is a better STARTING candidate pool, not a replacement for
+        # the junk/overlap filtering below, which runs either way.
+        normalized_upc = (upc or "").strip()
+        search_params: dict[str, str] = {"limit": str(max(1, min(limit * 3, 30)))}
+        if normalized_upc:
+            search_params["gtin"] = normalized_upc
+        else:
+            search_params["q"] = normalized_query
         client = self._client or httpx.Client(timeout=self._timeout_seconds)
         should_close = self._client is None
         try:
@@ -93,7 +115,7 @@ class EbayListingService:
                     "Authorization": f"Bearer {token}",
                     "X-EBAY-C-MARKETPLACE-ID": marketplace_id,
                 },
-                params={"q": normalized_query, "limit": str(max(1, min(limit, 10)))},
+                params=search_params,
                 timeout=self._timeout_seconds,
             )
         except httpx.HTTPError:
@@ -110,7 +132,20 @@ class EbayListingService:
         items = payload.get("itemSummaries") if isinstance(payload, dict) else None
         if not isinstance(items, list):
             return []
-        return [row for row in (_item_to_listing(item) for item in items) if row is not None]
+        candidates = [row for row in (_item_to_listing(item) for item in items) if row is not None]
+        # Over-fetch (limit*3 above) then filter down to `limit` -- a GTIN
+        # or keyword search can return real junk/off-target results (see
+        # the module docstring on marketplace_listing_filters), so
+        # filtering before truncating means a page of 3 rejects doesn't
+        # silently leave zero real listings when good ones existed further
+        # down the result set.
+        relevant = [
+            row
+            for row in candidates
+            if not is_junk_listing_title(row["title"])
+            and has_meaningful_title_overlap(normalized_query, row["title"])
+        ]
+        return relevant[:limit]
 
     def _access_token(self) -> str:
         now = time.time()

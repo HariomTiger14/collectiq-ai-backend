@@ -582,13 +582,19 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertEqual(response.marketplaceListings[0].title, "Cached Listing")
         self.assertEqual(live_ebay_requests, [])
 
-    def test_detail_skips_ebay_when_disabled_via_flag(self) -> None:
+    def test_detail_skips_marketplace_sources_when_all_disabled_via_flag(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if "pricecharting_catalog_history" in url:
                 return httpx.Response(200, json=[])
             if "catalog_marketplace_source_flags" in url:
-                return httpx.Response(200, json=[{"source": "ebay", "enabled": False}])
+                return httpx.Response(
+                    200,
+                    json=[
+                        {"source": "ebay", "enabled": False},
+                        {"source": "pricecharting", "enabled": False},
+                    ],
+                )
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
                     200,
@@ -615,6 +621,149 @@ class CatalogSearchServiceTest(unittest.TestCase):
         response = service.detail("45800", currency="AUD")
 
         self.assertEqual(response.marketplaceListings, [])
+
+    def test_detail_skips_only_the_disabled_marketplace_source(self) -> None:
+        # ebay disabled, pricecharting left enabled (fail-open default) --
+        # confirms each source's kill switch is independent, not an
+        # all-or-nothing flag.
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if "catalog_marketplace_source_flags" in url:
+                return httpx.Response(200, json=[{"source": "ebay", "enabled": False}])
+            if "pricecharting_listing_cache" in url and request.method == "GET":
+                return httpx.Response(200, json=[])
+            if "pricecharting_listing_cache" in url and request.method == "POST":
+                return httpx.Response(201, json=None)
+            if "/api/offers" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "success",
+                        "offers": [
+                            {
+                                "product-name": "God of War",
+                                "price": 1599,
+                                "condition-string": "Normal wear",
+                                "offer-url": "/offer/abc123",
+                            },
+                        ],
+                    },
+                )
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "45800",
+                            "product_name": "God of War",
+                            "console_name": "Playstation 4",
+                            "category": "Action & Adventure",
+                            "loose_price_cents": 1299,
+                            "currency": "USD",
+                            "normalized_identity": "god of war playstation 4",
+                        }
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.detail("45800")
+
+        self.assertEqual(len(response.marketplaceListings), 1)
+        self.assertEqual(response.marketplaceListings[0].source, "PriceCharting")
+
+    def test_detail_merges_ebay_and_pricecharting_listings_with_currency_conversion(
+        self,
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if "catalog_marketplace_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "ebay_listing_cache" in url and request.method == "GET":
+                return httpx.Response(200, json=[])
+            if "ebay_listing_cache" in url and request.method == "POST":
+                return httpx.Response(201, json=None)
+            if "identity/v1/oauth2/token" in url:
+                return httpx.Response(200, json={"access_token": "fake-token", "expires_in": 7200})
+            if "buy/browse/v1/item_summary/search" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "itemSummaries": [
+                            {
+                                "title": "God of War PS4 Brand New",
+                                "price": {"value": "20.00", "currency": "AUD"},
+                                "condition": "New",
+                                "itemWebUrl": "https://www.ebay.com.au/itm/12345",
+                            },
+                        ]
+                    },
+                )
+            if "pricecharting_listing_cache" in url and request.method == "GET":
+                return httpx.Response(200, json=[])
+            if "pricecharting_listing_cache" in url and request.method == "POST":
+                return httpx.Response(201, json=None)
+            if "/api/offers" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "success",
+                        "offers": [
+                            {
+                                "product-name": "God of War",
+                                "price": 1000,  # $10.00 USD
+                                "condition-string": "Normal wear",
+                                "offer-url": "/offer/abc123",
+                            },
+                        ],
+                    },
+                )
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "45800",
+                            "product_name": "God of War",
+                            "console_name": "Playstation 4",
+                            "category": "Action & Adventure",
+                            "loose_price_cents": 1299,
+                            "currency": "USD",
+                            "normalized_identity": "god of war playstation 4",
+                        }
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.detail("45800", currency="AUD")
+
+        self.assertEqual(len(response.marketplaceListings), 2)
+        by_source = {listing.source: listing for listing in response.marketplaceListings}
+        self.assertIn("eBay", by_source)
+        self.assertIn("PriceCharting", by_source)
+        self.assertEqual(by_source["eBay"].price, 20.00)
+        self.assertEqual(by_source["eBay"].currency, "AUD")
+        # $10.00 USD converted at the default rate (settings.fx_usd_to_aud,
+        # 1.52) -- PriceCharting has no per-region marketplace, so this is
+        # real currency conversion, not a different marketplace's native
+        # price the way eBay's AUD figure above already was.
+        self.assertEqual(by_source["PriceCharting"].price, round(10.00 * 1.52, 2))
+        self.assertEqual(by_source["PriceCharting"].currency, "AUD")
 
     def test_detail_missing_catalog_item_raises_not_found(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
