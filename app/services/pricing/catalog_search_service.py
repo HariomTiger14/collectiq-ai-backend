@@ -233,17 +233,18 @@ class CatalogSearchService:
             else _kicksdb_row_to_result(row, normalized_query)
             for _, _, source, row in top
         ]
-        # Deliberately no inline imageUrl enrichment here: this is the open,
-        # free-to-everyone catalog browse/search surface. Publisher-sourced
-        # card/product art (Pokemon/Magic/Yu-Gi-Oh/Lorcana/One Piece/LEGO/
-        # Funko) is only rendered inline in detail(), reached by tapping
-        # into a specific item to confirm and save it to a portfolio -- a
-        # bounded, per-item identification use, not an open image database.
-        # We DO still resolve the same match here and expose it as
-        # externalImageUrl (see _resolve_external_image_url) -- link-only,
-        # opened in an external/in-app browser tab by the client, never
-        # rendered inline, which is the lower-risk hyperlink pattern rather
-        # than hosting the image inside our own app layout.
+        # No inline imageUrl enrichment for most categories here: this is
+        # the open, free-to-everyone catalog browse/search surface.
+        # Publisher-sourced card/product art (Pokemon/Magic/Yu-Gi-Oh/
+        # Lorcana/One Piece/LEGO/Funko) is only rendered inline in
+        # detail(), reached by tapping into a specific item to confirm and
+        # save it to a portfolio -- a bounded, per-item identification use,
+        # not an open image database. We DO still resolve the same match
+        # here and expose it as externalImageUrl (see
+        # _resolve_external_image_url) -- link-only, opened in an
+        # external/in-app browser tab by the client, never rendered inline,
+        # which is the lower-risk hyperlink pattern rather than hosting the
+        # image inside our own app layout.
         # KicksDB (sneakers) images are unaffected; they come from
         # _kicksdb_row_to_result above, not this enrichment chain.
         if any(not result.imageUrl for result in results):
@@ -252,6 +253,19 @@ class CatalogSearchService:
                 self._resolve_external_image_url(result, enabled_image_categories)
                 for result in results
             ]
+            # Video games are the one exception: rawg_video_game_catalog is
+            # our own bulk-imported table (not a live third-party API call
+            # or a publisher's own card art), already rendered inline
+            # without restriction on detail() -- so it's reasonable to show
+            # it directly on the search results row too, rather than only
+            # after tapping in. Batched into a single extra request
+            # regardless of result count (see
+            # _enrich_pricecharting_video_game_images's own comment for
+            # why) rather than reusing detail()'s per-item three-tier
+            # fallback chain, which would mean up to 150 sequential HTTP
+            # round-trips for a 50-result page.
+            if "videogames" in enabled_image_categories:
+                results = self._enrich_pricecharting_video_game_images(results)
         return CatalogSearchResponse(
             query=normalized_query,
             count=len(results),
@@ -1157,6 +1171,97 @@ class CatalogSearchService:
             return []
         return [row for row in payload if isinstance(row, dict)]
 
+    def _enrich_pricecharting_video_game_images(
+        self, results: list[CatalogSearchResult]
+    ) -> list[CatalogSearchResult]:
+        """Batch-fills imageUrl for video-game search results in ONE request.
+
+        _enrich_with_video_games_image (below) chases a three-tier fallback
+        chain per item (exact -> prefix -> loose-match) -- fine for a
+        single detail() lookup, but doing that per row for up to 50 search
+        results would mean up to 150 sequential HTTP round-trips against
+        Supabase, an unacceptable latency hit on an interactive search
+        endpoint. This does the EXACT tier only, batched into a single
+        composite-OR request across every candidate row -- bounded to
+        exactly one extra request per search call regardless of result
+        count. A row that would only match via the prefix/loose-match
+        fallback (a punctuation or suffix difference from RAWG's title)
+        simply keeps its placeholder here; it still gets a real image the
+        moment the user taps into detail(), where the full fallback chain
+        still runs.
+        """
+        candidates: list[tuple[int, str, str]] = []
+        for index, result in enumerate(results):
+            if result.imageUrl or not result.setName:
+                continue
+            rawg_platform = _video_game_rawg_platform(result.setName)
+            if rawg_platform is None:
+                continue
+            base_title = _video_game_base_title(result.title)
+            if not base_title:
+                continue
+            normalized_name = _video_game_normalize_name(base_title)
+            if not normalized_name:
+                continue
+            normalized_name = _video_game_resolve_normalized_name(
+                normalized_name, rawg_platform
+            )
+            candidates.append((index, normalized_name, rawg_platform))
+
+        if not candidates:
+            return results
+
+        # Dedup pairs -- a search page can easily contain the same title on
+        # the same platform twice (different conditions/printings), no
+        # need to ask Supabase for the same pair more than once.
+        distinct_pairs = sorted({(name, platform) for _, name, platform in candidates})
+        or_filter = ",".join(
+            f"and(normalized_name.eq.{_pgrest_or_literal(name)},"
+            f"rawg_platform.eq.{_pgrest_or_literal(platform)})"
+            for name, platform in distinct_pairs
+        )
+        payload = self._request(
+            "GET",
+            "/rest/v1/rawg_video_game_catalog",
+            params={
+                "select": "normalized_name,rawg_platform,image_url",
+                "or": f"({or_filter})",
+                "limit": str(len(distinct_pairs) * 2),
+            },
+        )
+        if not isinstance(payload, list):
+            return results
+
+        # Same conservative discipline as the single-item path: a pair
+        # with more than one matching row (RAWG remasters/re-releases
+        # sharing a normalized name) is ambiguous -- suppressed, never
+        # guessed.
+        rows_by_pair: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            key = (
+                str(row.get("normalized_name") or ""),
+                str(row.get("rawg_platform") or ""),
+            )
+            rows_by_pair.setdefault(key, []).append(row)
+
+        image_by_pair: dict[tuple[str, str], str] = {}
+        for key, rows in rows_by_pair.items():
+            if len(rows) == 1:
+                image_url = rows[0].get("image_url")
+                if image_url:
+                    image_by_pair[key] = str(image_url)
+
+        updated = list(results)
+        for index, name, platform in candidates:
+            image_url = image_by_pair.get((name, platform))
+            if image_url:
+                updated[index] = updated[index].model_copy(
+                    update={"imageUrl": image_url}
+                )
+        return updated
+
     def _enrich_with_video_games_image(
         self, result: CatalogSearchResult
     ) -> CatalogSearchResult:
@@ -1910,6 +2015,20 @@ def _video_game_normalize_name(name: str) -> str:
     # match has to produce byte-identical output or nothing will ever
     # match.
     return _VIDEO_GAME_WHITESPACE_RE.sub(" ", name).strip().lower()
+
+
+def _pgrest_or_literal(value: str) -> str:
+    # PostgREST's composite or=(and(col.eq.X,...),...) syntax treats
+    # commas/parentheses/periods as its own filter-string delimiters -- a
+    # game title containing any of them (colons, apostrophes, and
+    # parentheses are all common, e.g. "god of war (2018)") would otherwise
+    # break the filter's own parsing, not just the comparison value. Per
+    # PostgREST's docs, wrapping the value in double quotes escapes it for
+    # this purpose; a literal backslash or double-quote inside the value
+    # itself must then be backslash-escaped, in that order (backslash
+    # first, same reasoning as _video_game_like_escape below).
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _video_game_like_escape(normalized_name: str) -> str:
