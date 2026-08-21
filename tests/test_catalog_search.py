@@ -18,6 +18,7 @@ from app.services.pricing.catalog_search_service import (
     _lorcana_set_name_from_console,
     _onepiece_set_code,
     _pokemon_variant_token,
+    _video_game_strip_punctuation,
     _yugioh_set_code,
 )
 
@@ -2743,6 +2744,34 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
         query = dict(catalog_requests[0].url.params)
         self.assertEqual(query.get("normalized_name"), "eq.super mario 64")
         self.assertEqual(query.get("rawg_platform"), "eq.Nintendo 64")
+
+    def test_video_game_strip_punctuation_folds_accented_letters_not_deletes_them(
+        self,
+    ) -> None:
+        # The bug this generalizes a fix for: without folding, an accented
+        # letter is simply removed by the non-alphanumeric strip (it isn't
+        # in [a-z0-9 ]) rather than reduced to its plain ASCII base letter
+        # -- "ragnarök" would become "ragnark" (one letter short, a
+        # different string), not "ragnarok". Covers a few distinct
+        # diacritic types (umlaut, acute accent), not just the one
+        # live-confirmed case.
+        # Always called on already-lowercased normalized_name values in
+        # real usage (both sides come from _video_game_normalize_name() or
+        # the DB column, which the import script lowercases at write
+        # time) -- exercised lowercase here to match, since the strip
+        # regex is deliberately case-sensitive ([a-z0-9 ], not
+        # [a-zA-Z0-9 ]) and would otherwise strip capital letters as if
+        # they were punctuation, an unrelated behavior this test isn't
+        # about.
+        self.assertEqual(_video_game_strip_punctuation("ragnarök"), "ragnarok")
+        self.assertEqual(_video_game_strip_punctuation("pokémon"), "pokemon")
+        self.assertEqual(_video_game_strip_punctuation("café racer"), "cafe racer")
+        # Still folds curly-vs-straight apostrophes and strips ordinary
+        # punctuation the same as before this change.
+        self.assertEqual(
+            _video_game_strip_punctuation("uncharted 4: a thief’s end"),
+            "uncharted 4 a thiefs end",
+        )
 
     def test_detail_resolves_god_of_war_ragnarok_alias_to_rawgs_real_title(
         self,

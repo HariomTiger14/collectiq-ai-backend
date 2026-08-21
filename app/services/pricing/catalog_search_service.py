@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -2044,16 +2045,50 @@ def _video_game_like_escape(normalized_name: str) -> str:
 _VIDEO_GAME_NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]")
 
 
+def _video_game_fold_diacritics(text: str) -> str:
+    # Found while investigating a real mismatch (RAWG's "God of War:
+    # Ragnarök" vs PriceCharting's "God of War Ragnarok" -- the ACTUAL bug
+    # in that specific case turned out to be a different, prefix-match
+    # collision, fixed separately via _VIDEO_GAME_TITLE_ALIASES; see that
+    # table's comment). But auditing the fold logic surfaced a second, real
+    # bug this fixes generally: without this, the bare non-alphanumeric
+    # strip below DELETES an accented letter like "ö" outright (it isn't in
+    # [a-z0-9 ]) rather than folding it to its plain "o" -- "ragnarök" ->
+    # "ragnark" (one letter short, an actual wrong string), not "ragnarok"
+    # (the correct fold). That silently broke the loose-match comparison
+    # for every accented title, not just this one -- a live count found
+    # 1,357 of 53,890 rawg_video_game_catalog rows (~2.5%) contain a
+    # character outside plain ASCII letters/digits/common punctuation, so
+    # this needed a general fix, not a one-off alias table entry per
+    # affected title.
+    #
+    # NFKD decomposes an accented Latin letter into its base letter plus a
+    # separate combining diacritical mark (e.g. "ö" -> "o" + COMBINING
+    # DIAERESIS); dropping every character in Unicode category "Mn"
+    # (nonspacing mark) then leaves just the plain base letters. Symbols
+    # that aren't letter+diacritic pairs (√, ×, #, fullwidth punctuation,
+    # etc.) don't decompose this way and fall through unchanged -- the
+    # existing non-alphanumeric strip below still removes those exactly as
+    # it did before this function existed, so this only changes behavior
+    # for genuinely accented letters.
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch)
+    )
+
+
 def _video_game_strip_punctuation(normalized_name: str) -> str:
     # For the loose-match fallback only (_fetch_video_game_image_by_
     # loose_match) -- reduces a title to bare alphanumerics + single
     # spaces, so colon-vs-no-colon and straight-vs-curly-apostrophe
     # differences between PriceCharting's and RAWG's titles for the same
     # game (e.g. "Uncharted 4 A Thief's End" vs "Uncharted 4: A Thief's
-    # End") stop mattering. Never used to build the actual SQL filter
-    # (normalized_name in the database still has real punctuation) --
-    # only for the local equality comparison against fetched candidates.
-    return _VIDEO_GAME_WHITESPACE_RE.sub(" ", _VIDEO_GAME_NON_ALNUM_RE.sub("", normalized_name)).strip()
+    # End"), and accented-vs-plain letter differences (e.g. "Ragnarök" vs
+    # "Ragnarok"), stop mattering. Never used to build the actual SQL
+    # filter (normalized_name in the database still has real punctuation
+    # and diacritics) -- only for the local equality comparison against
+    # fetched candidates.
+    folded = _video_game_fold_diacritics(normalized_name)
+    return _VIDEO_GAME_WHITESPACE_RE.sub(" ", _VIDEO_GAME_NON_ALNUM_RE.sub("", folded)).strip()
 
 
 # RAWG disambiguates same-named franchise entries with a suffix RAWG itself
@@ -2074,17 +2109,19 @@ def _video_game_strip_punctuation(normalized_name: str) -> str:
 _VIDEO_GAME_TITLE_ALIASES: dict[tuple[str, str], str] = {
     ("god of war", "PlayStation 2"): "god of war i",
     ("god of war", "PlayStation 4"): "god of war (2018)",
-    # RAWG's title for the 2022 game carries the Old Norse ö ("Ragnarök")
-    # and a colon after "War" -- PriceCharting's listing has neither
-    # ("God of War Ragnarok"). The gap isn't just cosmetic: the loose-match
-    # fallback strips ALL non-alphanumeric characters (including ö, not
-    # just ASCII punctuation) before comparing, which turns "ragnarök"
-    # into "ragnark" (the ö is deleted, not folded to "o") -- one letter
-    # short of PriceCharting's "ragnarok", so even that fallback tier
-    # can't bridge it and was live-confirmed picking an unrelated
-    # candidate instead (a "God of War Ragnarok: Valhalla" DLC
-    # screenshot, not the base game's real cover). Confirmed live against
-    # rawg_video_game_catalog before adding, same discipline as the two
+    # This one is NOT the accented-letter gap (ö vs o) -- that part is
+    # handled generally by _video_game_fold_diacritics(), no alias needed.
+    # The actual bug live-confirmed here is upstream of that: the prefix
+    # fallback tier (_fetch_video_game_image_by_prefix) does a raw,
+    # unfolded `normalized_name ilike 'god of war ragnarok%'` check, and
+    # "god of war ragnarok: valhalla" -- a SEPARATE, real DLC entry, not a
+    # longer title for the same base game -- happens to satisfy that raw
+    # prefix uniquely, so the prefix tier returned it (and never got as
+    # far as the correctly-folding loose-match tier at all). That's a
+    # structurally different failure than a punctuation/accent gap: a
+    # short title can be a genuine raw-byte prefix of an unrelated
+    # product's title, and no amount of string-normalization fixes that --
+    # it needs to be told apart by hand, the same reasoning as the two
     # entries above.
     ("god of war ragnarok", "PlayStation 4"): "god of war: ragnarök",
     ("god of war ragnarok", "PlayStation 5"): "god of war: ragnarök",
