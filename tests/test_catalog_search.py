@@ -3144,31 +3144,39 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
                 return httpx.Response(200, json=[])
             if "rawg_video_game_catalog" in url:
                 catalog_requests.append(request)
-                return httpx.Response(
-                    200,
-                    json=[
-                        {
-                            "normalized_name": "super mario 64",
-                            "rawg_platform": "Nintendo 64",
-                            "image_url": "https://img.example/mario64.jpg",
-                        },
-                        {
-                            "normalized_name": "worms",
-                            "rawg_platform": "Game Boy",
-                            "image_url": "https://img.example/worms.jpg",
-                        },
-                    ],
-                )
+                query = dict(request.url.params)
+                if query.get("rawg_platform") == "eq.Nintendo 64":
+                    return httpx.Response(
+                        200,
+                        json=[
+                            {
+                                "normalized_name": "super mario 64",
+                                "image_url": "https://img.example/mario64.jpg",
+                            },
+                        ],
+                    )
+                if query.get("rawg_platform") == "eq.Game Boy":
+                    return httpx.Response(
+                        200,
+                        json=[
+                            {
+                                "normalized_name": "worms",
+                                "image_url": "https://img.example/worms.jpg",
+                            },
+                        ],
+                    )
+                return httpx.Response(200, json=[])
             return httpx.Response(200, json=[])
 
         service = self._build_service(handler)
 
         response = service.search("mario worms", limit=20)
 
-        # Exactly ONE rawg_video_game_catalog request regardless of result
-        # count -- the whole point of batching over the per-item fallback
-        # chain detail() uses.
-        self.assertEqual(len(catalog_requests), 1)
+        # One request per distinct PLATFORM (Nintendo 64, Game Boy),
+        # regardless of result count -- amortizes the full matching chain
+        # across however many rows share a platform, rather than one
+        # request per row or per exact title.
+        self.assertEqual(len(catalog_requests), 2)
         by_id = {result.id: result for result in response.results}
         self.assertEqual(by_id["555"].imageUrl, "https://img.example/mario64.jpg")
         self.assertEqual(by_id["556"].imageUrl, "https://img.example/worms.jpg")
@@ -3218,6 +3226,57 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
         response = service.search("mario", limit=20)
 
         self.assertIsNone(response.results[0].imageUrl)
+
+    def test_search_row_resolves_via_the_prefix_fallback_not_just_exact(
+        self,
+    ) -> None:
+        # The actual reported bug this upgrade fixes: a title that only
+        # resolves via the "the "-prefix + loose-match fallback (e.g.
+        # PriceCharting's "Witcher 3 Wild Hunt" vs RAWG's "The Witcher 3:
+        # Wild Hunt") used to stay a placeholder on the search results row
+        # even though detail() could already resolve it -- the row-level
+        # batch only ever tried an exact match. Now the row gets the same
+        # answer detail() would give, without the user needing to tap in.
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "555",
+                            "product_name": "Witcher 3 Wild Hunt",
+                            "console_name": "Playstation 4",
+                            "category": "RPG",
+                            "loose_price_cents": 2000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "rawg_video_game_catalog" in url:
+                query = dict(request.url.params)
+                if query.get("rawg_platform") == "eq.PlayStation 4":
+                    return httpx.Response(
+                        200,
+                        json=[
+                            {
+                                "normalized_name": "the witcher 3: wild hunt",
+                                "image_url": "https://img.example/witcher3.jpg",
+                            },
+                        ],
+                    )
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        service = self._build_service(handler)
+
+        response = service.search("witcher 3", limit=20)
+
+        self.assertEqual(
+            response.results[0].imageUrl, "https://img.example/witcher3.jpg"
+        )
 
     def test_search_skips_video_game_enrichment_when_category_disabled(self) -> None:
         catalog_requests: list[httpx.Request] = []
