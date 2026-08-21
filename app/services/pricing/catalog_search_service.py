@@ -90,11 +90,50 @@ PRICECHARTING_PLATFORM_GROUPS: dict[str, str] = {
     "retro-other": "Other retro",
 }
 
+# Video Games as a selectable top-level category_group value -- distinct
+# from PRICECHARTING_CATEGORY_GROUPS/PRICECHARTING_PLATFORM_GROUPS above
+# because, unlike every other category, "Video Games with no platform
+# picked" still needs to mean something (any video game, any platform) --
+# see ANY_PLATFORM_GROUP below.
+PRICECHARTING_VIDEO_GAMES_CATEGORY_KEY = "video-games"
+
+# Sentinel passed as platform_group_filter to mean "any recognized video-
+# game platform" (platform_group is not null) rather than an exact match --
+# see 20260821_add_any_platform_sentinel_to_search_pricecharting_catalog.sql.
+# Chosen so it can never collide with a real platform_group value (those
+# are all short lowercase-hyphen keys like 'playstation'/'retro-other').
+ANY_PLATFORM_GROUP = "__any_platform__"
+
+# Subcategory drill-downs within a top-level category -- only categories
+# with a real second taxonomy dimension get an entry here. Splits the
+# combined keyword lists in PRICECHARTING_CATEGORY_GROUPS into individually
+# selectable subcategories; Video Games' subcategories are
+# PRICECHARTING_PLATFORM_GROUPS itself (handled separately in
+# resolve_category_group_filters, not duplicated here). Comics/Funko Pops/
+# Lego Sets/Coins/Sneakers have exactly one flat bucket each -- nothing to
+# drill into, so they're deliberately absent.
+PRICECHARTING_SUBCATEGORY_GROUPS: dict[str, dict[str, list[str]]] = {
+    "sports-cards": {
+        "baseball": ["Baseball"],
+        "basketball": ["Basketball"],
+        "football": ["Football"],
+        "hockey": ["Hockey"],
+        "soccer": ["Soccer"],
+    },
+    "trading-card-games": {
+        "magic": ["Magic"],
+        "pokemon": ["Pokemon"],
+        "yugioh": ["Yugioh"],
+        "lorcana": ["Lorcana"],
+    },
+}
+
 
 def resolve_category_group_filters(
     category_group: str | None,
+    subcategory: str | None = None,
 ) -> tuple[list[str] | None, str | None]:
-    """Resolves a category_group key into RPC-ready filter args.
+    """Resolves a (category_group, subcategory) pair into RPC-ready filter args.
 
     Returns (category_keywords, platform_group_filter) -- exactly one is
     ever non-None (or both None for an unrecognized/absent group), matching
@@ -102,8 +141,18 @@ def resolve_category_group_filters(
     mechanisms. Shared by admin's search_catalog_rows and the public
     Discover search below so the two can't drift apart.
     """
+    if category_group == PRICECHARTING_VIDEO_GAMES_CATEGORY_KEY:
+        if subcategory in PRICECHARTING_PLATFORM_GROUPS:
+            return None, subcategory
+        return None, ANY_PLATFORM_GROUP
     if category_group in PRICECHARTING_PLATFORM_GROUPS:
+        # Back-compat: a bare platform key as category_group (the shape
+        # used before Category/Subcategory were split into two params)
+        # still works, identical to Video Games + that platform.
         return None, category_group
+    subgroups = PRICECHARTING_SUBCATEGORY_GROUPS.get(category_group or "")
+    if subgroups and subcategory in subgroups:
+        return subgroups[subcategory], None
     keywords = PRICECHARTING_CATEGORY_GROUPS.get(category_group or "")
     return (keywords if keywords else None), None
 
@@ -125,6 +174,7 @@ class CatalogSearchService:
         limit: int = 20,
         *,
         category_group: str | None = None,
+        subcategory: str | None = None,
         min_price: float | None = None,
         max_price: float | None = None,
         source: str | None = None,
@@ -153,7 +203,8 @@ class CatalogSearchService:
         pc_rows = (
             self._fetch_rows(
                 normalized_query, bounded_limit,
-                category_group=category_group, min_price=min_price, max_price=max_price,
+                category_group=category_group, subcategory=subcategory,
+                min_price=min_price, max_price=max_price,
             )
             if normalized_source != "kicksdb"
             else []
@@ -341,6 +392,7 @@ class CatalogSearchService:
         limit: int,
         *,
         category_group: str | None = None,
+        subcategory: str | None = None,
         min_price: float | None = None,
         max_price: float | None = None,
     ) -> list[dict[str, Any]]:
@@ -373,7 +425,9 @@ class CatalogSearchService:
         # pricecharting_catalog_search_idx GIN/tsvector index), a separate,
         # larger, unscoped change. This was very likely already slow before
         # today, unrelated to anything changed here.
-        category_keywords, platform_group_filter = resolve_category_group_filters(category_group)
+        category_keywords, platform_group_filter = resolve_category_group_filters(
+            category_group, subcategory
+        )
         payload = self._request(
             "POST",
             "/rest/v1/rpc/search_pricecharting_catalog",
