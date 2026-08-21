@@ -2789,6 +2789,109 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
             _video_game_strip_edition_suffix("resident evil 4 remake")
         )
 
+    def test_video_game_strip_punctuation_treats_hyphen_as_space(self) -> None:
+        # Real gap found while auditing: RAWG's "E.T. the Extra-Terrestrial"
+        # vs PriceCharting's "ET the Extra Terrestrial" (a space, no
+        # hyphen) only differ by that one character, but deleting the
+        # hyphen with no replacement joined the two words into
+        # "extraterrestrial" -- one word short of "extra terrestrial",
+        # so they never compared equal even though it's the same game.
+        self.assertEqual(
+            _video_game_strip_punctuation("et the extra-terrestrial"),
+            "et the extra terrestrial",
+        )
+        self.assertEqual(
+            _video_game_strip_punctuation("et the extra terrestrial"),
+            "et the extra terrestrial",
+        )
+
+    def test_detail_falls_back_to_the_prefix_when_pricecharting_drops_the_article(
+        self,
+    ) -> None:
+        # Real, live-confirmed gap: PriceCharting frequently drops a
+        # leading "The" that RAWG's own title keeps -- e.g. PriceCharting's
+        # "Witcher 3: Wild Hunt" vs RAWG's "The Witcher 3: Wild Hunt",
+        # "Elder Scrolls V: Skyrim" vs "The Elder Scrolls V: Skyrim".
+        # Confirmed live against real data for two major franchises.
+        catalog_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "888",
+                            "product_name": "Witcher 3 Wild Hunt",
+                            "console_name": "Playstation 4",
+                            "category": "RPG",
+                            "loose_price_cents": 2000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "rawg_video_game_catalog" in url:
+                catalog_requests.append(request)
+                query = dict(request.url.params)
+                if query.get("normalized_name") == "eq.the witcher 3 wild hunt":
+                    return httpx.Response(
+                        200,
+                        json=[{"image_url": "https://img.example/witcher3.jpg"}],
+                    )
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        service = self._build_service(handler)
+
+        response = service.detail("888")
+
+        self.assertEqual(response.result.imageUrl, "https://img.example/witcher3.jpg")
+
+    def test_detail_the_prefix_fallback_never_strips_an_existing_the(self) -> None:
+        # A title genuinely already starting with "the" must not get a
+        # second "the " prepended -- confirms the fallback only ever
+        # ADDS the article, never guesses at removing or duplicating one.
+        catalog_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "889",
+                            "product_name": "The Nonexistent Game",
+                            "console_name": "Playstation 4",
+                            "category": "RPG",
+                            "loose_price_cents": 2000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "rawg_video_game_catalog" in url:
+                catalog_requests.append(request)
+                query = dict(request.url.params)
+                self.assertNotIn(
+                    "the the nonexistent game", query.get("normalized_name", "")
+                )
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        service = self._build_service(handler)
+        response = service.detail("889")
+
+        self.assertIsNone(response.result.imageUrl)
+
     def test_detail_falls_back_to_stripped_edition_suffix(self) -> None:
         # Integration-level proof: no match for the full title, but
         # stripping "remastered" and retrying the whole exact/prefix/
@@ -2912,9 +3015,8 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
             if "rawg_video_game_catalog" in url:
                 catalog_requests.append(request)
                 query = dict(request.url.params)
-                if query.get("normalized_name") == "eq.terminator":
-                    return httpx.Response(200, json=[])
-                if query.get("normalized_name", "").startswith("like."):
+                normalized_name_param = query.get("normalized_name", "")
+                if normalized_name_param == "like.terminator*":
                     return httpx.Response(
                         200,
                         json=[
@@ -3159,11 +3261,13 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
         response = service.detail("555")
 
         self.assertIsNone(response.result.imageUrl)
-        # Exact match (0 rows) falls through to prefix, then loose-match --
-        # both also 0 rows here since the mock handler serves the same
-        # empty fixture regardless of query, so still correctly suppressed,
-        # just via all 3 tiers now.
-        self.assertEqual(len(catalog_requests), 3)
+        # Exact match (0 rows) falls through to prefix, then loose-match,
+        # then the edition-suffix fallback (no suffix here, so it's a
+        # no-op) and the "the "-prefix fallback (a fresh exact/prefix/
+        # loose chain against "the super mario 64") -- all also 0 rows
+        # since the mock handler serves the same empty fixture regardless
+        # of query, so still correctly suppressed, just via 6 requests now.
+        self.assertEqual(len(catalog_requests), 6)
 
     def test_detail_suppresses_ambiguous_matches(self) -> None:
         handler, catalog_requests = self._build_handler(
@@ -3178,10 +3282,12 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
 
         self.assertIsNone(response.result.imageUrl)
         # Exact match (2 ambiguous rows) falls through to prefix, then
-        # loose-match, both of which the mock handler also serves the
+        # loose-match, then the "the "-prefix retry's own exact/prefix/
+        # loose chain -- all of which the mock handler also serves the
         # same 2 rows for -- still ambiguous, still correctly suppressed,
-        # just via all 3 tiers now.
-        self.assertEqual(len(catalog_requests), 3)
+        # just via 6 requests now (edition-suffix fallback is a no-op,
+        # no suffix in this title).
+        self.assertEqual(len(catalog_requests), 6)
 
     def test_detail_enriches_via_prefix_fallback_when_rawg_title_is_longer(self) -> None:
         # "Brothers" (PriceCharting) -> "Brothers: A Tale of Two Sons"
@@ -3263,7 +3369,10 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
             if "rawg_video_game_catalog" in url:
                 catalog_requests.append(request)
                 query = dict(request.url.params)
-                if query.get("normalized_name", "").startswith("like."):
+                normalized_name_param = query.get("normalized_name", "")
+                if normalized_name_param.startswith(
+                    "like."
+                ) or normalized_name_param.startswith("ilike."):
                     return httpx.Response(
                         200,
                         json=[
@@ -3279,7 +3388,9 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
         response = service.detail("558")
 
         self.assertIsNone(response.result.imageUrl)
-        self.assertEqual(len(catalog_requests), 3)
+        # Exact/prefix/loose all stay ambiguous (2 rows) for both "doom"
+        # and the "the "-prefix retry's "the doom" -- 6 requests total.
+        self.assertEqual(len(catalog_requests), 6)
 
     def test_detail_enriches_via_loose_match_for_mid_title_punctuation(self) -> None:
         # Real, live-confirmed case: PriceCharting's "Uncharted 4 A Thief's
@@ -3316,12 +3427,13 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
                 query = dict(request.url.params)
                 normalized_name_param = query.get("normalized_name", "")
                 if normalized_name_param.startswith("like.uncharted 4"):
-                    # 3rd tier's first-word anchor ("like.uncharted*") is a
-                    # superset match of the 2nd tier's full-title prefix
-                    # ("like.uncharted 4 a thiefs end*") -- distinguish by
-                    # checking for the full phrase vs. just the bare word.
+                    # 3rd tier's filter-word contains pattern
+                    # ("ilike.*uncharted*") is a superset match of the 2nd
+                    # tier's full-title prefix ("like.uncharted 4 a
+                    # thiefs end*") -- distinguish by checking for the
+                    # full phrase vs. just the bare word.
                     return httpx.Response(200, json=[])
-                if normalized_name_param == "like.uncharted*":
+                if normalized_name_param == "ilike.*uncharted*":
                     return httpx.Response(
                         200,
                         json=[
@@ -3341,7 +3453,7 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
         self.assertEqual(response.result.imageUrl, "https://img.example/uncharted4.jpg")
         self.assertEqual(len(catalog_requests), 3)
         loose_query = dict(catalog_requests[2].url.params)
-        self.assertEqual(loose_query.get("normalized_name"), "like.uncharted*")
+        self.assertEqual(loose_query.get("normalized_name"), "ilike.*uncharted*")
 
     def test_detail_skips_unmapped_video_game_platform(self) -> None:
         catalog_requests: list[httpx.Request] = []
