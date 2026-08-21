@@ -1335,9 +1335,24 @@ class CatalogSearchService:
         # entry at all (an actual data-coverage gap, not a matching bug)
         # or the difference isn't a simple trailing suffix.
         stripped = _video_game_strip_edition_suffix(normalized_name)
-        if stripped is None:
+        base_for_article_check = stripped if stripped is not None else normalized_name
+        if stripped is not None:
+            image_url = self._fetch_video_game_image_chain(stripped, rawg_platform)
+            if image_url is not None:
+                return image_url
+        # Second last-resort fallback, same live audit: PriceCharting
+        # frequently drops a leading "The" that RAWG's own title keeps
+        # (e.g. PriceCharting's "Witcher 3: Wild Hunt" vs RAWG's "The
+        # Witcher 3: Wild Hunt", "Elder Scrolls V: Skyrim" vs "The Elder
+        # Scrolls V: Skyrim") -- recovered 23 more titles this way,
+        # including two major franchises. Only ever PREPENDS "the ", never
+        # guesses at removing one, so a title genuinely starting with
+        # "The" already went through the tiers above unchanged.
+        if base_for_article_check.startswith("the "):
             return None
-        return self._fetch_video_game_image_chain(stripped, rawg_platform)
+        return self._fetch_video_game_image_chain(
+            f"the {base_for_article_check}", rawg_platform
+        )
 
     def _fetch_video_game_image_chain(
         self, normalized_name: str, rawg_platform: str
@@ -1422,27 +1437,43 @@ class CatalogSearchService:
         #
         # Can't be a SQL-side filter without a new stripped-punctuation
         # column (normalized_name still has the original punctuation) --
-        # so this fetches a small, cheap, still index-backed candidate set
-        # (a leading-prefix match on just the title's FIRST word, e.g.
-        # "uncharted", confirmed live to return single digits of rows per
-        # platform even for a common word) and does the real comparison
-        # locally: both sides stripped to bare alphanumerics before
-        # comparing, so "Uncharted 4: A Thief's End" (curly ’) and
+        # so this fetches a small, cheap candidate set and does the real
+        # comparison locally: both sides stripped to bare alphanumerics
+        # before comparing, so "Uncharted 4: A Thief's End" (curly ’) and
         # "Uncharted 4 A Thief's End" (straight ') both reduce to
         # "uncharted 4 a thiefs end" and match. Same uniqueness
-        # requirement as every other tier -- a shared first word among
+        # requirement as every other tier -- a shared filter word among
         # genuinely different games (e.g. "Doom" -> DOOM 2016 / Eternal /
         # 3 / II) will never loosely-equal each other once compared, so
         # this can't accidentally resolve an ambiguous title.
-        first_word = normalized_name.split(" ", 1)[0] if normalized_name else ""
-        if not first_word:
+        #
+        # The filter word is the LONGEST word in the title (excluding
+        # "the"/"a"/"an"), used as an ilike CONTAINS pattern
+        # (ilike.*word*), not a leading-prefix pattern -- live-confirmed
+        # real gap with a prefix-anchored approach: for a query like "the
+        # witcher 3 wild hunt" (reconstructed by _fetch_video_game_image's
+        # "the " fallback, see that method), the real RAWG row ALSO starts
+        # with "the ", so filtering on "witcher" as a PREFIX pattern
+        # (requiring the candidate to literally start with "witcher")
+        # never matches "the witcher 3: wild hunt" at all -- the word's
+        # position in the string can't be assumed. A contains pattern
+        # sidesteps that; rawg_video_game_catalog is small enough (~54K
+        # rows total, confirmed live via EXPLAIN ANALYZE: a full ilike
+        # contains-scan takes ~135ms) that an unindexed contains scan here
+        # is fine -- a fundamentally different scale than the multi-
+        # million-row pricecharting_catalog elsewhere in this codebase,
+        # where the same pattern would be a real production risk.
+        words = normalized_name.split(" ") if normalized_name else []
+        filter_words = [w for w in words if w not in ("the", "a", "an")] or words
+        if not filter_words:
             return None
+        filter_word = max(filter_words, key=len)
         stripped_target = _video_game_strip_punctuation(normalized_name)
         if not stripped_target:
             return None
         params = {
             "select": "normalized_name,image_url",
-            "normalized_name": f"like.{_video_game_like_escape(first_word)}*",
+            "normalized_name": f"ilike.*{_video_game_like_escape(filter_word)}*",
             "rawg_platform": f"eq.{rawg_platform}",
             "limit": "50",
         }
@@ -2158,7 +2189,16 @@ def _video_game_strip_punctuation(normalized_name: str) -> str:
     # filter (normalized_name in the database still has real punctuation
     # and diacritics) -- only for the local equality comparison against
     # fetched candidates.
-    folded = _video_game_fold_diacritics(normalized_name)
+    #
+    # A hyphen is replaced with a space FIRST, before the general strip
+    # below deletes it outright -- live-confirmed real gap: RAWG's
+    # "E.T. the Extra-Terrestrial" vs PriceCharting's "ET the Extra
+    # Terrestrial" (a space, no hyphen) only differ by that one
+    # character, but deleting the hyphen with no replacement joins the
+    # two words into "extraterrestrial", one word short of PriceCharting's
+    # "extra terrestrial" -- a real string, just the wrong one, so they
+    # never compared equal even though the games are actually the same.
+    folded = _video_game_fold_diacritics(normalized_name).replace("-", " ")
     return _VIDEO_GAME_WHITESPACE_RE.sub(" ", _VIDEO_GAME_NON_ALNUM_RE.sub("", folded)).strip()
 
 
