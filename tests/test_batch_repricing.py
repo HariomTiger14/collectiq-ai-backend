@@ -242,6 +242,7 @@ def test_available_reprice_writes_a_valuation_snapshot():
     assert snapshot["value_aud"] == 250.0
     assert snapshot["low_estimate_aud"] == 200.0
     assert snapshot["high_estimate_aud"] == 300.0
+    assert snapshot["currency"] == "AUD"
     assert snapshot["valuation_status"] == "market_estimated"
     assert snapshot["pricing_provider"] == "MarketEngine"
     assert snapshot["confidence_score"] == 0.9

@@ -339,6 +339,7 @@ class BatchRepricingService:
                     "value_aud": value,
                     "low_estimate_aud": low if low is not None else value,
                     "high_estimate_aud": high if high is not None else value,
+                    "currency": pricing.currency,
                     "display_string": pricing.displayString,
                     "valuation_status": "market_estimated",
                     "reason_code": "market_estimated",

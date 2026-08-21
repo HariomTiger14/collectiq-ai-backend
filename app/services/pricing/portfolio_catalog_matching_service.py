@@ -241,6 +241,7 @@ def backfill_catalog_history_for_item(
                 "value_aud": value * rate,
                 "low_estimate_aud": low * rate,
                 "high_estimate_aud": high * rate,
+                "currency": display_currency,
                 "display_string": None,
                 "valuation_status": "market_estimated",
                 "reason_code": "catalog_history_backfill",

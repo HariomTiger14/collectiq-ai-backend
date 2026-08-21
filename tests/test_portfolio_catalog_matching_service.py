@@ -295,6 +295,7 @@ class BackfillCatalogHistoryForItemTest(unittest.TestCase):
 
         rate = _exchange_rate("USD", "AUD")
         self.assertEqual(reader.inserted_rows[0]["value_aud"], 100.0 * rate)
+        self.assertEqual(reader.inserted_rows[0]["currency"], "AUD")
 
     def test_returns_zero_when_catalog_detail_lookup_fails(self) -> None:
         catalog = _ExplodingDetailCatalog()
