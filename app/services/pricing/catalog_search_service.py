@@ -259,12 +259,11 @@ class CatalogSearchService:
             # or a publisher's own card art), already rendered inline
             # without restriction on detail() -- so it's reasonable to show
             # it directly on the search results row too, rather than only
-            # after tapping in. Batched into a single extra request
-            # regardless of result count (see
+            # after tapping in. Runs the full matching chain via one
+            # request per distinct platform present in this response, not
+            # one per row or per exact title -- see
             # _enrich_pricecharting_video_game_images's own comment for
-            # why) rather than reusing detail()'s per-item three-tier
-            # fallback chain, which would mean up to 150 sequential HTTP
-            # round-trips for a 50-result page.
+            # why that stays cheap at this table's scale.
             if "videogames" in enabled_image_categories:
                 results = self._enrich_pricecharting_video_game_images(results)
         return CatalogSearchResponse(
@@ -1175,21 +1174,28 @@ class CatalogSearchService:
     def _enrich_pricecharting_video_game_images(
         self, results: list[CatalogSearchResult]
     ) -> list[CatalogSearchResult]:
-        """Batch-fills imageUrl for video-game search results in ONE request.
+        """Fills imageUrl for video-game search results, one request per
+        distinct PLATFORM rather than per row or per exact title.
 
-        _enrich_with_video_games_image (below) chases a three-tier fallback
-        chain per item (exact -> prefix -> loose-match) -- fine for a
-        single detail() lookup, but doing that per row for up to 50 search
-        results would mean up to 150 sequential HTTP round-trips against
-        Supabase, an unacceptable latency hit on an interactive search
-        endpoint. This does the EXACT tier only, batched into a single
-        composite-OR request across every candidate row -- bounded to
-        exactly one extra request per search call regardless of result
-        count. A row that would only match via the prefix/loose-match
-        fallback (a punctuation or suffix difference from RAWG's title)
-        simply keeps its placeholder here; it still gets a real image the
-        moment the user taps into detail(), where the full fallback chain
-        still runs.
+        Originally this batched only the exact-match tier into a single
+        composite-OR request -- fast, but a row needing the prefix/loose-
+        match/edition-suffix/"the "-prefix fallbacks (the majority of real
+        gaps found in later audits) kept its placeholder until the user
+        tapped into detail(), where the full chain runs per item. Revised
+        after repeated reports traced back to this same row-vs-detail gap:
+        instead of asking Supabase for specific titles, this fetches EVERY
+        row for each distinct platform actually present in the candidate
+        set ONCE, then runs the full exact -> prefix -> loose -> edition-
+        suffix-retry -> "the "-prefix-retry chain locally against that
+        already-fetched list (see _match_video_game_with_fallbacks) --
+        the same matching power as detail(), just amortized across
+        however many rows in this response share a platform instead of
+        one HTTP round-trip per tier per row.
+        rawg_video_game_catalog is small enough for this to stay cheap:
+        confirmed live via EXPLAIN ANALYZE, the single largest platform
+        (PC, ~10K of the table's ~54K rows) is a ~77ms sequential scan,
+        and a real search response typically touches only 1-4 distinct
+        platforms among its video-game rows, not one per row.
         """
         candidates: list[tuple[int, str, str]] = []
         for index, result in enumerate(results):
@@ -1212,47 +1218,37 @@ class CatalogSearchService:
         if not candidates:
             return results
 
-        # Dedup pairs -- a search page can easily contain the same title on
-        # the same platform twice (different conditions/printings), no
-        # need to ask Supabase for the same pair more than once.
-        distinct_pairs = sorted({(name, platform) for _, name, platform in candidates})
-        or_filter = ",".join(
-            f"and(normalized_name.eq.{_pgrest_or_literal(name)},"
-            f"rawg_platform.eq.{_pgrest_or_literal(platform)})"
-            for name, platform in distinct_pairs
-        )
-        payload = self._request(
-            "GET",
-            "/rest/v1/rawg_video_game_catalog",
-            params={
-                "select": "normalized_name,rawg_platform,image_url",
-                "or": f"({or_filter})",
-                "limit": str(len(distinct_pairs) * 2),
-            },
-        )
-        if not isinstance(payload, list):
-            return results
-
-        # Same conservative discipline as the single-item path: a pair
-        # with more than one matching row (RAWG remasters/re-releases
-        # sharing a normalized name) is ambiguous -- suppressed, never
-        # guessed.
-        rows_by_pair: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        for row in payload:
-            if not isinstance(row, dict):
-                continue
-            key = (
-                str(row.get("normalized_name") or ""),
-                str(row.get("rawg_platform") or ""),
+        distinct_platforms = sorted({platform for _, _, platform in candidates})
+        rows_by_platform: dict[str, list[dict[str, Any]]] = {}
+        for platform in distinct_platforms:
+            payload = self._request(
+                "GET",
+                "/rest/v1/rawg_video_game_catalog",
+                params={
+                    "select": "normalized_name,image_url",
+                    "rawg_platform": f"eq.{platform}",
+                    "limit": "20000",
+                },
             )
-            rows_by_pair.setdefault(key, []).append(row)
+            rows_by_platform[platform] = (
+                [row for row in payload if isinstance(row, dict)]
+                if isinstance(payload, list)
+                else []
+            )
 
+        # Dedup (name, platform) pairs -- a search page can easily contain
+        # the same title on the same platform twice (different
+        # conditions/printings), no need to re-run the match twice.
         image_by_pair: dict[tuple[str, str], str] = {}
-        for key, rows in rows_by_pair.items():
-            if len(rows) == 1:
-                image_url = rows[0].get("image_url")
-                if image_url:
-                    image_by_pair[key] = str(image_url)
+        for _, name, platform in candidates:
+            key = (name, platform)
+            if key in image_by_pair:
+                continue
+            image_url = _match_video_game_with_fallbacks(
+                name, rows_by_platform.get(platform, [])
+            )
+            if image_url:
+                image_by_pair[key] = image_url
 
         updated = list(results)
         for index, name, platform in candidates:
@@ -2096,20 +2092,6 @@ def _video_game_normalize_name(name: str) -> str:
     return _VIDEO_GAME_WHITESPACE_RE.sub(" ", name).strip().lower()
 
 
-def _pgrest_or_literal(value: str) -> str:
-    # PostgREST's composite or=(and(col.eq.X,...),...) syntax treats
-    # commas/parentheses/periods as its own filter-string delimiters -- a
-    # game title containing any of them (colons, apostrophes, and
-    # parentheses are all common, e.g. "god of war (2018)") would otherwise
-    # break the filter's own parsing, not just the comparison value. Per
-    # PostgREST's docs, wrapping the value in double quotes escapes it for
-    # this purpose; a literal backslash or double-quote inside the value
-    # itself must then be backslash-escaped, in that order (backslash
-    # first, same reasoning as _video_game_like_escape below).
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
-
-
 def _video_game_like_escape(normalized_name: str) -> str:
     # Postgres's default LIKE escape char is backslash -- a literal "%" or
     # "_" in a game title (rare, but not impossible) would otherwise act
@@ -2278,6 +2260,81 @@ def _video_game_strip_edition_suffix(normalized_name: str) -> str | None:
     stripped = normalized_name[: match.start()].strip()
     return stripped or None
 
+
+def _match_video_game_normalized_name(
+    normalized_name: str, platform_rows: list[dict[str, Any]]
+) -> str | None:
+    """Runs the exact -> prefix -> loose-match chain against an already-
+    fetched, complete per-platform row list, instead of one SQL round-trip
+    per tier per row -- see _enrich_pricecharting_video_game_images for
+    why this exists (the batched search-row path). Same three-tier
+    priority and the same uniqueness/safety discipline as the single-item
+    live-query chain (_fetch_video_game_image_chain and friends below):
+    an ambiguous or unsafe match is suppressed, never guessed.
+    """
+    if not normalized_name:
+        return None
+
+    exact = [
+        row
+        for row in platform_rows
+        if row.get("normalized_name") == normalized_name
+    ]
+    if len(exact) == 1:
+        image_url = exact[0].get("image_url")
+        return str(image_url) if image_url else None
+
+    prefix_matches = [
+        row
+        for row in platform_rows
+        if isinstance(row.get("normalized_name"), str)
+        and row["normalized_name"].startswith(normalized_name)
+    ]
+    if len(prefix_matches) == 1:
+        candidate_name = str(prefix_matches[0].get("normalized_name") or "")
+        if _video_game_prefix_suffix_is_safe(normalized_name, candidate_name):
+            image_url = prefix_matches[0].get("image_url")
+            return str(image_url) if image_url else None
+
+    stripped_target = _video_game_strip_punctuation(normalized_name)
+    if stripped_target:
+        loose_matches = [
+            row
+            for row in platform_rows
+            if _video_game_strip_punctuation(str(row.get("normalized_name") or ""))
+            == stripped_target
+        ]
+        if len(loose_matches) == 1:
+            image_url = loose_matches[0].get("image_url")
+            return str(image_url) if image_url else None
+
+    return None
+
+
+def _match_video_game_with_fallbacks(
+    normalized_name: str, platform_rows: list[dict[str, Any]]
+) -> str | None:
+    """Adds the edition-suffix and "the "-prefix retries on top of
+    _match_video_game_normalized_name -- the local-matching counterpart of
+    _fetch_video_game_image's own two last-resort fallbacks, see that
+    method's comments for why each exists.
+    """
+    image_url = _match_video_game_normalized_name(normalized_name, platform_rows)
+    if image_url is not None:
+        return image_url
+
+    stripped = _video_game_strip_edition_suffix(normalized_name)
+    base_for_article_check = stripped if stripped is not None else normalized_name
+    if stripped is not None:
+        image_url = _match_video_game_normalized_name(stripped, platform_rows)
+        if image_url is not None:
+            return image_url
+
+    if base_for_article_check.startswith("the "):
+        return None
+    return _match_video_game_normalized_name(
+        f"the {base_for_article_check}", platform_rows
+    )
 
 
 def _cents_to_units(value: Any) -> float | None:
