@@ -1346,10 +1346,27 @@ class CatalogSearchService:
         # "Doom" prefix-matches DOOM (2016), DOOM Eternal, Doom 3, DOOM II,
         # and Doom 3: BFG Edition on PS4 alone -- multiple genuinely
         # different games, not just longer spellings of the same one, so
-        # this correctly suppresses rather than guessing. Only a title
-        # that prefix-matches exactly one row is used.
+        # this correctly suppresses rather than guessing when several rows
+        # match. Only a title that prefix-matches exactly one row is used.
+        #
+        # A single unique match ISN'T automatically safe on its own,
+        # though -- a live, systematic audit of every real PriceCharting
+        # video-game title against rawg_video_game_catalog found 95 real
+        # cases where the ONLY prefix match is a numbered sequel, not a
+        # longer title for the same game (e.g. PriceCharting's "Terminator"
+        # uniquely prefix-matching RAWG's "Terminator 2: Judgment Day",
+        # PriceCharting's "Iron Man" uniquely matching "Iron Man 2") --
+        # confirmed those originals simply have no OTHER RAWG entry to
+        # create ambiguity, so uniqueness alone let a wrong sequel's cover
+        # through. _video_game_prefix_suffix_is_safe rejects a match whose
+        # suffix (what comes after the matched prefix) looks like a
+        # sequel/numbered-installment continuation rather than an edition/
+        # subtitle/release-year suffix for the SAME game -- a rejected
+        # match falls through to the loose-match tier below, which
+        # requires fold-EXACT equality (not just a shared prefix) and so
+        # correctly returns nothing rather than guessing.
         params = {
-            "select": "image_url",
+            "select": "normalized_name,image_url",
             "normalized_name": f"like.{_video_game_like_escape(normalized_name)}*",
             "rawg_platform": f"eq.{rawg_platform}",
             "limit": "2",
@@ -1357,8 +1374,10 @@ class CatalogSearchService:
         payload = self._request("GET", "/rest/v1/rawg_video_game_catalog", params=params)
         if isinstance(payload, list) and len(payload) == 1:
             row = payload[0]
-            image_url = row.get("image_url") if isinstance(row, dict) else None
-            return str(image_url) if image_url else None
+            candidate_name = str(row.get("normalized_name") or "") if isinstance(row, dict) else ""
+            if _video_game_prefix_suffix_is_safe(normalized_name, candidate_name):
+                image_url = row.get("image_url") if isinstance(row, dict) else None
+                return str(image_url) if image_url else None
         return self._fetch_video_game_image_by_loose_match(normalized_name, rawg_platform)
 
     def _fetch_video_game_image_by_loose_match(
@@ -2040,6 +2059,30 @@ def _video_game_like_escape(normalized_name: str) -> str:
     # backslash itself must be escaped first, or escaping "%"/"_" after
     # would double-escape their own inserted backslashes.
     return normalized_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+# Matches a suffix that starts with a bare number or roman numeral --
+# "2", "3", "ii", "iv", etc. -- immediately after the matched prefix
+# (optionally preceded by whitespace, e.g. "terminator" + " 2: judgment
+# day"). This is the numbered-sequel/installment pattern, not an edition/
+# subtitle/release-year suffix for the same game (those instead start with
+# "(", ":", "-", "!", or a letter that isn't itself a roman numeral word,
+# e.g. "remaster"/"dx"/"deluxe" -- none of which this pattern matches, so
+# they're unaffected). \b anchors "x" so it doesn't also match the start of
+# an unrelated word like "xtreme".
+_VIDEO_GAME_SEQUEL_SUFFIX_RE = re.compile(
+    r"^\s*(\d+|i{1,3}|iv|vi{0,3}|ix|x)\b", re.IGNORECASE
+)
+
+
+def _video_game_prefix_suffix_is_safe(normalized_name: str, candidate_normalized_name: str) -> bool:
+    # See _fetch_video_game_image_by_prefix's own comment for the live
+    # audit (95 real cases) this fixes generally. `candidate_normalized_
+    # name` is only ever passed in here already confirmed to start with
+    # `normalized_name` (the SQL prefix filter guarantees that) -- this
+    # just checks what comes right after.
+    suffix = candidate_normalized_name[len(normalized_name):]
+    return _VIDEO_GAME_SEQUEL_SUFFIX_RE.match(suffix) is None
 
 
 _VIDEO_GAME_NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]")

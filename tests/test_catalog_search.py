@@ -18,6 +18,7 @@ from app.services.pricing.catalog_search_service import (
     _lorcana_set_name_from_console,
     _onepiece_set_code,
     _pokemon_variant_token,
+    _video_game_prefix_suffix_is_safe,
     _video_game_strip_punctuation,
     _yugioh_set_code,
 )
@@ -2744,6 +2745,107 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
         query = dict(catalog_requests[0].url.params)
         self.assertEqual(query.get("normalized_name"), "eq.super mario 64")
         self.assertEqual(query.get("rawg_platform"), "eq.Nintendo 64")
+
+    def test_video_game_prefix_suffix_rejects_numbered_sequels(self) -> None:
+        # A live, systematic audit of every real PriceCharting video-game
+        # title against rawg_video_game_catalog found 95 real cases where
+        # the prefix fallback's ONLY unique match was a numbered sequel,
+        # not a longer title for the same game -- e.g. PriceCharting's
+        # "Terminator" uniquely prefix-matching RAWG's "Terminator 2:
+        # Judgment Day". These must be rejected here.
+        self.assertFalse(
+            _video_game_prefix_suffix_is_safe(
+                "terminator", "terminator 2: judgment day"
+            )
+        )
+        self.assertFalse(
+            _video_game_prefix_suffix_is_safe("pony friends", "pony friends 2")
+        )
+        self.assertFalse(_video_game_prefix_suffix_is_safe("iron man", "iron man 2"))
+        self.assertFalse(
+            _video_game_prefix_suffix_is_safe(
+                "zelda", "zelda ii: the adventure of link"
+            )
+        )
+        self.assertFalse(
+            _video_game_prefix_suffix_is_safe("contra", "contra iii: the alien wars")
+        )
+
+    def test_video_game_prefix_suffix_accepts_genuine_longer_titles(self) -> None:
+        # The far more common, legitimate case this fallback exists for --
+        # RAWG's own title is simply longer (an edition/release-year/
+        # official-subtitle suffix), same game, must still be accepted.
+        self.assertTrue(
+            _video_game_prefix_suffix_is_safe(
+                "rio", "rio: the multiplayer party game"
+            )
+        )
+        self.assertTrue(_video_game_prefix_suffix_is_safe("grid", "grid (2008)"))
+        self.assertTrue(
+            _video_game_prefix_suffix_is_safe("battleship", "battleship (1993)")
+        )
+        self.assertTrue(
+            _video_game_prefix_suffix_is_safe(
+                "hitman 2", "hitman 2: silent assassin"
+            )
+        )
+        self.assertTrue(
+            _video_game_prefix_suffix_is_safe(
+                "brothers", "brothers a tale of two sons"
+            )
+        )
+
+    def test_detail_rejects_prefix_match_that_is_actually_a_sequel(self) -> None:
+        # Integration-level proof for the same bug class as the two pure-
+        # function tests above: the prefix tier finds a unique candidate,
+        # but it's the wrong game (a sequel) -- must fall through to the
+        # loose-match tier (which also correctly finds nothing here) rather
+        # than returning the sequel's cover for the original's listing.
+        catalog_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "999",
+                            "product_name": "Terminator",
+                            "console_name": "PAL NES",
+                            "category": "Action",
+                            "loose_price_cents": 500,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "rawg_video_game_catalog" in url:
+                catalog_requests.append(request)
+                query = dict(request.url.params)
+                if query.get("normalized_name") == "eq.terminator":
+                    return httpx.Response(200, json=[])
+                if query.get("normalized_name", "").startswith("like."):
+                    return httpx.Response(
+                        200,
+                        json=[
+                            {
+                                "normalized_name": "terminator 2: judgment day",
+                                "image_url": "https://img.example/terminator2.jpg",
+                            },
+                        ],
+                    )
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        service = self._build_service(handler)
+
+        response = service.detail("999")
+
+        self.assertIsNone(response.result.imageUrl)
 
     def test_video_game_strip_punctuation_folds_accented_letters_not_deletes_them(
         self,
