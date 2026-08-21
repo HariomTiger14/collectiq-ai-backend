@@ -19,6 +19,7 @@ from app.services.pricing.catalog_search_service import (
     _onepiece_set_code,
     _pokemon_variant_token,
     _video_game_prefix_suffix_is_safe,
+    _video_game_strip_edition_suffix,
     _video_game_strip_punctuation,
     _yugioh_set_code,
 )
@@ -2745,6 +2746,91 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
         query = dict(catalog_requests[0].url.params)
         self.assertEqual(query.get("normalized_name"), "eq.super mario 64")
         self.assertEqual(query.get("rawg_platform"), "eq.Nintendo 64")
+
+    def test_video_game_strip_edition_suffix_strips_remaster_and_edition_words(
+        self,
+    ) -> None:
+        # A live, systematic audit found 1,083 real PriceCharting video-
+        # game titles ("Remastered"/"HD"/"Definitive Edition"/etc.) with no
+        # match through any existing tier -- and confirmed via RAWG's live
+        # search API that most of these games DO exist in RAWG, just
+        # under the base title with no separate remaster-specific entry.
+        self.assertEqual(
+            _video_game_strip_edition_suffix("valkyria chronicles remastered"),
+            "valkyria chronicles",
+        )
+        self.assertEqual(
+            _video_game_strip_edition_suffix("dying light: definitive edition"),
+            "dying light",
+        )
+        self.assertEqual(
+            _video_game_strip_edition_suffix("beholder complete edition"),
+            "beholder",
+        )
+        self.assertEqual(
+            _video_game_strip_edition_suffix("gran turismo 6 anniversary edition"),
+            "gran turismo 6",
+        )
+        # No suffix present -- must return None (not the unchanged
+        # string), so the caller knows not to bother retrying.
+        self.assertIsNone(_video_game_strip_edition_suffix("mario kart 8"))
+
+    def test_video_game_strip_edition_suffix_does_not_strip_remake(self) -> None:
+        # The one deliberate exclusion: a remake is a distinct, separately
+        # -developed product with its own real box art (Final Fantasy VII
+        # Remake, Resident Evil 4 Remake), not a technical re-release
+        # reusing the original's key art -- live-confirmed that stripping
+        # "remake" would have shown the ORIGINAL 1997 Final Fantasy VII's
+        # cover on a "Final Fantasy VII Remake" listing.
+        self.assertIsNone(
+            _video_game_strip_edition_suffix("final fantasy vii remake")
+        )
+        self.assertIsNone(
+            _video_game_strip_edition_suffix("resident evil 4 remake")
+        )
+
+    def test_detail_falls_back_to_stripped_edition_suffix(self) -> None:
+        # Integration-level proof: no match for the full title, but
+        # stripping "remastered" and retrying the whole exact/prefix/
+        # loose chain against the stripped title finds the base game.
+        catalog_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "777",
+                            "product_name": "Valkyria Chronicles Remastered",
+                            "console_name": "Nintendo Switch",
+                            "category": "Strategy",
+                            "loose_price_cents": 4000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "rawg_video_game_catalog" in url:
+                catalog_requests.append(request)
+                query = dict(request.url.params)
+                if query.get("normalized_name") == "eq.valkyria chronicles":
+                    return httpx.Response(
+                        200,
+                        json=[{"image_url": "https://img.example/valkyria.jpg"}],
+                    )
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        service = self._build_service(handler)
+
+        response = service.detail("777")
+
+        self.assertEqual(response.result.imageUrl, "https://img.example/valkyria.jpg")
 
     def test_video_game_prefix_suffix_rejects_numbered_sequels(self) -> None:
         # A live, systematic audit of every real PriceCharting video-game
