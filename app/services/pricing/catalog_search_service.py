@@ -2074,6 +2074,20 @@ def _video_game_strip_punctuation(normalized_name: str) -> str:
 _VIDEO_GAME_TITLE_ALIASES: dict[tuple[str, str], str] = {
     ("god of war", "PlayStation 2"): "god of war i",
     ("god of war", "PlayStation 4"): "god of war (2018)",
+    # RAWG's title for the 2022 game carries the Old Norse ö ("Ragnarök")
+    # and a colon after "War" -- PriceCharting's listing has neither
+    # ("God of War Ragnarok"). The gap isn't just cosmetic: the loose-match
+    # fallback strips ALL non-alphanumeric characters (including ö, not
+    # just ASCII punctuation) before comparing, which turns "ragnarök"
+    # into "ragnark" (the ö is deleted, not folded to "o") -- one letter
+    # short of PriceCharting's "ragnarok", so even that fallback tier
+    # can't bridge it and was live-confirmed picking an unrelated
+    # candidate instead (a "God of War Ragnarok: Valhalla" DLC
+    # screenshot, not the base game's real cover). Confirmed live against
+    # rawg_video_game_catalog before adding, same discipline as the two
+    # entries above.
+    ("god of war ragnarok", "PlayStation 4"): "god of war: ragnarök",
+    ("god of war ragnarok", "PlayStation 5"): "god of war: ragnarök",
 }
 
 

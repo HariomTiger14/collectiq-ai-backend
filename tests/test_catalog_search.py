@@ -2744,6 +2744,56 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
         self.assertEqual(query.get("normalized_name"), "eq.super mario 64")
         self.assertEqual(query.get("rawg_platform"), "eq.Nintendo 64")
 
+    def test_detail_resolves_god_of_war_ragnarok_alias_to_rawgs_real_title(
+        self,
+    ) -> None:
+        # RAWG's actual title is "God of War: Ragnarök" (colon + the
+        # Old Norse ö) -- PriceCharting's listing is plain "God of War
+        # Ragnarok". The alias must send the EXACT ("god of war: ragnarök")
+        # query on the first (exact-match) tier -- if this alias were
+        # missing, live testing showed the loose-match fallback tier
+        # picks an unrelated "Ragnarok: Valhalla" DLC screenshot instead
+        # of the real game's cover, a worse outcome than no image at all.
+        catalog_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "4557968",
+                            "product_name": "God of War Ragnarok",
+                            "console_name": "Playstation 5",
+                            "category": "Action & Adventure",
+                            "loose_price_cents": 2285,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "rawg_video_game_catalog" in url:
+                catalog_requests.append(request)
+                query = dict(request.url.params)
+                if query.get("normalized_name") == "eq.god of war: ragnarök":
+                    return httpx.Response(
+                        200,
+                        json=[{"image_url": "https://img.example/gow-ragnarok.jpg"}],
+                    )
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        service = self._build_service(handler)
+
+        response = service.detail("4557968")
+
+        self.assertEqual(response.result.imageUrl, "https://img.example/gow-ragnarok.jpg")
+        self.assertEqual(len(catalog_requests), 1)
+
     def test_search_batches_video_game_image_lookup_in_one_request(self) -> None:
         catalog_requests: list[httpx.Request] = []
 
