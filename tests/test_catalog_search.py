@@ -160,6 +160,96 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertIsNone(captured["json"]["category_keywords"])
         self.assertEqual(captured["json"]["platform_group_filter"], "nintendo")
 
+    def test_search_forwards_sports_cards_subcategory_to_pricecharting_rpc(
+        self,
+    ) -> None:
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "search_pricecharting_catalog" in str(request.url):
+                captured["json"] = json.loads(request.read())
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        service.search(
+            "trout", limit=10, category_group="sports-cards", subcategory="baseball"
+        )
+
+        self.assertEqual(captured["json"]["category_keywords"], ["Baseball"])
+        self.assertIsNone(captured["json"]["platform_group_filter"])
+
+    def test_search_ignores_unknown_subcategory_for_sports_cards(self) -> None:
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "search_pricecharting_catalog" in str(request.url):
+                captured["json"] = json.loads(request.read())
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        # An unrecognized subcategory falls back to the full category's
+        # combined keyword list, same as no subcategory at all.
+        service.search(
+            "trout", limit=10, category_group="sports-cards", subcategory="cricket"
+        )
+
+        self.assertEqual(
+            captured["json"]["category_keywords"],
+            ["Baseball", "Basketball", "Football", "Hockey", "Soccer"],
+        )
+
+    def test_search_video_games_category_with_platform_subcategory(self) -> None:
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "search_pricecharting_catalog" in str(request.url):
+                captured["json"] = json.loads(request.read())
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        service.search(
+            "mario", limit=10, category_group="video-games", subcategory="nintendo"
+        )
+
+        self.assertIsNone(captured["json"]["category_keywords"])
+        self.assertEqual(captured["json"]["platform_group_filter"], "nintendo")
+
+    def test_search_video_games_category_with_no_subcategory_uses_any_platform_sentinel(
+        self,
+    ) -> None:
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "search_pricecharting_catalog" in str(request.url):
+                captured["json"] = json.loads(request.read())
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        service.search("mario", limit=10, category_group="video-games")
+
+        self.assertIsNone(captured["json"]["category_keywords"])
+        self.assertEqual(captured["json"]["platform_group_filter"], "__any_platform__")
+
     def test_search_forwards_price_filters_to_kicksdb_rpc(self) -> None:
         captured: dict = {}
 
