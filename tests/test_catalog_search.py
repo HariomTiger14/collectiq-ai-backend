@@ -2744,6 +2744,147 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
         self.assertEqual(query.get("normalized_name"), "eq.super mario 64")
         self.assertEqual(query.get("rawg_platform"), "eq.Nintendo 64")
 
+    def test_search_batches_video_game_image_lookup_in_one_request(self) -> None:
+        catalog_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "555",
+                            "product_name": "Super Mario 64",
+                            "console_name": "Nintendo 64",
+                            "category": "Nintendo 64",
+                            "loose_price_cents": 3000,
+                            "currency": "USD",
+                        },
+                        {
+                            "pricecharting_id": "556",
+                            "product_name": "Worms",
+                            "console_name": "Gameboy",
+                            "category": "Game Boy",
+                            "loose_price_cents": 500,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "rawg_video_game_catalog" in url:
+                catalog_requests.append(request)
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "normalized_name": "super mario 64",
+                            "rawg_platform": "Nintendo 64",
+                            "image_url": "https://img.example/mario64.jpg",
+                        },
+                        {
+                            "normalized_name": "worms",
+                            "rawg_platform": "Game Boy",
+                            "image_url": "https://img.example/worms.jpg",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = self._build_service(handler)
+
+        response = service.search("mario worms", limit=20)
+
+        # Exactly ONE rawg_video_game_catalog request regardless of result
+        # count -- the whole point of batching over the per-item fallback
+        # chain detail() uses.
+        self.assertEqual(len(catalog_requests), 1)
+        by_id = {result.id: result for result in response.results}
+        self.assertEqual(by_id["555"].imageUrl, "https://img.example/mario64.jpg")
+        self.assertEqual(by_id["556"].imageUrl, "https://img.example/worms.jpg")
+
+    def test_search_suppresses_ambiguous_video_game_pair_in_batch(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "555",
+                            "product_name": "Super Mario 64",
+                            "console_name": "Nintendo 64",
+                            "category": "Nintendo 64",
+                            "loose_price_cents": 3000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "rawg_video_game_catalog" in url:
+                # Two rows share the same (normalized_name, rawg_platform)
+                # pair -- ambiguous, must be suppressed rather than
+                # guessing, same discipline as the single-item path.
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "normalized_name": "super mario 64",
+                            "rawg_platform": "Nintendo 64",
+                            "image_url": "https://img.example/mario64-a.jpg",
+                        },
+                        {
+                            "normalized_name": "super mario 64",
+                            "rawg_platform": "Nintendo 64",
+                            "image_url": "https://img.example/mario64-b.jpg",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = self._build_service(handler)
+
+        response = service.search("mario", limit=20)
+
+        self.assertIsNone(response.results[0].imageUrl)
+
+    def test_search_skips_video_game_enrichment_when_category_disabled(self) -> None:
+        catalog_requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "555",
+                            "product_name": "Super Mario 64",
+                            "console_name": "Nintendo 64",
+                            "category": "Nintendo 64",
+                            "loose_price_cents": 3000,
+                            "currency": "USD",
+                        },
+                    ],
+                )
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(
+                    200, json=[{"category": "videogames", "enabled": False}]
+                )
+            if "rawg_video_game_catalog" in url:
+                catalog_requests.append(request)
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        service = self._build_service(handler)
+
+        response = service.search("mario", limit=20)
+
+        self.assertEqual(catalog_requests, [])
+        self.assertIsNone(response.results[0].imageUrl)
+
     def test_detail_suppresses_when_no_match(self) -> None:
         handler, catalog_requests = self._build_handler(catalog_rows=[])
         service = self._build_service(handler)
