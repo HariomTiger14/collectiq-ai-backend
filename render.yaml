@@ -443,6 +443,24 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python3 -c "pass"
 
+  # App-facing: fetch today's USD-base FX rates (Frankfurter/ECB, free, no
+  # key) and store them in fx_rates_daily. Runs once a day -- currency
+  # doesn't move fast enough for collectibles to need anything more real-time.
+  # get_rate()'s "most recent earlier date" fallback covers a missed run or
+  # a non-trading day, so this doesn't need to run without fail.
+  - type: cron
+    name: packlox-fx-rates-refresh-sit
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    schedule: "0 3 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: curl -fsS -X POST "https://api-sit.packlox.com/admin/pricing/fx-rates/refresh" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"
+    envVars:
+      - key: ADMIN_JOB_TOKEN
+        sync: false
+
   # App-facing: batch re-price every portfolio item (persist refreshed values).
   # Calls the deployed web service, which owns all the pricing env; the endpoint
   # no-ops safely while PRICING_PROVIDER=mock (never zeroes existing values).
