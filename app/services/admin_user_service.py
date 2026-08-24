@@ -485,7 +485,13 @@ class SupabaseAdminUserRepository:
         }
 
     def _get_auth_user(self, user_id: str) -> dict[str, Any] | None:
-        payload = self._request("GET", f"/auth/v1/admin/users/{user_id}")
+        # A deleted account's user_id can still be referenced by retained
+        # records (e.g. support tickets, which are intentionally kept after
+        # account deletion). Supabase returns 404 for it, so this must
+        # degrade to None rather than raising.
+        payload = self._request(
+            "GET", f"/auth/v1/admin/users/{user_id}", treat_404_as_none=True
+        )
         if isinstance(payload, dict) and payload.get("id"):
             return payload
         return None
@@ -857,6 +863,7 @@ class SupabaseAdminUserRepository:
         json_payload: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
         return_response: bool = False,
+        treat_404_as_none: bool = False,
     ):
         headers = {
             "apikey": self._service_role_key,
@@ -876,6 +883,8 @@ class SupabaseAdminUserRepository:
                 params=params,
                 json=json_payload,
             )
+            if treat_404_as_none and response.status_code == 404:
+                return None
             response.raise_for_status()
             if return_response:
                 return response

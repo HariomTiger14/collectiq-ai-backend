@@ -752,6 +752,37 @@ class AdminTeamTest(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
 
 
+class AdminUserRepositoryAuthLookupTest(unittest.TestCase):
+    def test_get_auth_user_returns_none_instead_of_raising_for_a_deleted_user(self) -> None:
+        # Support tickets are intentionally retained after account deletion,
+        # so their user_id can point at an auth user that no longer exists.
+        # Supabase returns 404 for that lookup -- this must degrade to None,
+        # not blow up every admin screen that shows a ticket's owner email.
+        client = Mock()
+        client.request.return_value = _response({"message": "User not found"}, status_code=404)
+        repository = SupabaseAdminUserRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        result = repository._get_auth_user("deleted-user-1")
+
+        self.assertIsNone(result)
+
+    def test_other_error_statuses_still_raise(self) -> None:
+        client = Mock()
+        client.request.return_value = _response({"message": "boom"}, status_code=500)
+        repository = SupabaseAdminUserRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        with self.assertRaises(Exception):
+            repository._get_auth_user("user-1")
+
+
 class _FakeAdminUsersClient:
     def __init__(self) -> None:
         self.requests: list[dict] = []
@@ -991,9 +1022,9 @@ class _FakeTeamClient:
         raise AssertionError(f"Unexpected request: {method} {url}")
 
 
-def _response(payload, headers: dict | None = None) -> httpx.Response:
+def _response(payload, headers: dict | None = None, status_code: int = 200) -> httpx.Response:
     return httpx.Response(
-        status_code=200,
+        status_code=status_code,
         json=payload,
         headers=headers,
         request=httpx.Request("GET", "https://supabase.test"),
