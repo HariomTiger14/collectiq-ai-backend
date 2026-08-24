@@ -139,6 +139,28 @@ class ReplyAsAdminTest(unittest.TestCase):
         email.send_ticket_reply_notification.assert_called_once()
         self.assertEqual(email.send_ticket_reply_notification.call_args.kwargs["to"], "sam@example.com")
 
+    def test_default_actor_is_a_real_display_name_not_the_internal_auth_mode(
+        self,
+    ) -> None:
+        # This endpoint authenticates with a single shared admin token (see
+        # require_admin_job_token), not a per-person login, so it has no
+        # real identity to attribute a reply to. Real bug found live: the
+        # old default ("admin_token") -- an internal auth-mode string, not
+        # a name -- was stored as sender_label and leaked straight into the
+        # user-facing chat UI as if it were the replier's name.
+        client = _FakeClient()
+        svc = _service(client)
+
+        svc.reply_as_admin(ticket_id="ticket-1", body="No actor supplied")
+
+        insert = next(
+            r
+            for r in client.requests
+            if r["method"] == "POST" and "support_messages" in r["url"]
+        )
+        self.assertEqual(insert["json"]["sender_label"], "PackLox Support")
+        self.assertNotEqual(insert["json"]["sender_label"], "admin_token")
+
     def test_sets_first_response_at_only_once(self) -> None:
         client = _FakeClient(first_response_at="2026-08-01T00:00:00Z")
         svc = _service(client)
@@ -192,6 +214,68 @@ class SetTicketStatusTest(unittest.TestCase):
         svc = _service(_FakeClient())
         with self.assertRaises(SupportTicketError):
             svc.set_ticket_status(ticket_id="ticket-1", status="archived")
+
+    def test_resolving_notifies_the_user_by_push_and_email(self) -> None:
+        # Real gap found live: an admin can resolve a ticket without
+        # replying first (e.g. it was already handled elsewhere), and
+        # nothing told the user at all -- no push, no email, not even an
+        # unread marker in their ticket list.
+        client = _FakeClient()
+        push = Mock()
+        email = Mock(is_configured=True)
+        user_repo = Mock()
+        user_repo._get_auth_user.return_value = {"id": "user-1", "email": "sam@example.com"}
+        svc = _service(client, push_service=push, email_service=email, user_repository=user_repo)
+
+        svc.set_ticket_status(ticket_id="ticket-1", status="resolved")
+
+        push.dispatch_to_user.assert_called_once()
+        self.assertEqual(push.dispatch_to_user.call_args.kwargs["user_id"], "user-1")
+        self.assertEqual(
+            push.dispatch_to_user.call_args.kwargs["kind"], "support_ticket_resolved",
+        )
+        email.send_ticket_resolved_notification.assert_called_once()
+        self.assertEqual(
+            email.send_ticket_resolved_notification.call_args.kwargs["to"], "sam@example.com",
+        )
+
+    def test_resolving_marks_the_ticket_unread_by_user(self) -> None:
+        client = _FakeClient()
+        svc = _service(client)
+
+        svc.set_ticket_status(ticket_id="ticket-1", status="resolved")
+
+        patch = next(r for r in client.requests if r["method"] == "PATCH" and "support_tickets" in r["url"])
+        self.assertTrue(patch["json"]["unread_by_user"])
+
+    def test_reopening_does_not_notify_or_mark_unread(self) -> None:
+        # Only resolving is a user-facing event worth a notification --
+        # an admin reopening a ticket is an internal housekeeping action.
+        client = _FakeClient()
+        push = Mock()
+        email = Mock(is_configured=True)
+        svc = _service(client, push_service=push, email_service=email)
+
+        svc.set_ticket_status(ticket_id="ticket-1", status="open")
+
+        push.dispatch_to_user.assert_not_called()
+        email.send_ticket_resolved_notification.assert_not_called()
+        patch = next(r for r in client.requests if r["method"] == "PATCH" and "support_tickets" in r["url"])
+        self.assertNotIn("unread_by_user", patch["json"])
+
+    def test_a_failed_resolution_notification_does_not_block_the_status_change(
+        self,
+    ) -> None:
+        client = _FakeClient()
+        push = Mock()
+        push.dispatch_to_user.side_effect = RuntimeError("FCM down")
+        svc = _service(client, push_service=push, email_service=Mock(is_configured=False))
+
+        # Must not raise -- a failed push can't block the status change.
+        svc.set_ticket_status(ticket_id="ticket-1", status="resolved")
+
+        patch = next(r for r in client.requests if r["method"] == "PATCH" and "support_tickets" in r["url"])
+        self.assertEqual(patch["json"]["status"], "resolved")
 
 
 class AttachmentTest(unittest.TestCase):

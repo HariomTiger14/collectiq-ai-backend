@@ -268,8 +268,16 @@ class SupportTicketService:
         }
 
     def reply_as_admin(
-        self, *, ticket_id: str, body: str, actor: str = "admin_token",
+        self, *, ticket_id: str, body: str, actor: str = "PackLox Support",
     ) -> dict[str, Any]:
+        # `actor` becomes the message's sender_label, shown to the user in
+        # the app as the replier's name. This endpoint authenticates with a
+        # single shared admin token (see require_admin_job_token), not a
+        # per-person login, so there is no real identity to attribute a
+        # reply to -- the default here must be a real display name, never
+        # an internal auth-mode string. Real bug found live: the old
+        # default ("admin_token") leaked straight into the chat UI as if it
+        # were the replier's name.
         body = (body or "").strip()
         if not body:
             raise SupportTicketError("A message is required.")
@@ -291,13 +299,53 @@ class SupportTicketService:
     ) -> dict[str, Any]:
         if status not in ("open", "resolved"):
             raise SupportTicketError(f"Unknown status: {status!r}")
-        self._get_ticket_row(ticket_id)
+        ticket = self._get_ticket_row(ticket_id)
         patch: dict[str, Any] = {"status": status}
         patch["resolved_at"] = datetime.now(timezone.utc).isoformat() if status == "resolved" else None
+        if status == "resolved":
+            # An admin can resolve a ticket without replying first (e.g. it
+            # was already handled elsewhere) -- without this the user had no
+            # signal at all: no push, no email, and not even an unread
+            # marker in their ticket list, so the only way to notice was to
+            # already be looking at the ticket.
+            patch["unread_by_user"] = True
         self._patch_ticket(ticket_id, patch)
+        if status == "resolved":
+            self._notify_user_of_resolution(ticket=ticket)
         return self.get_ticket_thread(ticket_id=ticket_id, user_id=None)
 
     # -- notification (best-effort, never blocks the reply) ----------------
+
+    def _notify_user_of_resolution(self, *, ticket: dict[str, Any]) -> None:
+        user_id = str(ticket.get("user_id") or "")
+        if not user_id:
+            return
+        subject = str(ticket.get("subject") or "your support ticket")
+        try:
+            self._push_service.dispatch_to_user(
+                user_id=user_id,
+                title="Your support ticket was resolved",
+                body=subject[:180],
+                dry_run=False,
+                kind="support_ticket_resolved",
+                notification_data={
+                    "type": "support_ticket_resolved",
+                    "ticketId": str(ticket.get("id") or ""),
+                },
+            )
+        except Exception:  # noqa: BLE001 - a missed push can't block the status change
+            pass
+
+        try:
+            auth_user = self._user_repository._get_auth_user(user_id) or {}
+            email = auth_user.get("email")
+            if email and self._email_service.is_configured:
+                self._email_service.send_ticket_resolved_notification(
+                    to=email,
+                    subject=subject,
+                )
+        except Exception:  # noqa: BLE001 - a missed email can't block the status change
+            pass
 
     def _notify_user_of_reply(self, *, ticket: dict[str, Any], reply_body: str) -> None:
         user_id = str(ticket.get("user_id") or "")

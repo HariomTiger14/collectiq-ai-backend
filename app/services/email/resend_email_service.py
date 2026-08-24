@@ -93,6 +93,30 @@ class ResendEmailService:
             text=text,
         )
 
+    def send_ticket_resolved_notification(
+        self,
+        *,
+        to: str,
+        subject: str,
+    ) -> dict[str, Any]:
+        html = (
+            f"<p>Your PackLox support ticket \"{_escape_html(subject)}\" has been "
+            "marked resolved.</p>"
+            "<p>If this doesn't look right, open the PackLox app and go to "
+            "Settings &rarr; Support to reopen it by replying.</p>"
+        )
+        text = (
+            f'Your PackLox support ticket "{subject}" has been marked resolved.\n\n'
+            "If this doesn't look right, open the PackLox app and go to "
+            "Settings > Support to reopen it by replying."
+        )
+        return self.send(
+            to=to,
+            subject=f"Resolved: {subject}",
+            html=html,
+            text=text,
+        )
+
 
 def _escape_html(text: str) -> str:
     return (
