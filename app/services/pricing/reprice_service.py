@@ -21,6 +21,7 @@ from app.services.pricing.currency_conversion import (
     convert_pricing_result,
     normalize_display_currency,
 )
+from app.services.pricing.pricecharting_pricing_provider import attribution_url_for
 from app.services.pricing.provider_factory import get_pricing_provider
 from app.services.pricing.shared_cache_repository import (
     SharedPricingCacheError,
@@ -184,6 +185,10 @@ def _response_from_pricing(pricing: PricingResult) -> RepricePricingResponse:
     attribution = diagnostics.get("attributionText") or (
         f"Pricing data powered by {pricing.pricingSource}" if available else ""
     )
+    attribution_url = attribution_url_for(
+        pricing_provider=pricing.pricingSource,
+        matched_product_id=diagnostics.get("matchedProductId"),
+    )
     return RepricePricingResponse(
         status="available" if available else "unavailable",
         reasonCode=reason_code,
@@ -199,6 +204,7 @@ def _response_from_pricing(pricing: PricingResult) -> RepricePricingResponse:
         pricingSource={
             "name": pricing.pricingSource,
             "attributionText": attribution,
+            "attributionUrl": attribution_url,
             "lastChecked": pricing.lastUpdated,
         },
         originalMarketPayload={

@@ -24,6 +24,23 @@ from app.services.pricing.cache import InMemoryPricingCache, ProviderThrottle
 logger = logging.getLogger("collectiq.pricing.pricecharting")
 
 
+def attribution_url_for(
+    *, pricing_provider: str | None, matched_product_id: str | None
+) -> str | None:
+    """Real link-out for the "Pricing data by PriceCharting" attribution.
+
+    matchedProductId is PriceCharting's own numeric product id, already
+    computed above in providerDiagnostics but never previously surfaced to a
+    client. Only build the link when the priced result actually came from
+    PriceCharting -- other providers don't share this id shape.
+    """
+    if not matched_product_id or not pricing_provider:
+        return None
+    if "pricecharting" not in pricing_provider.lower():
+        return None
+    return f"https://www.pricecharting.com/offers?product={matched_product_id}"
+
+
 class PriceChartingPricingProvider(PricingProvider):
     provider_name = "pricecharting"
 
