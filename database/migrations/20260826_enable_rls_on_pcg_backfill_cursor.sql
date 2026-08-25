@@ -1,0 +1,23 @@
+-- Enable RLS on _pcg_backfill_cursor, the one table in `public` that still
+-- had it off (Supabase security advisor: rls_disabled_in_public).
+--
+-- The anon key is public by design -- it ships inside the mobile app -- so
+-- a public-schema table without RLS is readable AND writable by anyone with
+-- the project URL. The contents here are harmless (a single row holding one
+-- opaque pricing-cache cursor string; no user data, no PII, no secrets), so
+-- this is an integrity foothold rather than a data leak: someone could
+-- clear or rewrite the cursor, not learn anything from it.
+--
+-- No policies are added on purpose. service_role bypasses RLS, so anything
+-- server-side keeps working, while anon/authenticated get no access at all.
+-- That is the same shape the other internal tables here already use
+-- (kicksdb_catalog, pricecharting_catalog_history, support_tickets, ... all
+-- run RLS-enabled with zero policies).
+--
+-- Note this table is currently ORPHANED: no reference to it exists in the
+-- backend, the admin portal, the mobile app, or any migration -- it is a
+-- leftover from a script that has since been removed. Enabling RLS is the
+-- conservative fix; dropping it would be the tidier one, but that is a
+-- destructive change and is deliberately left as a separate decision.
+
+alter table public._pcg_backfill_cursor enable row level security;
