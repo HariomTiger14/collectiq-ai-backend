@@ -280,8 +280,58 @@ class BatchRepricingService:
                 "valuationSource": source,
             }
         )
-        market = dict(raw.get("marketSummary") or {})
-        market["lastUpdated"] = iso
+        # Everything below is *derived from the price we just replaced*, so
+        # leaving it behind produces a self-contradicting record. That is not
+        # hypothetical: a Pokemon card whose original scan matched a video
+        # game kept displayString "$62.00 AUD" and a 56/149 AUD range next to
+        # a freshly repriced estimatedMarketValue of 1.84, and the app renders
+        # displayString verbatim -- so the item still *read* as $62 long after
+        # it had been correctly repriced. Recompute what we can and drop what
+        # no longer has a basis, rather than letting the old match linger.
+        raw_pricing["displayString"] = (
+            _clean(getattr(pricing, "displayString", None))
+            or _display_string(value, currency)
+        )
+        original = dict(getattr(pricing, "originalMarketPayload", None) or {})
+        original_value = _to_float(original.get("price"))
+        original_currency = _clean(original.get("currency"))
+        if original_value is not None and original_value > 0 and original_currency:
+            raw_pricing["originalPrice"] = original_value
+            raw_pricing["originalCurrency"] = original_currency.upper()
+            raw_pricing["exchangeRateUsed"] = _to_float(
+                original.get("exchangeRateUsed")
+            )
+            raw_pricing["exchangeRateDate"] = (
+                _clean(original.get("exchangeRateDate")) or iso
+            )
+        else:
+            for stale_key in (
+                "originalPrice",
+                "originalCurrency",
+                "exchangeRateUsed",
+                "exchangeRateDate",
+            ):
+                raw_pricing.pop(stale_key, None)
+        # lowEstimateAud/highEstimateAud are a denormalised copy of the range
+        # in a currency this job does not recompute; a stale pair is worse
+        # than an absent one, since consumers cannot tell it is out of date.
+        raw_pricing.pop("lowEstimateAud", None)
+        raw_pricing.pop("highEstimateAud", None)
+        match_metadata = dict(getattr(pricing, "matchMetadata", None) or {})
+        diagnostics = dict(getattr(pricing, "diagnostics", None) or {})
+        explanation = _clean(
+            match_metadata.get("reason") or diagnostics.get("priceExplanation")
+        )
+        if explanation:
+            raw_pricing["pricingExplanation"] = explanation
+        else:
+            raw_pricing.pop("pricingExplanation", None)
+        raw_pricing.pop("reasonCode", None)
+
+        # The comparable sales are the clearest evidence of *which product*
+        # was priced. Keeping the previous match's comps (e.g. "Raichu #19
+        # Box Only") alongside a new price makes the mismatch invisible.
+        market = _market_summary_from(pricing, value, low, high, iso)
         raw.update(
             {
                 "estimatedValue": value,
@@ -440,6 +490,62 @@ def _request_from_row(row: dict[str, Any]) -> RepriceRequest | None:
         correctionSource="scheduled_reprice",
         identity=identity,
     )
+
+
+def _market_summary_from(
+    pricing: Any,
+    value: float,
+    low: float | None,
+    high: float | None,
+    iso: str,
+) -> dict[str, Any]:
+    """Rebuild marketSummary from the pricing we just computed.
+
+    Merging into the previous summary would keep the old match's comparable
+    sales, which are the clearest evidence of *which product* was priced --
+    a card left showing "Raichu #19 Box Only" comps next to a corrected card
+    price hides the fact that the two came from different products.
+    """
+    comps = list(getattr(pricing, "comparableSales", None) or [])
+    prices = [
+        _to_float(getattr(comp, "soldPrice", None))
+        for comp in comps
+    ]
+    prices = [price for price in prices if price is not None and price > 0]
+    prices.sort()
+    average = sum(prices) / len(prices) if prices else value
+    if prices:
+        middle = len(prices) // 2
+        median = (
+            prices[middle]
+            if len(prices) % 2
+            else (prices[middle - 1] + prices[middle]) / 2
+        )
+    else:
+        median = value
+    return {
+        "averagePrice": average,
+        "medianPrice": median,
+        "lowPrice": low if low is not None else value,
+        "highPrice": high if high is not None else value,
+        "salesCount": len(comps),
+        "trendLabel": getattr(pricing, "marketTrend", None) or "Stable",
+        "confidence": _to_float(getattr(pricing, "pricingConfidence", None)),
+        "lastUpdated": iso,
+        "sources": [source] if (source := _source_name(pricing)) else [],
+        "comps": [
+            {
+                "source": comp.source,
+                "title": comp.title,
+                "soldPrice": _to_float(comp.soldPrice),
+                "currency": comp.currency,
+                "soldDate": comp.soldDate,
+                "condition": comp.condition,
+                "url": getattr(comp, "url", None),
+            }
+            for comp in comps
+        ],
+    }
 
 
 def _source_name(pricing: Any) -> str | None:
