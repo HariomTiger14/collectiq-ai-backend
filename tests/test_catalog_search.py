@@ -308,6 +308,72 @@ class CatalogSearchServiceTest(unittest.TestCase):
 
         self.assertEqual(pricecharting_requests, [])
 
+    def _source_probe(self) -> tuple[CatalogSearchService, list[str], list[str]]:
+        pricecharting: list[str] = []
+        kicksdb: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                kicksdb.append(url)
+            elif "search_pricecharting_catalog" in url:
+                pricecharting.append(url)
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        return service, pricecharting, kicksdb
+
+    def test_category_filter_excludes_kicksdb_which_has_no_such_taxonomy(
+        self,
+    ) -> None:
+        # KicksDB rows carry no category/platform group, so they can never
+        # satisfy a PriceCharting category filter -- fetching them anyway
+        # let a Yu-Gi-Oh-filtered search return "Nike Air Max Muscle 95
+        # Yu-Gi-Oh! Joey" alongside real cards.
+        service, pricecharting, kicksdb = self._source_probe()
+
+        service.search(
+            "yu-gi-oh",
+            limit=10,
+            category_group="trading-card-games",
+            subcategory="yugioh",
+        )
+
+        self.assertEqual(kicksdb, [])
+        self.assertEqual(len(pricecharting), 1)
+
+    def test_sneakers_category_filter_queries_only_kicksdb(self) -> None:
+        # Sneakers live entirely in kicksdb_catalog, so resolving them
+        # through the PriceCharting taxonomy would return nothing at all.
+        service, pricecharting, kicksdb = self._source_probe()
+
+        service.search("sneakers", limit=10, category_group="sneakers")
+
+        self.assertEqual(pricecharting, [])
+        self.assertEqual(len(kicksdb), 1)
+
+    def test_unfiltered_search_still_queries_both_sources(self) -> None:
+        service, pricecharting, kicksdb = self._source_probe()
+
+        service.search("charizard", limit=10)
+
+        self.assertEqual(len(pricecharting), 1)
+        self.assertEqual(len(kicksdb), 1)
+
+    def test_explicit_source_still_wins_over_the_category_filter(self) -> None:
+        service, pricecharting, kicksdb = self._source_probe()
+
+        service.search(
+            "jordan", limit=10, category_group="trading-card-games", source="kicksdb",
+        )
+
+        self.assertEqual(pricecharting, [])
+        self.assertEqual(len(kicksdb), 1)
+
     def test_search_falls_back_to_generic_price_for_scan_derived_rows(self) -> None:
         # Scan-derived rows (source_kind='scan_derived', promoted from
         # pricing_cache_entries) never populate the PriceCharting-specific
