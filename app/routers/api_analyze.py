@@ -43,6 +43,7 @@ from app.services.pricing.currency_conversion import (
     convert_pricing_result,
     normalize_display_currency,
 )
+from app.services.pricing.pricecharting_pricing_provider import attribution_url_for
 from app.services.pricing.provider_factory import get_pricing_provider
 from app.services.pricing.shared_cache_repository import (
     SharedPricingCacheError,
@@ -357,6 +358,10 @@ async def _analyze_collectible(
         if market_estimated_value and diagnostics.pricingProvider
         else None
     )
+    attribution_url = attribution_url_for(
+        pricing_provider=diagnostics.pricingProvider,
+        matched_product_id=pricing.providerDiagnostics.get("matchedProductId"),
+    )
     cache_policy = pricing_cache_policy(
         category=recognition.category,
         valuation_status=pricing.valuationStatus,
@@ -394,6 +399,7 @@ async def _analyze_collectible(
             "pricingSource": {
                 "name": diagnostics.pricingProvider,
                 "attributionText": attribution_text,
+                "attributionUrl": attribution_url,
                 "lastChecked": pricing.lastUpdated,
             },
             "originalMarket": {

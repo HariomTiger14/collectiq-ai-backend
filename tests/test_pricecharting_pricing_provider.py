@@ -14,6 +14,7 @@ from app.services.pricing.base_pricing_provider import (
 from app.services.pricing.mock_pricing_provider import MockPricingProvider
 from app.services.pricing.pricecharting_pricing_provider import (
     PriceChartingPricingProvider,
+    attribution_url_for,
 )
 
 
@@ -547,6 +548,42 @@ class _FakeThrottle:
         self.acquired_for.append(provider_name)
         if self.exception is not None:
             raise self.exception
+
+
+class AttributionUrlForTest(unittest.TestCase):
+    def test_builds_a_real_pricecharting_product_link(self) -> None:
+        url = attribution_url_for(
+            pricing_provider="pricecharting", matched_product_id="123456"
+        )
+
+        self.assertEqual(
+            url, "https://www.pricecharting.com/offers?product=123456"
+        )
+
+    def test_matches_case_insensitively_and_within_a_compound_provider_name(
+        self,
+    ) -> None:
+        url = attribution_url_for(
+            pricing_provider="PriceCharting+eBay", matched_product_id="9"
+        )
+
+        self.assertEqual(url, "https://www.pricecharting.com/offers?product=9")
+
+    def test_returns_none_without_a_matched_product_id(self) -> None:
+        self.assertIsNone(
+            attribution_url_for(pricing_provider="pricecharting", matched_product_id="")
+        )
+        self.assertIsNone(
+            attribution_url_for(pricing_provider="pricecharting", matched_product_id=None)
+        )
+
+    def test_returns_none_for_a_non_pricecharting_provider(self) -> None:
+        self.assertIsNone(
+            attribution_url_for(pricing_provider="ebay", matched_product_id="123")
+        )
+        self.assertIsNone(
+            attribution_url_for(pricing_provider=None, matched_product_id="123")
+        )
 
 
 if __name__ == "__main__":
