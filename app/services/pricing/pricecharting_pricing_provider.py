@@ -457,12 +457,28 @@ class PriceChartingPricingProvider(PricingProvider):
                 "upper",
                 "deck",
             },
+            "trading_card": {
+                "card",
+                "cards",
+                "pokemon",
+                "pokémon",
+                "magic",
+                "mtg",
+                "yugioh",
+                "yu-gi-oh",
+                "lorcana",
+                "one piece",
+                "tcg",
+                "holo",
+                "promo",
+            },
         }[expected_family]
         has_family_signal = any(keyword in product_text for keyword in family_keywords)
         has_required_identity = self._has_required_category_identity(
             expected_family,
             product_text,
             recognition,
+            product,
         )
 
         if not has_family_signal or not has_required_identity or title_overlap < 0.45:
@@ -483,14 +499,54 @@ class PriceChartingPricingProvider(PricingProvider):
             return "comic"
         if any(value in normalized for value in {"sports card", "rookie card"}):
             return "sports_card"
+        # Checked after sports_card so "sports card"/"rookie card" keep their
+        # stricter rules. Without this branch the whole guard short-circuited
+        # for every TCG scan, which is how a Pokemon card came back priced
+        # against a video game's Box Only/Manual Only tiers.
+        if any(
+            value in normalized
+            for value in {
+                "trading card",
+                "tcg",
+                "pokemon",
+                "pokémon",
+                "magic",
+                "yugioh",
+                "yu-gi-oh",
+                "lorcana",
+                "one piece",
+            }
+        ):
+            return "trading_card"
         return None
+
+    # PriceCharting only publishes these tiers for boxed video games -- a
+    # trading card has neither a box nor a manual. Their presence on a
+    # product row is therefore proof the row is a game, whatever its name.
+    _VIDEO_GAME_ONLY_PRICE_KEYS = (
+        "box-only-price",
+        "boxOnlyPrice",
+        "manual-only-price",
+        "manualOnlyPrice",
+    )
 
     def _has_required_category_identity(
         self,
         expected_family: str,
         product_text: str,
         recognition: RecognitionResult,
+        product: dict | None = None,
     ) -> bool:
+        if expected_family == "trading_card":
+            # Name-matching alone cannot separate a card from a same-named
+            # game ("Raichu" the card vs a Pokemon title), and PriceCharting's
+            # search spans both. The price tiers can: a row carrying Box Only
+            # or Manual Only prices is a game, so reject it rather than
+            # pricing a $1.84 card off $56/$62/$149 game comps.
+            for key in self._VIDEO_GAME_ONLY_PRICE_KEYS:
+                if self._parse_price((product or {}).get(key)) is not None:
+                    return False
+            return True
         if expected_family == "comic":
             recognition_text = self._recognition_text(recognition)
             if "homage" in product_text and "homage" not in recognition_text:
