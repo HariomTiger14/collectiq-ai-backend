@@ -382,7 +382,14 @@ services:
     branch: main
     schedule: "15 4 * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m scripts.backfill_kicksdb_catalog --max-requests 120 --catalog-batch-size 100
+    # 102 segments x up to 10 pages each = 1,020 requests worst case; 1,100
+    # leaves a little slack for a retried page without letting a runaway
+    # config burn the month. At a daily cadence that is ~30,600 requests of
+    # the Starter plan's 50,000, leaving room for live scan-time lookups.
+    # The old cap of 120 predates the expanded segment list and would now
+    # truncate the run around the 12th segment, silently skipping every
+    # brand after it.
+    startCommand: python -m scripts.backfill_kicksdb_catalog --max-requests 1100 --catalog-batch-size 100
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8

@@ -175,11 +175,37 @@ class FetchSegmentTest(unittest.TestCase):
 class LoadSegmentsTest(unittest.TestCase):
     def test_returns_default_when_no_json_given(self) -> None:
         segments = load_segments(None)
-        self.assertEqual(len(segments), 10)
-        self.assertEqual(segments[0]["label"], "sneakers-by-rank")
         labels = {segment["label"] for segment in segments}
+        # The global catch-all must stay first: it is the only segment that
+        # can reach a brand or gender value not enumerated below.
+        self.assertEqual(segments[0]["label"], "sneakers-by-rank")
         self.assertIn("nike-by-rank", labels)
         self.assertIn("vans-by-rank", labels)
+
+    def test_capped_brands_are_split_across_every_gender(self) -> None:
+        # A brand query maxes out at KicksDB's 1,000-result cap, so the big
+        # brands are additionally split by gender. Splitting on an
+        # incomplete gender list would silently drop products -- Jordan
+        # alone has 1,000+ in each of men/women/kids -- so assert all four
+        # windows exist, not just men/women.
+        labels = {segment["label"] for segment in load_segments(None)}
+        for gender in ("men", "women", "kids", "unisex"):
+            self.assertIn(f"jordan-{gender}-by-rank", labels)
+
+    def test_brands_that_fit_under_the_cap_get_a_single_segment(self) -> None:
+        labels = {segment["label"] for segment in load_segments(None)}
+        # Previously absent entirely (only 5 of Yeezy's 122 products were
+        # stored, because it relied on charting in the global top-1,000).
+        self.assertIn("yeezy-by-rank", labels)
+        self.assertNotIn("yeezy-men-by-rank", labels)
+
+    def test_every_default_segment_is_unique_and_well_formed(self) -> None:
+        segments = load_segments(None)
+        labels = [segment["label"] for segment in segments]
+        self.assertEqual(len(labels), len(set(labels)), "duplicate segment label")
+        for segment in segments:
+            self.assertTrue(segment["filters"].startswith('product_type="sneakers"'))
+            self.assertEqual(segment["sort"], "rank")
 
     def test_parses_custom_segments_json(self) -> None:
         segments = load_segments(json.dumps([{"label": "nike", "filters": 'brand="Nike"'}]))
