@@ -66,7 +66,13 @@ class CatalogItemNotFoundError(CatalogSearchError):
 # console_name).
 PRICECHARTING_CATEGORY_GROUPS: dict[str, list[str]] = {
     "sports-cards": ["Baseball", "Basketball", "Football", "Hockey", "Soccer"],
-    "trading-card-games": ["Magic", "Pokemon", "Yugioh", "Lorcana"],
+    # "One Piece" was missing even though the catalog carries thousands of
+    # its cards (categories "One Piece", "One Piece Card", "One Piece
+    # Japanese Card"). Filtering to trading cards therefore *excluded* the
+    # game entirely: a One Piece search fell through to fuzzy matches in the
+    # other games, returning "Fluffy Berry" Pokemon cards for "Luffy" and
+    # YuGiOh cards for the set code "OP01".
+    "trading-card-games": ["Magic", "Pokemon", "Yugioh", "Lorcana", "One Piece"],
     "comics": ["Comic"],
     "funko-pops": ["Funko"],
     "lego-sets": ["Lego"],
@@ -133,6 +139,7 @@ PRICECHARTING_SUBCATEGORY_GROUPS: dict[str, dict[str, list[str]]] = {
         "pokemon": ["Pokemon"],
         "yugioh": ["Yugioh"],
         "lorcana": ["Lorcana"],
+        "onepiece": ["One Piece"],
     },
 }
 

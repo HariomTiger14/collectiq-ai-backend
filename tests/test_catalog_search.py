@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.services.pricing.catalog_search_service import (
+    resolve_category_group_filters,
     CatalogItemNotFoundError,
     CatalogSearchService,
     _funko_lookup_title,
@@ -355,6 +356,20 @@ class CatalogSearchServiceTest(unittest.TestCase):
 
         self.assertEqual(pricecharting, [])
         self.assertEqual(len(kicksdb), 1)
+
+    def test_one_piece_is_part_of_the_trading_card_games_group(self) -> None:
+        # It was missing from the group despite thousands of its cards being
+        # in the catalog, so filtering to trading cards EXCLUDED the game:
+        # "Luffy" fell through to "Fluffy Berry" Pokemon cards and the set
+        # code "OP01" returned YuGiOh cards.
+        keywords, platform = resolve_category_group_filters(
+            "trading-card-games", "onepiece",
+        )
+        self.assertEqual(keywords, ["One Piece"])
+        self.assertIsNone(platform)
+
+        all_keywords, _ = resolve_category_group_filters("trading-card-games")
+        self.assertIn("One Piece", all_keywords)
 
     def test_unfiltered_search_still_queries_both_sources(self) -> None:
         service, pricecharting, kicksdb = self._source_probe()
