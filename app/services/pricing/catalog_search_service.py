@@ -66,7 +66,13 @@ class CatalogItemNotFoundError(CatalogSearchError):
 # console_name).
 PRICECHARTING_CATEGORY_GROUPS: dict[str, list[str]] = {
     "sports-cards": ["Baseball", "Basketball", "Football", "Hockey", "Soccer"],
-    "trading-card-games": ["Magic", "Pokemon", "Yugioh", "Lorcana"],
+    # "One Piece" was missing even though the catalog carries thousands of
+    # its cards (categories "One Piece", "One Piece Card", "One Piece
+    # Japanese Card"). Filtering to trading cards therefore *excluded* the
+    # game entirely: a One Piece search fell through to fuzzy matches in the
+    # other games, returning "Fluffy Berry" Pokemon cards for "Luffy" and
+    # YuGiOh cards for the set code "OP01".
+    "trading-card-games": ["Magic", "Pokemon", "Yugioh", "Lorcana", "One Piece"],
     "comics": ["Comic"],
     "funko-pops": ["Funko"],
     "lego-sets": ["Lego"],
@@ -98,6 +104,13 @@ PRICECHARTING_PLATFORM_GROUPS: dict[str, str] = {
 # see ANY_PLATFORM_GROUP below.
 PRICECHARTING_VIDEO_GAMES_CATEGORY_KEY = "video-games"
 
+# Sneakers are the one selectable category that lives entirely in
+# kicksdb_catalog rather than pricecharting_catalog, so it is not part of
+# PRICECHARTING_CATEGORY_GROUPS -- resolving it through the PriceCharting
+# taxonomy would return nothing. Matches kSneakersCategoryKey in the
+# mobile app's search screen; the two must stay in sync.
+SNEAKERS_CATEGORY_KEY = "sneakers"
+
 # Sentinel passed as platform_group_filter to mean "any recognized video-
 # game platform" (platform_group is not null) rather than an exact match --
 # see 20260821_add_any_platform_sentinel_to_search_pricecharting_catalog.sql.
@@ -126,6 +139,7 @@ PRICECHARTING_SUBCATEGORY_GROUPS: dict[str, dict[str, list[str]]] = {
         "pokemon": ["Pokemon"],
         "yugioh": ["Yugioh"],
         "lorcana": ["Lorcana"],
+        "onepiece": ["One Piece"],
     },
 }
 
@@ -201,6 +215,19 @@ class CatalogSearchService:
         # are actually queried. source, when given, skips fetching the
         # other source entirely rather than fetching-then-discarding.
         normalized_source = source if source in ("pricecharting", "kicksdb") else None
+        # A category filter is a PriceCharting-taxonomy concept, and KicksDB
+        # rows carry no category/platform group at all -- so they can never
+        # satisfy one. Fetching them anyway meant a filtered search still
+        # returned sneakers: filtering to Yu-Gi-Oh surfaced "Nike Air Max
+        # Muscle 95 Yu-Gi-Oh! Joey" alongside real cards. Treat a category
+        # filter as implicitly choosing the source it belongs to, unless the
+        # caller named a source explicitly.
+        if normalized_source is None and (category_group or subcategory):
+            normalized_source = (
+                "kicksdb"
+                if category_group == SNEAKERS_CATEGORY_KEY
+                else "pricecharting"
+            )
         pc_rows = (
             self._fetch_rows(
                 normalized_query, bounded_limit,
