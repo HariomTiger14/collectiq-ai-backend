@@ -357,6 +357,31 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertEqual(pricecharting, [])
         self.assertEqual(len(kicksdb), 1)
 
+    def test_a_category_filter_alone_browses_without_a_search_term(self) -> None:
+        # "Show me this category" is a complete request. Requiring a query
+        # forced Discover's chips to type a representative term into the
+        # search box just to get results, which read as the app typing for
+        # the user.
+        service, pricecharting, _ = self._source_probe()
+
+        response = service.search("", limit=10, category_group="comics")
+
+        self.assertEqual(len(pricecharting), 1, "browse should still query")
+        self.assertEqual(response.query, "")
+
+    def test_a_short_query_with_no_category_filter_still_returns_nothing(
+        self,
+    ) -> None:
+        # Unchanged: a stray one-character keystroke must not sweep the
+        # whole catalog.
+        service, pricecharting, kicksdb = self._source_probe()
+
+        response = service.search("a", limit=10)
+
+        self.assertEqual(response.count, 0)
+        self.assertEqual(pricecharting, [])
+        self.assertEqual(kicksdb, [])
+
     def test_one_piece_is_part_of_the_trading_card_games_group(self) -> None:
         # It was missing from the group despite thousands of its cards being
         # in the catalog, so filtering to trading cards EXCLUDED the game:

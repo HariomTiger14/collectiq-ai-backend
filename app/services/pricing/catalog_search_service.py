@@ -196,7 +196,15 @@ class CatalogSearchService:
     ) -> CatalogSearchResponse:
         normalized_query = _normalize_query(query)
         bounded_limit = max(1, min(limit, 50))
-        if len(normalized_query) < 2:
+        # A category filter is a complete request on its own: "show me this
+        # category" needs no search term. Requiring one meant Discover's
+        # category chips had to type a representative query into the search
+        # box just to get results, which read as the app typing for the
+        # user. Both RPCs handle an empty query as a browse -- see the
+        # is_browse branch added to search_pricecharting_catalog, and
+        # search_kicksdb_catalog's ilike '%%' which already matched all.
+        is_browse = bool(category_group or subcategory)
+        if len(normalized_query) < 2 and not is_browse:
             return CatalogSearchResponse(query=normalized_query, count=0, results=[])
         if not self.is_configured:
             raise CatalogSearchError("Catalog search is not configured.")
