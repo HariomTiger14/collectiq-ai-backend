@@ -52,15 +52,45 @@ if ! command -v psql >/dev/null 2>&1; then
     exit 1
 fi
 
-# statement_timeout=0 so the build is not cut off; keepalives so neither the
-# pooler nor a NAT table decides an in-progress build is an idle client.
-export PGOPTIONS="-c statement_timeout=0 -c lock_timeout=0 -c idle_in_transaction_session_timeout=0"
 export PGCONNECT_TIMEOUT=30
-DSN="$DATABASE_URL"
-case "$DSN" in
-    *\?*) DSN="$DSN&keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=6" ;;
-    *)    DSN="$DSN?keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=6" ;;
-esac
+
+# Split the password out of the connection string and pass it through the
+# environment instead. A DSN handed to psql as an argument is visible in
+# the process list to every user on the machine -- `ps` prints it in clear
+# -- and this build runs long enough for that to matter. PGPASSWORD is not
+# in argv, so it does not show up.
+#
+# The keepalive parameters are appended here too: without them the pooler
+# drops the connection mid-build and cancels it with no error text.
+eval "$(python3 - "$DATABASE_URL" <<'PYEOF'
+import shlex, sys
+from urllib.parse import urlsplit, urlunsplit, quote, unquote
+
+parts = urlsplit(sys.argv[1])
+# unquote: urlsplit leaves percent-escapes encoded, but PGPASSWORD must be
+# the literal password. strip: the libpq URI parser skips stray whitespace
+# around the password field, so a URL that connects fine can still carry a
+# leading space that would break PGPASSWORD verbatim -- this .env does.
+# (No apostrophes in these comments: the macOS bash 3.2 parser counts
+# quotes naively inside command substitution and one here breaks the
+# whole script.)
+password = unquote(parts.password or "").strip()
+host = parts.hostname or ""
+if parts.port:
+    host = f"{host}:{parts.port}"
+user = quote(parts.username or "", safe="")
+netloc = user + "@" + host if parts.username else host
+keepalives = "keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=6"
+query = f"{parts.query}&{keepalives}" if parts.query else keepalives
+dsn = urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
+print(f"DSN={shlex.quote(dsn)}")
+print(f"export PGPASSWORD={shlex.quote(password)}")
+PYEOF
+)"
+if [[ -z "${DSN:-}" ]]; then
+    echo "Could not parse DATABASE_URL." >&2
+    exit 1
+fi
 
 q() { psql "$DSN" -X -q -t -A -c "$1" 2>/dev/null; }
 
@@ -127,7 +157,17 @@ echo "This scans the table twice and takes a while; reads and writes keep workin
 echo "If it is interrupted, just run this script again."
 echo
 
-psql "$DSN" -X -q -v ON_ERROR_STOP=1 -f "$MIGRATION" &
+# The timeouts are set IN-SESSION, not via PGOPTIONS: Supabase's pooler does
+# not pass the `options` startup parameter through, so a PGOPTIONS-based
+# statement_timeout=0 silently keeps the server default -- which is exactly
+# how a previous run of this script was cancelled at 68%% of the first table
+# scan. SET survives across -c/-f boundaries within one psql session, and
+# each statement still autocommits individually, which CONCURRENTLY needs.
+psql "$DSN" -X -q -v ON_ERROR_STOP=1 \
+    -c "set statement_timeout = 0" \
+    -c "set lock_timeout = 0" \
+    -c "set idle_in_transaction_session_timeout = 0" \
+    -f "$MIGRATION" &
 build_pid=$!
 watch_progress "$build_pid" &
 watch_pid=$!
