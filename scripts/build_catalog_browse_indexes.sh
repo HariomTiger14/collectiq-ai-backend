@@ -19,7 +19,11 @@
 #
 # Safe to run against a live database. CONCURRENTLY does not block reads or
 # writes, so the repricing crons keep running; it just takes longer than a
-# plain build (two table scans instead of one).
+# plain build (two table scans instead of one). Do NOT run it while a
+# manual VACUUM of the table is in flight, though: the validation phase
+# and VACUUM both take ShareUpdateExclusive and can deadlock -- observed
+# live, the build lost at 81% of validation. If that happens the vacuum
+# finishes on its own; just re-run this script afterwards.
 #
 # Usage:
 #   scripts/build_catalog_browse_indexes.sh                # build
