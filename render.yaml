@@ -1,137 +1,31 @@
-# ⚠️ DOCUMENTATION MIRROR — NOT the source of truth.
-# This Render project is managed manually in the Render dashboard (project
-# "PackLox"), NOT provisioned from this file. Service names, the web service's
-# Docker runtime, and the full secret set live in the dashboard. Keep this file
-# in sync by hand as a readable spec; editing it does NOT change Render.
+# Render Blueprint spec for the PackLox CRON JOBS.
 #
-# Live services (dashboard):
-#   packlox-api-sit                          web  (Docker)   — FastAPI app
-#   collectiq-pricecharting-refresh-sit      cron (Python 3) — daily catalog refresh
-#   packlox-batch-reprice-sit                cron (Python 3) — daily batch re-pricing
-#   packlox-price-alerts-sit                 cron (Python 3) — 6-hourly alert pipeline
-#   packlox-catalog-promote-scan-derived-sit cron (Python 3) — daily scan-derived catalog promotion
-#   packlox-discover-pricecharting-sets-sit  cron (Python 3) — weekly comics/coins/sports-cards set discovery
-#   packlox-backfill-pricecharting-sets-sit  cron (Python 3) — comics/coins/sports-cards catalog backfill
-#   packlox-match-portfolio-catalog-sit      cron (Python 3) — hourly portfolio-item-to-catalog linking
+# A Render Blueprint instance provisions and syncs every cron defined here:
+# add a cron to this file, merge to main, and Render creates it -- no more
+# manual dashboard setup. envVars marked `sync: false` are secrets: Render
+# prompts for their values when the Blueprint instance is created (and for
+# any new service added later); values never live in git.
 #
-# The three app-facing crons call the deployed web service over HTTP (so all
-# the pricing / Supabase / Firebase secrets live only on packlox-api-sit and
-# are not duplicated per-cron). packlox-batch-reprice-sit and
-# packlox-price-alerts-sit need ADMIN_JOB_TOKEN;
-# packlox-catalog-promote-scan-derived-sit needs ADMIN_IMPORT_TOKEN instead —
-# its endpoint reuses the same auth dependency as /admin/pricecharting/import,
-# not the job-token one the other two use.
+# NOT in this file, on purpose:
+#   * packlox-api-sit (the API web service). A Blueprint never adopts an
+#     existing service -- it creates a parallel copy -- and the API carries
+#     the api-sit.packlox.com custom domain (attachable to only one
+#     service) plus live traffic. It stays dashboard-managed.
+#
+# The app-facing curl crons (fx-rates, batch-reprice, price-alerts,
+# promote-scan-derived, match-portfolio) call the deployed API over HTTP so
+# the pricing / Supabase / Firebase secrets live only on packlox-api-sit
+# and are not duplicated per-cron. batch-reprice and price-alerts need
+# ADMIN_JOB_TOKEN; promote-scan-derived needs ADMIN_IMPORT_TOKEN instead --
+# its endpoint reuses the same auth dependency as
+# /admin/pricecharting/import, not the job-token one the other two use.
+#
+# History: before 2026-08-27 every service was created by hand and this
+# file was only a documentation mirror; the Blueprint instance created that
+# day made it the source of truth for the crons. The hand-made cron copies
+# were deleted after the Blueprint versions were verified.
 
 services:
-  - type: web
-    name: packlox-api-sit
-    # Live runtime is Docker (has a Dockerfile); shown as python here only for
-    # the env reference below.
-    runtime: python
-    plan: starter
-    region: oregon
-    branch: main
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /health
-    autoDeploy: true
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.8
-      - key: ENVIRONMENT
-        value: sit
-      - key: APP_VERSION
-        value: 0.1.0
-      - key: COMMIT_SHA
-        sync: false
-      - key: BUILD_TIME
-        sync: false
-      - key: PUBLIC_API_URL
-        value: https://api-sit.packlox.com
-      - key: PUBLIC_FRONTEND_URL
-        value: https://sit.packlox.com
-      - key: CORS_ALLOWED_ORIGINS
-        value: https://sit.packlox.com,https://admin.packlox.com,https://packlox-admin-portal.hariomritesh.workers.dev,http://localhost:8000,http://127.0.0.1:8000,http://localhost:3000,http://127.0.0.1:3000
-      - key: HEALTH_TIMEOUT_SECONDS
-        value: "3"
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false
-      - key: SUPABASE_ANON_KEY
-        sync: false
-      - key: SUPABASE_HEALTH_REQUIRED
-        value: "true"
-      - key: AI_PROVIDER
-        value: auto
-      # Set to "auto" (with a real pricing key below) for live market values;
-      # "mock" makes every valuation come back unavailable.
-      - key: PRICING_PROVIDER
-        value: auto
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: GEMINI_MODEL
-        value: gemini-3.6-flash
-      - key: GEMINI_TIMEOUT_SECONDS
-        value: "30"
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: OPENAI_MODEL
-        value: gpt-4.1-mini
-      - key: OPENAI_TIMEOUT_SECONDS
-        value: "30"
-      - key: PRICING_CACHE_TTL_SECONDS
-        value: "900"
-      - key: PRICING_PROVIDER_MIN_INTERVAL_MS
-        value: "250"
-      # Real pricing providers (auto routes by category → tcgplayer/pricecharting
-      # /ebay for cards, kicksdb for sneakers). TCGPLAYER_* is not configured;
-      # cards fall back to PriceCharting + eBay.
-      - key: PRICECHARTING_API_KEY
-        sync: false
-      - key: EBAY_ACCESS_TOKEN
-        sync: false
-      - key: EBAY_CLIENT_ID
-        sync: false
-      - key: EBAY_CLIENT_SECRET
-        sync: false
-      - key: EBAY_OAUTH_TOKEN_URL
-        sync: false
-      - key: EBAY_BROWSE_API_URL
-        sync: false
-      - key: EBAY_MARKETPLACE_ID
-        sync: false
-      - key: EBAY_TIMEOUT_SECONDS
-        sync: false
-      - key: KICKSDB_API_KEY
-        sync: false
-      - key: KICKSDB_API_BASE
-        sync: false
-      - key: KICKSDB_PROVIDER_ENABLED
-        sync: false
-      # Push (price-alert dispatch runs here when the alerts cron calls the API).
-      - key: FIREBASE_PROJECT_ID
-        sync: false
-      - key: FIREBASE_SERVICE_ACCOUNT_JSON
-        sync: false
-      # Admin auth: crons authenticate to the /admin endpoints with this token.
-      - key: ADMIN_IMPORT_TOKEN
-        sync: false
-      - key: ADMIN_JOB_TOKEN
-        sync: false
-      - key: ADMIN_PROFILE_TABLE
-        value: profiles
-      - key: PRICECHARTING_CSV_VIDEO_GAMES_URL
-        sync: false
-      - key: PRICECHARTING_CSV_POKEMON_URL
-        sync: false
-      - key: PRICECHARTING_CSV_MAGIC_URL
-        sync: false
-      - key: PRICECHARTING_CSV_YUGIOH_URL
-        sync: false
-      - key: PRICECHARTING_CSV_ONE_PIECE_URL
-        sync: false
-
   - type: cron
     name: collectiq-pricecharting-refresh-sit
     runtime: python
@@ -466,27 +360,6 @@ services:
       - key: PRICECHARTING_API_TOKEN
         sync: false
 
-  # TEMPORARY / diagnostic only: exists purely to get Shell access to a
-  # different Render region (Ohio, vs. the Oregon used everywhere else) so
-  # we can test whether sportscardspro.com's Cloudflare block is scoped to
-  # our specific Oregon outbound IP or to Render's ASN as a whole. Schedule
-  # is set far in the future -- this cron is never meant to actually run;
-  # only its Shell tab gets used. Safe to delete once the test is done.
-  - type: cron
-    name: packlox-region-test-ohio-sit
-    runtime: python
-    plan: starter
-    region: ohio
-    branch: main
-    schedule: "0 0 1 1 *"
-    buildCommand: pip install -r requirements.txt
-    startCommand: python3 -c "pass"
-
-  # App-facing: fetch today's USD-base FX rates (Frankfurter/ECB, free, no
-  # key) and store them in fx_rates_daily. Runs once a day -- currency
-  # doesn't move fast enough for collectibles to need anything more real-time.
-  # get_rate()'s "most recent earlier date" fallback covers a missed run or
-  # a non-trading day, so this doesn't need to run without fail.
   - type: cron
     name: packlox-fx-rates-refresh-sit
     runtime: python
@@ -495,7 +368,7 @@ services:
     branch: main
     schedule: "0 3 * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: curl -fsS -X POST "https://api-sit.packlox.com/admin/pricing/fx-rates/refresh" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"
+    startCommand: 'curl -fsS -X POST "https://api-sit.packlox.com/admin/pricing/fx-rates/refresh" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"'
     envVars:
       - key: ADMIN_JOB_TOKEN
         sync: false
@@ -519,7 +392,7 @@ services:
     buildCommand: pip install -r requirements.txt
     # URL hardcoded (not $PUBLIC_API_URL) — the env var wasn't reliably present
     # on the cron, so curl got an empty host and failed with "(3) bad/illegal URL".
-    startCommand: curl -fsS -X POST "https://api-sit.packlox.com/admin/pricing/reprice-all?limit=5000" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"
+    startCommand: 'curl -fsS -X POST "https://api-sit.packlox.com/admin/pricing/reprice-all?limit=5000" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"'
     envVars:
       - key: ADMIN_JOB_TOKEN
         sync: false
@@ -538,7 +411,7 @@ services:
     branch: main
     schedule: "0 */6 * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: curl -fsS -X POST "https://api-sit.packlox.com/admin/push/price-alerts/run?limit=200" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"
+    startCommand: 'curl -fsS -X POST "https://api-sit.packlox.com/admin/push/price-alerts/run?limit=200" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"'
     envVars:
       - key: ADMIN_JOB_TOKEN
         sync: false
@@ -564,7 +437,7 @@ services:
     branch: main
     schedule: "0 17 * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: curl -fsS -X POST "https://api-sit.packlox.com/admin/catalog/promote-scan-derived?dryRun=false&minHitCount=1" -H "X-Admin-Token: $ADMIN_IMPORT_TOKEN"
+    startCommand: 'curl -fsS -X POST "https://api-sit.packlox.com/admin/catalog/promote-scan-derived?dryRun=false&minHitCount=1" -H "X-Admin-Token: $ADMIN_IMPORT_TOKEN"'
     envVars:
       - key: ADMIN_IMPORT_TOKEN
         sync: false
@@ -586,7 +459,7 @@ services:
     branch: main
     schedule: "0 * * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: curl -fsS -X POST "https://api-sit.packlox.com/admin/portfolio/match-catalog?dryRun=false&limit=500" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"
+    startCommand: 'curl -fsS -X POST "https://api-sit.packlox.com/admin/portfolio/match-catalog?dryRun=false&limit=500" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"'
     envVars:
       - key: ADMIN_JOB_TOKEN
         sync: false
