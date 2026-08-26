@@ -86,8 +86,7 @@ begin
         foreach tok in array category_keywords loop
             cat_where := cat_where || format(' or c.category ilike %L', '%' || tok || '%');
         end loop;
-        cat_where := '(' || substring(cat_where from 5) || ')'
-            || ' and c.loose_price_cents is not null';
+        cat_where := '(' || substring(cat_where from 5) || ')';
     else
         cat_where := null;
     end if;
@@ -114,6 +113,17 @@ begin
         -- price/platform predicates below it are untouched.
         filter_where := cat_where || substring(filter_where from position('
           and (' in filter_where));
+    end if;
+
+    -- Browsing is restricted to priced rows, for BOTH filter mechanisms --
+    -- category keywords and the Video Games platform_group path. It has to
+    -- sit out here rather than inside the category branch above: browsing
+    -- Video Games sends platform_group_filter with no keywords at all, so a
+    -- restriction attached to the keyword branch would silently skip it and
+    -- browsing a console would open on unpriced rows (`desc` is NULLS FIRST)
+    -- and take the slow sorted path.
+    if is_browse then
+        filter_where := filter_where || ' and c.loose_price_cents is not null';
     end if;
 
     execute format(
@@ -158,13 +168,42 @@ begin
     );
     end if;
 
-    -- Browsing always takes the ordered path. The unordered fast path
-    -- exists to avoid ranking a huge token match, but with no query there
-    -- is no ranking to skip -- and skipping the order here would hand back
-    -- an arbitrary slice of the category (Comics alone is ~276k rows),
-    -- which is worse than the sort costs. limit is <= 50, so Postgres does
-    -- a cheap top-N sort backed by the loose_price_cents index.
-    if is_browse or estimated_rows <= broad_query_row_threshold then
+    -- Browsing pages through a narrow index-only scan first, then fetches
+    -- only the rows it actually returns.
+    --
+    -- Selecting c.* directly makes this table's width the whole problem:
+    -- the ORDER BY is served by walking the price index from the top, but
+    -- every candidate row has to be pulled from the heap just to test its
+    -- category, and pricecharting_catalog is ~12M rows / 16GB. Yu-Gi-Oh at
+    -- offset 200 has to walk past ~12k more-expensive rows to find its 220
+    -- matches, and at one random 16GB-table heap fetch each that measured
+    -- 80s -- on the second or third scroll of a category, not an edge case.
+    --
+    -- The inner select reads pricecharting_id/loose_price_cents/category
+    -- and nothing else, so it is satisfiable entirely from
+    -- pricecharting_catalog_browse_price_idx (which carries category as an
+    -- INCLUDE column for exactly this). Walking 12k index entries touches
+    -- no heap at all; only the ~20 surviving ids are joined back for their
+    -- full rows.
+    --
+    -- The outer ORDER BY repeats the inner one because a join does not
+    -- preserve row order.
+    if is_browse then
+        return query execute format(
+            'select c.* from public.pricecharting_catalog c
+             join (
+                 select c.pricecharting_id, c.loose_price_cents
+                 from public.pricecharting_catalog c
+                 where %s and %s
+                 order by %s
+                 limit %L offset %L
+             ) page on page.pricecharting_id = c.pricecharting_id
+             order by page.loose_price_cents desc, page.pricecharting_id asc',
+            token_where, filter_where, order_by_clause, result_limit, result_offset
+        );
+    end if;
+
+    if estimated_rows <= broad_query_row_threshold then
         return query execute format(
             'select c.* from public.pricecharting_catalog c
              where %s and %s
