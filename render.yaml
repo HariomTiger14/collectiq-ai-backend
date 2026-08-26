@@ -413,6 +413,38 @@ services:
   # in these categories daily via its saved console_uid. ~44 download-custom
   # requests/run (6,600 sets / 150 per batch) -- a couple minutes, not the
   # multi-day sportscardspro backfill problem.
+  # Tier-3 sportscardspro rotation -- every sports card a fresh price
+  # point (and a history row when it moved) every ~2-3 days. The first
+  # pass fetched all ~36,700 sets once and then froze them (backfill's
+  # claim query excludes success rows); tiers 1-2 only re-touch small
+  # sets and user-tracked items, so most of the 10.5M sports rows had a
+  # single-point price "history". This cron rotates the whole registry
+  # oldest-refreshed-first via the same throttle-paced console_uid CSV
+  # path the backfill used: 220 requests x 3 sets at 15s spacing = ~660
+  # sets in ~55 min hourly, full cycle ~2.3 days. Shares sportscardspro's
+  # Cloudflare budget with the (now normally idle) backfill cron; both
+  # carry a 429 breaker so a collision degrades to a shorter run.
+  - type: cron
+    name: packlox-tier3-sportscardspro-rotation-sit
+    runtime: python
+    plan: starter
+    region: ohio
+    branch: main
+    schedule: "10 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m scripts.refresh_sportscardspro_rotation --max-requests 220
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ENVIRONMENT
+        value: sit
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: PRICECHARTING_API_TOKEN
+        sync: false
+
   - type: cron
     name: packlox-refresh-completed-pricecharting-categories-sit
     runtime: python
