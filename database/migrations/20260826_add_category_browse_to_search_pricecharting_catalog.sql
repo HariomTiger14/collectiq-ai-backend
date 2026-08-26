@@ -86,7 +86,8 @@ begin
         foreach tok in array category_keywords loop
             cat_where := cat_where || format(' or c.category ilike %L', '%' || tok || '%');
         end loop;
-        cat_where := '(' || substring(cat_where from 5) || ')';
+        cat_where := '(' || substring(cat_where from 5) || ')'
+            || ' and c.loose_price_cents is not null';
     else
         cat_where := null;
     end if;
@@ -123,15 +124,22 @@ begin
     estimated_rows := (plan_json->0->'Plan'->>'Plan Rows')::bigint;
 
     -- Relevance tiers are meaningless with no search term, so browsing
-    -- gets its own order: priced rows first (a large share of the catalog
-    -- has no price, and an unpriced row is the least useful thing to open
-    -- a category with), then most valuable, then alphabetical so the order
-    -- is stable between requests.
+    -- gets its own order: most valuable first, with the id as a tiebreak
+    -- so paging is stable between requests.
+    --
+    -- The shape here is chosen to be servable straight from
+    -- pricecharting_catalog_loose_price_cents_idx, which matters a lot on
+    -- a 12M-row/16GB table: ranking a whole category by price means a
+    -- bitmap heap scan over every page that category touches, and for
+    -- Comic Books (~276k rows) that measured 45s. Walking the price index
+    -- backwards and stopping at the first 20 matches instead measured 5ms.
+    -- Two details keep the planner on that path: browsing is restricted to
+    -- priced rows (an unpriced row is the least useful thing to open a
+    -- category with anyway, and `is null` as a leading sort key forces a
+    -- sort), and product_name is left out of the sort keys so ties resolve
+    -- by an incremental sort over a handful of rows rather than a full one.
     if is_browse then
-        order_by_clause := '(c.loose_price_cents is null) asc,
-            c.loose_price_cents desc,
-            c.product_name asc,
-            c.pricecharting_id asc';
+        order_by_clause := 'c.loose_price_cents desc, c.pricecharting_id asc';
     else
     order_by_clause := format(
         'case
