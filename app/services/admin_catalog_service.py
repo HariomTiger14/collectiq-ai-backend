@@ -10,6 +10,7 @@ from app.services.pricing.admin_review_queue_service import _total_from_content_
 from app.services.pricing.catalog_search_service import (
     PRICECHARTING_CATEGORY_GROUPS,
     PRICECHARTING_PLATFORM_GROUPS,
+    SNEAKERS_CATEGORY_KEY,
     resolve_category_group_filters,
     _POKEMON_SET_TCGPLAYER_GROUPS,
     _funko_lookup_title,
@@ -49,6 +50,103 @@ class AdminCatalogService:
     ) -> None:
         self._repository = repository or SupabaseAdminCatalogRepository()
 
+    def _list_items_all_sources(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        category: str | None,
+        category_group: str | None,
+        min_price: float | None,
+        max_price: float | None,
+        query: str,
+        sort: str | None,
+    ) -> dict[str, Any]:
+        """One page spanning both catalog tables: half PriceCharting, half
+        KicksDB, each side paged independently at offset//2.
+
+        A true cross-table merge would need a shared ranking (search) or a
+        shared sort key (browse) across tables with different columns and
+        different index guarantees -- cost out of proportion for an
+        internal tool. The half-and-half page is honest instead: each
+        side keeps its own native order, a page is always at most `limit`
+        rows, and when one table runs out its half simply comes back
+        empty while the other keeps paging.
+
+        A category-group filter picks sides the same way the public
+        search does: sneakers lives only in kicksdb_catalog, every other
+        group only in pricecharting_catalog, so the excluded side is
+        skipped outright rather than queried for guaranteed-empty pages.
+        (SNEAKERS_CATEGORY_KEY is the shared constant the mobile app's
+        chips send.)
+        """
+        include_pricecharting = category_group != SNEAKERS_CATEGORY_KEY
+        include_kicksdb = category_group is None or category_group == SNEAKERS_CATEGORY_KEY
+        # With one side filtered out the survivor gets the whole page --
+        # half-and-half only makes sense when there are two halves.
+        both = include_pricecharting and include_kicksdb
+        per_side = max(1, limit // 2) if both else limit
+        side_offset = offset // 2 if both else offset
+        searching = bool(query) and len(query) >= 2
+
+        pc_rows: list[dict[str, Any]] = []
+        kd_rows: list[dict[str, Any]] = []
+        pc_more = kd_more = False
+        total_count: int | None = None
+        if searching:
+            if include_pricecharting:
+                pc_rows, pc_more = self._repository.search_catalog_rows(
+                    query, limit=per_side, offset=side_offset,
+                    category_group=category_group, min_price=min_price, max_price=max_price,
+                )
+            if include_kicksdb:
+                kd_rows, kd_more = self._repository.search_kicksdb_rows(
+                    query, limit=per_side, offset=side_offset,
+                    min_price=min_price, max_price=max_price,
+                )
+        else:
+            total_count = 0
+            if include_pricecharting:
+                pc_rows = self._repository.list_catalog_rows(
+                    source="pricecharting", limit=per_side, offset=side_offset,
+                    category=category, category_group=category_group,
+                    min_price=min_price, max_price=max_price, sort=sort,
+                )
+                total_count += self._repository.count_catalog_rows(
+                    source="pricecharting", category=category, category_group=category_group,
+                    min_price=min_price, max_price=max_price,
+                ) or 0
+            if include_kicksdb:
+                kd_rows = self._repository.list_catalog_rows(
+                    source="kicksdb", limit=per_side, offset=side_offset,
+                    category=category, category_group=None,
+                    min_price=min_price, max_price=max_price, sort=sort,
+                )
+                total_count += self._repository.count_catalog_rows(
+                    source="kicksdb", category=category, category_group=None,
+                    min_price=min_price, max_price=max_price,
+                ) or 0
+
+        pc_items = [_compact_catalog_row(row, source="pricecharting") for row in pc_rows]
+        pc_items = self._enrich_funko_images(pc_items)
+        pc_items = self._enrich_pokemon_images(pc_items)
+        pc_items = self._enrich_lego_images(pc_items)
+        pc_items = self._enrich_magic_images(pc_items)
+        pc_items = self._enrich_yugioh_images(pc_items)
+        pc_items = self._enrich_lorcana_images(pc_items)
+        pc_items = self._enrich_onepiece_images(pc_items)
+        pc_items = self._enrich_videogames_images(pc_items)
+        kd_items = [_compact_catalog_row(row, source="kicksdb") for row in kd_rows]
+        items = pc_items + kd_items
+        return {
+            "success": True,
+            "source": "all",
+            "count": len(items),
+            "totalCount": total_count,
+            "hasMore": (pc_more or kd_more) if searching else None,
+            "items": items,
+        }
+
     def update_item(self, catalog_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not self._repository.is_configured:
             raise AdminCatalogError("Supabase catalog configuration is missing.")
@@ -76,9 +174,16 @@ class AdminCatalogService:
     ) -> dict[str, Any]:
         if not self._repository.is_configured:
             raise AdminCatalogError("Supabase catalog configuration is missing.")
-        normalized_source = source if source in ("pricecharting", "kicksdb") else "pricecharting"
+        normalized_source = source if source in ("pricecharting", "kicksdb", "all") else "pricecharting"
         bounded_limit = max(1, min(limit, 100))
         normalized_query = (query or "").strip()
+        if normalized_source == "all":
+            return self._list_items_all_sources(
+                limit=bounded_limit, offset=max(0, offset),
+                category=category, category_group=category_group,
+                min_price=min_price, max_price=max_price,
+                query=normalized_query, sort=sort,
+            )
         # A typed search reuses the same relevance-ranked RPC the public
         # catalog search runs (search_pricecharting_catalog), instead of
         # the plain paginated browse below -- so the admin table can show
@@ -103,6 +208,16 @@ class AdminCatalogService:
             rows, has_more = self._repository.search_catalog_rows(
                 normalized_query, limit=bounded_limit, offset=max(0, offset),
                 category_group=category_group, min_price=min_price, max_price=max_price,
+            )
+            total_count = None
+        elif normalized_query and len(normalized_query) >= 2 and normalized_source == "kicksdb":
+            # The "no search RPC yet" this branch used to cite went stale:
+            # search_kicksdb_catalog has existed since the sneakers catalog
+            # landed (the public Discover search uses it). Wire it up so the
+            # admin KicksDB tab stops being browse-only.
+            rows, has_more = self._repository.search_kicksdb_rows(
+                normalized_query, limit=bounded_limit, offset=max(0, offset),
+                min_price=min_price, max_price=max_price,
             )
             total_count = None
         else:
@@ -582,6 +697,36 @@ class SupabaseAdminCatalogRepository:
         rows = [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
         has_more = len(rows) > limit
         return rows[:limit], has_more
+
+    def search_kicksdb_rows(
+        self,
+        query: str,
+        *,
+        limit: int,
+        offset: int = 0,
+        min_price: float | None = None,
+        max_price: float | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        # Mirrors the public sneakers search (CatalogSearchService's
+        # search_kicksdb_catalog RPC call). The RPC has no offset
+        # parameter, so paging over-fetches offset+limit+1 rows and
+        # slices -- fine at this table's scale (~44k rows, fetches capped
+        # by the pager's reach) and not worth a migration until someone
+        # actually pages deep here.
+        payload = self._request(
+            "POST",
+            "/rest/v1/rpc/search_kicksdb_catalog",
+            json_payload={
+                "search_query": query,
+                "result_limit": offset + limit + 1,
+                "min_price_cents": int(min_price * 100) if min_price is not None else None,
+                "max_price_cents": int(max_price * 100) if max_price is not None else None,
+            },
+        )
+        rows = [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
+        window = rows[offset:offset + limit]
+        has_more = len(rows) > offset + limit
+        return window, has_more
 
     def count_catalog_rows(
         self,
