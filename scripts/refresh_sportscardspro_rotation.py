@@ -168,12 +168,17 @@ def main(argv: list[str] | None = None) -> int:
                 ):
                     failed_batches += 1
                     continue
-            # Stamp only after the write lands: a failed batch keeps its
-            # sets at the front of the rotation for the next run.
-            refreshed_ids.extend(row["registry_id"] for row in chunk)
-
-    if not args.dry_run and refreshed_ids:
-        registry.mark_tier3_refreshed(refreshed_ids)
+            # Stamp each batch as soon as its write lands, not in one
+            # PATCH at the end of the run: a run is ~55 minutes long, and
+            # end-of-run stamping means a killed run (deploy, timeout,
+            # OOM) loses every stamp -- the next run would re-spend all
+            # 220 throttled requests re-fetching sets whose data already
+            # landed. A failed batch is simply never stamped, keeping its
+            # sets at the front of the rotation.
+            batch_ids = [row["registry_id"] for row in chunk]
+            if not args.dry_run:
+                registry.mark_tier3_refreshed(batch_ids)
+            refreshed_ids.extend(batch_ids)
 
     print(
         json.dumps(
