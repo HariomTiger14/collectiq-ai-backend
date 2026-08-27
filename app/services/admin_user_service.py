@@ -125,6 +125,9 @@ class AdminUserService:
                 plan=plan,
                 source="admin_override",
                 purchase_token=None,
+                # This call sits behind the admin-token route; the public
+                # verify endpoint can never reach admin_override.
+                trusted_caller=True,
             )
         except SubscriptionServiceError as error:
             raise AdminUserServiceError(str(error)) from error

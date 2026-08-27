@@ -56,6 +56,14 @@ class SubscriptionPurchaseInvalidError(SubscriptionServiceError):
     502."""
 
 
+class SubscriptionVerificationUnavailableError(SubscriptionServiceError):
+    """A store purchase was claimed but the matching verifier isn't
+    configured and untrusted grants are disallowed (production). The
+    purchase may be perfectly genuine -- the server just can't check it
+    yet -- so this maps to a retryable 503, never a granted plan and
+    never a 422 that would tell the app its purchase is bad."""
+
+
 class SubscriptionService:
     def __init__(
         self,
@@ -173,6 +181,7 @@ class SubscriptionService:
         plan: str,
         source: str,
         purchase_token: str | None,
+        trusted_caller: bool = False,
     ) -> dict[str, Any]:
         """Verify (when the source requires it) and record an entitlement,
         returning it.
@@ -186,6 +195,27 @@ class SubscriptionService:
         """
         self._require_config()
         normalized_source = source if source in _VALID_SOURCES else "mock"
+        # admin_override exists only for the admin console's Set Free/Set
+        # Pro action, which reaches here through the admin-token-gated
+        # route with trusted_caller=True. The PUBLIC /subscription/verify
+        # endpoint forwards the client's source verbatim, so without this
+        # check any signed-in user could send source=admin_override and
+        # write themselves a Pro row.
+        if normalized_source == "admin_override" and not trusted_caller:
+            raise SubscriptionPurchaseInvalidError(
+                "Source admin_override is not accepted from this endpoint."
+            )
+        # "mock"/"none" trust the claimed plan outright -- the SIT dummy
+        # billing path. Fine everywhere except production, where an
+        # unverified claim must never become a paid entitlement.
+        if (
+            normalized_source in ("mock", "none")
+            and not trusted_caller
+            and not settings.subscription_allow_untrusted_sources
+        ):
+            raise SubscriptionPurchaseInvalidError(
+                f"Source {normalized_source} is not accepted in this environment."
+            )
         now_iso = datetime.now(timezone.utc).isoformat()
         row: dict[str, Any] = {
             "user_id": user_id,
@@ -256,10 +286,15 @@ class SubscriptionService:
         except GooglePlayVerificationNotConfiguredError:
             # No service account configured yet (e.g. today's SIT env) --
             # degrade to trusting the client rather than hard-failing every
-            # subscription check, matching this file's existing pattern of
-            # graceful degradation when a downstream integration isn't set
-            # up. Once configured, this path is never taken.
-            return {"plan": claimed_plan, "status": "active"}
+            # subscription check. ONLY outside production: there, an
+            # unconfigured verifier fails closed with a retryable 503 --
+            # a genuine purchase the server can't check yet must neither
+            # be granted unverified nor rejected as invalid.
+            if settings.subscription_allow_untrusted_sources:
+                return {"plan": claimed_plan, "status": "active"}
+            raise SubscriptionVerificationUnavailableError(
+                "Google Play verification is not configured on this server."
+            ) from None
         except GooglePlayPurchaseInvalidError as error:
             raise SubscriptionPurchaseInvalidError(str(error)) from error
         return {
@@ -274,7 +309,11 @@ class SubscriptionService:
         try:
             entitlement = self._apple_verifier.verify_signed_transaction(signed_transaction or "")
         except AppleVerificationNotConfiguredError:
-            return {"plan": claimed_plan, "status": "active"}
+            if settings.subscription_allow_untrusted_sources:
+                return {"plan": claimed_plan, "status": "active"}
+            raise SubscriptionVerificationUnavailableError(
+                "App Store verification is not configured on this server."
+            ) from None
         except AppleTransactionInvalidError as error:
             raise SubscriptionPurchaseInvalidError(str(error)) from error
         expires_iso = None

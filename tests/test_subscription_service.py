@@ -1,6 +1,6 @@
 import time
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import httpx
 
@@ -11,10 +11,12 @@ from app.services.subscription.apple_verification_service import (
 from app.services.subscription.google_play_verification_service import (
     GooglePlayEntitlement,
     GooglePlayPurchaseInvalidError,
+    GooglePlayVerificationNotConfiguredError,
 )
 from app.services.subscription.subscription_service import (
     SubscriptionPurchaseInvalidError,
     SubscriptionService,
+    SubscriptionVerificationUnavailableError,
 )
 
 
@@ -80,13 +82,102 @@ class SubscriptionServiceScanUsageTest(unittest.TestCase):
         )
 
         result = service.verify_and_grant(
-            user_id="user-1", plan="pro", source="admin_override", purchase_token=None
+            user_id="user-1", plan="pro", source="admin_override",
+            purchase_token=None, trusted_caller=True,
         )
 
         self.assertEqual(result["plan"], "pro")
         self.assertEqual(result["source"], "admin_override")
         request = client.requests[-1]
         self.assertEqual(request["json"][0]["source"], "admin_override")
+
+
+class ProductionFailClosedTest(unittest.TestCase):
+    """The production latch: untrusted grant paths that are correct for
+    SIT (mock source, unconfigured-verifier fallback) must fail CLOSED
+    when subscription_allow_untrusted_sources is off."""
+
+    @staticmethod
+    def _latch(allow: bool):
+        # settings is a frozen dataclass, so patch the symbol the service
+        # module reads rather than mutating the instance.
+        from types import SimpleNamespace
+        return patch(
+            "app.services.subscription.subscription_service.settings",
+            SimpleNamespace(subscription_allow_untrusted_sources=allow),
+        )
+
+    def _service(self, client=None):
+        return SubscriptionService(
+            supabase_url="https://supabase.test", service_role_key="service-role",
+            anon_key="anon-key", client=client or _FakeSubscriptionClient(),
+        )
+
+    def test_admin_override_is_rejected_from_the_public_path_in_any_env(self) -> None:
+        # Without this, any signed-in user could POST source=admin_override
+        # and write themselves a Pro row -- even in SIT.
+        client = _FakeSubscriptionClient()
+        with self._latch(True):
+            with self.assertRaises(SubscriptionPurchaseInvalidError):
+                self._service(client).verify_and_grant(
+                    user_id="user-1", plan="pro", source="admin_override", purchase_token=None,
+                )
+        self.assertFalse(any(r["method"] == "POST" for r in client.requests))
+
+    def test_admin_override_still_works_for_the_trusted_admin_caller(self) -> None:
+        with self._latch(False):
+            result = self._service().verify_and_grant(
+                user_id="user-1", plan="pro", source="admin_override",
+                purchase_token=None, trusted_caller=True,
+            )
+        self.assertEqual(result["plan"], "pro")
+
+    def test_mock_source_is_rejected_when_untrusted_sources_are_off(self) -> None:
+        client = _FakeSubscriptionClient()
+        with self._latch(False):
+            with self.assertRaises(SubscriptionPurchaseInvalidError):
+                self._service(client).verify_and_grant(
+                    user_id="user-1", plan="pro", source="mock", purchase_token=None,
+                )
+        self.assertFalse(any(r["method"] == "POST" for r in client.requests))
+
+    def test_mock_source_still_grants_when_untrusted_sources_are_allowed(self) -> None:
+        with self._latch(True):
+            result = self._service().verify_and_grant(
+                user_id="user-1", plan="pro", source="mock", purchase_token=None,
+            )
+        self.assertEqual(result["plan"], "pro")
+
+    def test_unconfigured_google_verifier_fails_closed_when_latched(self) -> None:
+        # The purchase may be genuine -- the server just can't check it --
+        # so this must be the retryable Unavailable error, never a grant
+        # and never PurchaseInvalid.
+        unconfigured = Mock()
+        unconfigured.verify_purchase_token.side_effect = GooglePlayVerificationNotConfiguredError("no sa")
+        client = _FakeSubscriptionClient()
+        service = SubscriptionService(
+            supabase_url="https://supabase.test", service_role_key="service-role",
+            anon_key="anon-key", client=client, google_play_verifier=unconfigured,
+        )
+        with self._latch(False):
+            with self.assertRaises(SubscriptionVerificationUnavailableError):
+                service.verify_and_grant(
+                    user_id="user-1", plan="pro", source="google_play", purchase_token="tok",
+                )
+        self.assertFalse(any(r["method"] == "POST" for r in client.requests))
+
+    def test_unconfigured_google_verifier_still_degrades_open_in_sit(self) -> None:
+        unconfigured = Mock()
+        unconfigured.verify_purchase_token.side_effect = GooglePlayVerificationNotConfiguredError("no sa")
+        service = SubscriptionService(
+            supabase_url="https://supabase.test", service_role_key="service-role",
+            anon_key="anon-key", client=_FakeSubscriptionClient(), google_play_verifier=unconfigured,
+        )
+        with self._latch(True):
+            result = service.verify_and_grant(
+                user_id="user-1", plan="pro", source="google_play", purchase_token="tok",
+            )
+        self.assertEqual(result["plan"], "pro")
 
 
 class VerifyAndGrantRealVerificationTest(unittest.TestCase):
@@ -211,7 +302,7 @@ class EntitlementChangeAuditTest(unittest.TestCase):
             client=client, audit_service=audit_service,
         )
 
-        service.verify_and_grant(user_id="user-1", plan="pro", source="admin_override", purchase_token=None)
+        service.verify_and_grant(user_id="user-1", plan="pro", source="admin_override", purchase_token=None, trusted_caller=True)
 
         audit_service.record.assert_called_once()
         call_kwargs = audit_service.record.call_args.kwargs
@@ -232,7 +323,7 @@ class EntitlementChangeAuditTest(unittest.TestCase):
             client=client, audit_service=audit_service,
         )
 
-        service.verify_and_grant(user_id="user-1", plan="pro", source="admin_override", purchase_token=None)
+        service.verify_and_grant(user_id="user-1", plan="pro", source="admin_override", purchase_token=None, trusted_caller=True)
 
         audit_service.record.assert_not_called()
 

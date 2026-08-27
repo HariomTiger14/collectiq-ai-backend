@@ -222,6 +222,19 @@ class Settings:
     resend_from_address: str = os.getenv("RESEND_FROM_ADDRESS", "PackLox Support <info@packlox.com>")
 
     # ---- Google Play (real subscription verification) ----
+    # Whether /subscription/verify may TRUST the client: the "mock" source
+    # (SIT dummy billing) and the trust-the-claim fallback used when a
+    # store verifier isn't configured yet. Defaults to true everywhere
+    # EXCEPT production -- in production an unverified claim must never
+    # grant a paid plan (that is the whole money bug), so there the mock
+    # source is rejected and an unconfigured verifier fails CLOSED with a
+    # retryable 503 instead of open with a free Pro. Overridable for a
+    # deliberate prod smoke test, never as a steady state.
+    subscription_allow_untrusted_sources: bool = os.getenv(
+        "SUBSCRIPTION_ALLOW_UNTRUSTED_SOURCES",
+        "false" if resolve_environment() in ("production", "prod") else "true",
+    ).strip().lower() in ("1", "true", "yes")
+
     google_play_package_name: str = os.getenv("GOOGLE_PLAY_PACKAGE_NAME", "com.collectiq.ai")
     # Same raw-JSON-in-env-var convention as firebase_service_account_json above
     # -- a separate service account, scoped to the Android Publisher API only
