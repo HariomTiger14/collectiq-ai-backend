@@ -175,7 +175,13 @@ services:
     name: packlox-backfill-pricecharting-sets-sit
     runtime: python
     plan: starter
-    region: oregon
+    # ohio, NOT oregon: sportscardspro.com 403-blocks Render's Oregon
+    # outbound IP even for plain page views (live-confirmed 2026-08-09; see
+    # the discover cron's comment). The hand-made Oregon copy of this cron
+    # was suspended for exactly that reason. In Oregon this cron would
+    # no-op today (first pass complete, nothing to claim) and then silently
+    # fail the moment the weekly discover job registers new sets.
+    region: ohio
     branch: main
     schedule: "*/15 * * * *"
     buildCommand: pip install -r requirements.txt
@@ -296,17 +302,6 @@ services:
       - key: KICKSDB_API_KEY
         sync: false
 
-  # Daily refresh for the 5 pricecharting.com registry categories that are
-  # already 100% backfilled (coins, comic-books, funko-pops, lego-sets,
-  # lorcana-cards -- ~6,600 sets total) but permanently excluded from
-  # backfill-pricecharting-sets-sit's claim_rows() once successful. Unlike
-  # sportscardspro.com's categories (still mid first-pass, heavily
-  # throttled), these are small and completely unthrottled, so rather than
-  # complicate the shared claim/priority-tier logic sportscardspro depends
-  # on, this is a standalone script: unconditionally re-downloads every set
-  # in these categories daily via its saved console_uid. ~44 download-custom
-  # requests/run (6,600 sets / 150 per batch) -- a couple minutes, not the
-  # multi-day sportscardspro backfill problem.
   # Tier-3 sportscardspro rotation -- every sports card a fresh price
   # point (and a history row when it moved) every ~2-3 days. The first
   # pass fetched all ~36,700 sets once and then froze them (backfill's
@@ -339,6 +334,17 @@ services:
       - key: PRICECHARTING_API_TOKEN
         sync: false
 
+  # Daily refresh for the 5 pricecharting.com registry categories that are
+  # already 100% backfilled (coins, comic-books, funko-pops, lego-sets,
+  # lorcana-cards -- ~6,600 sets total) but permanently excluded from
+  # backfill-pricecharting-sets-sit's claim_rows() once successful. Unlike
+  # sportscardspro.com's categories (huge and heavily throttled -- their
+  # recurring refresh is the tier-3 rotation cron above), these are small and completely unthrottled, so rather than
+  # complicate the shared claim/priority-tier logic sportscardspro depends
+  # on, this is a standalone script: unconditionally re-downloads every set
+  # in these categories daily via its saved console_uid. ~44 download-custom
+  # requests/run (6,600 sets / 150 per batch) -- a couple minutes, not the
+  # multi-day sportscardspro backfill problem.
   - type: cron
     name: packlox-refresh-completed-pricecharting-categories-sit
     runtime: python
