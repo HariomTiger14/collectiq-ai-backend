@@ -34,6 +34,8 @@ from typing import Any
 
 import httpx
 
+from scripts._ops_run_recorder import dump_and_report, run_with_recorder
+
 
 DEFAULT_API_BASE = "https://api.kicks.dev"
 DEFAULT_PAGE_SIZE = 100
@@ -248,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     print(
-        json.dumps(
+        dump_and_report(
             {
                 "success": True,
                 "dryRun": args.dry_run,
@@ -708,4 +710,4 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_with_recorder("kicksdb-catalog-refresh", main))

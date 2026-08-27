@@ -1,6 +1,7 @@
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from app.services.ops.observability import recorded_admin_job
 from pydantic import BaseModel, Field
 
 from app.routers.admin_auth import (
@@ -65,6 +66,7 @@ def pricing_health_quick(
 
 
 @router.post("/reprice-all")
+@recorded_admin_job("batch-reprice")
 def reprice_all_portfolio_items(
     dry_run: bool = Query(False, alias="dryRun"),
     limit: int = Query(1000, ge=1, le=10000),

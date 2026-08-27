@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from app.services.ops.observability import recorded_admin_job
 
 from app.routers.admin_auth import require_admin_job_token
 from app.services.alerts.price_alert_evaluation_service import (
@@ -28,6 +29,7 @@ async def evaluate_price_alerts(
 
 
 @router.post("/price-alerts/run")
+@recorded_admin_job("price-alerts-run")
 async def run_price_alert_push_job(
     dry_run: bool = Query(False, alias="dryRun"),
     evaluate: bool = Query(True, alias="evaluate"),

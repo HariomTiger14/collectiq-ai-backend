@@ -1,6 +1,7 @@
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from app.services.ops.observability import recorded_admin_job
 
 from app.routers.admin_auth import require_admin_job_token
 from app.services.pricing.portfolio_catalog_matching_service import (
@@ -13,6 +14,7 @@ router = APIRouter(prefix="/admin/portfolio", tags=["Admin"])
 
 
 @router.post("/match-catalog")
+@recorded_admin_job("match-portfolio-catalog")
 def match_portfolio_items_to_catalog(
     dry_run: bool = Query(True, alias="dryRun"),
     limit: int = Query(200, ge=1, le=2000),
