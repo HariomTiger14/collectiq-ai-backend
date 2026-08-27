@@ -314,6 +314,133 @@ class AdminCatalogListItemsTest(unittest.TestCase):
             "pikachu", limit=20, offset=0, category_group="coins", min_price=5, max_price=25,
         )
 
+    def test_service_kicksdb_search_branch_uses_kicksdb_rpc(self) -> None:
+        # The old "KicksDB has no search RPC yet" restriction went stale:
+        # search_kicksdb_catalog has existed since the sneakers catalog
+        # landed. A typed query on the kicksdb source must route through
+        # it instead of silently falling back to browse.
+        from unittest.mock import MagicMock
+
+        repository = MagicMock()
+        repository.is_configured = True
+        repository.search_kicksdb_rows.return_value = ([], False)
+        service = AdminCatalogService(repository=repository)
+
+        result = service.list_items(source="kicksdb", limit=20, offset=40, query="dunk low", min_price=5, max_price=250)
+
+        repository.search_kicksdb_rows.assert_called_once_with(
+            "dunk low", limit=20, offset=40, min_price=5, max_price=250,
+        )
+        repository.list_catalog_rows.assert_not_called()
+        self.assertIsNone(result["totalCount"])
+
+    def test_repository_kicksdb_search_slices_offset_window(self) -> None:
+        # search_kicksdb_catalog has no offset parameter, so the
+        # repository over-fetches offset+limit+1 and slices -- the window
+        # must be the requested page, and hasMore true only when a row
+        # exists past it.
+        rows = [{"kicksdb_id": f"id-{i}", "title": f"Sneaker {i}"} for i in range(7)]
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            import json as _json
+            captured["payload"] = _json.loads(request.content)
+            return httpx.Response(200, json=rows)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        repository = SupabaseAdminCatalogRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        window, has_more = repository.search_kicksdb_rows("jordan", limit=2, offset=4)
+
+        self.assertEqual(captured["payload"]["result_limit"], 7)
+        self.assertEqual([r["kicksdb_id"] for r in window], ["id-4", "id-5"])
+        self.assertTrue(has_more)
+
+    def test_service_all_source_merges_both_tables_half_and_half(self) -> None:
+        # source=all: one page = half PriceCharting + half KicksDB, each
+        # side paged independently at offset//2, totals summed.
+        from unittest.mock import MagicMock
+
+        repository = MagicMock()
+        repository.is_configured = True
+        repository.list_catalog_rows.side_effect = lambda *, source, **kw: (
+            [{"pricecharting_id": "pc-1", "product_name": "Card"}]
+            if source == "pricecharting"
+            else [{"kicksdb_id": "kd-1", "title": "Shoe"}]
+        )
+        repository.count_catalog_rows.side_effect = lambda *, source, **kw: (
+            100 if source == "pricecharting" else 40
+        )
+        repository.has_sibling_pokemon_rows.return_value = False
+        repository.fetch_funko_image_rows.return_value = []
+        service = AdminCatalogService(repository=repository)
+
+        result = service.list_items(source="all", limit=50, offset=100)
+
+        sources = [item["source"] for item in result["items"]]
+        self.assertEqual(sources, ["PriceCharting", "KicksDB"])
+        self.assertEqual(result["totalCount"], 140)
+        self.assertEqual(result["source"], "all")
+        for call in repository.list_catalog_rows.call_args_list:
+            self.assertEqual(call.kwargs["limit"], 25)
+            self.assertEqual(call.kwargs["offset"], 50)
+
+    def test_service_all_source_search_queries_both_rpcs(self) -> None:
+        from unittest.mock import MagicMock
+
+        repository = MagicMock()
+        repository.is_configured = True
+        repository.search_catalog_rows.return_value = ([], True)
+        repository.search_kicksdb_rows.return_value = ([], False)
+        service = AdminCatalogService(repository=repository)
+
+        result = service.list_items(source="all", limit=50, offset=0, query="jordan")
+
+        repository.search_catalog_rows.assert_called_once()
+        repository.search_kicksdb_rows.assert_called_once()
+        self.assertTrue(result["hasMore"])
+        self.assertIsNone(result["totalCount"])
+
+    def test_service_all_source_sneakers_group_skips_pricecharting(self) -> None:
+        # A sneakers category-group filter can only ever match
+        # kicksdb_catalog, so the pricecharting side is skipped outright
+        # and the surviving side gets the WHOLE page, not half of one.
+        from unittest.mock import MagicMock
+
+        repository = MagicMock()
+        repository.is_configured = True
+        repository.list_catalog_rows.return_value = []
+        repository.count_catalog_rows.return_value = 40
+        service = AdminCatalogService(repository=repository)
+
+        service.list_items(source="all", limit=50, offset=50, category_group="sneakers")
+
+        repository.list_catalog_rows.assert_called_once()
+        call = repository.list_catalog_rows.call_args
+        self.assertEqual(call.kwargs["source"], "kicksdb")
+        self.assertEqual(call.kwargs["limit"], 50)
+        self.assertEqual(call.kwargs["offset"], 50)
+
+    def test_service_all_source_non_sneakers_group_skips_kicksdb(self) -> None:
+        from unittest.mock import MagicMock
+
+        repository = MagicMock()
+        repository.is_configured = True
+        repository.list_catalog_rows.return_value = []
+        repository.count_catalog_rows.return_value = 10
+        repository.has_sibling_pokemon_rows.return_value = False
+        repository.fetch_funko_image_rows.return_value = []
+        service = AdminCatalogService(repository=repository)
+
+        service.list_items(source="all", limit=50, offset=0, category_group="comics")
+
+        repository.list_catalog_rows.assert_called_once()
+        self.assertEqual(repository.list_catalog_rows.call_args.kwargs["source"], "pricecharting")
+
     def test_repository_counts_pricecharting_rows_via_content_range(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             self.assertEqual(request.headers.get("prefer"), "count=estimated")

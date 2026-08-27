@@ -36,7 +36,7 @@ def get_catalog_pipeline_status(
 
 @router.get("/items")
 def list_catalog_items(
-    source: str = Query(default="pricecharting", pattern="^(pricecharting|kicksdb)$"),
+    source: str = Query(default="pricecharting", pattern="^(pricecharting|kicksdb|all)$"),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     category: str | None = Query(default=None, min_length=1),
