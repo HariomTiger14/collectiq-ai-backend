@@ -1,6 +1,7 @@
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from app.services.ops.observability import recorded_admin_job
 
 from app.routers.admin_auth import require_admin_job_token
 from app.services.pricing.fx_rate_service import FxRateService, FxRateServiceError
@@ -10,6 +11,7 @@ router = APIRouter(prefix="/admin/pricing/fx-rates", tags=["Admin"])
 
 
 @router.post("/refresh")
+@recorded_admin_job("fx-rates-refresh")
 def refresh_fx_rates(
     _admin: dict[str, Any] = Depends(require_admin_job_token),
 ) -> dict[str, Any]:

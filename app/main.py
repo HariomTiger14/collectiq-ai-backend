@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core.config import UPLOAD_DIR, settings
+from app.services.ops.observability import record_unhandled_error
 from app.routers import (
     admin_audit,
     admin_catalog,
@@ -91,4 +92,24 @@ async def http_exception_handler(
     return JSONResponse(
         status_code=exc.status_code,
         content={"success": False, "error": exc.detail},
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(
+    request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    # Every unhandled exception becomes an ops_error_events row so the
+    # admin portal's error feed sees it (grouped by route + error class);
+    # HTTPExceptions never reach here -- deliberate 4xx/5xx responses are
+    # not defects. The route TEMPLATE (/admin/users/{user_id}), not the
+    # concrete path, keys the fingerprint so one buggy route groups as
+    # one issue. Recording is best-effort and can never mask the error:
+    # the client still gets the same 500 it always did.
+    route = getattr(getattr(request, "scope", {}).get("route"), "path", None) or request.url.path
+    record_unhandled_error(route=route, error=exc)
+    return JSONResponse(
+        status_code=500,
+        content={"success": False, "error": {"code": "internal_error", "message": "Internal server error."}},
     )

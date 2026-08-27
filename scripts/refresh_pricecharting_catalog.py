@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from scripts._ops_run_recorder import dump_and_report, run_with_recorder
 from scripts.import_pricecharting_catalog import PRICECHARTING_CSV_ENV_VARS
 from scripts.import_pricecharting_catalog import SupabaseCatalogClient
 from scripts.import_pricecharting_catalog import to_catalog_row
@@ -54,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
         summaries.append(summary)
 
     print(
-        json.dumps(
+        dump_and_report(
             {
                 "success": True,
                 "dryRun": args.dry_run,
@@ -342,4 +343,4 @@ def _sha256_file(path: Path) -> str:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_with_recorder("pricecharting-csv-refresh", main))

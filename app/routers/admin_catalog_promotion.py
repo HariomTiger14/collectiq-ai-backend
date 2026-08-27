@@ -1,6 +1,7 @@
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from app.services.ops.observability import recorded_admin_job
 
 from app.routers.admin_auth import require_admin_import_token
 from app.services.admin_import_job_service import AdminImportJobService
@@ -14,6 +15,7 @@ router = APIRouter(prefix="/admin/catalog", tags=["Admin"])
 
 
 @router.post("/promote-scan-derived")
+@recorded_admin_job("promote-scan-derived")
 def promote_scan_derived_catalog_rows(
     dry_run: bool = Query(True, alias="dryRun"),
     min_hit_count: int = Query(

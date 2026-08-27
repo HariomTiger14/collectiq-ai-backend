@@ -49,6 +49,7 @@ from typing import Any
 
 import httpx
 
+from scripts._ops_run_recorder import dump_and_report, run_with_recorder
 from scripts.backfill_pricecharting_sets import (
     REQUEST_HEADERS,
     SOURCE_SITE_BASE_URLS,
@@ -109,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
     if not rows:
-        print(json.dumps({"success": True, "setsConsidered": 0}, indent=2), flush=True)
+        print(dump_and_report({"success": True, "setsConsidered": 0}, indent=2), flush=True)
         return 0
 
     source_downloaded_at = datetime.now(timezone.utc).isoformat()
@@ -181,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
             refreshed_ids.extend(batch_ids)
 
     print(
-        json.dumps(
+        dump_and_report(
             {
                 "success": True,
                 "dryRun": args.dry_run,
@@ -310,4 +311,4 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_with_recorder("tier3-sportscardspro-rotation", main))

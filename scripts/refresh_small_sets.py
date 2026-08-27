@@ -27,6 +27,7 @@ from typing import Any
 
 import httpx
 
+from scripts._ops_run_recorder import dump_and_report, run_with_recorder
 from scripts.backfill_pricecharting_sets import (
     API_SEARCH_RESULT_CAP,
     REQUEST_HEADERS,
@@ -111,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         reader.mark_tier1_checked(checked_ids)
 
     print(
-        json.dumps(
+        dump_and_report(
             {
                 "success": True,
                 "dryRun": args.dry_run,
@@ -277,4 +278,4 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_with_recorder("small-sets-refresh", main))

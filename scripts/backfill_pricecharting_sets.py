@@ -103,6 +103,7 @@ class _StartRateLimiter:
             self._next_allowed_start = now + self._min_interval_seconds
 
 
+from scripts._ops_run_recorder import dump_and_report, run_with_recorder
 from scripts.import_pricecharting_catalog import (
     TEXT_FIELDS,
     PartialCatalogWriteError,
@@ -366,7 +367,7 @@ def _run_backfill(
     phase_seconds["claim"] = time.perf_counter() - claim_started_at
     print(f"Claimed {len(claimed_rows)} registry rows.", flush=True)
     if not claimed_rows:
-        print(json.dumps({"success": True, "claimed": 0}, indent=2), flush=True)
+        print(dump_and_report({"success": True, "claimed": 0}, indent=2), flush=True)
         return 0
 
     source_downloaded_at = datetime.now(timezone.utc).isoformat()
@@ -564,7 +565,7 @@ def _run_backfill(
             registry_client.mark_failure(failed_rows)
 
     print(
-        json.dumps(
+        dump_and_report(
             _build_result_summary(
                 dry_run=args.dry_run,
                 claimed_count=len(claimed_rows),
@@ -1548,4 +1549,4 @@ class SupabaseRegistryOpsClient:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_with_recorder("pricecharting-sets-backfill", main))
