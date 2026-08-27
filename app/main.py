@@ -24,6 +24,7 @@ from app.routers import (
     auth,
     data_requests,
     health,
+    client_telemetry,
     metadata,
     pricing,
     portfolio,
@@ -82,6 +83,7 @@ app.include_router(portfolio.router)
 app.include_router(pricing.router)
 app.include_router(search.router)
 app.include_router(metadata.router)
+app.include_router(client_telemetry.router)
 
 
 @app.exception_handler(HTTPException)
