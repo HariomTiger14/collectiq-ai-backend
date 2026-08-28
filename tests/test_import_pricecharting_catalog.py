@@ -18,6 +18,7 @@ from scripts.import_pricecharting_catalog import (
     source_timestamp,
     to_catalog_history_row,
     to_catalog_row,
+    to_catalog_row_from_api_product,
 )
 
 
@@ -656,3 +657,88 @@ def _fake_supabase_jwt(role: str) -> str:
 def _b64_json(payload: dict[str, str]) -> str:
     encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
     return encoded.rstrip("=")
+
+
+class ApiCategoryCanonicalizationTest(unittest.TestCase):
+    """Step-1 regression suite for the cross-source category flap
+    (2026-08-29 SCD2 audit): API paths attached a short `genre` while CSV
+    paths fall back to console_name (the long, canonical form), so a card
+    alternating between paths minted a fake SCD2 version per crossing."""
+
+    CSV_ROW = {
+        "id": "6870091",
+        "product-name": "Luis Robert [Refractor]",
+        "console-name": "Baseball Cards 2020 Topps Chrome Ben Baller",
+        "loose-price": "12.34",
+    }
+    API_PRODUCT = {
+        "id": "6870091",
+        "product-name": "Luis Robert [Refractor]",
+        "console-name": "Baseball Cards 2020 Topps Chrome Ben Baller",
+        "genre": "Baseball Card",
+        "loose-price": 1234,
+    }
+
+    def test_api_and_csv_paths_produce_the_same_category(self) -> None:
+        csv_row = to_catalog_row(dict(self.CSV_ROW), "sportscardspro-set-backfill", "2026-08-29T00:00:00Z")
+        api_row = to_catalog_row_from_api_product(dict(self.API_PRODUCT), "sportscardspro-tier1-refresh", "2026-08-29T00:00:00Z")
+        self.assertEqual(csv_row["category"], api_row["category"])
+
+    def test_canonical_form_is_the_long_console_name_fallback(self) -> None:
+        api_row = to_catalog_row_from_api_product(dict(self.API_PRODUCT), "sportscardspro-tier1-refresh", "2026-08-29T00:00:00Z")
+        self.assertEqual(api_row["category"], "Baseball Cards 2020 Topps Chrome Ben Baller")
+        self.assertNotEqual(api_row["category"], "Baseball Card")
+
+    def test_console_name_is_unchanged_and_keeps_set_detail(self) -> None:
+        api_row = to_catalog_row_from_api_product(dict(self.API_PRODUCT), "sportscardspro-tier1-refresh", "2026-08-29T00:00:00Z")
+        self.assertEqual(api_row["console_name"], "Baseball Cards 2020 Topps Chrome Ben Baller")
+
+    def test_canonical_category_is_inside_the_scd2_hash(self) -> None:
+        # The hash both paths compute must be identical for the same logical
+        # item -- proving canonicalization happens BEFORE hashing, not after.
+        csv_row = to_catalog_row(dict(self.CSV_ROW), "sportscardspro-set-backfill", "2026-08-29T00:00:00Z")
+        api_row = to_catalog_row_from_api_product(dict(self.API_PRODUCT), "sportscardspro-tier1-refresh", "2026-08-29T00:00:00Z")
+        self.assertEqual(csv_row["content_hash"], api_row["content_hash"])
+
+    def test_alternating_paths_stay_hash_stable(self) -> None:
+        # CSV -> API -> CSV -> API: after the first canonical version, no
+        # crossing may change the hash again.
+        hashes = [
+            to_catalog_row(dict(self.CSV_ROW), "sportscardspro-set-backfill", "t1")["content_hash"],
+            to_catalog_row_from_api_product(dict(self.API_PRODUCT), "sportscardspro-tier1-refresh", "t2")["content_hash"],
+            to_catalog_row(dict(self.CSV_ROW), "sportscardspro-tier3-refresh", "t3")["content_hash"],
+            to_catalog_row_from_api_product(dict(self.API_PRODUCT), "sportscardspro-tracked-refresh", "t4")["content_hash"],
+        ]
+        self.assertEqual(len(set(hashes)), 1)
+
+    def test_a_genuine_category_change_still_versions(self) -> None:
+        moved = dict(self.API_PRODUCT)
+        moved["console-name"] = "Baseball Cards 2021 Topps Chrome"
+        before = to_catalog_row_from_api_product(dict(self.API_PRODUCT), "x", "t")["content_hash"]
+        after = to_catalog_row_from_api_product(moved, "x", "t")["content_hash"]
+        self.assertNotEqual(before, after)
+
+    def test_unchanged_record_is_hash_identical_across_runs(self) -> None:
+        first = to_catalog_row_from_api_product(dict(self.API_PRODUCT), "sportscardspro-tier1-refresh", "run1")
+        second = to_catalog_row_from_api_product(dict(self.API_PRODUCT), "sportscardspro-tier1-refresh", "run2")
+        self.assertEqual(first["content_hash"], second["content_hash"])
+
+    def test_raw_payload_keeps_the_original_api_product_untouched(self) -> None:
+        api_row = to_catalog_row_from_api_product(dict(self.API_PRODUCT), "sportscardspro-tier1-refresh", "t")
+        self.assertEqual(api_row["raw_payload"].get("genre"), "Baseball Card")
+
+    def test_product_without_console_name_keeps_its_genre(self) -> None:
+        # Safety valve: nothing to fall back to -> better a short category
+        # than none at all.
+        bare = {"id": "1", "product-name": "Mystery", "genre": "Baseball Card", "loose-price": 100}
+        row = to_catalog_row_from_api_product(bare, "sportscardspro-tier1-refresh", "t")
+        self.assertEqual(row["category"], "Baseball Card")
+
+    def test_browse_filters_match_the_canonical_long_form(self) -> None:
+        # Category filtering everywhere is substring/ilike on keywords
+        # (PRICECHARTING_CATEGORY_GROUPS / browse_category ladder); the
+        # canonical long form must keep matching them.
+        from app.services.pricing.catalog_search_service import PRICECHARTING_CATEGORY_GROUPS
+        long_form = "Baseball Cards 2020 Topps Chrome Ben Baller"
+        keywords = PRICECHARTING_CATEGORY_GROUPS["sports-cards"]
+        self.assertTrue(any(kw.lower() in long_form.lower() for kw in keywords))

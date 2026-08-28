@@ -39,6 +39,7 @@ from scripts.import_pricecharting_catalog import (
     SupabaseCatalogClient,
     dedupe_catalog_rows,
     to_catalog_row,
+    to_catalog_row_from_api_product,
 )
 
 
@@ -156,7 +157,7 @@ def refresh_small_sets(
             skipped += 1
             continue
         set_catalog_rows = [
-            to_catalog_row(product, f"{row['source_site']}-tier1-refresh", source_downloaded_at)
+            to_catalog_row_from_api_product(product, f"{row['source_site']}-tier1-refresh", source_downloaded_at)
             for product in products
         ]
         set_catalog_rows = [catalog_row for catalog_row in set_catalog_rows if catalog_row is not None]

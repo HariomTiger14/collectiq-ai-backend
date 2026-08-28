@@ -111,6 +111,7 @@ from scripts.import_pricecharting_catalog import (
     load_rows_from_text,
     pick_text,
     to_catalog_row,
+    to_catalog_row_from_api_product,
 )
 
 
@@ -666,7 +667,7 @@ def _evaluate_api_search_products(
     if not _products_match_set_name(products, set_name):
         return "rejected_ambiguous", None
     catalog_rows = [
-        to_catalog_row(product, "sportscardspro-api-search", source_downloaded_at)
+        to_catalog_row_from_api_product(product, "sportscardspro-api-search", source_downloaded_at)
         for product in products
     ]
     catalog_rows = [catalog_row for catalog_row in catalog_rows if catalog_row is not None]

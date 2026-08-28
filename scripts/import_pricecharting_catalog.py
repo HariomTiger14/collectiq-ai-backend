@@ -351,6 +351,52 @@ def to_catalog_row(
     return normalized_row
 
 
+def to_catalog_row_from_api_product(
+    product: dict[str, Any],
+    source_file: str,
+    source_downloaded_at: str,
+) -> dict[str, Any] | None:
+    """to_catalog_row() for /api/product(s) payloads -- canonicalizes
+    category BEFORE the SCD2 hash is computed.
+
+    The API attaches a short `genre` ("Baseball Card") that the category
+    alias picks up, while the CSV/set paths have no category column at all
+    and fall back to console_name -- the long form ("Baseball Cards 2020
+    Topps Chrome ..."), which ~95% of stored rows already hold and which
+    the 2026-08-29 SCD2 audit fixed as canonical. Feeding the API's short
+    form into the shared hash made every card that alternated between an
+    API path (tier-1/tier-2/api-search) and a CSV path (backfill/tier-3/
+    completed-categories) mint a fake "metadata changed" SCD2 version on
+    each crossing -- ~17% of all history versions were this flap.
+
+    Stripping the API's category aliases here makes every ingestion path
+    resolve category through the same console_name fallback inside
+    to_catalog_row(), which also computes the hash -- so canonicalization
+    is strictly hash-first by construction. raw_payload keeps the original
+    untouched API product (restored after conversion; the hash signature
+    never includes raw_payload, so this cannot affect change detection).
+
+    Only strips when the product actually carries a console name to fall
+    back to -- a payload without one keeps its genre rather than ending up
+    with no category at all.
+    """
+    has_console_name = any(
+        str(product.get(alias) or "").strip()
+        for alias in TEXT_FIELDS["console_name"]
+    )
+    if not has_console_name:
+        return to_catalog_row(product, source_file, source_downloaded_at)
+    stripped = {
+        key: value
+        for key, value in product.items()
+        if key not in TEXT_FIELDS["category"]
+    }
+    row = to_catalog_row(stripped, source_file, source_downloaded_at)
+    if row is not None:
+        row["raw_payload"] = product
+    return row
+
+
 def normalize_catalog_row(row: dict[str, Any]) -> dict[str, Any]:
     return {
         column: row.get(column) if row.get(column) != "" else None
