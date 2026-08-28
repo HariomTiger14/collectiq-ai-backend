@@ -19,6 +19,8 @@ from scripts.import_pricecharting_catalog import (
     to_catalog_history_row,
     to_catalog_row,
     to_catalog_row_from_api_product,
+    to_price_observation_row,
+    prices_differ,
 )
 
 
@@ -609,12 +611,15 @@ class _FakeSupabaseTransport:
         *,
         current_rows: list[dict[str, str]],
         fail_on_post_call_index: int | None = None,
+        fail_on_price_history_post: bool = False,
     ) -> None:
         self.current_rows = current_rows
         self.closed_ids: list[str] = []
         self.inserted_rows: list[dict[str, object]] = []
         self.upserted_rows: list[dict[str, object]] = []
+        self.price_history_rows: list[dict[str, object]] = []
         self._fail_on_post_call_index = fail_on_post_call_index
+        self._fail_on_price_history_post = fail_on_price_history_post
         self._post_call_count = 0
 
     def get(self, url: str, **kwargs):
@@ -627,11 +632,17 @@ class _FakeSupabaseTransport:
         return _FakeSupabaseResponse()
 
     def post(self, url: str, **kwargs):
+        rows = kwargs.get("json", [])
+        if url.endswith("/pricecharting_price_history"):
+            if self._fail_on_price_history_post:
+                return _FailingSupabaseResponse()
+            self.price_history_rows.extend(rows)
+            # return=representation: echo the rows as "all inserted".
+            return _FakeSupabaseResponse(rows)
         call_index = self._post_call_count
         self._post_call_count += 1
         if call_index == self._fail_on_post_call_index:
             return _FailingSupabaseResponse()
-        rows = kwargs.get("json", [])
         if url.endswith("/pricecharting_catalog_history"):
             self.inserted_rows.extend(rows)
         else:
@@ -742,3 +753,169 @@ class ApiCategoryCanonicalizationTest(unittest.TestCase):
         long_form = "Baseball Cards 2020 Topps Chrome Ben Baller"
         keywords = PRICECHARTING_CATEGORY_GROUPS["sports-cards"]
         self.assertTrue(any(kw.lower() in long_form.lower() for kw in keywords))
+
+
+class PriceHistoryDualWriteTest(unittest.TestCase):
+    """Step-2 shadow-write behavior matrix: which events produce a legacy
+    SCD2 version, a compact price observation, both, or neither."""
+
+    def _run_sync(self, rows, current_rows, *, fail_price_history=False):
+        transport = _FakeSupabaseTransport(
+            current_rows=current_rows,
+            fail_on_price_history_post=fail_price_history,
+        )
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+            error = None
+            try:
+                client.sync_scd2_history_rows(rows, batch_size=100)
+            except PartialCatalogWriteError as exc:
+                error = exc
+        return transport, client, error
+
+    @staticmethod
+    def _current_from(row, **overrides):
+        current = {
+            "pricecharting_id": row["pricecharting_id"],
+            "change_hash": catalog_history_change_hash(row),
+            "currency": row.get("currency") or "USD",
+            **{col: row.get(col) for col in (
+                "loose_price_cents", "cib_price_cents", "new_price_cents",
+                "graded_price_cents", "box_only_price_cents", "manual_only_price_cents",
+            )},
+        }
+        current.update(overrides)
+        if overrides:
+            recomputed = dict(row)
+            recomputed.update({k: v for k, v in overrides.items() if k != "change_hash"})
+            current["change_hash"] = catalog_history_change_hash(recomputed)
+        return current
+
+    def test_A_price_only_change_writes_both(self) -> None:
+        row = _catalog_row("1", "Pikachu")
+        current = self._current_from(row, loose_price_cents=555)
+        transport, client, error = self._run_sync([row], [current])
+        self.assertIsNone(error)
+        self.assertEqual(len(transport.inserted_rows), 1)        # legacy +1
+        self.assertEqual(len(transport.price_history_rows), 1)   # price_history +1
+        self.assertEqual(transport.price_history_rows[0]["loose_price_cents"], 1000)
+        self.assertEqual(client.price_history_stats["inserted"], 1)
+
+    def test_B_metadata_only_change_writes_legacy_only(self) -> None:
+        row = _catalog_row("1", "Pikachu")
+        # Same prices; stored current has a different (old) product name.
+        old_named = dict(row); old_named["product_name"] = "Old Name"
+        current = {
+            "pricecharting_id": "1",
+            "change_hash": catalog_history_change_hash(old_named),
+            "currency": "USD",
+            "loose_price_cents": row["loose_price_cents"],
+            "cib_price_cents": row["cib_price_cents"],
+            "new_price_cents": row["new_price_cents"],
+            "graded_price_cents": row["graded_price_cents"],
+            "box_only_price_cents": row["box_only_price_cents"],
+            "manual_only_price_cents": row["manual_only_price_cents"],
+        }
+        transport, client, error = self._run_sync([row], [current])
+        self.assertIsNone(error)
+        self.assertEqual(len(transport.inserted_rows), 1)        # legacy +1
+        self.assertEqual(len(transport.price_history_rows), 0)   # price_history +0
+        self.assertEqual(client.price_history_stats["attempted"], 0)
+
+    def test_C_price_and_metadata_change_writes_both(self) -> None:
+        row = _catalog_row("1", "Pikachu")
+        old = dict(row); old["product_name"] = "Old Name"
+        current = self._current_from(old, loose_price_cents=555)
+        transport, _, error = self._run_sync([row], [current])
+        self.assertIsNone(error)
+        self.assertEqual(len(transport.inserted_rows), 1)
+        self.assertEqual(len(transport.price_history_rows), 1)
+
+    def test_D_unchanged_input_writes_nothing(self) -> None:
+        row = _catalog_row("1", "Pikachu")
+        current = self._current_from(row)
+        transport, client, error = self._run_sync([row], [current])
+        self.assertIsNone(error)
+        self.assertEqual(len(transport.inserted_rows), 0)
+        self.assertEqual(len(transport.price_history_rows), 0)
+        self.assertEqual(len(transport.closed_ids), 0)
+
+    def test_E_category_canonicalization_only_writes_legacy_only(self) -> None:
+        # The exact Step-1 wave shape: stored current holds the deprecated
+        # short category, incoming row the canonical long form; prices equal.
+        row = _catalog_row("1", "Pikachu")
+        short_cat = dict(row); short_cat["category"] = "Pokemon Card"
+        current = {
+            "pricecharting_id": "1",
+            "change_hash": catalog_history_change_hash(short_cat),
+            "currency": "USD",
+            **{c: row.get(c) for c in (
+                "loose_price_cents", "cib_price_cents", "new_price_cents",
+                "graded_price_cents", "box_only_price_cents", "manual_only_price_cents")},
+        }
+        transport, _, error = self._run_sync([row], [current])
+        self.assertIsNone(error)
+        self.assertEqual(len(transport.inserted_rows), 1)        # legacy +1 (the one-time wave)
+        self.assertEqual(len(transport.price_history_rows), 0)   # price_history +0
+
+    def test_F_retry_is_idempotent_at_the_database(self) -> None:
+        # The DB enforces (pricecharting_id, observed_at) uniqueness with
+        # ignore-duplicates; the writer must send the SAME observed_at for
+        # the same input, making the retried insert a conflict-skip.
+        row = _catalog_row("1", "Pikachu")
+        first = to_price_observation_row(row)
+        second = to_price_observation_row(dict(row))
+        self.assertEqual(
+            (first["pricecharting_id"], first["observed_at"]),
+            (second["pricecharting_id"], second["observed_at"]),
+        )
+        # And the writer's Prefer header requests DB-level dedup:
+        import inspect
+        src = inspect.getsource(SupabaseCatalogClient._insert_price_observation_rows)
+        self.assertIn("ignore-duplicates", src)
+        self.assertIn("on_conflict", src)
+
+    def test_G_sequential_price_changes_produce_ordered_observations(self) -> None:
+        base = {
+            "id": "1", "product-name": "Pikachu", "console-name": "Pokemon Cards",
+        }
+        row1 = to_catalog_row({**base, "loose-price": "1000"}, "pokemon.csv", "2026-08-01T00:00:00Z")
+        row2 = to_catalog_row({**base, "loose-price": "1100"}, "pokemon.csv", "2026-08-02T00:00:00Z")
+        obs1, obs2 = to_price_observation_row(row1), to_price_observation_row(row2)
+        self.assertLess(obs1["observed_at"], obs2["observed_at"])
+        self.assertNotEqual(obs1["loose_price_cents"], obs2["loose_price_cents"])
+        self.assertNotEqual(obs1["observed_at"], obs2["observed_at"])  # distinct idempotency keys
+
+    def test_H_null_transitions_count_as_price_changes(self) -> None:
+        row = _catalog_row("1", "Pikachu")            # loose = 1000, others None
+        current = self._current_from(row, loose_price_cents=None)  # was unpriced
+        self.assertTrue(prices_differ(row, current))
+        gone = dict(row); gone["loose_price_cents"] = None
+        current2 = self._current_from(row)            # was 1000
+        self.assertTrue(prices_differ(gone, current2))  # priced -> unpriced also observes
+
+    def test_I_currency_and_source_are_preserved_on_observations(self) -> None:
+        row = _catalog_row("1", "Pikachu")
+        obs = to_price_observation_row(row)
+        self.assertEqual(obs["currency"], "USD")
+        self.assertEqual(obs["source_file"], "pokemon.csv")
+        changed_currency = dict(row); changed_currency["currency"] = "AUD"
+        self.assertTrue(prices_differ(changed_currency, self._current_from(row)))
+
+    def test_J_price_history_failure_fails_the_batch_before_legacy_writes(self) -> None:
+        # Ordering is the transaction strategy: observation insert runs
+        # first, so its failure must leave legacy history COMPLETELY
+        # untouched (clean retry redoes both sides).
+        row = _catalog_row("1", "Pikachu")
+        current = self._current_from(row, loose_price_cents=555)
+        transport, client, error = self._run_sync([row], [current], fail_price_history=True)
+        self.assertIsNotNone(error)                      # surfaced, not swallowed
+        self.assertEqual(error.failed_ids, ["1"])
+        self.assertEqual(len(transport.inserted_rows), 0)  # no legacy insert
+        self.assertEqual(len(transport.closed_ids), 0)     # no legacy close
+        self.assertEqual(client.price_history_stats["failed"], 1)

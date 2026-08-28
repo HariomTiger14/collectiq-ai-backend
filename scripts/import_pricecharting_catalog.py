@@ -419,6 +419,47 @@ def to_catalog_history_row(catalog_row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+PRICE_OBSERVATION_COLUMNS = (
+    "loose_price_cents",
+    "cib_price_cents",
+    "new_price_cents",
+    "graded_price_cents",
+    "box_only_price_cents",
+    "manual_only_price_cents",
+)
+
+
+def to_price_observation_row(catalog_row: dict[str, Any]) -> dict[str, Any]:
+    """Compact pricecharting_price_history row (Step-2 shadow write).
+
+    Carries exactly the reader contract (_fetch_history_rows): the six
+    price columns, currency, source, and the observation timestamp --
+    observed_at is the provider-download timestamp, which also forms the
+    (pricecharting_id, observed_at) idempotency key, so a retried
+    ingestion of the same input conflicts instead of duplicating."""
+    return {
+        "pricecharting_id": catalog_row.get("pricecharting_id"),
+        "observed_at": source_timestamp(catalog_row.get("source_downloaded_at")),
+        **{column: catalog_row.get(column) for column in PRICE_OBSERVATION_COLUMNS},
+        "currency": catalog_row.get("currency") or "USD",
+        "source_file": catalog_row.get("source_file"),
+    }
+
+
+def prices_differ(catalog_row: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Whether any of the six price columns (or currency) differs between
+    the incoming row and the stored current version. Metadata, category
+    canonicalization, raw_payload, timestamps, and ingestion path play no
+    part -- a version whose prices are unchanged must NOT produce a price
+    observation."""
+    if (catalog_row.get("currency") or "USD") != (current.get("currency") or "USD"):
+        return True
+    return any(
+        catalog_row.get(column) != current.get(column)
+        for column in PRICE_OBSERVATION_COLUMNS
+    )
+
+
 def source_timestamp(source_downloaded_at: Any) -> str:
     if isinstance(source_downloaded_at, datetime):
         return source_downloaded_at.astimezone(timezone.utc).isoformat()
@@ -546,6 +587,12 @@ class SupabaseCatalogClient:
             "scd2_comparison": 0.0,
             "scd2_insert": 0.0,
         }
+        self.price_history_stats: dict[str, int] = {
+            "attempted": 0,
+            "inserted": 0,
+            "duplicateSkipped": 0,
+            "failed": 0,
+        }
 
     def upsert_rows(self, rows: list[dict[str, Any]], *, batch_size: int) -> int:
         if batch_size <= 0:
@@ -666,6 +713,7 @@ class SupabaseCatalogClient:
                     )
                     rows_to_insert = []
                     changed_ids = []
+                    price_observations = []
                     for row in batch:
                         product_id = str(row.get("pricecharting_id") or "").strip()
                         if not product_id:
@@ -677,8 +725,32 @@ class SupabaseCatalogClient:
                         if current:
                             changed_ids.append(product_id)
                         rows_to_insert.append(history_row)
+                        # Step-2 shadow write: a compact price observation
+                        # for price-bearing events only -- a brand-new item
+                        # (first observation) or a version whose prices
+                        # actually differ from the stored current version.
+                        # Metadata-only versions (incl. category
+                        # canonicalization) write NO observation.
+                        if current is None or prices_differ(row, current):
+                            price_observations.append(to_price_observation_row(row))
 
                     insert_started_at = time.perf_counter()
+                    # Price observations are written BEFORE the legacy
+                    # close/insert on purpose: PostgREST offers no
+                    # cross-request transaction (the legacy close+insert
+                    # pair is already non-atomic today), so consistency
+                    # comes from ordering + idempotency instead. If this
+                    # insert fails, the whole sub-batch fails BEFORE any
+                    # legacy write -- the change hash still differs, so
+                    # the job's normal retry redoes both sides; if the
+                    # legacy write fails after this succeeded, the retry
+                    # re-runs and this insert conflict-skips on the
+                    # (pricecharting_id, observed_at) unique key. Either
+                    # order of failure converges; neither can produce a
+                    # legacy version whose price observation is silently
+                    # unrecoverable.
+                    if price_observations:
+                        self._insert_price_observation_rows(client, price_observations)
                     if changed_ids:
                         self._close_current_history_rows(
                             client,
@@ -729,7 +801,16 @@ class SupabaseCatalogClient:
         response = client.get(
             f"{self.supabase_url}/rest/v1/pricecharting_catalog_history",
             params={
-                "select": "pricecharting_id,change_hash",
+                # change_hash gates whether ANY version is written; the
+                # price columns + currency classify whether the change is
+                # price-bearing (-> also a compact price observation) or
+                # metadata-only (-> legacy version only). Fetched together
+                # so classification costs no extra round trip.
+                "select": (
+                    "pricecharting_id,change_hash,currency,"
+                    "loose_price_cents,cib_price_cents,new_price_cents,"
+                    "graded_price_cents,box_only_price_cents,manual_only_price_cents"
+                ),
                 "is_current": "eq.true",
                 "pricecharting_id": f"in.({','.join(ids)})",
             },
@@ -796,6 +877,49 @@ class SupabaseCatalogClient:
                 f"with HTTP {response.status_code}: {response.text}"
             ) from exc
         return len(rows)
+
+    def _insert_price_observation_rows(
+        self,
+        client: httpx.Client,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        # resolution=ignore-duplicates + return=representation: retried
+        # observations conflict on (pricecharting_id, observed_at) and are
+        # silently skipped by the DATABASE (not application memory); the
+        # representation contains only the genuinely inserted rows, which
+        # is what makes inserted-vs-duplicate observable.
+        self.price_history_stats["attempted"] += len(rows)
+        response = client.post(
+            f"{self.supabase_url}/rest/v1/pricecharting_price_history",
+            params={"on_conflict": "pricecharting_id,observed_at"},
+            headers={
+                **self._headers(),
+                "Prefer": "resolution=ignore-duplicates,return=representation",
+            },
+            json=rows,
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            self.price_history_stats["failed"] += len(rows)
+            raise SystemExit(
+                "Supabase price-history insert failed "
+                f"with HTTP {response.status_code}: {response.text}"
+            ) from exc
+        try:
+            inserted = len(response.json())
+        except ValueError:
+            inserted = len(rows)
+        self.price_history_stats["inserted"] += inserted
+        self.price_history_stats["duplicateSkipped"] += len(rows) - inserted
+        # Batch-level observability only -- one aggregate line per write,
+        # never per row.
+        print(
+            f"  price_history: attempted {len(rows)}, inserted {inserted}, "
+            f"duplicate-skipped {len(rows) - inserted} "
+            f"(run totals: {self.price_history_stats})",
+            flush=True,
+        )
 
     def _upsert(
         self,
