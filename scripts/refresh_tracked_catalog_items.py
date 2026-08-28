@@ -37,7 +37,11 @@ from scripts.backfill_pricecharting_sets import (
     chunked,
     write_catalog_rows,
 )
-from scripts.import_pricecharting_catalog import SupabaseCatalogClient, to_catalog_row
+from scripts.import_pricecharting_catalog import (
+    SupabaseCatalogClient,
+    to_catalog_row,
+    to_catalog_row_from_api_product,
+)
 
 
 # source_file values written by refresh_pricecharting_catalog.py's own daily
@@ -162,7 +166,7 @@ def refresh_candidates(
         if product is None:
             failed += 1
             continue
-        catalog_row = to_catalog_row(product, f"{source_site}-tracked-refresh", source_downloaded_at)
+        catalog_row = to_catalog_row_from_api_product(product, f"{source_site}-tracked-refresh", source_downloaded_at)
         if catalog_row is None:
             failed += 1
             continue
