@@ -325,6 +325,12 @@ class CatalogSearchService:
         # whose hard rule -- no paywalling the content -- this surface
         # satisfies (catalog search sits behind no paywall). Killable via
         # the 'magic' admin flag.
+        # LEGO is the fifth (owner decision 2026-08-30) and the only one
+        # with an affirmative licence: Rebrickable's terms permit
+        # commercial use of its data/images WITH ATTRIBUTION -- the app
+        # renders a linked "via Rebrickable" credit wherever this imagery
+        # shows (same pattern the RAWG terms forced for video games).
+        # Killable via the 'lego' admin flag.
         if any(not result.imageUrl for result in results):
             enabled_image_categories = self._fetch_enabled_image_categories()
             # Pokemon thumbnails BEFORE the link-only pass: rows that get
@@ -341,6 +347,10 @@ class CatalogSearchService:
             if "magic" in enabled_image_categories:
                 results = [
                     self._enrich_with_magic_image(result) for result in results
+                ]
+            if "lego" in enabled_image_categories:
+                results = [
+                    self._enrich_with_lego_image(result) for result in results
                 ]
             results = [
                 self._resolve_external_image_url(result, enabled_image_categories)
