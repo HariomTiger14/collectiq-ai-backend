@@ -1628,13 +1628,34 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
     # _fetch_catalog_row's GET /rest/v1/pricecharting_catalog?pricecharting_id=eq.<id>
     # shape, not the search_pricecharting_catalog RPC.
 
-    def _handler(self, *, search_row: dict, tcgplayer_rows: dict, sibling_rows: dict):
+    def _handler(
+        self,
+        *,
+        search_row: dict,
+        tcgplayer_rows: dict,
+        sibling_rows: dict,
+        tcgdex_rows: dict | None = None,
+    ):
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
             if "pricecharting_catalog_history" in url:
                 return httpx.Response(200, json=[])
+            if "tcgdex_pokemon_catalog" in url:
+                params = request.url.params
+                language = params.get("language", "").removeprefix("eq.")
+                set_selector = (
+                    params.get("set_key", "").removeprefix("eq.")
+                    or params.get("set_name", "").removeprefix("eq.")
+                )
+                number = params.get("local_id_norm", "").removeprefix("eq.")
+                return httpx.Response(
+                    200,
+                    json=(tcgdex_rows or {}).get(
+                        (language, set_selector, number), []
+                    ),
+                )
             if "tcgplayer_pokemon_catalog" in url:
                 group_name = request.url.params.get("group_name", "").removeprefix("eq.")
                 card_number = request.url.params.get("card_number", "").removeprefix("eq.")
@@ -1691,6 +1712,207 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
             response.result.imageUrl,
             "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
         )
+
+    def _service(self, **handler_kwargs) -> CatalogSearchService:
+        return CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(self._handler(**handler_kwargs))
+            ),
+        )
+
+    def test_detail_uses_tcgdex_image_for_modern_set(self) -> None:
+        # The five-set TCGplayer dict never covered modern sets; TCGdex
+        # covers every English expansion by normalized set-name equality.
+        service = self._service(
+            search_row={
+                "pricecharting_id": "990001",
+                "product_name": "Venusaur ex #1",
+                "console_name": "Pokemon Stellar Crown",
+                "category": "Pokemon Card",
+                "loose_price_cents": 900,
+                "currency": "USD",
+            },
+            tcgplayer_rows={},
+            sibling_rows={
+                "Pokemon Stellar Crown": [{"pricecharting_id": "990001"}]
+            },
+            tcgdex_rows={
+                ("en", "stellar crown", "1"): [
+                    {"image_url": "https://assets.tcgdex.net/en/sv/sv07/001"}
+                ],
+            },
+        )
+
+        response = service.detail("990001")
+
+        self.assertEqual(
+            response.result.imageUrl,
+            "https://assets.tcgdex.net/en/sv/sv07/001/high.webp",
+        )
+
+    def test_detail_tcgdex_miss_falls_back_to_tcgplayer_classic_set(self) -> None:
+        service = self._service(
+            search_row={
+                "pricecharting_id": "630417",
+                "product_name": "Charizard #4",
+                "console_name": "Pokemon Base Set",
+                "category": "Pokemon Card",
+                "loose_price_cents": 16100,
+                "currency": "USD",
+            },
+            tcgplayer_rows={
+                ("Base Set", "4"): [
+                    {
+                        "product_name": "Charizard",
+                        "image_url": "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
+                        "variant_tag": None,
+                    },
+                ],
+            },
+            sibling_rows={"Pokemon Base Set": [{"pricecharting_id": "630417"}]},
+            tcgdex_rows={},
+        )
+
+        response = service.detail("630417")
+
+        self.assertEqual(
+            response.result.imageUrl,
+            "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
+        )
+
+    def test_detail_sibling_variant_rows_suppress_tcgdex_too(self) -> None:
+        # TCGdex also has exactly one photo per card, so the same
+        # print-variant ambiguity that suppresses the TCGplayer generic
+        # image must suppress TCGdex.
+        service = self._service(
+            search_row={
+                "pricecharting_id": "990002",
+                "product_name": "Pikachu #25",
+                "console_name": "Pokemon Stellar Crown",
+                "category": "Pokemon Card",
+                "loose_price_cents": 500,
+                "currency": "USD",
+            },
+            tcgplayer_rows={},
+            sibling_rows={
+                "Pokemon Stellar Crown": [
+                    {"pricecharting_id": "990002"},
+                    {"pricecharting_id": "990003"},
+                ]
+            },
+            tcgdex_rows={
+                ("en", "stellar crown", "25"): [
+                    {"image_url": "https://assets.tcgdex.net/en/sv/sv07/025"}
+                ],
+            },
+        )
+
+        response = service.detail("990002")
+
+        self.assertIsNone(response.result.imageUrl)
+
+    def test_detail_japanese_mapped_set_uses_tcgdex_ja(self) -> None:
+        service = self._service(
+            search_row={
+                "pricecharting_id": "990004",
+                "product_name": "Superior Energy Retrieval #98",
+                "console_name": "Pokemon Japanese Clay Burst",
+                "category": "Pokemon Card",
+                "loose_price_cents": 300,
+                "currency": "USD",
+            },
+            tcgplayer_rows={},
+            sibling_rows={
+                "Pokemon Japanese Clay Burst": [{"pricecharting_id": "990004"}]
+            },
+            tcgdex_rows={
+                ("ja", "クレイバースト", "98"): [
+                    {"image_url": "https://assets.tcgdex.net/ja/sv/sv2D/098"}
+                ],
+            },
+        )
+
+        response = service.detail("990004")
+
+        self.assertEqual(
+            response.result.imageUrl,
+            "https://assets.tcgdex.net/ja/sv/sv2D/098/high.webp",
+        )
+
+    def test_detail_japanese_unmapped_set_gets_no_image(self) -> None:
+        # Unmapped Japanese sets mean no attempt at all -- deterministic
+        # mapping only, never a fuzzy cross-language guess.
+        service = self._service(
+            search_row={
+                "pricecharting_id": "990005",
+                "product_name": "Meganium #154",
+                "console_name": "Pokemon Japanese Gold, Silver, New World",
+                "category": "Pokemon Card",
+                "loose_price_cents": 4000,
+                "currency": "USD",
+            },
+            tcgplayer_rows={},
+            sibling_rows={},
+            tcgdex_rows={},
+        )
+
+        response = service.detail("990005")
+
+        self.assertIsNone(response.result.imageUrl)
+
+    def test_detail_promo_number_routes_to_black_star_promos(self) -> None:
+        service = self._service(
+            search_row={
+                "pricecharting_id": "990006",
+                "product_name": "Pikachu #SM210",
+                "console_name": "Pokemon Promo",
+                "category": "Pokemon Card",
+                "loose_price_cents": 1200,
+                "currency": "USD",
+            },
+            tcgplayer_rows={},
+            sibling_rows={"Pokemon Promo": [{"pricecharting_id": "990006"}]},
+            tcgdex_rows={
+                ("en", "sm black star promos", "sm210"): [
+                    {"image_url": "https://assets.tcgdex.net/en/smp/SM210"}
+                ],
+            },
+        )
+
+        response = service.detail("990006")
+
+        self.assertEqual(
+            response.result.imageUrl,
+            "https://assets.tcgdex.net/en/smp/SM210/high.webp",
+        )
+
+    def test_detail_tcgdex_ambiguous_rows_are_not_trusted(self) -> None:
+        service = self._service(
+            search_row={
+                "pricecharting_id": "990007",
+                "product_name": "Eevee #75",
+                "console_name": "Pokemon Stellar Crown",
+                "category": "Pokemon Card",
+                "loose_price_cents": 200,
+                "currency": "USD",
+            },
+            tcgplayer_rows={},
+            sibling_rows={
+                "Pokemon Stellar Crown": [{"pricecharting_id": "990007"}]
+            },
+            tcgdex_rows={
+                ("en", "stellar crown", "75"): [
+                    {"image_url": "https://assets.tcgdex.net/en/sv/sv07/075"},
+                    {"image_url": "https://assets.tcgdex.net/en/sv/sv07/075b"},
+                ],
+            },
+        )
+
+        response = service.detail("990007")
+
+        self.assertIsNone(response.result.imageUrl)
 
     def test_detail_suppresses_generic_image_when_sibling_variant_rows_exist(self) -> None:
         # Real production shape: Base Set Charizard #4 has 5 PriceCharting
