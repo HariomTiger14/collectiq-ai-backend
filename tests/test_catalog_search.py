@@ -2650,6 +2650,76 @@ class MagicImageEnrichmentTest(unittest.TestCase):
             response.result.imageUrl, "https://cards.scryfall.io/normal/gilded-charm.jpg"
         )
 
+    def test_detail_resolves_vintage_set_alias_by_name(self) -> None:
+        # PriceCharting's "Magic Beta" is Scryfall's "Limited Edition
+        # Beta" -- without the alias table the game's most iconic cards
+        # (live-verified: Black Lotus) resolved to no set and no image.
+        search_row = {
+            "pricecharting_id": "8800001",
+            "product_name": "Black Lotus",
+            "console_name": "Magic Beta",
+            "category": "Magic Beta",
+            "loose_price_cents": 2500000,
+            "currency": "USD",
+        }
+        name_rows = {
+            ("limited edition beta", "black lotus"): [
+                {"image_url": "https://cards.scryfall.io/normal/beta-black-lotus.jpg"},
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(search_row=search_row, number_rows={}, name_rows=name_rows)
+                )
+            ),
+        )
+
+        response = service.detail("8800001")
+
+        self.assertEqual(
+            response.result.imageUrl,
+            "https://cards.scryfall.io/normal/beta-black-lotus.jpg",
+        )
+
+    def test_detail_resolves_renamed_commander_set_alias_by_number(self) -> None:
+        # "Magic Lord of the Rings Commander" is Scryfall's "Tales of
+        # Middle-earth Commander" -- a numbered modern card that still
+        # missed because the set name never resolved.
+        search_row = {
+            "pricecharting_id": "8800002",
+            "product_name": "Dwarven Sol Ring #409",
+            "console_name": "Magic Lord of the Rings Commander",
+            "category": "Magic Lord of the Rings Commander",
+            "loose_price_cents": 1500,
+            "currency": "USD",
+        }
+        number_rows = {
+            ("tales of middle earth commander", "409"): [
+                {"image_url": "https://cards.scryfall.io/normal/dwarven-sol-ring.jpg"},
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(search_row=search_row, number_rows=number_rows, name_rows={})
+                )
+            ),
+        )
+
+        response = service.detail("8800002")
+
+        self.assertEqual(
+            response.result.imageUrl,
+            "https://cards.scryfall.io/normal/dwarven-sol-ring.jpg",
+        )
+
     def test_detail_falls_back_to_name_when_no_number(self) -> None:
         search_row = {
             "pricecharting_id": "2244134",
