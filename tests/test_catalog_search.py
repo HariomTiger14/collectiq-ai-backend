@@ -1798,8 +1798,11 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
             tcgplayer_rows={},
             sibling_rows={
                 "Pokemon Stellar Crown": [
-                    {"pricecharting_id": "990002"},
-                    {"pricecharting_id": "990003"},
+                    {"pricecharting_id": "990002", "product_name": "Pikachu #25"},
+                    {
+                        "pricecharting_id": "990003",
+                        "product_name": "Pikachu [Reverse Holo] #25",
+                    },
                 ]
             },
             tcgdex_rows={
@@ -1941,8 +1944,11 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
         }
         sibling_rows = {
             "Pokemon Base Set": [
-                {"pricecharting_id": "630417"},
-                {"pricecharting_id": "7096109"},  # [1999-2000]
+                {"pricecharting_id": "630417", "product_name": "Charizard #4"},
+                {
+                    "pricecharting_id": "7096109",
+                    "product_name": "Charizard [1999-2000] #4",
+                },
             ]
         }
 

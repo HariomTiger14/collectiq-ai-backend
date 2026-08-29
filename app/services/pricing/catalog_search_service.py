@@ -903,17 +903,22 @@ class CatalogSearchService:
             if exact_image_url:
                 return result.model_copy(update={"imageUrl": exact_image_url})
 
-        if self._has_sibling_pokemon_rows(set_name, card_number, exclude_id=result.id):
-            return result
-
-        tcgdex_image_url = self._fetch_tcgdex_pokemon_image(set_name, card_number)
-        if tcgdex_image_url:
-            return result.model_copy(update={"imageUrl": tcgdex_image_url})
-
-        if group_name is None:
-            return result
-        generic_image_url = self._fetch_tcgplayer_generic_image(group_name, card_number)
+        # Find a generic candidate FIRST (TCGdex primary, TCGplayer
+        # classic-set fallback), and only then run the sibling-ambiguity
+        # check. Ordering matters for cost, not semantics: the sibling
+        # query runs against 12M-row pricecharting_catalog with no btree
+        # on console_name (~160ms warm, worse under tier-3 write load,
+        # observed timing out live), while both image lookups are cheap
+        # indexed hits on small tables. Misses -- the common case -- now
+        # never pay for the sibling check at all.
+        generic_image_url = self._fetch_tcgdex_pokemon_image(set_name, card_number)
+        if generic_image_url is None and group_name is not None:
+            generic_image_url = self._fetch_tcgplayer_generic_image(
+                group_name, card_number
+            )
         if generic_image_url is None:
+            return result
+        if self._has_sibling_pokemon_rows(set_name, card_number, exclude_id=result.id):
             return result
         return result.model_copy(update={"imageUrl": generic_image_url})
 
@@ -1017,21 +1022,28 @@ class CatalogSearchService:
     def _has_sibling_pokemon_rows(
         self, set_name: str, card_number: str, *, exclude_id: str
     ) -> bool:
-        # Cheap by design: an indexed eq filter on console_name narrows
-        # to a handful of rows before the ilike suffix check ever runs,
-        # nothing like the unindexed full-table scans this table has
-        # broken on before (see _fetch_rows()'s comment).
+        # Console-equality only, suffix check client-side. The obvious
+        # server-side version (console eq + product_name ilike '%#<n>')
+        # planned onto the product_name trigram index instead, which
+        # explodes on short numbers ('%#27' -> 56K candidate rows,
+        # measured 13s live) -- the planner's pattern-selectivity estimate
+        # is off by ~50x, so it keeps picking that path even now that
+        # pricecharting_catalog_pokemon_sibling_idx exists. Fetching the
+        # console's rows alone forces the partial index (one set = a few
+        # hundred rows; the largest Pokemon console, "Pokemon Promo", is
+        # ~2.5K -- the 3000 cap covers every console with headroom).
         params = {
-            "select": "pricecharting_id",
+            "select": "pricecharting_id,product_name",
             "console_name": f"eq.{set_name}",
-            "product_name": f"ilike.*#{card_number}",
-            "limit": "3",
+            "limit": "3000",
         }
         payload = self._request("GET", "/rest/v1/pricecharting_catalog", params=params)
         if not isinstance(payload, list):
             return False
+        suffix = f"#{card_number}".lower()
         return any(
             str(row.get("pricecharting_id")) != str(exclude_id)
+            and str(row.get("product_name") or "").lower().endswith(suffix)
             for row in payload
             if isinstance(row, dict)
         )
