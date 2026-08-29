@@ -2246,6 +2246,40 @@ def _normalize_magic_text(text: str) -> str:
     return " ".join(text.split())
 
 
+# PriceCharting's vintage/renamed Magic set names differ from Scryfall's
+# canonical ones (which is what scryfall_magic_catalog's
+# normalized_set_name is built from), so a bare prefix-strip left the
+# game's most iconic sets imageless -- live-verified 2026-08-30: Black
+# Lotus (Alpha/Beta/Unlimited), 4th-10th Edition Counterspells, and
+# "Lord of the Rings Commander" all resolved to nothing. Keys are the
+# lowercased PriceCharting name after the "Magic " prefix; values are
+# Scryfall's exact set names (verified against api.scryfall.com/sets).
+# "Judge Gift" is deliberately absent: Scryfall splits it into per-year
+# sets ("Judge Gift Cards 2014"...), so one console name cannot resolve
+# to one set -- left unmatched rather than guessed, per this file's
+# standing rule.
+_MAGIC_SET_ALIASES = {
+    "alpha": "Limited Edition Alpha",
+    "beta": "Limited Edition Beta",
+    "unlimited": "Unlimited Edition",
+    "revised": "Revised Edition",
+    "4th edition": "Fourth Edition",
+    "5th edition": "Fifth Edition",
+    "6th edition": "Classic Sixth Edition",
+    "7th edition": "Seventh Edition",
+    "8th edition": "Eighth Edition",
+    "9th edition": "Ninth Edition",
+    "10th edition": "Tenth Edition",
+    "30th anniversary": "30th Anniversary Edition",
+    "collectors edition": "Collectors' Edition",
+    "international edition": "Intl. Collectors' Edition",
+    "summer edition": "Summer Magic / Edgar",
+    "lord of the rings": "The Lord of the Rings: Tales of Middle-earth",
+    "lord of the rings commander": "Tales of Middle-earth Commander",
+    "lord of the rings art series": "Tales of Middle-earth Art Series",
+}
+
+
 def _magic_set_name_from_console(console_name: str) -> str | None:
     # PriceCharting's Magic console_name is always "Magic <set name>"
     # (e.g. "Magic Streets of New Capenna") -- verified against a real
@@ -2253,7 +2287,10 @@ def _magic_set_name_from_console(console_name: str) -> str | None:
     text = console_name.strip()
     if not text.lower().startswith("magic "):
         return None
-    return text[len("Magic "):].strip() or None
+    stripped = text[len("Magic "):].strip()
+    if not stripped:
+        return None
+    return _MAGIC_SET_ALIASES.get(stripped.lower(), stripped)
 
 
 def _magic_card_number(product_title: str) -> str | None:
