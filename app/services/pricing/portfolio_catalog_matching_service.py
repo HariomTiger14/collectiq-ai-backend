@@ -296,6 +296,8 @@ class PortfolioItemReader:
         params = {
             "select": "id,user_id,title,category,raw_json",
             "pricecharting_id": "is.null",
+            # Don't spend catalog-match attempts on soft-deleted rows.
+            "sync_status": "neq.deleted",
             "order": "pricecharting_match_attempted_at.asc.nullsfirst",
             "limit": str(limit),
         }

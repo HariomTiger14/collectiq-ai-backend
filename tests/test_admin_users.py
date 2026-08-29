@@ -276,6 +276,35 @@ class AdminUsersTest(unittest.TestCase):
 
         self.assertEqual(snapshot["itemTitle"], "Deleted or unknown item")
 
+    def test_portfolio_queries_exclude_soft_deleted_rows(self) -> None:
+        client = _FakeAdminUsersClient()
+        subscription_service = Mock()
+        subscription_service.get_entitlement.return_value = {"plan": "free"}
+        subscription_service.get_scan_usage.return_value = {"used": 0}
+        service = AdminUserService(
+            repository=SupabaseAdminUserRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            ),
+            subscription_service=subscription_service,
+        )
+
+        service.get_user_detail("user-1")
+
+        # Every user-scoped portfolio query must exclude soft-deleted rows.
+        # Lookups by item id (e.g. valuation-history title resolution) are
+        # exempt on purpose: tombstones may still be referenced by history.
+        portfolio_requests = [
+            request
+            for request in client.requests
+            if request["url"].endswith("/rest/v1/portfolio_items")
+            and "user_id" in request["params"]
+        ]
+        self.assertTrue(portfolio_requests)
+        for request in portfolio_requests:
+            self.assertEqual(request["params"]["sync_status"], "neq.deleted")
+
     def test_override_subscription_delegates_to_subscription_service(self) -> None:
         subscription_service = Mock()
         subscription_service.verify_and_grant.return_value = {
@@ -299,7 +328,11 @@ class AdminUsersTest(unittest.TestCase):
         self.assertTrue(payload["success"])
         self.assertEqual(payload["subscription"]["plan"], "pro")
         subscription_service.verify_and_grant.assert_called_once_with(
-            user_id="user-1", plan="pro", source="admin_override", purchase_token=None
+            user_id="user-1",
+            plan="pro",
+            source="admin_override",
+            purchase_token=None,
+            trusted_caller=True,
         )
 
     def test_reset_scan_usage_delegates_to_subscription_service(self) -> None:

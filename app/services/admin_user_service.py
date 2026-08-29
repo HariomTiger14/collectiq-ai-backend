@@ -589,11 +589,15 @@ class SupabaseAdminUserRepository:
         # 50-user list page could trigger hundreds of oversized requests.
         if not user_id:
             return None
+        params = {"user_id": f"eq.{user_id}", "select": "user_id", "limit": "1"}
+        if table == "portfolio_items":
+            # Soft-deleted rows (sync_status='deleted') must not count.
+            params["sync_status"] = "neq.deleted"
         try:
             response = self._request(
                 "GET",
                 f"/rest/v1/{table}",
-                params={"user_id": f"eq.{user_id}", "select": "user_id", "limit": "1"},
+                params=params,
                 extra_headers={"Prefer": "count=exact"},
                 return_response=True,
             )
@@ -640,11 +644,15 @@ class SupabaseAdminUserRepository:
         # smaller than fetching up to 1000 full rows per user).
         if not user_ids:
             return {}
+        params = {"user_id": self._in_filter(user_ids), "select": "user_id", "limit": "10000"}
+        if table == "portfolio_items":
+            # Soft-deleted rows (sync_status='deleted') must not count.
+            params["sync_status"] = "neq.deleted"
         try:
             payload = self._request(
                 "GET",
                 f"/rest/v1/{table}",
-                params={"user_id": self._in_filter(user_ids), "select": "user_id", "limit": "10000"},
+                params=params,
             )
         except AdminUserServiceError:
             return {}
@@ -683,16 +691,21 @@ class SupabaseAdminUserRepository:
     def _optional_rows(self, table: str, user_id: str, *, limit: int) -> list[dict[str, Any]]:
         if not user_id:
             return []
+        params = {
+            "user_id": f"eq.{user_id}",
+            "select": "*",
+            "limit": str(limit),
+            "order": "updated_at.desc.nullslast,created_at.desc.nullslast",
+        }
+        if table == "portfolio_items":
+            # The app soft-deletes portfolio rows (sync_status='deleted');
+            # tombstones must not count toward portfolio value or item lists.
+            params["sync_status"] = "neq.deleted"
         try:
             payload = self._request(
                 "GET",
                 f"/rest/v1/{table}",
-                params={
-                    "user_id": f"eq.{user_id}",
-                    "select": "*",
-                    "limit": str(limit),
-                    "order": "updated_at.desc.nullslast,created_at.desc.nullslast",
-                },
+                params=params,
             )
         except AdminUserServiceError:
             return []

@@ -250,6 +250,9 @@ class SupabasePricingReviewQueueRepository:
     ) -> list[PortfolioItem]:
         params = {
             "select": "*",
+            # Exclude app-side soft deletes (sync_status='deleted') from
+            # the review queue and admin portfolio listings.
+            "sync_status": "neq.deleted",
             "limit": str(limit),
             "offset": str(offset),
             "order": "updated_at.desc.nullslast,created_at.desc.nullslast",
@@ -278,7 +281,13 @@ class SupabasePricingReviewQueueRepository:
         # large tables and only falls back to an exact count when the
         # result set is already small, which is the right tradeoff for a
         # pagination total -- doesn't need to be perfectly exact.
-        params: dict[str, str] = {"select": "id", "limit": "1"}
+        params: dict[str, str] = {
+            "select": "id",
+            "limit": "1",
+            # Keep pagination totals consistent with list_items: soft-deleted
+            # rows (sync_status='deleted') are invisible to admin surfaces.
+            "sync_status": "neq.deleted",
+        }
         if user_id:
             params["user_id"] = f"eq.{user_id}"
         if category:

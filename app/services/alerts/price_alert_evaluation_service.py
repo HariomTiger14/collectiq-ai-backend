@@ -134,6 +134,8 @@ class PriceAlertEvaluationService:
                 "select": "id,user_id,raw_json,estimated_value_high,"
                 "estimated_value_low",
                 "user_id": f"in.({joined})",
+                # Soft-deleted items must not trigger price alerts.
+                "sync_status": "neq.deleted",
             },
         )
         data = response.json()
