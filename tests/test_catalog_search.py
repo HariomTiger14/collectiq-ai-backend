@@ -1799,7 +1799,7 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
 
         self.assertEqual(
             response.result.imageUrl,
-            "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
+            "https://tcgplayer-cdn.tcgplayer.com/product/42382_in_1000x1000.jpg",
         )
 
     def _service(self, **handler_kwargs) -> CatalogSearchService:
@@ -1868,7 +1868,7 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
 
         self.assertEqual(
             response.result.imageUrl,
-            "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
+            "https://tcgplayer-cdn.tcgplayer.com/product/42382_in_1000x1000.jpg",
         )
 
     def test_detail_plain_row_gets_tcgdex_image_despite_variant_siblings(self) -> None:
@@ -2131,7 +2131,7 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
 
         self.assertEqual(
             response.result.imageUrl,
-            "https://tcgplayer-cdn.tcgplayer.com/product/106999_200w.jpg",
+            "https://tcgplayer-cdn.tcgplayer.com/product/106999_in_1000x1000.jpg",
         )
 
     def test_detail_uses_exact_error_variant_image(self) -> None:
@@ -2174,7 +2174,7 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
 
         self.assertEqual(
             response.result.imageUrl,
-            "https://tcgplayer-cdn.tcgplayer.com/product/657516_200w.jpg",
+            "https://tcgplayer-cdn.tcgplayer.com/product/657516_in_1000x1000.jpg",
         )
 
     def test_detail_skips_unmapped_pokemon_set(self) -> None:
@@ -2315,7 +2315,7 @@ class CatalogImageFlagsGatingTest(unittest.TestCase):
 
         self.assertEqual(
             response.result.imageUrl,
-            "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
+            "https://tcgplayer-cdn.tcgplayer.com/product/42382_in_1000x1000.jpg",
         )
 
     def test_detail_fails_open_and_still_enriches_when_flags_table_empty(self) -> None:
@@ -2340,7 +2340,7 @@ class CatalogImageFlagsGatingTest(unittest.TestCase):
 
         self.assertEqual(
             response.result.imageUrl,
-            "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
+            "https://tcgplayer-cdn.tcgplayer.com/product/42382_in_1000x1000.jpg",
         )
 
 
