@@ -331,6 +331,10 @@ class CatalogSearchService:
         # renders a linked "via Rebrickable" credit wherever this imagery
         # shows (same pattern the RAWG terms forced for video games).
         # Killable via the 'lego' admin flag.
+        # One Piece is the sixth (owner decision 2026-08-30, same
+        # Lorcana-shaped call: no publisher policy exists either way, the
+        # optcgapi hotlink and per-row lookup were already in place for
+        # the external link). Killable via the 'onepiece' admin flag.
         if any(not result.imageUrl for result in results):
             enabled_image_categories = self._fetch_enabled_image_categories()
             # Pokemon thumbnails BEFORE the link-only pass: rows that get
@@ -351,6 +355,10 @@ class CatalogSearchService:
             if "lego" in enabled_image_categories:
                 results = [
                     self._enrich_with_lego_image(result) for result in results
+                ]
+            if "onepiece" in enabled_image_categories:
+                results = [
+                    self._enrich_with_onepiece_image(result) for result in results
                 ]
             results = [
                 self._resolve_external_image_url(result, enabled_image_categories)
