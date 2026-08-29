@@ -1708,6 +1708,59 @@ class CatalogSearchServiceTest(unittest.TestCase):
         )
         self.assertIsNone(response.results[0].externalImageUrl)
 
+    def test_search_renders_lego_thumbnail_inline(self) -> None:
+        # Owner decision 2026-08-30: LEGO search rows render the
+        # Rebrickable image inline (imageUrl); the app shows a linked
+        # Rebrickable attribution wherever this imagery appears.
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "rebrickable_lego_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "name": "Titanic",
+                            "image_url": (
+                                "https://cdn.rebrickable.com/media/sets/10294-1.jpg"
+                            ),
+                        }
+                    ],
+                )
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "7700001",
+                            "product_name": "Titanic #10294",
+                            "console_name": "LEGO Sculptures",
+                            "category": "LEGO Sculptures",
+                            "loose_price_cents": 45000,
+                            "currency": "USD",
+                            "normalized_identity": "titanic lego sculptures",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.search("lego titanic", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://cdn.rebrickable.com/media/sets/10294-1.jpg",
+        )
+        self.assertIsNone(response.results[0].externalImageUrl)
+
     def test_search_does_not_set_external_image_url_when_kicksdb_already_has_image(
         self,
     ) -> None:
