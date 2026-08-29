@@ -1,10 +1,13 @@
 import json
 import unittest
+from contextlib import contextmanager
+from dataclasses import replace
 from unittest.mock import patch
 
 import httpx
 from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.main import app
 from app.services.pricing.catalog_search_service import (
     resolve_category_group_filters,
@@ -24,6 +27,30 @@ from app.services.pricing.catalog_search_service import (
     _video_game_strip_punctuation,
     _yugioh_set_code,
 )
+
+
+
+@contextmanager
+def _patched_marketplace_credentials():
+    # These detail() tests drive the real eBay/PriceCharting listing
+    # services through the injected MockTransport client, but both refuse
+    # to run without credentials -- inject fake ones so the tests never
+    # depend on the developer's real environment (they silently skipped
+    # the providers and failed wherever EBAY_CLIENT_ID/SECRET or
+    # PRICECHARTING_API_KEY were unset). Settings is a frozen dataclass,
+    # so swap each module's reference for a modified copy.
+    creds = replace(
+        settings,
+        ebay_client_id="test-ebay-client-id",
+        ebay_client_secret="test-ebay-client-secret",
+        pricecharting_api_key="test-pricecharting-key",
+    )
+    with patch(
+        "app.services.pricing.ebay_listing_service.settings", creds
+    ), patch(
+        "app.services.pricing.pricecharting_listing_service.settings", creds
+    ):
+        yield
 
 
 class CatalogSearchServiceTest(unittest.TestCase):
@@ -994,7 +1021,8 @@ class CatalogSearchServiceTest(unittest.TestCase):
             client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
 
-        response = service.detail("45800", currency="AUD")
+        with _patched_marketplace_credentials():
+            response = service.detail("45800", currency="AUD")
 
         self.assertEqual(len(response.marketplaceListings), 1)
         listing = response.marketplaceListings[0]
@@ -1062,7 +1090,8 @@ class CatalogSearchServiceTest(unittest.TestCase):
             client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
 
-        response = service.detail("45800")
+        with _patched_marketplace_credentials():
+            response = service.detail("45800")
 
         self.assertEqual(response.result.pricing.currency, "USD")
         self.assertEqual(requested_marketplace_ids, ["EBAY_US"])
@@ -1218,7 +1247,8 @@ class CatalogSearchServiceTest(unittest.TestCase):
             client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
 
-        response = service.detail("45800")
+        with _patched_marketplace_credentials():
+            response = service.detail("45800")
 
         self.assertEqual(len(response.marketplaceListings), 1)
         self.assertEqual(response.marketplaceListings[0].source, "PriceCharting")
@@ -1294,7 +1324,8 @@ class CatalogSearchServiceTest(unittest.TestCase):
             client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
 
-        response = service.detail("45800", currency="AUD")
+        with _patched_marketplace_credentials():
+            response = service.detail("45800", currency="AUD")
 
         self.assertEqual(len(response.marketplaceListings), 2)
         by_source = {listing.source: listing for listing in response.marketplaceListings}
