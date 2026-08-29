@@ -1761,6 +1761,60 @@ class CatalogSearchServiceTest(unittest.TestCase):
         )
         self.assertIsNone(response.results[0].externalImageUrl)
 
+    def test_search_renders_onepiece_thumbnail_inline(self) -> None:
+        # Owner decision 2026-08-30: One Piece search rows render the
+        # optcgapi image inline (imageUrl) instead of exposing it only
+        # as an externalImageUrl link.
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "one_piece_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "card_name": "Monkey D Luffy",
+                            "is_plain": True,
+                            "image_url": (
+                                "https://optcgapi.com/images/OP01-003.png"
+                            ),
+                        }
+                    ],
+                )
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "6600001",
+                            "product_name": "Monkey D Luffy OP01-003",
+                            "console_name": "One Piece Romance Dawn",
+                            "category": "One Piece Romance Dawn",
+                            "loose_price_cents": 900,
+                            "currency": "USD",
+                            "normalized_identity": "monkey d luffy one piece",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.search("monkey d luffy", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://optcgapi.com/images/OP01-003.png",
+        )
+        self.assertIsNone(response.results[0].externalImageUrl)
+
     def test_search_does_not_set_external_image_url_when_kicksdb_already_has_image(
         self,
     ) -> None:
