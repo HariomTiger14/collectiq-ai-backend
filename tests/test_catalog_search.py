@@ -516,6 +516,53 @@ class CatalogSearchServiceTest(unittest.TestCase):
             any("search_kicksdb_catalog" in str(r.url) for r in requests)
         )
 
+    def test_search_breaks_score_ties_by_popularity_not_alphabet(self) -> None:
+        # A broad query like "nike" scores every "Nike ..." title
+        # identically; the tie must go to the marketplace-popular shoe
+        # (lower KicksDB rank), not the alphabetically-first one. This is
+        # the "searching nike showed only A'ja Wilson women's models"
+        # bug: alphabetical tie-breaking front-loaded the A's.
+        def kicksdb_row(kicksdb_id: str, title: str, rank: int | None) -> dict:
+            return {
+                "kicksdb_id": kicksdb_id,
+                "title": title,
+                "brand": "Nike",
+                "model": title,
+                "category": "Sneakers",
+                "rank": rank,
+                "currency": "USD",
+                "min_price_cents": 10000,
+                "max_price_cents": 20000,
+                "avg_price_cents": 15000,
+                "sku": kicksdb_id,
+                "updated_at": "2026-08-10T00:00:00Z",
+            }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "search_kicksdb_catalog" in str(request.url):
+                return httpx.Response(
+                    200,
+                    json=[
+                        kicksdb_row("kdb-aja", "Nike A'ja Wilson A'One", rank=180000),
+                        kicksdb_row("kdb-af1", "Nike Air Force 1 Low White", rank=20),
+                        kicksdb_row("kdb-norank", "Nike Zoom Obscure", rank=None),
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.search("nike", limit=10)
+
+        self.assertEqual(
+            [result.id for result in response.results],
+            ["kdb-af1", "kdb-aja", "kdb-norank"],
+        )
+
     def test_detail_falls_back_to_kicksdb_catalog_with_image(self) -> None:
         # When a catalog id isn't a pricecharting_catalog row at all, detail()
         # must try kicksdb_catalog before raising not-found — this is the

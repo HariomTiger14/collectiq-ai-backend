@@ -253,21 +253,40 @@ class CatalogSearchService:
             else []
         )
 
-        scored: list[tuple[int, str, str, dict[str, Any]]] = [
-            (_match_score(row, normalized_query), str(row.get("product_name") or ""), "pricecharting", row)
+        scored: list[tuple[int, int, str, str, dict[str, Any]]] = [
+            (
+                _match_score(row, normalized_query),
+                _POPULARITY_UNRANKED,
+                str(row.get("product_name") or ""),
+                "pricecharting",
+                row,
+            )
             for row in pc_rows
         ] + [
-            (_kicksdb_match_score(row, normalized_query), str(row.get("title") or ""), "kicksdb", row)
+            (
+                _kicksdb_match_score(row, normalized_query),
+                _kicksdb_popularity(row),
+                str(row.get("title") or ""),
+                "kicksdb",
+                row,
+            )
             for row in kicksdb_rows
         ]
-        scored.sort(key=lambda item: (-item[0], item[1]))
+        # Tie-break equal match scores by marketplace popularity before
+        # title: a broad query like "nike" scores thousands of titles
+        # identically, and a pure-alphabetical tie-break filled the first
+        # page with whatever sorted first ("Nike A'ja Wilson ..."), not
+        # what anyone was looking for. PriceCharting rows have no
+        # popularity signal and share one neutral value, so their relative
+        # (title) order is unchanged.
+        scored.sort(key=lambda item: (-item[0], item[1], item[2]))
         top = scored[:bounded_limit]
 
         results = [
             _row_to_result(row, normalized_query)
             if source == "pricecharting"
             else _kicksdb_row_to_result(row, normalized_query)
-            for _, _, source, row in top
+            for _, _, _, source, row in top
         ]
         # No inline imageUrl enrichment for most categories here: this is
         # the open, free-to-everyone catalog browse/search surface.
@@ -1820,6 +1839,19 @@ def _int_or_none(value: object) -> int | None:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+# Sort sentinel for rows with no popularity signal (PriceCharting rows,
+# and KicksDB rows missing a rank): sorts after every real rank.
+_POPULARITY_UNRANKED = 10**9
+
+
+def _kicksdb_popularity(row: dict[str, Any]) -> int:
+    try:
+        rank = int(row.get("rank"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return _POPULARITY_UNRANKED
+    return rank if rank > 0 else _POPULARITY_UNRANKED
 
 
 def _kicksdb_match_confidence(row: dict[str, Any], query: str) -> float:
