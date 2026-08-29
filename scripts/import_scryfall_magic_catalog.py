@@ -97,8 +97,13 @@ def image_url_from_card(source_row: dict[str, Any]) -> str | None:
 
 
 def to_catalog_row(source_row: dict[str, Any]) -> dict[str, Any] | None:
-    if source_row.get("lang") != "en":
-        return None
+    # No language filter: the default_cards export includes a non-English
+    # row ONLY when the card exists in no other language (Scryfall's own
+    # definition of the export), so accepting every row admits exactly the
+    # only-printed-language collector specials -- e.g. the Quenya-only
+    # Tales of Middle-earth Commander Sol Ring #409, which a lang=='en'
+    # filter silently dropped, leaving those cards imageless (found live
+    # 2026-08-30). English cards are unaffected either way.
     scryfall_id = str(source_row.get("id") or "").strip()
     name = str(source_row.get("name") or "").strip()
     set_name = str(source_row.get("set_name") or "").strip()
