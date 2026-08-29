@@ -313,6 +313,13 @@ class CatalogSearchService:
         # documented usage model -- unlike the publisher-art sources this
         # comment was written about -- explicitly provides that size for
         # list display. See _enrich_pokemon_search_thumbnails.
+        # Lorcana is the third exception (owner decision 2026-08-30, an
+        # accepted step past the link-only posture the 2026-08-29 review
+        # kept): its images are hotlinks to Ravensburger's own publisher
+        # CDN, detail() already renders the same image inline, and the
+        # same per-row lookup was already being paid here to build the
+        # external link -- inline display only changes which field the
+        # match lands in. Still killable via the 'lorcana' admin flag.
         if any(not result.imageUrl for result in results):
             enabled_image_categories = self._fetch_enabled_image_categories()
             # Pokemon thumbnails BEFORE the link-only pass: rows that get
@@ -322,6 +329,10 @@ class CatalogSearchService:
             results = self._enrich_pokemon_search_thumbnails(
                 results, enabled_image_categories
             )
+            if "lorcana" in enabled_image_categories:
+                results = [
+                    self._enrich_with_lorcana_image(result) for result in results
+                ]
             results = [
                 self._resolve_external_image_url(result, enabled_image_categories)
                 for result in results
