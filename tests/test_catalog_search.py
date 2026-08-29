@@ -564,6 +564,143 @@ class CatalogSearchServiceTest(unittest.TestCase):
         )
         self.assertEqual(response.history, [])
 
+    def _kicksdb_detail_service_with_variants(
+        self, variants: list[dict]
+    ) -> CatalogSearchService:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "kicksdb_catalog_history" in str(request.url):
+                return httpx.Response(200, json=[])
+            if "kicksdb_catalog" in str(request.url):
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "kicksdb_id": "kdb-9",
+                            "title": "Air Jordan 4 Retro Infrared",
+                            "brand": "Jordan",
+                            "category": "Sneakers",
+                            "currency": "USD",
+                            "min_price_cents": 11500,
+                            "max_price_cents": 39300,
+                            "avg_price_cents": 18000,
+                            "product_url": "https://stockx.com/air-jordan-4-infrared",
+                            "sku": "DH6927-061",
+                            "variants": variants,
+                            "updated_at": "2026-08-10T00:00:00Z",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        return CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+    def test_kicksdb_detail_includes_per_size_marketplace_listings(self) -> None:
+        # The variants JSON stored on the kicksdb_catalog row carries live
+        # StockX market depth per size; detail() must surface it as
+        # marketplaceListings without any extra request. Hidden and
+        # zero-ask sizes are dead listings and must be skipped, and output
+        # order follows the variant position, not JSON order.
+        service = self._kicksdb_detail_service_with_variants(
+            [
+                {
+                    "size": "10.5",
+                    "size_type": "us m",
+                    "sizes": [{"size": "US M 10.5", "type": "us m"}],
+                    "position": 2,
+                    "hidden": False,
+                    "currency": "USD",
+                    "lowest_ask": 131.0,
+                    "total_asks": 4,
+                    "sales_count_30_days": 2,
+                },
+                {
+                    "size": "10",
+                    "size_type": "us m",
+                    "sizes": [{"size": "US M 10", "type": "us m"}],
+                    "position": 1,
+                    "hidden": False,
+                    "currency": "USD",
+                    "lowest_ask": 115,
+                    "total_asks": 13,
+                    "sales_count_30_days": 8,
+                },
+                {
+                    "size": "9",
+                    "size_type": "us m",
+                    "sizes": [],
+                    "position": 0,
+                    "hidden": False,
+                    "currency": "USD",
+                    "lowest_ask": 0,
+                    "total_asks": 0,
+                    "sales_count_30_days": 0,
+                },
+                {
+                    "size": "8",
+                    "size_type": "us m",
+                    "sizes": [{"size": "US M 8", "type": "us m"}],
+                    "position": 3,
+                    "hidden": True,
+                    "currency": "USD",
+                    "lowest_ask": 99,
+                    "total_asks": 1,
+                    "sales_count_30_days": 1,
+                },
+            ]
+        )
+
+        response = service.detail("kdb-9")
+
+        self.assertEqual(len(response.marketplaceListings), 2)
+        first, second = response.marketplaceListings
+        self.assertEqual(first.title, "Size US M 10")
+        self.assertEqual(first.size, "US M 10")
+        self.assertEqual(first.price, 115.0)
+        self.assertEqual(first.currency, "USD")
+        self.assertEqual(first.source, "StockX")
+        self.assertEqual(first.condition, "New")
+        self.assertEqual(first.totalAsks, 13)
+        self.assertEqual(first.salesLast30Days, 8)
+        self.assertEqual(first.url, "https://stockx.com/air-jordan-4-infrared")
+        self.assertEqual(second.size, "US M 10.5")
+        self.assertEqual(second.price, 131.0)
+
+    def test_kicksdb_marketplace_listings_convert_to_requested_currency(self) -> None:
+        from app.services.pricing.catalog_search_service import _exchange_rate
+
+        service = self._kicksdb_detail_service_with_variants(
+            [
+                {
+                    "size": "10",
+                    "size_type": "us m",
+                    "sizes": [{"size": "US M 10", "type": "us m"}],
+                    "position": 0,
+                    "hidden": False,
+                    "currency": "USD",
+                    "lowest_ask": 115,
+                    "total_asks": 13,
+                    "sales_count_30_days": 8,
+                },
+            ]
+        )
+
+        response = service.detail("kdb-9", currency="AUD")
+
+        listing = response.marketplaceListings[0]
+        self.assertEqual(listing.currency, "AUD")
+        self.assertEqual(listing.price, round(115 * _exchange_rate("USD", "AUD"), 2))
+
+    def test_kicksdb_detail_without_variants_returns_no_listings(self) -> None:
+        service = self._kicksdb_detail_service_with_variants([])
+
+        response = service.detail("kdb-9")
+
+        self.assertEqual(response.marketplaceListings, [])
+
     def test_short_query_returns_empty_without_supabase(self) -> None:
         service = CatalogSearchService(
             supabase_url="",

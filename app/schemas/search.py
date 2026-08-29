@@ -56,6 +56,12 @@ class MarketplaceListing(BaseModel):
     condition: str = ""
     url: str
     source: str = "eBay"
+    # Sneaker (KicksDB/StockX) listings only -- per-size market depth.
+    # None for eBay/PriceCharting listings, so existing clients and cached
+    # rows deserialize unchanged.
+    size: str | None = None
+    totalAsks: int | None = None
+    salesLast30Days: int | None = None
 
 
 class CatalogHistoryPoint(BaseModel):
