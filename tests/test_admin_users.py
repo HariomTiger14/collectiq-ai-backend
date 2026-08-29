@@ -292,10 +292,14 @@ class AdminUsersTest(unittest.TestCase):
 
         service.get_user_detail("user-1")
 
+        # Every user-scoped portfolio query must exclude soft-deleted rows.
+        # Lookups by item id (e.g. valuation-history title resolution) are
+        # exempt on purpose: tombstones may still be referenced by history.
         portfolio_requests = [
             request
             for request in client.requests
             if request["url"].endswith("/rest/v1/portfolio_items")
+            and "user_id" in request["params"]
         ]
         self.assertTrue(portfolio_requests)
         for request in portfolio_requests:
@@ -324,7 +328,11 @@ class AdminUsersTest(unittest.TestCase):
         self.assertTrue(payload["success"])
         self.assertEqual(payload["subscription"]["plan"], "pro")
         subscription_service.verify_and_grant.assert_called_once_with(
-            user_id="user-1", plan="pro", source="admin_override", purchase_token=None
+            user_id="user-1",
+            plan="pro",
+            source="admin_override",
+            purchase_token=None,
+            trusted_caller=True,
         )
 
     def test_reset_scan_usage_delegates_to_subscription_service(self) -> None:

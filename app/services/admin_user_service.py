@@ -589,11 +589,15 @@ class SupabaseAdminUserRepository:
         # 50-user list page could trigger hundreds of oversized requests.
         if not user_id:
             return None
+        params = {"user_id": f"eq.{user_id}", "select": "user_id", "limit": "1"}
+        if table == "portfolio_items":
+            # Soft-deleted rows (sync_status='deleted') must not count.
+            params["sync_status"] = "neq.deleted"
         try:
             response = self._request(
                 "GET",
                 f"/rest/v1/{table}",
-                params={"user_id": f"eq.{user_id}", "select": "user_id", "limit": "1"},
+                params=params,
                 extra_headers={"Prefer": "count=exact"},
                 return_response=True,
             )
