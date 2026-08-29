@@ -1815,6 +1815,59 @@ class CatalogSearchServiceTest(unittest.TestCase):
         )
         self.assertIsNone(response.results[0].externalImageUrl)
 
+    def test_search_renders_yugioh_thumbnail_inline(self) -> None:
+        # Owner decision 2026-08-30, contingent on re-hosting: Yu-Gi-Oh
+        # search rows render the (self-hosted) image inline. The fixture
+        # URL mirrors the catalog-images bucket rows produced by
+        # scripts/rehost_yugioh_images.py.
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "yugioh_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "image_url": (
+                                "https://example.supabase.co/storage/v1/object/public/catalog-images/yugioh/ygo/89631139.jpg"
+                            )
+                        }
+                    ],
+                )
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "5500001",
+                            "product_name": "Blue-Eyes White Dragon LOB-001",
+                            "console_name": "YuGiOh Legend of Blue Eyes White Dragon",
+                            "category": "YuGiOh Legend of Blue Eyes White Dragon",
+                            "loose_price_cents": 4500,
+                            "currency": "USD",
+                            "normalized_identity": "blue eyes white dragon yugioh",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.search("blue eyes white dragon", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://example.supabase.co/storage/v1/object/public/catalog-images/yugioh/ygo/89631139.jpg",
+        )
+        self.assertIsNone(response.results[0].externalImageUrl)
+
     def test_search_does_not_set_external_image_url_when_kicksdb_already_has_image(
         self,
     ) -> None:
