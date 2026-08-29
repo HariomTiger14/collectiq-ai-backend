@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import httpx
@@ -6,6 +7,10 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.services.pricing.admin_health_service import PricingHealthService
+
+# Staleness is judged against the wall clock, so fixture load times must be
+# relative — hardcoded dates rot past stale_after_hours and flip the suite red.
+_FRESH_LOAD_ISO = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
 
 
 class AdminPricingHealthEndpointTest(unittest.TestCase):
@@ -316,9 +321,9 @@ def _supabase_handler(request: httpx.Request) -> httpx.Response:
             200,
             json=[
                 {
-                    "source_downloaded_at": "2026-07-27T00:00:00+00:00",
-                    "imported_at": "2026-07-27T00:00:00+00:00",
-                    "updated_at": "2026-07-27T00:00:00+00:00",
+                    "source_downloaded_at": _FRESH_LOAD_ISO,
+                    "imported_at": _FRESH_LOAD_ISO,
+                    "updated_at": _FRESH_LOAD_ISO,
                 }
             ],
         )
@@ -335,35 +340,35 @@ def _supabase_summary_handler(request: httpx.Request) -> httpx.Response:
                     "current_rows": 129605,
                     "history_rows": 134467,
                     "closed_history_rows": 4862,
-                    "last_loaded_at": "2026-07-27T00:00:00+00:00",
+                    "last_loaded_at": _FRESH_LOAD_ISO,
                 },
                 {
                     "source_file": "one_piece.csv",
                     "current_rows": 11847,
                     "history_rows": 12466,
                     "closed_history_rows": 619,
-                    "last_loaded_at": "2026-07-27T00:00:00+00:00",
+                    "last_loaded_at": _FRESH_LOAD_ISO,
                 },
                 {
                     "source_file": "pokemon.csv",
                     "current_rows": 91278,
                     "history_rows": 96424,
                     "closed_history_rows": 5146,
-                    "last_loaded_at": "2026-07-27T00:00:00+00:00",
+                    "last_loaded_at": _FRESH_LOAD_ISO,
                 },
                 {
                     "source_file": "video_games.csv",
                     "current_rows": 122186,
                     "history_rows": 125947,
                     "closed_history_rows": 3761,
-                    "last_loaded_at": "2026-07-27T00:00:00+00:00",
+                    "last_loaded_at": _FRESH_LOAD_ISO,
                 },
                 {
                     "source_file": "yugioh.csv",
                     "current_rows": 77428,
                     "history_rows": 80188,
                     "closed_history_rows": 2760,
-                    "last_loaded_at": "2026-07-27T00:00:00+00:00",
+                    "last_loaded_at": _FRESH_LOAD_ISO,
                 },
             ],
         )
