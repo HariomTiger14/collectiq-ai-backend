@@ -1604,6 +1604,58 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertIsNone(response.results[0].imageUrl)
         self.assertIsNone(response.results[0].externalImageUrl)
 
+    def test_search_renders_lorcana_thumbnail_inline(self) -> None:
+        # Owner decision 2026-08-30: Lorcana search rows render the
+        # publisher-CDN image inline (imageUrl) instead of exposing it
+        # only as an externalImageUrl link.
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "lorcana_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "image_url": (
+                                "https://api.lorcana.ravensburger.com/images/en/set13/70.jpg"
+                            )
+                        }
+                    ],
+                )
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "9001",
+                            "product_name": "Elsa - Spirit of Winter #70",
+                            "console_name": "Lorcana Archazia's Island",
+                            "category": "Lorcana Archazia's Island",
+                            "loose_price_cents": 4200,
+                            "currency": "USD",
+                            "normalized_identity": "elsa spirit of winter lorcana",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.search("elsa lorcana", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://api.lorcana.ravensburger.com/images/en/set13/70.jpg",
+        )
+        self.assertIsNone(response.results[0].externalImageUrl)
+
     def test_search_does_not_set_external_image_url_when_kicksdb_already_has_image(
         self,
     ) -> None:
