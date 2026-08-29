@@ -87,6 +87,31 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(len(user["pushDevices"]), 1)
         self.assertEqual(user["pushDevices"][0]["platform"], "ios")
 
+    def test_portfolio_queries_exclude_soft_deleted_rows(self) -> None:
+        client = _FakeAdminUsersClient()
+        subscription_service = Mock()
+        subscription_service.get_entitlement.return_value = {"plan": "free"}
+        subscription_service.get_scan_usage.return_value = {"used": 0}
+        service = AdminUserService(
+            repository=SupabaseAdminUserRepository(
+                supabase_url="https://supabase.test",
+                service_role_key="service-role",
+                client=client,
+            ),
+            subscription_service=subscription_service,
+        )
+
+        service.get_user_detail("user-1")
+
+        portfolio_requests = [
+            request
+            for request in client.requests
+            if request["url"].endswith("/rest/v1/portfolio_items")
+        ]
+        self.assertTrue(portfolio_requests)
+        for request in portfolio_requests:
+            self.assertEqual(request["params"]["sync_status"], "neq.deleted")
+
     def test_override_subscription_delegates_to_subscription_service(self) -> None:
         subscription_service = Mock()
         subscription_service.verify_and_grant.return_value = {

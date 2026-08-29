@@ -246,6 +246,9 @@ class SupabasePricingReviewQueueRepository:
             f"/rest/v1/{self._table_name}",
             params={
                 "select": "*",
+                # Exclude app-side soft deletes (sync_status='deleted') from
+                # the review queue and admin portfolio listings.
+                "sync_status": "neq.deleted",
                 "limit": str(limit),
                 "order": "updated_at.desc.nullslast,created_at.desc.nullslast",
             },

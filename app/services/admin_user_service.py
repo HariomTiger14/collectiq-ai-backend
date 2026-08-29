@@ -292,16 +292,21 @@ class SupabaseAdminUserRepository:
     def _optional_rows(self, table: str, user_id: str, *, limit: int) -> list[dict[str, Any]]:
         if not user_id:
             return []
+        params = {
+            "user_id": f"eq.{user_id}",
+            "select": "*",
+            "limit": str(limit),
+            "order": "updated_at.desc.nullslast,created_at.desc.nullslast",
+        }
+        if table == "portfolio_items":
+            # The app soft-deletes portfolio rows (sync_status='deleted');
+            # tombstones must not count toward portfolio value or item lists.
+            params["sync_status"] = "neq.deleted"
         try:
             payload = self._request(
                 "GET",
                 f"/rest/v1/{table}",
-                params={
-                    "user_id": f"eq.{user_id}",
-                    "select": "*",
-                    "limit": str(limit),
-                    "order": "updated_at.desc.nullslast,created_at.desc.nullslast",
-                },
+                params=params,
             )
         except AdminUserServiceError:
             return []

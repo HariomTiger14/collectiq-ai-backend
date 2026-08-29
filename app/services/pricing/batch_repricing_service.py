@@ -372,6 +372,9 @@ class BatchRepricingService:
             params={
                 "select": "id,user_id,category,title,manufacturer,series,year,"
                 "raw_json,estimated_value_high,estimated_value_low,pricecharting_id",
+                # Skip app-side soft deletes: repricing tombstones wastes
+                # provider lookups and resurrects them in valuation history.
+                "sync_status": "neq.deleted",
                 "order": "id.asc",
                 "limit": str(page_size),
                 "offset": str(offset),
