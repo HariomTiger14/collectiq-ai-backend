@@ -19,6 +19,7 @@ from app.services.pricing.ebay_listing_service import (
     ebay_marketplace_for_currency,
 )
 from app.services.pricing.tcgdex_pokemon_sets import (
+    is_safe_variant_tag,
     normalize_card_number,
     resolve_english_set_key,
     resolve_japanese_set_name,
@@ -572,7 +573,10 @@ class CatalogSearchService:
                 continue
             if "pokemon" not in result.setName.lower():
                 continue
-            if _POKEMON_BRACKET_TAG_RE.search(result.title):
+            row_variant_token = _pokemon_variant_token(result.title)
+            if row_variant_token is not None and not is_safe_variant_tag(
+                row_variant_token
+            ):
                 continue
             card_number = _pokemon_card_number(result.title)
             if card_number is None:
@@ -1030,9 +1034,11 @@ class CatalogSearchService:
             if exact_image_url:
                 return result.model_copy(update={"imageUrl": exact_image_url})
 
-        # TCGdex: plain rows only, no sibling check needed (see comment
-        # above -- the base scan IS the plain print).
-        if variant_token is None:
+        # TCGdex: plain rows AND stage-1 safe same-face variants (reverse
+        # holo / reverse / holo / jumbo -- see SAFE_VARIANT_TAGS), no
+        # sibling check needed (the base scan depicts the right card face
+        # for all of them). Other bracket tags stay placeholder-only.
+        if variant_token is None or is_safe_variant_tag(variant_token):
             tcgdex_image_url = self._fetch_tcgdex_pokemon_image(set_name, card_number)
             if tcgdex_image_url:
                 return result.model_copy(update={"imageUrl": tcgdex_image_url})

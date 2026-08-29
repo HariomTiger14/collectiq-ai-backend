@@ -67,6 +67,28 @@ JA_SET_MAP: dict[str, str] = {
 }
 
 
+# Stage-1 safe same-face variant tags (2026-08-29 audit + reviewer
+# approval): for these bracket tags the canonical TCGdex image depicts
+# exactly the right card face -- the tag describes foil treatment or
+# format, not a visible print difference. Each family was validated
+# against real production rows with visual inspection before being
+# listed. Everything NOT listed stays default-deny (placeholder); the
+# list only grows by explicit review (stage-2 candidates: cosmos holo,
+# cracked ice, rainbow foil, sparkle/spectra/tekno, prism, ...).
+SAFE_VARIANT_TAGS: frozenset[str] = frozenset({
+    "reverse holo",
+    "reverse",
+    "holo",
+    "jumbo",
+})
+
+
+def is_safe_variant_tag(variant_token: str | None) -> bool:
+    if not variant_token:
+        return False
+    return variant_token.strip().lower() in SAFE_VARIANT_TAGS
+
+
 def resolve_english_set_key(console_name: str) -> str | None:
     """PriceCharting console_name ("Pokemon Stellar Crown") -> TCGdex
     English set_key ("stellar crown"), or None when this console is not an
