@@ -308,8 +308,20 @@ class CatalogSearchService:
         # image inside our own app layout.
         # KicksDB (sneakers) images are unaffected; they come from
         # _kicksdb_row_to_result above, not this enrichment chain.
+        # Pokemon is the newer second exception (2026-08-29): TCGdex
+        # low.webp thumbnails render inline here too, because TCGdex's
+        # documented usage model -- unlike the publisher-art sources this
+        # comment was written about -- explicitly provides that size for
+        # list display. See _enrich_pokemon_search_thumbnails.
         if any(not result.imageUrl for result in results):
             enabled_image_categories = self._fetch_enabled_image_categories()
+            # Pokemon thumbnails BEFORE the link-only pass: rows that get
+            # an inline TCGdex low.webp short-circuit
+            # _resolve_external_image_url (imageUrl set -> early return),
+            # so those rows skip the per-row enrichment chain entirely.
+            results = self._enrich_pokemon_search_thumbnails(
+                results, enabled_image_categories
+            )
             results = [
                 self._resolve_external_image_url(result, enabled_image_categories)
                 for result in results
@@ -534,6 +546,103 @@ class CatalogSearchService:
         if not isinstance(payload, list):
             return []
         return [row for row in payload if isinstance(row, dict)]
+
+    def _enrich_pokemon_search_thumbnails(
+        self, results: list[CatalogSearchResult], enabled: set[str]
+    ) -> list[CatalogSearchResult]:
+        # Inline Pokemon thumbnails on the search surface, per the
+        # reviewer-approved TCGdex architecture: low.webp (245x337) is the
+        # size TCGdex's own docs designate for "displaying lots of small
+        # images" -- unlike the publisher-art sources this surface stayed
+        # link-only for, TCGdex's documented usage model covers list
+        # thumbnails. One batched request per language for the whole page,
+        # never per-row.
+        #
+        # Print-variant rows (bracket-tagged titles) keep the placeholder
+        # here: at thumbnail size the image identifies the card DESIGN,
+        # which all prints share, but a stamped/foiled print could still
+        # read visibly wrong, and the batched path has no room for the
+        # detail page's sibling suppression -- so variants opt out rather
+        # than guess. Print-level precision stays detail()'s job.
+        if "pokemon" not in enabled:
+            return results
+        wanted: dict[int, tuple[str, str, str, str]] = {}
+        for index, result in enumerate(results):
+            if result.imageUrl or not result.setName:
+                continue
+            if "pokemon" not in result.setName.lower():
+                continue
+            if _POKEMON_BRACKET_TAG_RE.search(result.title):
+                continue
+            card_number = _pokemon_card_number(result.title)
+            if card_number is None:
+                continue
+            console = result.setName.strip()
+            lowered = console.lower()
+            if lowered.startswith("pokemon japanese"):
+                language, column = "ja", "set_name"
+                selector = resolve_japanese_set_name(console)
+            elif lowered == "pokemon promo":
+                language, column = "en", "set_key"
+                selector = resolve_promo_set_key(card_number)
+            else:
+                language, column = "en", "set_key"
+                selector = resolve_english_set_key(console)
+            if selector is None:
+                continue
+            wanted[index] = (
+                language, column, selector, normalize_card_number(card_number)
+            )
+        if not wanted:
+            return results
+
+        found: dict[tuple[str, str, str, str], list[str | None]] = {}
+        for language in {spec[0] for spec in wanted.values()}:
+            clauses = sorted(
+                {
+                    (column, selector, number)
+                    for lang, column, selector, number in wanted.values()
+                    if lang == language
+                }
+            )
+            or_filter = ",".join(
+                f'and({column}.eq."{selector}",local_id_norm.eq."{number}")'
+                for column, selector, number in clauses
+            )
+            payload = self._request(
+                "GET",
+                "/rest/v1/tcgdex_pokemon_catalog",
+                params={
+                    "select": "set_key,set_name,local_id_norm,image_url",
+                    "language": f"eq.{language}",
+                    "or": f"({or_filter})",
+                    "limit": "500",
+                },
+            )
+            if not isinstance(payload, list):
+                continue
+            for row in payload:
+                if not isinstance(row, dict):
+                    continue
+                for column in ("set_key", "set_name"):
+                    key = (
+                        language,
+                        column,
+                        str(row.get(column) or ""),
+                        str(row.get("local_id_norm") or ""),
+                    )
+                    found.setdefault(key, []).append(row.get("image_url"))
+
+        enriched = list(results)
+        for index, key in wanted.items():
+            hits = found.get(key) or []
+            # Exactly one row, with an image -- same distrust of
+            # zero/ambiguous matches as the detail path.
+            if len(hits) == 1 and hits[0]:
+                enriched[index] = enriched[index].model_copy(
+                    update={"imageUrl": f"{hits[0]}/low.webp"}
+                )
+        return enriched
 
     def _resolve_external_image_url(
         self, result: CatalogSearchResult, enabled: set[str]
