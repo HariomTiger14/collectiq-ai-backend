@@ -637,10 +637,17 @@ class CatalogSearchService:
         for index, key in wanted.items():
             hits = found.get(key) or []
             # Exactly one row, with an image -- same distrust of
-            # zero/ambiguous matches as the detail path.
+            # zero/ambiguous matches as the detail path. low.webp renders
+            # in the list tile; externalImageUrl carries the high.webp so
+            # the row's "View image" link opens the full-size asset, not
+            # the 245px thumbnail (found live: the link showed a tiny
+            # image in the in-app browser).
             if len(hits) == 1 and hits[0]:
                 enriched[index] = enriched[index].model_copy(
-                    update={"imageUrl": f"{hits[0]}/low.webp"}
+                    update={
+                        "imageUrl": f"{hits[0]}/low.webp",
+                        "externalImageUrl": f"{hits[0]}/high.webp",
+                    }
                 )
         return enriched
 

@@ -1745,6 +1745,12 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
             by_id["1"].imageUrl,
             "https://assets.tcgdex.net/en/sv/sv07/025/low.webp",
         )
+        # The row's external link must open the full-size asset, not the
+        # 245px thumbnail.
+        self.assertEqual(
+            by_id["1"].externalImageUrl,
+            "https://assets.tcgdex.net/en/sv/sv07/025/high.webp",
+        )
         self.assertEqual(
             by_id["3"].imageUrl,
             "https://assets.tcgdex.net/ja/SV/SV2D/027/low.webp",
