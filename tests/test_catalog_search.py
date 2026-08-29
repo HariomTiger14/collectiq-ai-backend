@@ -1671,6 +1671,89 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
 
         return handler
 
+    def test_search_attaches_batched_tcgdex_thumbnails(self) -> None:
+        # Search-surface Pokemon thumbnails: one batched tcgdex query per
+        # language for the whole page (never per-row), low.webp attached
+        # inline for plain rows, bracket-variant rows left to the
+        # link-only chain, Japanese via the hand map.
+        tcgdex_requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "tcgdex_pokemon_catalog" in url:
+                tcgdex_requests.append(url)
+                language = request.url.params.get("language", "")
+                if language == "eq.en":
+                    return httpx.Response(200, json=[{
+                        "set_key": "stellar crown",
+                        "set_name": "Stellar Crown",
+                        "local_id_norm": "25",
+                        "image_url": "https://assets.tcgdex.net/en/sv/sv07/025",
+                    }])
+                return httpx.Response(200, json=[{
+                    "set_key": "クレイバースト",
+                    "set_name": "クレイバースト",
+                    "local_id_norm": "27",
+                    "image_url": "https://assets.tcgdex.net/ja/SV/SV2D/027",
+                }])
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(200, json=[
+                    {
+                        "pricecharting_id": "1",
+                        "product_name": "Pikachu #25",
+                        "console_name": "Pokemon Stellar Crown",
+                        "category": "Pokemon Card",
+                        "loose_price_cents": 500,
+                        "currency": "USD",
+                        "source_file": "pokemon.csv",
+                    },
+                    {
+                        "pricecharting_id": "2",
+                        "product_name": "Pikachu [Reverse Holo] #25",
+                        "console_name": "Pokemon Stellar Crown",
+                        "category": "Pokemon Card",
+                        "loose_price_cents": 900,
+                        "currency": "USD",
+                        "source_file": "pokemon.csv",
+                    },
+                    {
+                        "pricecharting_id": "3",
+                        "product_name": "Wigglytuff #27",
+                        "console_name": "Pokemon Japanese Clay Burst",
+                        "category": "Pokemon Card",
+                        "loose_price_cents": 300,
+                        "currency": "USD",
+                        "source_file": "pokemon.csv",
+                    },
+                ])
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.search("pikachu", limit=10)
+
+        by_id = {r.id: r for r in response.results}
+        self.assertEqual(
+            by_id["1"].imageUrl,
+            "https://assets.tcgdex.net/en/sv/sv07/025/low.webp",
+        )
+        self.assertEqual(
+            by_id["3"].imageUrl,
+            "https://assets.tcgdex.net/ja/SV/SV2D/027/low.webp",
+        )
+        # Variant row: no inline thumbnail (print ambiguity), link-only.
+        self.assertIsNone(by_id["2"].imageUrl)
+        batched = [u for u in tcgdex_requests if "or=" in u]
+        self.assertEqual(len(batched), 2)  # one per language, not per row
+
     def test_detail_uses_plain_image_when_no_sibling_variant_rows(self) -> None:
         search_row = {
             "pricecharting_id": "630417",
