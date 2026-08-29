@@ -1656,6 +1656,58 @@ class CatalogSearchServiceTest(unittest.TestCase):
         )
         self.assertIsNone(response.results[0].externalImageUrl)
 
+    def test_search_renders_magic_thumbnail_inline(self) -> None:
+        # Owner decision 2026-08-30: Magic search rows render the
+        # Scryfall image inline (imageUrl) instead of exposing it only
+        # as an externalImageUrl link.
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(200, json=[])
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            if "scryfall_magic_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "image_url": (
+                                "https://cards.scryfall.io/normal/gilded-charm.jpg"
+                            )
+                        }
+                    ],
+                )
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "3773958",
+                            "product_name": "Cabaretti Charm [Gilded Foil] #365",
+                            "console_name": "Magic Streets of New Capenna",
+                            "category": "Magic Streets of New Capenna",
+                            "loose_price_cents": 5000,
+                            "currency": "USD",
+                            "normalized_identity": "cabaretti charm magic",
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.search("cabaretti charm", limit=10)
+
+        self.assertEqual(
+            response.results[0].imageUrl,
+            "https://cards.scryfall.io/normal/gilded-charm.jpg",
+        )
+        self.assertIsNone(response.results[0].externalImageUrl)
+
     def test_search_does_not_set_external_image_url_when_kicksdb_already_has_image(
         self,
     ) -> None:

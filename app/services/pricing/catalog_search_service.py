@@ -320,6 +320,11 @@ class CatalogSearchService:
         # same per-row lookup was already being paid here to build the
         # external link -- inline display only changes which field the
         # match lands in. Still killable via the 'lorcana' admin flag.
+        # Magic is the fourth (owner decision 2026-08-30, same shape):
+        # Scryfall-hosted imagery under Wizards' Fan Content Policy,
+        # whose hard rule -- no paywalling the content -- this surface
+        # satisfies (catalog search sits behind no paywall). Killable via
+        # the 'magic' admin flag.
         if any(not result.imageUrl for result in results):
             enabled_image_categories = self._fetch_enabled_image_categories()
             # Pokemon thumbnails BEFORE the link-only pass: rows that get
@@ -332,6 +337,10 @@ class CatalogSearchService:
             if "lorcana" in enabled_image_categories:
                 results = [
                     self._enrich_with_lorcana_image(result) for result in results
+                ]
+            if "magic" in enabled_image_categories:
+                results = [
+                    self._enrich_with_magic_image(result) for result in results
                 ]
             results = [
                 self._resolve_external_image_url(result, enabled_image_categories)
