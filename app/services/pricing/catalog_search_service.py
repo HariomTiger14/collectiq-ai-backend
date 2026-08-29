@@ -396,7 +396,23 @@ class CatalogSearchService:
             kicksdb_history_points = [
                 _kicksdb_history_row_to_point(row) for row in kicksdb_history_rows
             ]
+            kicksdb_listings = _kicksdb_marketplace_listings(kicksdb_row)
             if target_currency:
+                kicksdb_listings = [
+                    listing
+                    if listing.currency == target_currency
+                    else listing.model_copy(
+                        update={
+                            "price": round(
+                                listing.price
+                                * _exchange_rate(listing.currency, target_currency),
+                                2,
+                            ),
+                            "currency": target_currency,
+                        }
+                    )
+                    for listing in kicksdb_listings
+                ]
                 kicksdb_result = kicksdb_result.model_copy(
                     update={
                         "pricing": _convert_catalog_pricing(
@@ -417,6 +433,7 @@ class CatalogSearchService:
             return CatalogDetailResponse(
                 result=kicksdb_result,
                 history=kicksdb_history_points,
+                marketplaceListings=kicksdb_listings,
             )
 
         raise CatalogItemNotFoundError("Catalog item was not found.")
@@ -1571,7 +1588,7 @@ class CatalogSearchService:
                 "kicksdb_id,title,brand,model,gender,product_type,category,"
                 "secondary_category,image_url,rank,release_date,currency,"
                 "min_price_cents,max_price_cents,avg_price_cents,product_url,"
-                "sku,updated_at"
+                "sku,variants,updated_at"
             ),
             "kicksdb_id": f"eq.{catalog_id}",
             "limit": "1",
@@ -1732,6 +1749,77 @@ def _kicksdb_pricing_from_row(row: dict[str, Any]) -> CatalogSearchPricing:
         lowEstimate=_cents_to_units(row.get("min_price_cents")),
         highEstimate=_cents_to_units(row.get("max_price_cents")),
     )
+
+
+def _kicksdb_marketplace_listings(row: dict[str, Any]) -> list[MarketplaceListing]:
+    # Per-size StockX market depth parsed from the variants JSON stored on
+    # the same kicksdb_catalog row detail() already fetched -- no extra
+    # request. A "listing" here is the current lowest ask for one size, not
+    # a completed sale; the UI must label it as market/listings, never as
+    # sold prices. Zero-ask and hidden sizes are dead listings, not free
+    # shoes, and are skipped.
+    variants = row.get("variants")
+    if not isinstance(variants, list):
+        return []
+    product_url = _clean(row.get("product_url")) or ""
+    fallback_currency = str(row.get("currency") or "USD").upper()
+    listings: list[tuple[int, MarketplaceListing]] = []
+    for variant in variants:
+        if not isinstance(variant, dict) or variant.get("hidden") is True:
+            continue
+        try:
+            price = float(variant.get("lowest_ask") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price <= 0:
+            continue
+        size_label = _kicksdb_variant_size_label(variant)
+        try:
+            position = int(variant.get("position") or 0)
+        except (TypeError, ValueError):
+            position = 0
+        listings.append(
+            (
+                position,
+                MarketplaceListing(
+                    title=f"Size {size_label}",
+                    price=round(price, 2),
+                    currency=str(variant.get("currency") or fallback_currency).upper(),
+                    condition="New",
+                    url=product_url,
+                    source="StockX",
+                    size=size_label,
+                    totalAsks=_int_or_none(variant.get("total_asks")),
+                    salesLast30Days=_int_or_none(variant.get("sales_count_30_days")),
+                ),
+            )
+        )
+    listings.sort(key=lambda item: item[0])
+    return [listing for _, listing in listings[:40]]
+
+
+def _kicksdb_variant_size_label(variant: dict[str, Any]) -> str:
+    # Prefer the display form matching the variant's own size system
+    # (e.g. "US M 10" from sizes[] where type == size_type) over the bare
+    # numeric `size`, which is ambiguous across men's/women's/GS scales.
+    size_type = str(variant.get("size_type") or "").strip().lower()
+    sizes = variant.get("sizes")
+    if isinstance(sizes, list):
+        for entry in sizes:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("type") or "").strip().lower() == size_type:
+                label = str(entry.get("size") or "").strip()
+                if label:
+                    return label
+    return str(variant.get("size") or "").strip() or "One size"
+
+
+def _int_or_none(value: object) -> int | None:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 def _kicksdb_match_confidence(row: dict[str, Any], query: str) -> float:
