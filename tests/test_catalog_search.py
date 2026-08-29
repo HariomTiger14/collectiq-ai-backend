@@ -1865,10 +1865,13 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
             "https://tcgplayer-cdn.tcgplayer.com/product/42382_200w.jpg",
         )
 
-    def test_detail_sibling_variant_rows_suppress_tcgdex_too(self) -> None:
-        # TCGdex also has exactly one photo per card, so the same
-        # print-variant ambiguity that suppresses the TCGplayer generic
-        # image must suppress TCGdex.
+    def test_detail_plain_row_gets_tcgdex_image_despite_variant_siblings(self) -> None:
+        # TCGdex images are canonical base-print scans, so the PLAIN row is
+        # exactly what the photo depicts -- bracket-tagged siblings must
+        # not suppress it. Real bug found live on rollout day: search
+        # showed a thumbnail for a plain row (Area Zero Underdepths #131,
+        # which has [Reverse Holo]/[Prize Pack]/[Gym Stamp Asia] siblings)
+        # while its detail page suppressed the same image.
         service = self._service(
             search_row={
                 "pricecharting_id": "990002",
@@ -1896,6 +1899,40 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
         )
 
         response = service.detail("990002")
+
+        self.assertEqual(
+            response.result.imageUrl,
+            "https://assets.tcgdex.net/en/sv/sv07/025/high.webp",
+        )
+
+    def test_detail_bracketed_variant_row_never_gets_tcgdex_image(self) -> None:
+        # An unstamped base scan on a [Reverse Holo] row would be visibly
+        # wrong -- bracketed rows only ever get the TCGplayer variant-exact
+        # image, never the TCGdex base scan.
+        service = self._service(
+            search_row={
+                "pricecharting_id": "990003",
+                "product_name": "Pikachu [Reverse Holo] #25",
+                "console_name": "Pokemon Stellar Crown",
+                "category": "Pokemon Card",
+                "loose_price_cents": 900,
+                "currency": "USD",
+            },
+            tcgplayer_rows={},
+            sibling_rows={
+                "Pokemon Stellar Crown": [
+                    {"pricecharting_id": "990003",
+                     "product_name": "Pikachu [Reverse Holo] #25"},
+                ]
+            },
+            tcgdex_rows={
+                ("en", "stellar crown", "25"): [
+                    {"image_url": "https://assets.tcgdex.net/en/sv/sv07/025"}
+                ],
+            },
+        )
+
+        response = service.detail("990003")
 
         self.assertIsNone(response.result.imageUrl)
 

@@ -993,9 +993,20 @@ class CatalogSearchService:
         # hand-verified map in tcgdex_pokemon_sets.py. The TCGplayer path
         # stays as (a) the only variant-exact source (Shadowless/error
         # products) and (b) generic fallback for its 5 classic sets, until
-        # TCGdex is validated in production and it retires. The
-        # print-variant safety above applies to BOTH sources: TCGdex also
-        # has one photo per card, so sibling ambiguity suppresses it too.
+        # TCGdex is validated in production and it retires.
+        #
+        # Print-variant safety differs by SOURCE, deliberately:
+        # - TCGdex images are canonical base-print scans, so the PLAIN row
+        #   (no bracket tag) is exactly what the photo depicts -- it gets
+        #   the image even when bracket-tagged siblings exist. Bracketed
+        #   rows never get a TCGdex image (an unstamped base scan on a
+        #   [Reverse Holo]/[1st Edition] row would be visibly wrong).
+        #   This also keeps detail consistent with the search surface
+        #   (found live: search showed a thumbnail for a plain row whose
+        #   detail page then suppressed the same image).
+        # - TCGplayer/TCGCSV photographs "one photo regardless of print"
+        #   with no guarantee WHICH print, so its generic image keeps the
+        #   original sibling suppression.
         if result.imageUrl or not result.setName or "pokemon" not in result.setName.lower():
             return result
         card_number = _pokemon_card_number(result.title)
@@ -1012,19 +1023,21 @@ class CatalogSearchService:
             if exact_image_url:
                 return result.model_copy(update={"imageUrl": exact_image_url})
 
-        # Find a generic candidate FIRST (TCGdex primary, TCGplayer
-        # classic-set fallback), and only then run the sibling-ambiguity
-        # check. Ordering matters for cost, not semantics: the sibling
-        # query runs against 12M-row pricecharting_catalog with no btree
-        # on console_name (~160ms warm, worse under tier-3 write load,
-        # observed timing out live), while both image lookups are cheap
-        # indexed hits on small tables. Misses -- the common case -- now
-        # never pay for the sibling check at all.
-        generic_image_url = self._fetch_tcgdex_pokemon_image(set_name, card_number)
-        if generic_image_url is None and group_name is not None:
-            generic_image_url = self._fetch_tcgplayer_generic_image(
-                group_name, card_number
-            )
+        # TCGdex: plain rows only, no sibling check needed (see comment
+        # above -- the base scan IS the plain print).
+        if variant_token is None:
+            tcgdex_image_url = self._fetch_tcgdex_pokemon_image(set_name, card_number)
+            if tcgdex_image_url:
+                return result.model_copy(update={"imageUrl": tcgdex_image_url})
+
+        # TCGplayer generic fallback keeps the original sibling-suppression
+        # semantics. Candidate fetched FIRST, sibling check only before
+        # attaching: the sibling query runs against 12M-row
+        # pricecharting_catalog (~160ms warm, worse under tier-3 write
+        # load, observed timing out live), so misses must never pay for it.
+        if group_name is None:
+            return result
+        generic_image_url = self._fetch_tcgplayer_generic_image(group_name, card_number)
         if generic_image_url is None:
             return result
         if self._has_sibling_pokemon_rows(set_name, card_number, exclude_id=result.id):
