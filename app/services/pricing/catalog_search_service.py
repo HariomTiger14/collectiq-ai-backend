@@ -18,6 +18,12 @@ from app.services.pricing.ebay_listing_service import (
     EbayListingService,
     ebay_marketplace_for_currency,
 )
+from app.services.pricing.tcgdex_pokemon_sets import (
+    normalize_card_number,
+    resolve_english_set_key,
+    resolve_japanese_set_name,
+    resolve_promo_set_key,
+)
 from app.services.pricing.pricecharting_listing_service import (
     PriceChartingListingService,
 )
@@ -870,29 +876,96 @@ class CatalogSearchService:
         # same set+number, suppress rather than guess; (3) otherwise (no
         # siblings — true for most cards, which only have one row) use
         # the plain match, since there's no ambiguity to get wrong.
+        # 2026-08-29 (reviewer-approved): TCGdex (tcgdex_pokemon_catalog,
+        # imported by scripts/import_tcgdex_pokemon_catalog.py) is now the
+        # PRIMARY generic image source -- all English sets by normalized
+        # set-name equality, "Pokemon Promo" rows routed to Black Star
+        # Promo sets by number prefix, Japanese sets only through the
+        # hand-verified map in tcgdex_pokemon_sets.py. The TCGplayer path
+        # stays as (a) the only variant-exact source (Shadowless/error
+        # products) and (b) generic fallback for its 5 classic sets, until
+        # TCGdex is validated in production and it retires. The
+        # print-variant safety above applies to BOTH sources: TCGdex also
+        # has one photo per card, so sibling ambiguity suppresses it too.
         if result.imageUrl or not result.setName or "pokemon" not in result.setName.lower():
-            return result
-        group_name = _POKEMON_SET_TCGPLAYER_GROUPS.get(result.setName.strip().lower())
-        if group_name is None:
             return result
         card_number = _pokemon_card_number(result.title)
         if card_number is None:
             return result
+        set_name = result.setName.strip()
+        group_name = _POKEMON_SET_TCGPLAYER_GROUPS.get(set_name.lower())
 
         variant_token = _pokemon_variant_token(result.title)
-        exact_image_url = self._fetch_tcgplayer_exact_variant_image(
-            group_name, card_number, variant_token
-        )
-        if exact_image_url:
-            return result.model_copy(update={"imageUrl": exact_image_url})
+        if group_name is not None:
+            exact_image_url = self._fetch_tcgplayer_exact_variant_image(
+                group_name, card_number, variant_token
+            )
+            if exact_image_url:
+                return result.model_copy(update={"imageUrl": exact_image_url})
 
-        if self._has_sibling_pokemon_rows(result.setName, card_number, exclude_id=result.id):
-            return result
-
-        generic_image_url = self._fetch_tcgplayer_generic_image(group_name, card_number)
+        # Find a generic candidate FIRST (TCGdex primary, TCGplayer
+        # classic-set fallback), and only then run the sibling-ambiguity
+        # check. Ordering matters for cost, not semantics: the sibling
+        # query runs against 12M-row pricecharting_catalog with no btree
+        # on console_name (~160ms warm, worse under tier-3 write load,
+        # observed timing out live), while both image lookups are cheap
+        # indexed hits on small tables. Misses -- the common case -- now
+        # never pay for the sibling check at all.
+        generic_image_url = self._fetch_tcgdex_pokemon_image(set_name, card_number)
+        if generic_image_url is None and group_name is not None:
+            generic_image_url = self._fetch_tcgplayer_generic_image(
+                group_name, card_number
+            )
         if generic_image_url is None:
             return result
+        if self._has_sibling_pokemon_rows(set_name, card_number, exclude_id=result.id):
+            return result
         return result.model_copy(update={"imageUrl": generic_image_url})
+
+    def _fetch_tcgdex_pokemon_image(
+        self, console_name: str, card_number: str
+    ) -> str | None:
+        # Deterministic set resolution only (see tcgdex_pokemon_sets.py):
+        # unmapped Japanese sets and unroutable promo numbers mean no
+        # attempt, never a fuzzy guess. Exactly one row must match --
+        # zero is a miss, two+ is an ambiguity we don't trust.
+        lowered = console_name.lower()
+        if lowered.startswith("pokemon japanese"):
+            ja_set_name = resolve_japanese_set_name(console_name)
+            if ja_set_name is None:
+                return None
+            set_filter = {"language": "eq.ja", "set_name": f"eq.{ja_set_name}"}
+        elif lowered == "pokemon promo":
+            promo_set_key = resolve_promo_set_key(card_number)
+            if promo_set_key is None:
+                return None
+            set_filter = {"language": "eq.en", "set_key": f"eq.{promo_set_key}"}
+        else:
+            set_key = resolve_english_set_key(console_name)
+            if set_key is None:
+                return None
+            set_filter = {"language": "eq.en", "set_key": f"eq.{set_key}"}
+        params = {
+            "select": "image_url",
+            **set_filter,
+            "local_id_norm": f"eq.{normalize_card_number(card_number)}",
+            "limit": "2",
+        }
+        payload = self._request("GET", "/rest/v1/tcgdex_pokemon_catalog", params=params)
+        rows = (
+            [row for row in payload if isinstance(row, dict)]
+            if isinstance(payload, list)
+            else []
+        )
+        if len(rows) != 1:
+            return None
+        image_base = rows[0].get("image_url")
+        if not image_base:
+            return None
+        # TCGdex asset base + documented quality/format suffix; 600x825,
+        # the size their docs designate for "the main attraction" surface
+        # (our detail page -- card search results stay link-only).
+        return f"{image_base}/high.webp"
 
     def _fetch_tcgplayer_rows(self, group_name: str, card_number: str) -> list[dict[str, Any]]:
         params = {
@@ -949,21 +1022,28 @@ class CatalogSearchService:
     def _has_sibling_pokemon_rows(
         self, set_name: str, card_number: str, *, exclude_id: str
     ) -> bool:
-        # Cheap by design: an indexed eq filter on console_name narrows
-        # to a handful of rows before the ilike suffix check ever runs,
-        # nothing like the unindexed full-table scans this table has
-        # broken on before (see _fetch_rows()'s comment).
+        # Console-equality only, suffix check client-side. The obvious
+        # server-side version (console eq + product_name ilike '%#<n>')
+        # planned onto the product_name trigram index instead, which
+        # explodes on short numbers ('%#27' -> 56K candidate rows,
+        # measured 13s live) -- the planner's pattern-selectivity estimate
+        # is off by ~50x, so it keeps picking that path even now that
+        # pricecharting_catalog_pokemon_sibling_idx exists. Fetching the
+        # console's rows alone forces the partial index (one set = a few
+        # hundred rows; the largest Pokemon console, "Pokemon Promo", is
+        # ~2.5K -- the 3000 cap covers every console with headroom).
         params = {
-            "select": "pricecharting_id",
+            "select": "pricecharting_id,product_name",
             "console_name": f"eq.{set_name}",
-            "product_name": f"ilike.*#{card_number}",
-            "limit": "3",
+            "limit": "3000",
         }
         payload = self._request("GET", "/rest/v1/pricecharting_catalog", params=params)
         if not isinstance(payload, list):
             return False
+        suffix = f"#{card_number}".lower()
         return any(
             str(row.get("pricecharting_id")) != str(exclude_id)
+            and str(row.get("product_name") or "").lower().endswith(suffix)
             for row in payload
             if isinstance(row, dict)
         )
