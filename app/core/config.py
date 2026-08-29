@@ -192,6 +192,12 @@ class Settings:
         "PRICECHARTING_SHARED_THROTTLE_ENABLED",
         "true",
     )
+    rawg_api_key: str = os.getenv("RAWG_API_KEY", "")
+    rawg_api_base: str = os.getenv(
+        "RAWG_API_BASE",
+        "https://api.rawg.io/api",
+    )
+    rawg_timeout_seconds: float = float(os.getenv("RAWG_TIMEOUT_SECONDS", "5"))
     pricing_cache_ttl_seconds: int = int(os.getenv("PRICING_CACHE_TTL_SECONDS", "900"))
     pricing_provider_min_interval_ms: int = int(
         os.getenv("PRICING_PROVIDER_MIN_INTERVAL_MS", "250")
@@ -206,6 +212,74 @@ class Settings:
     firebase_project_id: str = os.getenv("FIREBASE_PROJECT_ID", "")
     firebase_service_account_json: str = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "")
     firebase_access_token: str = os.getenv("FIREBASE_ACCESS_TOKEN", "")
+
+    # ---- Resend (support ticket reply notifications) ----
+    # Separate from whatever SMTP provider Supabase Auth uses for its own
+    # emails (password reset etc, configured in the Supabase dashboard, not
+    # here) -- this is a direct application-level integration for arbitrary
+    # transactional email the backend triggers itself.
+    resend_api_key: str = os.getenv("RESEND_API_KEY", "")
+    resend_from_address: str = os.getenv("RESEND_FROM_ADDRESS", "PackLox Support <info@packlox.com>")
+
+    # ---- Google Play (real subscription verification) ----
+    # Whether /subscription/verify may TRUST the client: the "mock" source
+    # (SIT dummy billing) and the trust-the-claim fallback used when a
+    # store verifier isn't configured yet. Defaults to true everywhere
+    # EXCEPT production -- in production an unverified claim must never
+    # grant a paid plan (that is the whole money bug), so there the mock
+    # source is rejected and an unconfigured verifier fails CLOSED with a
+    # retryable 503 instead of open with a free Pro. Overridable for a
+    # deliberate prod smoke test, never as a steady state.
+    subscription_allow_untrusted_sources: bool = os.getenv(
+        "SUBSCRIPTION_ALLOW_UNTRUSTED_SOURCES",
+        "false" if resolve_environment() in ("production", "prod") else "true",
+    ).strip().lower() in ("1", "true", "yes")
+
+    google_play_package_name: str = os.getenv("GOOGLE_PLAY_PACKAGE_NAME", "com.collectiq.ai")
+    # Same raw-JSON-in-env-var convention as firebase_service_account_json above
+    # -- a separate service account, scoped to the Android Publisher API only
+    # (least privilege: it must not also carry Firebase messaging access).
+    google_play_service_account_json: str = os.getenv("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON", "")
+    # Matches GooglePlayBillingConfig's defaults in the mobile app
+    # (google_play_billing_repository.dart) -- must stay in sync with
+    # whatever COLLECTIQ_PRO_PRODUCT_ID/COLLECTIQ_PREMIUM_PRODUCT_ID the app
+    # was built with, since this is how a verified purchase's productId
+    # maps back to a plan name.
+    google_play_pro_product_id: str = os.getenv("GOOGLE_PLAY_PRO_PRODUCT_ID", "collectiq_pro_monthly_test")
+    google_play_premium_product_id: str = os.getenv(
+        "GOOGLE_PLAY_PREMIUM_PRODUCT_ID", "collectiq_premium_monthly_test",
+    )
+    google_play_timeout_seconds: float = float(os.getenv("GOOGLE_PLAY_TIMEOUT_SECONDS", "10"))
+    # Real-Time Developer Notifications arrive as an authenticated Pub/Sub
+    # push request; the OIDC token's audience must match this webhook's own
+    # public URL exactly, or a forged POST claiming to be Pub/Sub would be
+    # accepted. Sourced from public_api_url by default since that's already
+    # this backend's known external URL.
+    google_play_rtdn_audience: str = os.getenv(
+        "GOOGLE_PLAY_RTDN_AUDIENCE",
+        os.getenv("PUBLIC_API_URL", "https://api-sit.packlox.com").rstrip("/") + "/subscription/webhooks/google",
+    )
+
+    # ---- Apple App Store (real subscription verification) ----
+    apple_bundle_id: str = os.getenv("APPLE_BUNDLE_ID", "com.hariom.collectiqai")
+    apple_issuer_id: str = os.getenv("APPLE_ISSUER_ID", "")
+    apple_key_id: str = os.getenv("APPLE_KEY_ID", "")
+    # The .p8 private key's raw PEM content (App Store Connect > Users and
+    # Access > Keys), same "paste the whole file as one env var" convention
+    # as the Google service account JSON above -- not a file path, since
+    # this runs on Render where there's no persistent/mounted filesystem to
+    # put a real key file on.
+    apple_private_key: str = os.getenv("APPLE_PRIVATE_KEY", "")
+    apple_app_apple_id: str = os.getenv("APPLE_APP_APPLE_ID", "")
+    # Defaults match Google Play's product ids -- many apps reuse the same
+    # identifier string across both stores for simplicity, but these are
+    # independently configured in App Store Connect and can be overridden
+    # separately once real Apple product ids are registered.
+    apple_pro_product_id: str = os.getenv("APPLE_PRO_PRODUCT_ID", "collectiq_pro_monthly_test")
+    apple_premium_product_id: str = os.getenv("APPLE_PREMIUM_PRODUCT_ID", "collectiq_premium_monthly_test")
+    # "sandbox" until the app is actually live on the App Store -- matches
+    # api_storekit_environment naming applestoreserverlibrary itself uses.
+    apple_storekit_environment: str = os.getenv("APPLE_STOREKIT_ENVIRONMENT", "sandbox")
 
 
 settings = Settings()

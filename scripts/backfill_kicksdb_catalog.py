@@ -34,6 +34,8 @@ from typing import Any
 
 import httpx
 
+from scripts._ops_run_recorder import dump_and_report, run_with_recorder
+
 
 DEFAULT_API_BASE = "https://api.kicks.dev"
 DEFAULT_PAGE_SIZE = 100
@@ -61,26 +63,110 @@ PAGE_FETCH_RETRY_DELAY_SECONDS = 2.0
 # idempotent either way (write_catalog_rows only touches rows whose
 # content_hash actually changed), so running it daily against this same
 # list is exactly what keeps the catalog and its price history current.
-DEFAULT_SEGMENTS = [
-    {"label": "sneakers-by-rank", "filters": 'product_type="sneakers"', "sort": "rank"},
-    {"label": "nike-by-rank", "filters": 'product_type="sneakers" AND brand="Nike"', "sort": "rank"},
-    {"label": "jordan-by-rank", "filters": 'product_type="sneakers" AND brand="Jordan"', "sort": "rank"},
-    {"label": "adidas-by-rank", "filters": 'product_type="sneakers" AND brand="Adidas"', "sort": "rank"},
-    {
-        "label": "new-balance-by-rank",
-        "filters": 'product_type="sneakers" AND brand="New Balance"',
-        "sort": "rank",
-    },
-    {"label": "puma-by-rank", "filters": 'product_type="sneakers" AND brand="Puma"', "sort": "rank"},
-    {"label": "reebok-by-rank", "filters": 'product_type="sneakers" AND brand="Reebok"', "sort": "rank"},
-    {"label": "asics-by-rank", "filters": 'product_type="sneakers" AND brand="Asics"', "sort": "rank"},
-    {
-        "label": "converse-by-rank",
-        "filters": 'product_type="sneakers" AND brand="Converse"',
-        "sort": "rank",
-    },
-    {"label": "vans-by-rank", "filters": 'product_type="sneakers" AND brand="Vans"', "sort": "rank"},
+# Brands big enough that a single brand query still hits the 1,000-result
+# cap (each was confirmed live reporting total=1000, i.e. "at least 1,000").
+# One query can therefore never enumerate them, so each is additionally
+# split by gender: the four gender values are disjoint, so their windows
+# sum to well past what the brand-only query alone could reach. Jordan for
+# example reports 1,000+ in EACH of men/women/kids on its own.
+_CAPPED_BRANDS = [
+    "Nike",
+    "Jordan",
+    "Adidas",
+    "New Balance",
+    "Puma",
+    "Reebok",
+    "Asics",
+    "Converse",
+    "Vans",
+    "Salomon",
+    "Saucony",
+    "Crocs",
+    "UGG",
+    "On",
+    "Under Armour",
+    "Balenciaga",
+    "Alexander McQueen",
 ]
+
+# Every gender value present in KicksDB's sneaker data. Splitting on an
+# incomplete list would silently drop products, so this is enumerated from
+# the live catalog rather than assumed -- "kids" and "unisex" together
+# account for ~1,000 rows that a naive men/women split would lose. (Note
+# the value is "kids", not "youth"; "youth" returns zero.)
+_GENDERS = ["men", "women", "kids", "unisex"]
+
+# Brands whose entire catalog fits comfortably under the 1,000 cap, so one
+# query each is enough -- no gender split needed. Sizes confirmed live.
+# Several of these were almost entirely absent before (Yeezy had 5 of its
+# 122 products stored, Timberland 3 of 745) because they had no segment of
+# their own and only surfaced if they happened to rank in the global
+# top-1,000.
+_SMALL_BRANDS = [
+    "Yeezy",
+    "Birkenstock",
+    "Timberland",
+    "Onitsuka Tiger",
+    "Merrell",
+    "Mizuno",
+    "Brooks",
+    "Rick Owens",
+    "Maison Mihara Yasuhiro",
+    "Diadora",
+    "Fila",
+    "Golden Goose",
+    "Veja",
+    "Lacoste",
+    "Common Projects",
+    "Bravest Studios",
+]
+
+
+def _slug(value: str) -> str:
+    return value.lower().replace(" ", "-")
+
+
+def _build_default_segments() -> list[dict[str, str]]:
+    segments = [
+        # Global top-1,000 by rank: the catch-all. Kept in front of the
+        # per-brand segments so a brand that never gets its own entry (a new
+        # one, or a gender value not in _GENDERS) still has a route in.
+        {"label": "sneakers-by-rank", "filters": 'product_type="sneakers"', "sort": "rank"},
+    ]
+    for brand in _CAPPED_BRANDS:
+        # The unsplit brand query is kept alongside its gender splits. It is
+        # partly redundant, but it is the safety net if KicksDB ever adds a
+        # gender value we don't enumerate -- without it those products would
+        # vanish from the catalog silently.
+        segments.append(
+            {
+                "label": f"{_slug(brand)}-by-rank",
+                "filters": f'product_type="sneakers" AND brand="{brand}"',
+                "sort": "rank",
+            }
+        )
+        segments.extend(
+            {
+                "label": f"{_slug(brand)}-{gender}-by-rank",
+                "filters": (
+                    f'product_type="sneakers" AND brand="{brand}" AND gender="{gender}"'
+                ),
+                "sort": "rank",
+            }
+            for gender in _GENDERS
+        )
+    segments.extend(
+        {
+            "label": f"{_slug(brand)}-by-rank",
+            "filters": f'product_type="sneakers" AND brand="{brand}"',
+            "sort": "rank",
+        }
+        for brand in _SMALL_BRANDS
+    )
+    return segments
+
+
+DEFAULT_SEGMENTS = _build_default_segments()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -164,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     print(
-        json.dumps(
+        dump_and_report(
             {
                 "success": True,
                 "dryRun": args.dry_run,
@@ -624,4 +710,4 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_with_recorder("kicksdb-catalog-refresh", main))

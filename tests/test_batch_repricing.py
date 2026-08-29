@@ -242,6 +242,7 @@ def test_available_reprice_writes_a_valuation_snapshot():
     assert snapshot["value_aud"] == 250.0
     assert snapshot["low_estimate_aud"] == 200.0
     assert snapshot["high_estimate_aud"] == 300.0
+    assert snapshot["currency"] == "AUD"
     assert snapshot["valuation_status"] == "market_estimated"
     assert snapshot["pricing_provider"] == "MarketEngine"
     assert snapshot["confidence_score"] == 0.9
@@ -479,6 +480,24 @@ def test_catalog_matched_item_uses_catalog_lookup_valuation_strategy():
     service.reprice_all()
 
     assert snapshots[0]["valuation_strategy"] == "catalog_lookup"
+
+
+def test_catalog_matched_item_display_string_is_formatted_not_raw_float():
+    # Real bug hit in review: this path built its own displayString inline
+    # (f"{currency} {value}") instead of reusing reprice_service's
+    # _display_string(), so it skipped both the "$" and the :,.2f rounding
+    # that the live-API path always applies. A catalog-matched item with an
+    # FX-converted value like 15.184800000000001 showed literally that
+    # float, unrounded, on the admin user-detail valuation history panel.
+    catalog = _FakeCatalogSearch(market_value=250.0)
+    item = _item(pricecharting_id="12345")
+    service, _patched, snapshots = _service(
+        items_pages=[[item]], reprice=_ExplodingReprice(), catalog_search=catalog
+    )
+
+    service.reprice_all()
+
+    assert snapshots[0]["display_string"] == "AUD $250.00"
 
 
 def test_catalog_item_with_no_price_is_a_noop():

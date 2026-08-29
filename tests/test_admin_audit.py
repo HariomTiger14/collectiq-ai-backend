@@ -50,6 +50,35 @@ class AdminAuditTest(unittest.TestCase):
         self.assertEqual(payload["count"], 1)
         self.assertEqual(payload["events"][0]["targetId"], "item-1")
 
+    def test_list_events_oldest_first_reverses_the_in_memory_fallback(self) -> None:
+        # _IN_MEMORY_AUDIT_EVENTS is newest-first (record() inserts at
+        # index 0) -- oldest_first must actually return the oldest match,
+        # not just the newest N reversed in place.
+        service = AdminAuditService()
+        service.record(action="admin_users.role_updated", status="success", target_id="user-1")
+        service.record(action="admin_users.role_updated", status="success", target_id="user-1")
+        service.record(action="admin_users.role_updated", status="success", target_id="user-1")
+
+        newest = service.list_events(target_id="user-1", limit=1)
+        oldest = service.list_events(target_id="user-1", limit=1, oldest_first=True)
+
+        self.assertNotEqual(newest["events"][0]["id"], oldest["events"][0]["id"])
+        all_events = service.list_events(target_id="user-1", limit=10)["events"]
+        self.assertEqual(oldest["events"][0]["id"], all_events[-1]["id"])
+        self.assertEqual(newest["events"][0]["id"], all_events[0]["id"])
+
+    def test_supabase_repository_list_events_oldest_first_sets_ascending_order(self) -> None:
+        client = _FakeAuditSupabaseClient()
+        repository = SupabaseAdminAuditRepository(
+            supabase_url="https://supabase.test",
+            service_role_key="service-role",
+            client=client,
+        )
+
+        repository.list_events(oldest_first=True, limit=1)
+
+        self.assertEqual(client.requests[-1]["params"]["order"], "created_at.asc")
+
     def test_audit_events_endpoint_filters_status_target_type_actor_and_dates(self) -> None:
         AdminAuditService().record(
             action="pricing_review_queue.override_price",

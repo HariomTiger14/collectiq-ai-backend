@@ -9,6 +9,10 @@ from app.services.pricing.admin_review_queue_service import (
     SupabasePricingReviewQueueRepository,
 )
 
+# Caps the per-request fan-out of single-user Supabase Auth lookups used to
+# fill in an email for owners with no collector_profiles display name.
+_MAX_OWNER_EMAIL_LOOKUPS = 20
+
 
 class AdminPortfolioService:
     def __init__(
@@ -18,9 +22,19 @@ class AdminPortfolioService:
     ) -> None:
         self._repository = repository or SupabasePricingReviewQueueRepository()
 
-    def list_items(self, *, query: str | None = None, limit: int = 50) -> dict[str, Any]:
+    def list_items(
+        self,
+        *,
+        query: str | None = None,
+        limit: int = 50,
+        user_id: str | None = None,
+        offset: int = 0,
+        category: str | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+    ) -> dict[str, Any]:
         items = (
-            self._repository.list_items(limit=max(limit, 200))
+            self._repository.list_items(limit=max(limit, 200), user_id=user_id, offset=offset, category=category)
             if self._repository.is_configured
             else portfolio_service.list_items()
         )
@@ -31,13 +45,49 @@ class AdminPortfolioService:
                 for item in items
                 if normalized_query in _portfolio_search_text(item)
             ]
+        # Client-side, not a DB filter -- same limitation class as text
+        # search (see the comment below on totalCount). Price mostly lives
+        # inside the pricing/data JSONB blob, not a plain indexed column
+        # (only a scan-derived fallback, estimated_value, is a real column),
+        # so a correct DB-level range filter isn't safely expressible here.
+        if min_price is not None or max_price is not None:
+            items = [item for item in items if _item_price_in_range(item, min_price, max_price)]
         limited = items[:limit]
+        owner_names: dict[str, str] = {}
+        if self._repository.is_configured:
+            owner_ids = [str(item.data.get("userId")) for item in limited if item.data.get("userId")]
+            owner_names = self._repository.batch_owner_display_names(owner_ids)
+            # Not every user sets a display name. For the (usually small)
+            # remainder, fall back to their real email — one request per
+            # distinct owner, since Supabase Auth has no bulk-by-ids lookup.
+            # Capped so a page full of strangers can't turn into an
+            # unbounded fan-out of admin API calls.
+            missing_ids = list(dict.fromkeys(oid for oid in owner_ids if oid not in owner_names))
+            for owner_id in missing_ids[:_MAX_OWNER_EMAIL_LOOKUPS]:
+                email = self._repository.get_user_email(owner_id)
+                if email:
+                    owner_names[owner_id] = email
+        # A real DB total only means "total pages" when nothing is being
+        # filtered client-side (search or price range) -- both filter over
+        # a fetched batch, not at the DB level, so a count=estimated total
+        # would be the whole table's/category's count, not the filtered
+        # result's. Falls back to the old fetched-batch-length
+        # approximation whenever either is active.
+        has_client_side_filter = bool(normalized_query) or min_price is not None or max_price is not None
+        total_count = (
+            self._repository.count_items(user_id=user_id, category=category)
+            if self._repository.is_configured and not has_client_side_filter
+            else len(items)
+        )
         return {
             "success": True,
             "query": query or "",
             "count": len(limited),
-            "totalCount": len(items),
-            "items": [_compact_portfolio_item(item) for item in limited],
+            "totalCount": total_count,
+            "items": [
+                _compact_portfolio_item(item, owner_display_name=owner_names.get(str(item.data.get("userId"))))
+                for item in limited
+            ],
         }
 
     def get_item(self, item_id: str) -> dict[str, Any]:
@@ -48,9 +98,26 @@ class AdminPortfolioService:
         )
         if item is None:
             raise KeyError(f"Portfolio item {item_id} was not found.")
+        valuation_history = (
+            self._repository.list_valuation_history_for_item(item_id)
+            if self._repository.is_configured
+            else []
+        )
+        # list_items() resolves a real name/email for the Owner column, but
+        # this single-item lookup never did the same -- the item detail page
+        # showed a raw UUID even when the exact same item's row on the list
+        # page showed a real name.
+        owner_display_name = None
+        if self._repository.is_configured:
+            user_id = item.data.get("userId")
+            if user_id:
+                owner_display_name = self._repository.batch_owner_display_names([str(user_id)]).get(str(user_id))
+                if not owner_display_name:
+                    owner_display_name = self._repository.get_user_email(str(user_id))
         return {
             "success": True,
-            "item": _compact_portfolio_item(item, include_raw=True),
+            "item": _compact_portfolio_item(item, include_raw=True, owner_display_name=owner_display_name),
+            "valuationHistory": [_compact_valuation_snapshot(row) for row in valuation_history],
         }
 
     def update_item(self, item_id: str, updates: dict[str, Any], *, actor: str = "admin") -> dict[str, Any]:
@@ -103,7 +170,26 @@ def _portfolio_search_text(item: PortfolioItem) -> str:
     return " ".join(str(value) for value in values if value).lower()
 
 
-def _compact_portfolio_item(item: PortfolioItem, *, include_raw: bool = False) -> dict[str, Any]:
+def _item_price_in_range(item: PortfolioItem, min_price: float | None, max_price: float | None) -> bool:
+    data = item.data
+    pricing = data.get("pricing") if isinstance(data.get("pricing"), dict) else {}
+    value = _first_value(data, pricing, "estimatedValue", "estimatedMarketValue", "marketValue", "price")
+    try:
+        price = float(value) if value is not None else None
+    except (TypeError, ValueError):
+        price = None
+    if price is None:
+        return False
+    if min_price is not None and price < min_price:
+        return False
+    if max_price is not None and price > max_price:
+        return False
+    return True
+
+
+def _compact_portfolio_item(
+    item: PortfolioItem, *, include_raw: bool = False, owner_display_name: str | None = None,
+) -> dict[str, Any]:
     data = item.data
     pricing = data.get("pricing") if isinstance(data.get("pricing"), dict) else {}
     value = _first_value(data, pricing, "estimatedValue", "estimatedMarketValue", "marketValue", "price")
@@ -113,7 +199,11 @@ def _compact_portfolio_item(item: PortfolioItem, *, include_raw: bool = False) -
         "category": _first_text(data, "category", "type") or "Unknown",
         "condition": _first_text(data, "condition") or "Unknown",
         "userId": _first_text(data, "userId", "ownerId", "user_id", "owner_id") or "Unknown",
-        "ownerEmail": _first_text(data, "ownerEmail", "email"),
+        # There's no email column on this table (email lives only in
+        # Supabase Auth) — ownerEmail is really "owner display name" when
+        # sourced from collector_profiles, kept under its original field
+        # name so the frontend doesn't need to change.
+        "ownerEmail": owner_display_name or _first_text(data, "ownerEmail", "email"),
         "price": value,
         "currency": _first_text(data, pricing, "currency", "displayCurrency") or "USD",
         "provider": _provider_name(pricing),
@@ -136,43 +226,31 @@ def _compact_portfolio_item(item: PortfolioItem, *, include_raw: bool = False) -
 
 
 def _editable_portfolio_updates(updates: dict[str, Any]) -> dict[str, Any]:
+    # Financial/workflow fields (price, currency, confidence, pricingProvider,
+    # valuationStatus, reviewStatus) are deliberately not editable here — see
+    # the comment on PortfolioItemUpdateRequest for why.
     cleaned: dict[str, Any] = {}
     text_fields = {
         "category": "category",
         "condition": "condition",
         "adminNotes": "adminNotes",
-        "valuationStatus": "valuationStatus",
-        "reviewStatus": "reviewStatus",
-        "pricingProvider": "pricingProvider",
-        "currency": "currency",
     }
     for source_key, target_key in text_fields.items():
         value = updates.get(source_key)
         if value is not None:
             cleaned[target_key] = str(value).strip()
-    if "confidence" in updates and updates["confidence"] not in (None, ""):
-        cleaned["pricingConfidence"] = _bounded_number(updates["confidence"], minimum=0, maximum=100)
-    if "price" in updates and updates["price"] not in (None, ""):
-        price = _bounded_number(updates["price"], minimum=0)
-        cleaned["estimatedMarketValue"] = price
-        pricing = updates.get("pricing") if isinstance(updates.get("pricing"), dict) else {}
-        cleaned["pricing"] = {
-            **pricing,
-            "estimatedMarketValue": price,
-            "currency": cleaned.get("currency") or pricing.get("currency") or "USD",
-            "pricingConfidence": cleaned.get("pricingConfidence"),
-            "pricingSource": {"name": cleaned.get("pricingProvider") or pricing.get("pricingProvider") or "admin_override"},
-        }
     return {key: value for key, value in cleaned.items() if value not in (None, "")}
 
 
-def _bounded_number(value: Any, *, minimum: float = 0, maximum: float | None = None) -> float:
-    number = float(value)
-    if number < minimum:
-        number = minimum
-    if maximum is not None and number > maximum:
-        number = maximum
-    return number
+def _compact_valuation_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "valueAud": row.get("value_aud"),
+        "displayString": row.get("display_string"),
+        "valuationStatus": row.get("valuation_status"),
+        "valuationStrategy": row.get("valuation_strategy"),
+        "pricedAt": row.get("priced_at"),
+    }
 
 
 def _provider_name(pricing: dict[str, Any]) -> str:

@@ -11,7 +11,7 @@ from unittest.mock import patch
 import httpx
 from fastapi.testclient import TestClient
 
-from app.core.config import Settings, parse_cors_allowed_origins
+from app.core.config import Settings, UPLOAD_DIR, parse_cors_allowed_origins
 from app.main import app
 from app.services.ai.gemini_recognition_provider import GeminiRecognitionProvider
 from app.services.ai.openai_recognition_provider import OpenAIRecognitionProvider
@@ -175,7 +175,10 @@ class ApiEndpointsTest(unittest.TestCase):
         payload = response.json()
         self.assertTrue(payload["success"])
         self.assertTrue(payload["filename"].endswith(".png"))
-        self.assertIn("/uploads/", payload["imageUrl"])
+        # Uploads are transient analysis inputs: no hosted URL is returned and
+        # the file must not survive the request.
+        self.assertIsNone(payload["imageUrl"])
+        self.assertFalse((UPLOAD_DIR / payload["filename"]).exists())
         self.assertTrue(payload["title"])
         self.assertIn(
             payload["category"],
@@ -230,6 +233,41 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertGreaterEqual(pricing["pricingConfidence"], 0)
         self.assertLessEqual(pricing["pricingConfidence"], 100)
         self.assertTrue(pricing["lastUpdated"])
+
+    def test_uploads_are_not_served_over_http(self) -> None:
+        # The old public /uploads static mount is gone; nothing the scanner
+        # writes may be reachable over HTTP.
+        response = self.client.get("/uploads/anything.png")
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_api_analyze_enforces_scan_quota_for_signed_in_users(self) -> None:
+        # /api/analyze must apply the same free-plan monthly cap as the root
+        # /analyze route — it used to be an unmetered bypass.
+        with patch(
+            "app.routers.api_analyze._subscription_service.check_scan_allowed",
+            return_value={"allowed": False, "used": 30},
+        ):
+            response = self.client.post(
+                "/api/analyze",
+                json=_api_analyze_payload(),
+                headers={"Authorization": "Bearer test-user-token"},
+            )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("Monthly scan limit", response.json()["error"])
+
+    def test_api_analyze_quota_is_fail_open_without_token(self) -> None:
+        # No bearer token → the quota check must not run at all; the scan
+        # proceeds even when the subscription service would deny it.
+        with patch(
+            "app.routers.api_analyze._subscription_service.check_scan_allowed",
+            return_value={"allowed": False, "used": 30},
+        ) as check:
+            response = self.client.post("/api/analyze", json=_api_analyze_payload())
+
+        self.assertEqual(response.status_code, 200)
+        check.assert_not_called()
 
     def test_api_analyze_happy_path(self) -> None:
         response = self.client.post("/api/analyze", json=_api_analyze_payload())

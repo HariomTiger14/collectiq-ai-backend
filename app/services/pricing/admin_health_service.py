@@ -22,6 +22,24 @@ class PricingHealthService:
     stale_after_hours: int = 36
     client: httpx.Client | None = None
 
+    def quick_health(self) -> dict[str, Any]:
+        """Providers + currency only -- no network call at all, since both
+        are computed purely from local settings/env vars. Exists because the
+        full `health()` bundles these behind `_summary_health()`'s Supabase
+        RPC (`pricecharting_catalog_health_summary`), which has been
+        observed taking ~49s in production (an unindexed query over the
+        catalog tables) -- callers that only need provider/currency status
+        (the Settings page) shouldn't have to wait on catalog health they
+        never display.
+        """
+        catalog_configured = bool(self._supabase_url and self._service_role_key)
+        return {
+            "success": True,
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
+            "providers": _provider_statuses(catalog_configured),
+            "currency": _currency_status(),
+        }
+
     def health(self) -> dict[str, Any]:
         generated_at = datetime.now(timezone.utc)
         catalog_configured = bool(self._supabase_url and self._service_role_key)

@@ -1,13 +1,15 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from app.core.config import UPLOAD_DIR, settings
+from app.services.ops.observability import record_unhandled_error
 from app.routers import (
     admin_audit,
     admin_catalog,
+    admin_catalog_image_flags,
     admin_catalog_promotion,
+    admin_fx_rates,
     admin_notes,
     admin_ops,
     admin_pricecharting,
@@ -20,13 +22,17 @@ from app.routers import (
     api_analyze,
     api_subscription,
     auth,
+    data_requests,
     health,
+    client_telemetry,
     metadata,
     pricing,
     portfolio,
     push,
     scanner,
     search,
+    subscription_webhooks,
+    support,
 )
 
 
@@ -45,14 +51,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Scratch directory for in-flight scanner uploads. Files are deleted after
+# analysis; nothing here is served over HTTP.
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(admin_audit.router)
 app.include_router(admin_catalog.router)
+app.include_router(admin_catalog_image_flags.router)
 app.include_router(admin_catalog_promotion.router)
+app.include_router(admin_fx_rates.router)
 app.include_router(admin_notes.router)
 app.include_router(admin_ops.router)
 app.include_router(admin_pricecharting.router)
@@ -62,15 +71,19 @@ app.include_router(admin_pricing.router)
 app.include_router(admin_reports.router)
 app.include_router(admin_scans.router)
 app.include_router(admin_users.router)
+app.include_router(data_requests.router)
+app.include_router(support.router)
 app.include_router(push.router)
 app.include_router(api_analyze.root_router)
 app.include_router(api_analyze.router)
 app.include_router(api_subscription.router)
+app.include_router(subscription_webhooks.router)
 app.include_router(scanner.router)
 app.include_router(portfolio.router)
 app.include_router(pricing.router)
 app.include_router(search.router)
 app.include_router(metadata.router)
+app.include_router(client_telemetry.router)
 
 
 @app.exception_handler(HTTPException)
@@ -81,4 +94,24 @@ async def http_exception_handler(
     return JSONResponse(
         status_code=exc.status_code,
         content={"success": False, "error": exc.detail},
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(
+    request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    # Every unhandled exception becomes an ops_error_events row so the
+    # admin portal's error feed sees it (grouped by route + error class);
+    # HTTPExceptions never reach here -- deliberate 4xx/5xx responses are
+    # not defects. The route TEMPLATE (/admin/users/{user_id}), not the
+    # concrete path, keys the fingerprint so one buggy route groups as
+    # one issue. Recording is best-effort and can never mask the error:
+    # the client still gets the same 500 it always did.
+    route = getattr(getattr(request, "scope", {}).get("route"), "path", None) or request.url.path
+    record_unhandled_error(route=route, error=exc)
+    return JSONResponse(
+        status_code=500,
+        content={"success": False, "error": {"code": "internal_error", "message": "Internal server error."}},
     )

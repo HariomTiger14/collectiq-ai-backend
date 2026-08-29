@@ -14,6 +14,7 @@ from app.services.pricing.base_pricing_provider import (
 from app.services.pricing.mock_pricing_provider import MockPricingProvider
 from app.services.pricing.pricecharting_pricing_provider import (
     PriceChartingPricingProvider,
+    attribution_url_for,
 )
 
 
@@ -341,6 +342,30 @@ def _pricecharting_payload() -> dict:
     }
 
 
+def _video_game_priced_payload() -> dict:
+    """A row named like the card but priced like a boxed game.
+
+    box-only-price / manual-only-price are the tells: PriceCharting only
+    publishes them for games, and they are exactly the fields that produced
+    the bogus $62 median for a trading card.
+    """
+    return {
+        "products": [
+            {
+                "id": "pc-vg-9",
+                "product-name": "Raichu #19",
+                "console-name": "Pokemon Trading Card Game",
+                "loose-price": 5600,
+                "graded-price": 5600,
+                "box-only-price": 6200,
+                "manual-only-price": 14900,
+                "currency": "USD",
+                "lastUpdated": "2026-08-22T00:00:00Z",
+            }
+        ]
+    }
+
+
 def _lego_payload() -> dict:
     return {
         "products": [
@@ -547,6 +572,110 @@ class _FakeThrottle:
         self.acquired_for.append(provider_name)
         if self.exception is not None:
             raise self.exception
+
+
+class TradingCardCategoryGuardTest(unittest.TestCase):
+    """Regression cover for a real mispricing.
+
+    A scanned Raichu card was priced at $62 AUD off comps titled "Raichu #19
+    Graded / Box Only / Manual Only" -- video-game condition tiers. The card
+    is worth ~$1.84. The guard that should have caught this never ran,
+    because _expected_category_family returned None for trading cards and
+    short-circuited the whole check.
+    """
+
+    def test_trading_card_scan_rejects_a_video_game_product(self) -> None:
+        recognition = _recognition(
+            title="Raichu #19",
+            category="Trading Card Game",
+            condition="Unknown",
+        )
+        provider = _provider(
+            client=_FakeHttpClient(
+                response=_FakeResponse(body=_video_game_priced_payload()),
+            ),
+        )
+
+        with self.assertRaises(EmptyMarketDataError):
+            provider.price(recognition)
+
+    def test_trading_card_scan_still_accepts_a_real_card_product(self) -> None:
+        recognition = _recognition(
+            title="1999 Pokemon Charizard Holo",
+            category="Trading Card Game",
+            condition="Near Mint",
+        )
+        provider = _provider(
+            client=_FakeHttpClient(
+                response=_FakeResponse(body=_pricecharting_payload()),
+            ),
+        )
+
+        pricing = provider.price(recognition)
+
+        self.assertGreater(pricing.estimatedMarketValue, 0)
+
+    def test_trading_card_categories_are_recognised_as_a_guarded_family(
+        self,
+    ) -> None:
+        provider = _provider()
+        for category in [
+            "Trading Card Game",
+            "Pokemon Card",
+            "Magic the Gathering",
+            "YuGiOh",
+            "Lorcana",
+            "One Piece Card Game",
+        ]:
+            with self.subTest(category=category):
+                self.assertEqual(
+                    provider._expected_category_family(category),
+                    "trading_card",
+                )
+
+    def test_sports_cards_keep_their_own_stricter_family(self) -> None:
+        provider = _provider()
+
+        self.assertEqual(
+            provider._expected_category_family("Sports Card"),
+            "sports_card",
+        )
+
+
+class AttributionUrlForTest(unittest.TestCase):
+    def test_builds_a_real_pricecharting_product_link(self) -> None:
+        url = attribution_url_for(
+            pricing_provider="pricecharting", matched_product_id="123456"
+        )
+
+        self.assertEqual(
+            url, "https://www.pricecharting.com/offers?product=123456"
+        )
+
+    def test_matches_case_insensitively_and_within_a_compound_provider_name(
+        self,
+    ) -> None:
+        url = attribution_url_for(
+            pricing_provider="PriceCharting+eBay", matched_product_id="9"
+        )
+
+        self.assertEqual(url, "https://www.pricecharting.com/offers?product=9")
+
+    def test_returns_none_without_a_matched_product_id(self) -> None:
+        self.assertIsNone(
+            attribution_url_for(pricing_provider="pricecharting", matched_product_id="")
+        )
+        self.assertIsNone(
+            attribution_url_for(pricing_provider="pricecharting", matched_product_id=None)
+        )
+
+    def test_returns_none_for_a_non_pricecharting_provider(self) -> None:
+        self.assertIsNone(
+            attribution_url_for(pricing_provider="ebay", matched_product_id="123")
+        )
+        self.assertIsNone(
+            attribution_url_for(pricing_provider=None, matched_product_id="123")
+        )
 
 
 if __name__ == "__main__":

@@ -79,6 +79,52 @@ class AdminOpsSummaryEndpointTest(unittest.TestCase):
         self.assertNotIn("service-role-secret", serialized)
 
 
+class AdminOpsReadinessEndpointTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+
+    def test_requires_admin_token(self) -> None:
+        with patch("app.routers.admin_auth.settings") as settings:
+            settings.admin_import_token = "secret-token"
+
+            response = self.client.get(
+                "/admin/ops/readiness",
+                headers={"X-Admin-Token": "wrong-token"},
+            )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_returns_readiness_without_touching_pricing_or_health_checks(self) -> None:
+        # The whole point of this endpoint: it must not call
+        # HealthCheckService or PricingHealthService at all — those are
+        # what make /admin/ops/summary slow (a Supabase RPC observed
+        # taking ~49s in production). If either factory gets called here,
+        # this endpoint has regressed into doing the same expensive work.
+        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+            "app.routers.admin_ops.settings",
+        ) as settings, patch(
+            "app.routers.admin_ops.HealthCheckService",
+        ) as health_factory, patch(
+            "app.routers.admin_ops.PricingHealthService",
+        ) as pricing_factory:
+            auth_settings.admin_import_token = "secret-token"
+            _configure_settings(settings)
+
+            response = self.client.get(
+                "/admin/ops/readiness",
+                headers={"Authorization": "Bearer secret-token"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertTrue(payload["success"])
+        readiness = {item["key"]: item for item in payload["readiness"]}
+        self.assertTrue(readiness["admin_import_token"]["configured"])
+        self.assertFalse(readiness["openai_api_key"]["configured"])
+        health_factory.assert_not_called()
+        pricing_factory.assert_not_called()
+
+
 def _configure_settings(settings) -> None:
     settings.environment = "sit"
     settings.application_name = "PackLox API"

@@ -6,9 +6,11 @@ from app.schemas.api_subscription import (
 )
 from app.services.subscription.subscription_service import (
     SubscriptionNotConfiguredError,
+    SubscriptionPurchaseInvalidError,
     SubscriptionService,
     SubscriptionServiceError,
     SubscriptionUnauthorizedError,
+    SubscriptionVerificationUnavailableError,
 )
 
 router = APIRouter(prefix="/subscription", tags=["Subscription"])
@@ -36,6 +38,23 @@ def _handle(callable_):
     except SubscriptionNotConfiguredError as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        )
+    except SubscriptionVerificationUnavailableError as error:
+        # The purchase may be genuine; the server just can't verify it yet
+        # (store credentials not configured). Retryable, and deliberately
+        # NOT the 422 below -- the app must not tell the user their
+        # purchase is invalid.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        )
+    except SubscriptionPurchaseInvalidError as error:
+        # A forged/wrong-app/wrong-environment purchase claim -- distinct
+        # from a transient store-API failure (502 below), so the app can
+        # tell "your purchase is invalid" apart from "try again shortly".
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(error),
         )
     except SubscriptionServiceError as error:

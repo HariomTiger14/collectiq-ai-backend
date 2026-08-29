@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from app.routers.admin_auth import require_admin_import_token
@@ -28,6 +28,36 @@ def get_catalog_pipeline_status(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
                 "code": "admin_pipeline_status_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+
+
+@router.get("/items")
+def list_catalog_items(
+    source: str = Query(default="pricecharting", pattern="^(pricecharting|kicksdb|all)$"),
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    category: str | None = Query(default=None, min_length=1),
+    categoryGroup: str | None = Query(default=None, min_length=1),
+    minPrice: float | None = Query(default=None, ge=0),
+    maxPrice: float | None = Query(default=None, ge=0),
+    q: str | None = Query(default=None, max_length=120),
+    sort: str | None = Query(default=None, pattern="^(price_asc|price_desc)$"),
+    _admin: None = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    try:
+        return AdminCatalogService().list_items(
+            source=source, limit=limit, offset=offset,
+            category=category, category_group=categoryGroup, min_price=minPrice, max_price=maxPrice,
+            query=q, sort=sort,
+        )
+    except AdminCatalogError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "admin_catalog_list_unavailable",
                 "message": str(error),
                 "retryable": True,
             },

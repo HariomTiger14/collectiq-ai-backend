@@ -12,28 +12,41 @@ router = APIRouter(prefix="/admin/portfolio", tags=["Admin Portfolio"])
 
 
 class PortfolioItemUpdateRequest(BaseModel):
+    # Deliberately excludes price/currency/confidence/pricingProvider/
+    # valuationStatus/reviewStatus. Those are financial/workflow fields that
+    # already have their own properly-audited override paths — pricing
+    # overrides go through the Pricing Review Queue (typed confirmation +
+    # mandatory note), and reviewStatus is written by the scan-failure and
+    # review-queue flows. Letting this general-purpose item edit form also
+    # write those fields, with no note requirement, was a second, looser
+    # door to the same consequential actions.
     category: str | None = Field(default=None, max_length=120)
     condition: str | None = Field(default=None, max_length=120)
     adminNotes: str | None = Field(default=None, max_length=2000)
-    valuationStatus: str | None = Field(default=None, max_length=80)
-    reviewStatus: str | None = Field(default=None, max_length=80)
-    price: float | None = Field(default=None, ge=0)
-    currency: str | None = Field(default=None, max_length=8)
-    confidence: float | None = Field(default=None, ge=0, le=100)
-    pricingProvider: str | None = Field(default=None, max_length=120)
 
 
 @router.get("/items")
 def list_admin_portfolio_items(
     q: str | None = Query(default=None, min_length=1),
     limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    userId: str | None = Query(default=None, min_length=1),
+    category: str | None = Query(default=None, min_length=1),
+    minPrice: float | None = Query(default=None, ge=0),
+    maxPrice: float | None = Query(default=None, ge=0),
     _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
-    payload = AdminPortfolioService().list_items(query=q, limit=limit)
+    payload = AdminPortfolioService().list_items(
+        query=q, limit=limit, user_id=userId, offset=offset,
+        category=category, min_price=minPrice, max_price=maxPrice,
+    )
     _record_audit(
         action="admin_portfolio.items_viewed",
         status="success",
-        metadata={"query": q or "", "count": payload.get("count", 0)},
+        metadata={
+            "query": q or "", "userId": userId or "", "offset": offset, "count": payload.get("count", 0),
+            "category": category or "", "minPrice": minPrice, "maxPrice": maxPrice,
+        },
     )
     return payload
 

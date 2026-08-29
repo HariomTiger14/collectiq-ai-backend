@@ -30,13 +30,18 @@ from typing import Any
 
 import httpx
 
+from scripts._ops_run_recorder import dump_and_report, run_with_recorder
 from scripts.backfill_pricecharting_sets import (
     REQUEST_HEADERS,
     SOURCE_SITE_BASE_URLS,
     chunked,
     write_catalog_rows,
 )
-from scripts.import_pricecharting_catalog import SupabaseCatalogClient, to_catalog_row
+from scripts.import_pricecharting_catalog import (
+    SupabaseCatalogClient,
+    to_catalog_row,
+    to_catalog_row_from_api_product,
+)
 
 
 # source_file values written by refresh_pricecharting_catalog.py's own daily
@@ -122,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     print(
-        json.dumps(
+        dump_and_report(
             {
                 "success": True,
                 "dryRun": args.dry_run,
@@ -161,7 +166,7 @@ def refresh_candidates(
         if product is None:
             failed += 1
             continue
-        catalog_row = to_catalog_row(product, f"{source_site}-tracked-refresh", source_downloaded_at)
+        catalog_row = to_catalog_row_from_api_product(product, f"{source_site}-tracked-refresh", source_downloaded_at)
         if catalog_row is None:
             failed += 1
             continue
@@ -328,4 +333,4 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_with_recorder("tracked-items-refresh", main))

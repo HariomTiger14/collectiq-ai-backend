@@ -6,6 +6,36 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.services.pricing.admin_review_queue_service import _total_from_content_range
+from app.services.pricing.catalog_search_service import (
+    PRICECHARTING_CATEGORY_GROUPS,
+    PRICECHARTING_PLATFORM_GROUPS,
+    SNEAKERS_CATEGORY_KEY,
+    resolve_category_group_filters,
+    _POKEMON_SET_TCGPLAYER_GROUPS,
+    _funko_lookup_title,
+    _lego_name_words,
+    _lego_set_number,
+    _lego_title_before_number,
+    _magic_card_name,
+    _magic_card_number,
+    _magic_set_name_from_console,
+    _normalize_magic_text,
+    _lorcana_set_name_from_console,
+    _onepiece_meaningful_words,
+    _onepiece_set_code,
+    _yugioh_set_code,
+    _normalize_variant_words,
+    _pokemon_card_number,
+    _pokemon_variant_token,
+    _video_game_base_title,
+    _video_game_like_escape,
+    _video_game_normalize_name,
+    _video_game_rawg_platform,
+    _video_game_resolve_normalized_name,
+    _video_game_strip_punctuation,
+    select_best_funko_image,
+)
 
 
 class AdminCatalogError(Exception):
@@ -20,6 +50,103 @@ class AdminCatalogService:
     ) -> None:
         self._repository = repository or SupabaseAdminCatalogRepository()
 
+    def _list_items_all_sources(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        category: str | None,
+        category_group: str | None,
+        min_price: float | None,
+        max_price: float | None,
+        query: str,
+        sort: str | None,
+    ) -> dict[str, Any]:
+        """One page spanning both catalog tables: half PriceCharting, half
+        KicksDB, each side paged independently at offset//2.
+
+        A true cross-table merge would need a shared ranking (search) or a
+        shared sort key (browse) across tables with different columns and
+        different index guarantees -- cost out of proportion for an
+        internal tool. The half-and-half page is honest instead: each
+        side keeps its own native order, a page is always at most `limit`
+        rows, and when one table runs out its half simply comes back
+        empty while the other keeps paging.
+
+        A category-group filter picks sides the same way the public
+        search does: sneakers lives only in kicksdb_catalog, every other
+        group only in pricecharting_catalog, so the excluded side is
+        skipped outright rather than queried for guaranteed-empty pages.
+        (SNEAKERS_CATEGORY_KEY is the shared constant the mobile app's
+        chips send.)
+        """
+        include_pricecharting = category_group != SNEAKERS_CATEGORY_KEY
+        include_kicksdb = category_group is None or category_group == SNEAKERS_CATEGORY_KEY
+        # With one side filtered out the survivor gets the whole page --
+        # half-and-half only makes sense when there are two halves.
+        both = include_pricecharting and include_kicksdb
+        per_side = max(1, limit // 2) if both else limit
+        side_offset = offset // 2 if both else offset
+        searching = bool(query) and len(query) >= 2
+
+        pc_rows: list[dict[str, Any]] = []
+        kd_rows: list[dict[str, Any]] = []
+        pc_more = kd_more = False
+        total_count: int | None = None
+        if searching:
+            if include_pricecharting:
+                pc_rows, pc_more = self._repository.search_catalog_rows(
+                    query, limit=per_side, offset=side_offset,
+                    category_group=category_group, min_price=min_price, max_price=max_price,
+                )
+            if include_kicksdb:
+                kd_rows, kd_more = self._repository.search_kicksdb_rows(
+                    query, limit=per_side, offset=side_offset,
+                    min_price=min_price, max_price=max_price,
+                )
+        else:
+            total_count = 0
+            if include_pricecharting:
+                pc_rows = self._repository.list_catalog_rows(
+                    source="pricecharting", limit=per_side, offset=side_offset,
+                    category=category, category_group=category_group,
+                    min_price=min_price, max_price=max_price, sort=sort,
+                )
+                total_count += self._repository.count_catalog_rows(
+                    source="pricecharting", category=category, category_group=category_group,
+                    min_price=min_price, max_price=max_price,
+                ) or 0
+            if include_kicksdb:
+                kd_rows = self._repository.list_catalog_rows(
+                    source="kicksdb", limit=per_side, offset=side_offset,
+                    category=category, category_group=None,
+                    min_price=min_price, max_price=max_price, sort=sort,
+                )
+                total_count += self._repository.count_catalog_rows(
+                    source="kicksdb", category=category, category_group=None,
+                    min_price=min_price, max_price=max_price,
+                ) or 0
+
+        pc_items = [_compact_catalog_row(row, source="pricecharting") for row in pc_rows]
+        pc_items = self._enrich_funko_images(pc_items)
+        pc_items = self._enrich_pokemon_images(pc_items)
+        pc_items = self._enrich_lego_images(pc_items)
+        pc_items = self._enrich_magic_images(pc_items)
+        pc_items = self._enrich_yugioh_images(pc_items)
+        pc_items = self._enrich_lorcana_images(pc_items)
+        pc_items = self._enrich_onepiece_images(pc_items)
+        pc_items = self._enrich_videogames_images(pc_items)
+        kd_items = [_compact_catalog_row(row, source="kicksdb") for row in kd_rows]
+        items = pc_items + kd_items
+        return {
+            "success": True,
+            "source": "all",
+            "count": len(items),
+            "totalCount": total_count,
+            "hasMore": (pc_more or kd_more) if searching else None,
+            "items": items,
+        }
+
     def update_item(self, catalog_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not self._repository.is_configured:
             raise AdminCatalogError("Supabase catalog configuration is missing.")
@@ -31,6 +158,400 @@ class AdminCatalogService:
             raise AdminCatalogError("At least one catalog field is required.")
         row = self._repository.update_catalog_item(item_id, update)
         return {"success": True, "itemId": item_id, "item": row}
+
+    def list_items(
+        self,
+        *,
+        source: str = "pricecharting",
+        limit: int = 100,
+        offset: int = 0,
+        category: str | None = None,
+        category_group: str | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+        query: str | None = None,
+        sort: str | None = None,
+    ) -> dict[str, Any]:
+        if not self._repository.is_configured:
+            raise AdminCatalogError("Supabase catalog configuration is missing.")
+        normalized_source = source if source in ("pricecharting", "kicksdb", "all") else "pricecharting"
+        bounded_limit = max(1, min(limit, 100))
+        normalized_query = (query or "").strip()
+        if normalized_source == "all":
+            return self._list_items_all_sources(
+                limit=bounded_limit, offset=max(0, offset),
+                category=category, category_group=category_group,
+                min_price=min_price, max_price=max_price,
+                query=normalized_query, sort=sort,
+            )
+        # A typed search reuses the same relevance-ranked RPC the public
+        # catalog search runs (search_pricecharting_catalog), instead of
+        # the plain paginated browse below -- so the admin table can show
+        # publisher-sourced images on a text search too, not just on the
+        # empty-query browse list. (The public /api/pricing/catalog/search
+        # endpoint deliberately never renders images inline -- that's the
+        # right call for the open, unauthenticated consumer surface, but
+        # there's no reason for this internal, admin-token-gated tool to
+        # inherit the same restriction.) KicksDB has no search RPC yet
+        # (see list_catalog_rows), so a query is only honored for
+        # PriceCharting -- same "browse only" behavior the admin portal's
+        # own KicksDB tab already enforces client-side.
+        #
+        # category/category_group/min_price/max_price now flow into the
+        # search branch too (previously dropped the moment a query was
+        # typed -- see search_catalog_rows' own comment). Sort has no
+        # meaning here: the RPC already orders by relevance, and combining
+        # that with a price/recency sort isn't a coherent ask -- sort only
+        # applies to the plain-browse branch below.
+        has_more: bool | None = None
+        if normalized_query and len(normalized_query) >= 2 and normalized_source == "pricecharting":
+            rows, has_more = self._repository.search_catalog_rows(
+                normalized_query, limit=bounded_limit, offset=max(0, offset),
+                category_group=category_group, min_price=min_price, max_price=max_price,
+            )
+            total_count = None
+        elif normalized_query and len(normalized_query) >= 2 and normalized_source == "kicksdb":
+            # The "no search RPC yet" this branch used to cite went stale:
+            # search_kicksdb_catalog has existed since the sneakers catalog
+            # landed (the public Discover search uses it). Wire it up so the
+            # admin KicksDB tab stops being browse-only.
+            rows, has_more = self._repository.search_kicksdb_rows(
+                normalized_query, limit=bounded_limit, offset=max(0, offset),
+                min_price=min_price, max_price=max_price,
+            )
+            total_count = None
+        else:
+            rows = self._repository.list_catalog_rows(
+                source=normalized_source, limit=bounded_limit, offset=max(0, offset),
+                category=category, category_group=category_group, min_price=min_price, max_price=max_price,
+                sort=sort,
+            )
+            total_count = self._repository.count_catalog_rows(
+                source=normalized_source, category=category, category_group=category_group,
+                min_price=min_price, max_price=max_price,
+            )
+        items = [_compact_catalog_row(row, source=normalized_source) for row in rows]
+        if normalized_source == "pricecharting":
+            items = self._enrich_funko_images(items)
+            items = self._enrich_pokemon_images(items)
+            items = self._enrich_lego_images(items)
+            items = self._enrich_magic_images(items)
+            items = self._enrich_yugioh_images(items)
+            items = self._enrich_lorcana_images(items)
+            items = self._enrich_onepiece_images(items)
+            items = self._enrich_videogames_images(items)
+        return {
+            "success": True,
+            "source": normalized_source,
+            "count": len(rows),
+            "totalCount": total_count,
+            "hasMore": has_more,
+            "items": items,
+        }
+
+    def _enrich_funko_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # PriceCharting has no image data at all (confirmed live — see
+        # catalog_search_service.py). One batched lookup per page covers
+        # every Funko row on it, not one request per row.
+        lookup_by_index = {
+            index: _funko_lookup_title(str(item.get("title") or ""))
+            for index, item in enumerate(items)
+            if item.get("setName") and "funko" in str(item["setName"]).lower()
+        }
+        titles = sorted({title for title in lookup_by_index.values() if title})
+        if not titles:
+            return items
+        images_by_title = self._repository.fetch_funko_images(titles)
+        if not images_by_title:
+            return items
+        for index, lookup_title in lookup_by_index.items():
+            image_url = images_by_title.get(lookup_title)
+            if image_url:
+                items[index]["imageUrl"] = image_url
+        return items
+
+    def _enrich_pokemon_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mirrors CatalogSearchService._enrich_with_pokemon_image -- same
+        # small, verified _POKEMON_SET_TCGPLAYER_GROUPS mapping and the
+        # same print-variant safety rules (exact match first, suppress
+        # rather than guess when sibling variant rows exist, plain match
+        # otherwise), so the admin browse table shows the same images
+        # -- and the same gaps -- the mobile/public search does. See that
+        # method's comment for the full reasoning. tcgplayer_pokemon_
+        # catalog is our own small Supabase table (imported from TCGCSV),
+        # so this is one cheap indexed query per matched row, not a live
+        # third-party call.
+        targets = [
+            (index, item)
+            for index, item in enumerate(items)
+            if not item.get("imageUrl")
+            and item.get("setName")
+            and str(item["setName"]).strip().lower() in _POKEMON_SET_TCGPLAYER_GROUPS
+        ]
+        for index, item in targets:
+            group_name = _POKEMON_SET_TCGPLAYER_GROUPS[str(item["setName"]).strip().lower()]
+            card_number = _pokemon_card_number(str(item.get("title") or ""))
+            if not card_number:
+                continue
+            variant_token = _pokemon_variant_token(str(item.get("title") or ""))
+            image_url = self._repository.fetch_tcgplayer_exact_variant_image(
+                group_name, card_number, variant_token
+            )
+            if image_url:
+                items[index]["imageUrl"] = image_url
+                continue
+            if self._repository.has_sibling_pokemon_rows(
+                str(item["setName"]), card_number, exclude_id=str(item.get("id") or "")
+            ):
+                continue
+            generic_image_url = self._repository.fetch_tcgplayer_generic_image(
+                group_name, card_number
+            )
+            if generic_image_url:
+                items[index]["imageUrl"] = generic_image_url
+        return items
+
+    def _enrich_lego_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mirrors CatalogSearchService._enrich_with_lego_image -- same
+        # Rebrickable-backed base-number-plus-word-overlap safety check,
+        # so the admin browse table shows the same images -- and avoids
+        # the same false-number-match risk -- the mobile/public search
+        # does. One batched lookup per page covers every distinct LEGO
+        # set number on it, not one request per row (same pattern as the
+        # Funko enrichment above).
+        targets = [
+            (index, item)
+            for index, item in enumerate(items)
+            if not item.get("imageUrl")
+            and item.get("setName")
+            and "lego" in str(item["setName"]).lower()
+        ]
+        lookup_by_index: dict[int, tuple[str, set[str]]] = {}
+        for index, item in targets:
+            title = str(item.get("title") or "")
+            base_number = _lego_set_number(title)
+            if base_number is None:
+                continue
+            title_words = _lego_name_words(_lego_title_before_number(title))
+            if not title_words:
+                continue
+            lookup_by_index[index] = (base_number, title_words)
+        base_numbers = sorted({base_number for base_number, _ in lookup_by_index.values()})
+        if not base_numbers:
+            return items
+        candidates_by_number = self._repository.fetch_lego_candidates(base_numbers)
+        for index, (base_number, title_words) in lookup_by_index.items():
+            for candidate in candidates_by_number.get(base_number, []):
+                candidate_words = _lego_name_words(str(candidate.get("name") or ""))
+                if title_words & candidate_words:
+                    image_url = candidate.get("image_url")
+                    if image_url:
+                        items[index]["imageUrl"] = str(image_url)
+                    break
+        return items
+
+    def _enrich_magic_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mirrors CatalogSearchService._enrich_with_magic_image -- same
+        # Scryfall-backed number-first / name-fallback matching, so the
+        # admin browse table shows the same images the mobile/public
+        # search does. Batched once per distinct Magic set on the page
+        # (collector numbers and names are set-scoped, so the lookup
+        # naturally groups by set), not one request per row.
+        targets = [
+            (index, item)
+            for index, item in enumerate(items)
+            if not item.get("imageUrl")
+            and item.get("setName")
+            and "magic" in str(item["setName"]).lower()
+        ]
+        by_set: dict[str, list[tuple[int, str | None, str]]] = {}
+        for index, item in targets:
+            set_name = _magic_set_name_from_console(str(item["setName"]))
+            if set_name is None:
+                continue
+            title = str(item.get("title") or "")
+            card_number = _magic_card_number(title)
+            normalized_name = "" if card_number is not None else _normalize_magic_text(_magic_card_name(title))
+            if card_number is None and not normalized_name:
+                continue
+            by_set.setdefault(_normalize_magic_text(set_name), []).append(
+                (index, card_number, normalized_name)
+            )
+        for normalized_set_name, entries in by_set.items():
+            numbers = sorted({number for _, number, _ in entries if number is not None})
+            names = sorted({name for _, number, name in entries if number is None and name})
+            by_number, by_name = self._repository.fetch_magic_candidates(
+                normalized_set_name, numbers=numbers, names=names
+            )
+            for index, card_number, normalized_name in entries:
+                image_url = by_number.get(card_number) if card_number is not None else by_name.get(normalized_name)
+                if image_url:
+                    items[index]["imageUrl"] = image_url
+        return items
+
+    def _enrich_yugioh_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mirrors CatalogSearchService._enrich_with_yugioh_image -- same
+        # global set_code lookup (no per-set resolution needed), so the
+        # admin browse table shows the same images the mobile/public
+        # search does. One batched lookup per page covers every distinct
+        # set code on it, not one request per row (same pattern as the
+        # Funko/LEGO enrichment above).
+        lookup_by_index: dict[int, str] = {}
+        for index, item in enumerate(items):
+            if item.get("imageUrl") or not item.get("setName"):
+                continue
+            if "yugioh" not in str(item["setName"]).lower():
+                continue
+            set_code = _yugioh_set_code(str(item.get("title") or ""))
+            if set_code:
+                lookup_by_index[index] = set_code
+        set_codes = sorted(set(lookup_by_index.values()))
+        if not set_codes:
+            return items
+        images_by_code = self._repository.fetch_yugioh_images(set_codes)
+        for index, set_code in lookup_by_index.items():
+            image_url = images_by_code.get(set_code)
+            if image_url:
+                items[index]["imageUrl"] = image_url
+        return items
+
+    def _enrich_lorcana_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mirrors CatalogSearchService._enrich_with_lorcana_image -- same
+        # normalized-set-name + card-number lookup, so the admin browse
+        # table shows the same images the mobile/public search does.
+        # Batched once per distinct Lorcana set on the page (card numbers
+        # are set-scoped, so the lookup naturally groups by set), not one
+        # request per row.
+        by_set: dict[str, list[tuple[int, str]]] = {}
+        for index, item in enumerate(items):
+            if item.get("imageUrl") or not item.get("setName"):
+                continue
+            if "lorcana" not in str(item["setName"]).lower():
+                continue
+            set_name = _lorcana_set_name_from_console(str(item["setName"]))
+            if set_name is None:
+                continue
+            card_number = _lego_set_number(str(item.get("title") or ""))
+            if card_number is None:
+                continue
+            by_set.setdefault(_normalize_magic_text(set_name), []).append((index, card_number))
+        for normalized_set_name, entries in by_set.items():
+            numbers = sorted({number for _, number in entries})
+            images_by_number = self._repository.fetch_lorcana_images(normalized_set_name, numbers)
+            for index, card_number in entries:
+                image_url = images_by_number.get(card_number)
+                if image_url:
+                    items[index]["imageUrl"] = image_url
+        return items
+
+    def _enrich_onepiece_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mirrors CatalogSearchService._enrich_with_onepiece_image -- same
+        # is_plain / word-overlap disambiguation, so the admin browse
+        # table shows the same images -- and the same conservative gaps
+        # -- the mobile/public search does. Batched once per distinct set
+        # code on the page, not one request per row.
+        lookup_by_index: dict[int, tuple[str, str | None]] = {}
+        for index, item in enumerate(items):
+            if item.get("imageUrl") or not item.get("setName"):
+                continue
+            if "one piece" not in str(item["setName"]).lower():
+                continue
+            title = str(item.get("title") or "")
+            set_code = _onepiece_set_code(title)
+            if set_code is None:
+                continue
+            lookup_by_index[index] = (set_code, _pokemon_variant_token(title))
+        set_codes = sorted({code for code, _ in lookup_by_index.values()})
+        if not set_codes:
+            return items
+        rows_by_code = self._repository.fetch_onepiece_rows(set_codes)
+        for index, (set_code, variant_token) in lookup_by_index.items():
+            rows = rows_by_code.get(set_code, [])
+            if not rows:
+                continue
+            if variant_token is None:
+                plain_rows = [row for row in rows if row.get("is_plain")]
+                if len(plain_rows) == 1:
+                    image_url = plain_rows[0].get("image_url")
+                    if image_url:
+                        items[index]["imageUrl"] = str(image_url)
+                continue
+            variant_words = _onepiece_meaningful_words(variant_token)
+            if not variant_words:
+                continue
+            # Strict subset, and only when it uniquely identifies one
+            # candidate -- see CatalogSearchService._enrich_with_
+            # onepiece_image for why "any word in common" produced real
+            # wrong matches.
+            matches = [
+                row
+                for row in rows
+                if not row.get("is_plain")
+                and variant_words.issubset(_onepiece_meaningful_words(str(row.get("card_name") or "")))
+            ]
+            if len(matches) == 1:
+                image_url = matches[0].get("image_url")
+                if image_url:
+                    items[index]["imageUrl"] = str(image_url)
+        return items
+
+    def _enrich_videogames_images(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # Mirrors CatalogSearchService._enrich_with_video_games_image --
+        # same rawg_video_game_catalog lookup, so the admin browse table
+        # shows the same images the mobile/public search does. Unlike
+        # every other category above, there's no "video games" keyword to
+        # gate on in setName/category (PriceCharting's video-games export
+        # has none) -- the gate here IS the platform mapping itself, same
+        # as the mobile/public path. Each item's (normalized_name,
+        # rawg_platform) pair is its own lookup key rather than a shared
+        # per-set key, so this batches across the whole page as one
+        # OR-filtered request instead of grouping by set the way the
+        # Magic/Lorcana/One Piece lookups above do.
+        targets: list[tuple[int, str, str]] = []
+        for index, item in enumerate(items):
+            if item.get("imageUrl") or not item.get("setName"):
+                continue
+            rawg_platform = _video_game_rawg_platform(str(item["setName"]))
+            if rawg_platform is None:
+                continue
+            base_title = _video_game_base_title(str(item.get("title") or ""))
+            if not base_title:
+                continue
+            normalized_name = _video_game_normalize_name(base_title)
+            if not normalized_name:
+                continue
+            normalized_name = _video_game_resolve_normalized_name(normalized_name, rawg_platform)
+            targets.append((index, normalized_name, rawg_platform))
+        if not targets:
+            return items
+        pairs = sorted({(normalized_name, rawg_platform) for _, normalized_name, rawg_platform in targets})
+        images_by_pair = self._repository.fetch_video_game_images(pairs)
+        # Prefix fallback for whatever exact match missed -- mirrors
+        # CatalogSearchService._fetch_video_game_image_by_prefix (see its
+        # comment for why: RAWG's own title is usually just longer than
+        # PriceCharting's, not a different game, and this is index-backed
+        # via rawg_video_game_catalog_lookup_idx, not a repeat of the
+        # unindexed console_name filter that had to be reverted elsewhere
+        # in this file).
+        unmatched_pairs = [pair for pair in pairs if pair not in images_by_pair]
+        if unmatched_pairs:
+            images_by_pair.update(self._repository.fetch_video_game_images_by_prefix(unmatched_pairs))
+        # Loose-match fallback for whatever prefix match still missed --
+        # mirrors CatalogSearchService._fetch_video_game_image_by_
+        # loose_match (see its comment: a mid-title punctuation difference,
+        # e.g. "Uncharted 4 A Thief's End" vs RAWG's "Uncharted 4: A
+        # Thief's End", breaks a leading-prefix match even though it's
+        # clearly the same game).
+        still_unmatched_pairs = [pair for pair in unmatched_pairs if pair not in images_by_pair]
+        if still_unmatched_pairs:
+            images_by_pair.update(
+                self._repository.fetch_video_game_images_by_loose_match(still_unmatched_pairs)
+            )
+        for index, normalized_name, rawg_platform in targets:
+            image_url = images_by_pair.get((normalized_name, rawg_platform))
+            if image_url:
+                items[index]["imageUrl"] = image_url
+        return items
 
 
 class SupabaseAdminCatalogRepository:
@@ -71,6 +592,600 @@ class SupabaseAdminCatalogRepository:
             return payload[0]
         raise AdminCatalogError("Catalog item was not found.")
 
+    def list_catalog_rows(
+        self,
+        *,
+        source: str,
+        limit: int,
+        offset: int,
+        category: str | None = None,
+        category_group: str | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+        sort: str | None = None,
+    ) -> list[dict[str, Any]]:
+        # Independent of self._table_name (which stays scoped to
+        # pricecharting_catalog for writes) -- this is read-only browsing
+        # across whichever of the two catalog tables the caller asked for.
+        #
+        # Order columns are deliberately narrow: pricecharting_catalog had
+        # five indexes dropped in 20260808_drop_unused_pricecharting_catalog_
+        # indexes.sql after an unrelated unindexed sort (product_name.asc)
+        # caused production write timeouts, and that migration's own history
+        # says a naive column choice here already broke things once. Primary
+        # keys are always index-backed, so pricecharting_id.asc is the safe
+        # default. price_asc/price_desc are backed by the dedicated indexes
+        # from 20260820_add_price_sort_index_step{1,2}_*.sql (loose_price_
+        # cents / avg_price_cents) -- deliberately no "sort by recency"
+        # option: updated_at changes on every write to this table, making an
+        # index on it the single most expensive kind to maintain here (see
+        # that migration's own comment on the 2026-08-08 incident).
+        # kicksdb_catalog's rank column has its own dedicated partial index
+        # (kicksdb_catalog_rank_idx) and doubles as a meaningful "most
+        # popular first" ordering, not just a safe one.
+        price_column = "avg_price_cents" if source == "kicksdb" else "loose_price_cents"
+        default_order = "rank.asc.nullslast" if source == "kicksdb" else "pricecharting_id.asc"
+        order = {
+            "price_asc": f"{price_column}.asc.nullslast",
+            "price_desc": f"{price_column}.desc.nullslast",
+        }.get(sort or "", default_order)
+        table_name = "kicksdb_catalog" if source == "kicksdb" else "pricecharting_catalog"
+        params = {"select": "*", "order": order, "limit": str(limit), "offset": str(offset)}
+        params.update(_catalog_filter_params(
+            source, category=category, category_group=category_group, min_price=min_price, max_price=max_price,
+        ))
+        payload = self._request("GET", f"/rest/v1/{table_name}", params=params)
+        if not isinstance(payload, list):
+            raise AdminCatalogError("Supabase catalog response shape was invalid.")
+        return [row for row in payload if isinstance(row, dict)]
+
+    def search_catalog_rows(
+        self,
+        query: str,
+        *,
+        limit: int,
+        offset: int = 0,
+        category_group: str | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        # Mirrors CatalogSearchService._fetch_rows -- same relevance-ranked
+        # search_pricecharting_catalog RPC (filter + score + sort + limit
+        # done in SQL, backed by the pg_trgm GIN indexes that RPC's own
+        # comment documents), so a text search in the admin portal returns
+        # the same rows the public/mobile search would, just run through
+        # this service's own image enrichment afterward instead of the
+        # public path's deliberate no-inline-images restriction.
+        #
+        # result_offset (20260819_add_offset_to_search_pricecharting_catalog
+        # .sql) lets this page through the full ranked result set instead
+        # of only ever returning the first page -- without it, a franchise
+        # with many editions/reprints ranking ahead of a specific title
+        # (e.g. "Uncharted 2" variants outranking "Uncharted 4") could push
+        # a real match past the fixed cutoff with no way to reach it.
+        #
+        # Fetches limit+1 rows to detect whether a next page exists, rather
+        # than a real COUNT(*) -- this RPC's own adaptive design exists
+        # specifically because a real count over a broad ilike match is
+        # exactly the expensive-query risk it was built to avoid (see the
+        # adaptive migration's own comment on why 'pokemon'-style broad
+        # queries can't afford that), so an exact search total isn't worth
+        # the same risk for a pager.
+        #
+        # category/category_group/min_price/max_price (added in
+        # 20260820_add_filters_to_search_pricecharting_catalog.sql) let a
+        # typed search combine with the same filters browse mode already
+        # supports -- previously these were silently dropped the moment an
+        # admin typed anything into the search box, category is resolved to
+        # either a platform_group exact match (video-games platforms) or a
+        # category_keywords list, mirroring _catalog_filter_params exactly
+        # so the two code paths can't drift.
+        category_keywords, platform_group_filter = resolve_category_group_filters(category_group)
+        payload = self._request(
+            "POST",
+            "/rest/v1/rpc/search_pricecharting_catalog",
+            json_payload={
+                "search_query": query,
+                "result_limit": limit + 1,
+                "result_offset": offset,
+                "category_keywords": category_keywords,
+                "min_price_cents": int(min_price * 100) if min_price is not None else None,
+                "max_price_cents": int(max_price * 100) if max_price is not None else None,
+                "platform_group_filter": platform_group_filter,
+            },
+        )
+        rows = [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
+        has_more = len(rows) > limit
+        return rows[:limit], has_more
+
+    def search_kicksdb_rows(
+        self,
+        query: str,
+        *,
+        limit: int,
+        offset: int = 0,
+        min_price: float | None = None,
+        max_price: float | None = None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        # Mirrors the public sneakers search (CatalogSearchService's
+        # search_kicksdb_catalog RPC call). The RPC has no offset
+        # parameter, so paging over-fetches offset+limit+1 rows and
+        # slices -- fine at this table's scale (~44k rows, fetches capped
+        # by the pager's reach) and not worth a migration until someone
+        # actually pages deep here.
+        payload = self._request(
+            "POST",
+            "/rest/v1/rpc/search_kicksdb_catalog",
+            json_payload={
+                "search_query": query,
+                "result_limit": offset + limit + 1,
+                "min_price_cents": int(min_price * 100) if min_price is not None else None,
+                "max_price_cents": int(max_price * 100) if max_price is not None else None,
+            },
+        )
+        rows = [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
+        window = rows[offset:offset + limit]
+        has_more = len(rows) > offset + limit
+        return window, has_more
+
+    def count_catalog_rows(
+        self,
+        *,
+        source: str,
+        category: str | None = None,
+        category_group: str | None = None,
+        min_price: float | None = None,
+        max_price: float | None = None,
+    ) -> int:
+        # count=estimated, not count=exact: pricecharting_catalog has ~43k
+        # rows and RLS enabled (20260811_enable_rls_on_catalog_and_admin_
+        # tables.sql), so an exact COUNT(*) forces a full RLS-filtered scan.
+        # This table already has a documented production incident from an
+        # unrelated expensive-query mistake (statement timeouts, see
+        # 20260808_drop_unused_pricecharting_catalog_indexes.sql) -- not
+        # worth risking a repeat for a pagination total that doesn't need
+        # to be perfectly exact. PostgREST's estimated mode uses the
+        # planner's row estimate for large tables, falling back to an exact
+        # count when the result set is already small -- this holds even
+        # with the same filters applied, since the planner's estimate
+        # already accounts for filter selectivity.
+        table_name = "kicksdb_catalog" if source == "kicksdb" else "pricecharting_catalog"
+        id_column = "kicksdb_id" if source == "kicksdb" else "pricecharting_id"
+        headers = {
+            "apikey": self._service_role_key,
+            "Authorization": f"Bearer {self._service_role_key}",
+            "Accept": "application/json",
+            "Prefer": "count=estimated",
+        }
+        params = {"select": id_column, "limit": "1"}
+        params.update(_catalog_filter_params(
+            source, category=category, category_group=category_group, min_price=min_price, max_price=max_price,
+        ))
+        client = self._client or httpx.Client(timeout=self._timeout_seconds)
+        should_close = self._client is None
+        try:
+            response = client.request(
+                "GET",
+                f"{self._supabase_url}/rest/v1/{table_name}",
+                headers=headers,
+                params=params,
+            )
+            response.raise_for_status()
+            return _total_from_content_range(response.headers.get("content-range"))
+        except httpx.HTTPError as error:
+            raise AdminCatalogError("Supabase catalog count request failed.") from error
+        finally:
+            if should_close:
+                client.close()
+
+    def fetch_funko_images(self, normalized_titles: list[str]) -> dict[str, str]:
+        # One batched request for every distinct Funko title on a page,
+        # not one request per row -- see AdminCatalogService._enrich_funko_
+        # images. PostgREST's in.() filter needs each value double-quoted
+        # so titles containing spaces are treated as single list entries.
+        unique_titles = sorted({title for title in normalized_titles if title})
+        if not unique_titles:
+            return {}
+        quoted = ",".join(f'"{title}"' for title in unique_titles)
+        payload = self._request(
+            "GET",
+            "/rest/v1/funko_pop_catalog",
+            params={
+                "select": "normalized_title,image_url,series",
+                "normalized_title": f"in.({quoted})",
+            },
+        )
+        if not isinstance(payload, list):
+            return {}
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            grouped.setdefault(str(row.get("normalized_title") or ""), []).append(row)
+        images_by_title: dict[str, str] = {}
+        for title, candidates in grouped.items():
+            image_url = select_best_funko_image(candidates)
+            if image_url:
+                images_by_title[title] = image_url
+        return images_by_title
+
+    def fetch_lego_candidates(self, base_numbers: list[str]) -> dict[str, list[dict[str, Any]]]:
+        # One batched request for every distinct LEGO set number on a
+        # page -- see AdminCatalogService._enrich_lego_images. The word-
+        # overlap safety check itself happens in the caller, against
+        # whichever candidates share a base_number.
+        unique_numbers = sorted({number for number in base_numbers if number})
+        if not unique_numbers:
+            return {}
+        quoted = ",".join(f'"{number}"' for number in unique_numbers)
+        payload = self._request(
+            "GET",
+            "/rest/v1/rebrickable_lego_catalog",
+            params={
+                "select": "base_number,name,image_url",
+                "base_number": f"in.({quoted})",
+            },
+        )
+        if not isinstance(payload, list):
+            return {}
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            grouped.setdefault(str(row.get("base_number") or ""), []).append(row)
+        return grouped
+
+    def fetch_magic_candidates(
+        self, normalized_set_name: str, *, numbers: list[str], names: list[str]
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        # One batched request per lookup type (number-based, name-based)
+        # for a whole Magic set on the page -- see AdminCatalogService.
+        # _enrich_magic_images. Collector numbers are guaranteed unique
+        # within a Scryfall set, but names are not (a reprinted basic
+        # land with no distinguishing number can appear more than once)
+        # -- either way, more than one row for the same key means no
+        # confident single image, so it's dropped rather than guessed.
+        by_number = self._fetch_magic_unique_matches(
+            normalized_set_name, column="collector_number", values=numbers
+        )
+        by_name = self._fetch_magic_unique_matches(
+            normalized_set_name, column="normalized_name", values=names
+        )
+        return by_number, by_name
+
+    def _fetch_magic_unique_matches(
+        self, normalized_set_name: str, *, column: str, values: list[str]
+    ) -> dict[str, str]:
+        unique_values = sorted({value for value in values if value})
+        if not unique_values:
+            return {}
+        quoted = ",".join(f'"{value}"' for value in unique_values)
+        payload = self._request(
+            "GET",
+            "/rest/v1/scryfall_magic_catalog",
+            params={
+                "select": f"{column},image_url",
+                "normalized_set_name": f"eq.{normalized_set_name}",
+                column: f"in.({quoted})",
+            },
+        )
+        if not isinstance(payload, list):
+            return {}
+        counts: dict[str, int] = {}
+        images: dict[str, str] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get(column) or "")
+            counts[key] = counts.get(key, 0) + 1
+            image_url = row.get("image_url")
+            if image_url:
+                images[key] = str(image_url)
+        return {key: url for key, url in images.items() if counts.get(key) == 1}
+
+    def fetch_yugioh_images(self, set_codes: list[str]) -> dict[str, str]:
+        # One batched request for every distinct Yu-Gi-Oh set code on a
+        # page -- see AdminCatalogService._enrich_yugioh_images. set_code
+        # is the table's primary key, so no ambiguity check is needed
+        # here the way Magic/LEGO need one -- import time already
+        # resolved that (see yugioh_catalog's migration comment).
+        unique_codes = sorted({code for code in set_codes if code})
+        if not unique_codes:
+            return {}
+        quoted = ",".join(f'"{code}"' for code in unique_codes)
+        payload = self._request(
+            "GET",
+            "/rest/v1/yugioh_catalog",
+            params={
+                "select": "set_code,image_url",
+                "set_code": f"in.({quoted})",
+            },
+        )
+        if not isinstance(payload, list):
+            return {}
+        images_by_code: dict[str, str] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            code = str(row.get("set_code") or "")
+            image_url = row.get("image_url")
+            if code and image_url:
+                images_by_code[code] = str(image_url)
+        return images_by_code
+
+    def fetch_video_game_images(
+        self, pairs: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], str]:
+        # One batched OR-filtered request for every distinct
+        # (normalized_name, rawg_platform) pair on the page -- see
+        # AdminCatalogService._enrich_videogames_images. Same "exactly
+        # one row or suppress" discipline as CatalogSearchService.
+        # _fetch_video_game_image: RAWG can have more than one entry for
+        # the same normalized name + platform (remasters/re-releases),
+        # so ambiguous pairs are dropped rather than guessed.
+        unique_pairs = sorted(set(pairs))
+        if not unique_pairs:
+            return {}
+        or_filter = ",".join(
+            f'and(normalized_name.eq."{name}",rawg_platform.eq."{platform}")'
+            for name, platform in unique_pairs
+        )
+        payload = self._request(
+            "GET",
+            "/rest/v1/rawg_video_game_catalog",
+            params={
+                "select": "normalized_name,rawg_platform,image_url",
+                "or": f"({or_filter})",
+            },
+        )
+        if not isinstance(payload, list):
+            return {}
+        counts: dict[tuple[str, str], int] = {}
+        images: dict[tuple[str, str], str] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            key = (str(row.get("normalized_name") or ""), str(row.get("rawg_platform") or ""))
+            counts[key] = counts.get(key, 0) + 1
+            image_url = row.get("image_url")
+            if image_url:
+                images[key] = str(image_url)
+        return {key: url for key, url in images.items() if counts.get(key) == 1}
+
+    def fetch_video_game_images_by_prefix(
+        self, pairs: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], str]:
+        # Prefix fallback for whatever fetch_video_game_images's exact
+        # match missed -- mirrors CatalogSearchService.
+        # _fetch_video_game_image_by_prefix (see its comment for why: RAWG's
+        # own title is usually just longer than PriceCharting's, not a
+        # different game -- a trailing "!"/"DX"/edition suffix, or a
+        # subtitle PriceCharting's listing omits). Index-backed via
+        # rawg_video_game_catalog_lookup_idx (normalized_name, rawg_platform),
+        # not the unindexed console_name filter that had to be reverted
+        # elsewhere in this file.
+        #
+        # One OR-filtered LIKE request across every unmatched pair, same
+        # shape as fetch_video_game_images's exact-match batch -- but since
+        # a LIKE prefix match doesn't return which literal search key it
+        # satisfied the way an eq match does, matching returned rows back
+        # to search keys (and counting real ambiguity per key, not just per
+        # returned row) happens locally below.
+        unique_pairs = sorted(set(pairs))
+        if not unique_pairs:
+            return {}
+        or_filter = ",".join(
+            f'and(normalized_name.like."{_video_game_like_escape(name)}*",rawg_platform.eq."{platform}")'
+            for name, platform in unique_pairs
+        )
+        payload = self._request(
+            "GET",
+            "/rest/v1/rawg_video_game_catalog",
+            params={
+                "select": "normalized_name,rawg_platform,image_url",
+                "or": f"({or_filter})",
+            },
+        )
+        rows = [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
+        images: dict[tuple[str, str], str] = {}
+        for name, platform in unique_pairs:
+            matches = [
+                row
+                for row in rows
+                if str(row.get("rawg_platform") or "") == platform
+                and str(row.get("normalized_name") or "").startswith(name)
+            ]
+            if len(matches) == 1:
+                image_url = matches[0].get("image_url")
+                if image_url:
+                    images[(name, platform)] = str(image_url)
+        return images
+
+    def fetch_video_game_images_by_loose_match(
+        self, pairs: list[tuple[str, str]]
+    ) -> dict[tuple[str, str], str]:
+        # Loose-match fallback for whatever fetch_video_game_images_by_
+        # prefix still missed -- mirrors CatalogSearchService._fetch_
+        # video_game_image_by_loose_match (see its comment for why: a
+        # mid-title punctuation difference, not just a trailing one,
+        # breaks a leading-prefix match even for the same game).
+        #
+        # One OR-filtered request per page, anchored on each pair's first
+        # word (small, cheap, still index-backed candidate set -- live-
+        # confirmed single digits of rows per platform even for a common
+        # first word like "uncharted"). Real comparison happens locally:
+        # both sides stripped to bare alphanumerics, requiring exactly one
+        # match per pair, same discipline as every other tier.
+        unique_pairs = sorted(set(pairs))
+        if not unique_pairs:
+            return {}
+        first_words: dict[tuple[str, str], str] = {}
+        for name, platform in unique_pairs:
+            first_word = name.split(" ", 1)[0] if name else ""
+            if first_word:
+                first_words[(name, platform)] = first_word
+        if not first_words:
+            return {}
+        or_filter = ",".join(
+            f'and(normalized_name.like."{_video_game_like_escape(first_word)}*",rawg_platform.eq."{platform}")'
+            for (_, platform), first_word in first_words.items()
+        )
+        payload = self._request(
+            "GET",
+            "/rest/v1/rawg_video_game_catalog",
+            params={
+                "select": "normalized_name,rawg_platform,image_url",
+                "or": f"({or_filter})",
+            },
+        )
+        rows = [row for row in payload if isinstance(row, dict)] if isinstance(payload, list) else []
+        images: dict[tuple[str, str], str] = {}
+        for (name, platform), first_word in first_words.items():
+            stripped_target = _video_game_strip_punctuation(name)
+            if not stripped_target:
+                continue
+            matches = [
+                row
+                for row in rows
+                if str(row.get("rawg_platform") or "") == platform
+                and str(row.get("normalized_name") or "").startswith(first_word)
+                and _video_game_strip_punctuation(str(row.get("normalized_name") or "")) == stripped_target
+            ]
+            if len(matches) == 1:
+                image_url = matches[0].get("image_url")
+                if image_url:
+                    images[(name, platform)] = str(image_url)
+        return images
+
+    def fetch_lorcana_images(self, normalized_set_name: str, numbers: list[str]) -> dict[str, str]:
+        # One batched request per distinct Lorcana set on the page -- see
+        # AdminCatalogService._enrich_lorcana_images. (normalized_set_name,
+        # card_number) is the table's primary key, so no ambiguity check
+        # is needed here the way Magic/LEGO need one.
+        unique_numbers = sorted({number for number in numbers if number})
+        if not unique_numbers:
+            return {}
+        quoted = ",".join(f'"{number}"' for number in unique_numbers)
+        payload = self._request(
+            "GET",
+            "/rest/v1/lorcana_catalog",
+            params={
+                "select": "card_number,image_url",
+                "normalized_set_name": f"eq.{normalized_set_name}",
+                "card_number": f"in.({quoted})",
+            },
+        )
+        if not isinstance(payload, list):
+            return {}
+        images_by_number: dict[str, str] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            number = str(row.get("card_number") or "")
+            image_url = row.get("image_url")
+            if number and image_url:
+                images_by_number[number] = str(image_url)
+        return images_by_number
+
+    def fetch_onepiece_rows(self, set_codes: list[str]) -> dict[str, list[dict[str, Any]]]:
+        # One batched request for every distinct One Piece set code on a
+        # page -- see AdminCatalogService._enrich_onepiece_images. The
+        # is_plain / word-overlap disambiguation itself happens in the
+        # caller, against whichever rows share a card_set_id.
+        unique_codes = sorted({code for code in set_codes if code})
+        if not unique_codes:
+            return {}
+        quoted = ",".join(f'"{code}"' for code in unique_codes)
+        payload = self._request(
+            "GET",
+            "/rest/v1/one_piece_catalog",
+            params={
+                "select": "card_set_id,card_name,is_plain,image_url",
+                "card_set_id": f"in.({quoted})",
+            },
+        )
+        if not isinstance(payload, list):
+            return {}
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            grouped.setdefault(str(row.get("card_set_id") or ""), []).append(row)
+        return grouped
+
+    def _fetch_tcgplayer_rows(self, group_name: str, card_number: str) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            "/rest/v1/tcgplayer_pokemon_catalog",
+            params={
+                "select": "product_name,image_url,variant_tag",
+                "group_name": f"eq.{group_name}",
+                "card_number": f"eq.{card_number}",
+            },
+        )
+        if not isinstance(payload, list):
+            return []
+        return [row for row in payload if isinstance(row, dict)]
+
+    def fetch_tcgplayer_exact_variant_image(
+        self, group_name: str, card_number: str, variant_token: str | None
+    ) -> str | None:
+        # Mirrors CatalogSearchService._fetch_tcgplayer_exact_variant_image
+        # -- see that method for why Shadowless (a separate TCGCSV group)
+        # and named error products (variant_tag='error', matched by full
+        # word-overlap with the PriceCharting bracket tag) are the only
+        # two patterns treated as an exact print-variant match.
+        if not variant_token:
+            return None
+        if "shadowless" in variant_token:
+            for row in self._fetch_tcgplayer_rows(f"{group_name} (Shadowless)", card_number):
+                image_url = row.get("image_url")
+                if image_url:
+                    return str(image_url)
+            return None
+        variant_words = _normalize_variant_words(variant_token)
+        if not variant_words:
+            return None
+        for row in self._fetch_tcgplayer_rows(group_name, card_number):
+            if row.get("variant_tag") != "error":
+                continue
+            product_words = _normalize_variant_words(str(row.get("product_name") or ""))
+            if variant_words.issubset(product_words) and row.get("image_url"):
+                return str(row["image_url"])
+        return None
+
+    def fetch_tcgplayer_generic_image(self, group_name: str, card_number: str) -> str | None:
+        rows = [
+            row
+            for row in self._fetch_tcgplayer_rows(group_name, card_number)
+            if not row.get("variant_tag")
+        ]
+        if len(rows) != 1:
+            return None
+        image_url = rows[0].get("image_url")
+        return str(image_url) if image_url else None
+
+    def has_sibling_pokemon_rows(
+        self, set_name: str, card_number: str, *, exclude_id: str
+    ) -> bool:
+        payload = self._request(
+            "GET",
+            "/rest/v1/pricecharting_catalog",
+            params={
+                "select": "pricecharting_id",
+                "console_name": f"eq.{set_name}",
+                "product_name": f"ilike.*#{card_number}",
+                "limit": "3",
+            },
+        )
+        if not isinstance(payload, list):
+            return False
+        return any(
+            str(row.get("pricecharting_id")) != str(exclude_id)
+            for row in payload
+            if isinstance(row, dict)
+        )
+
     def _request(
         self,
         method: str,
@@ -103,10 +1218,108 @@ class SupabaseAdminCatalogRepository:
                 return None
             return response.json()
         except (httpx.HTTPError, ValueError) as error:
-            raise AdminCatalogError("Supabase catalog update request failed.") from error
+            raise AdminCatalogError("Supabase catalog request failed.") from error
         finally:
             if should_close:
                 client.close()
+
+
+# PRICECHARTING_CATEGORY_GROUPS / PRICECHARTING_PLATFORM_GROUPS now live in
+# catalog_search_service.py (imported above) -- shared with the public/
+# mobile Discover search, which needs the exact same taxonomy.
+
+
+def _catalog_filter_params(
+    source: str,
+    *,
+    category: str | None,
+    category_group: str | None = None,
+    min_price: float | None,
+    max_price: float | None,
+) -> dict[str, str]:
+    params: dict[str, str] = {}
+    is_platform_group = source != "kicksdb" and category_group in PRICECHARTING_PLATFORM_GROUPS
+    keywords = (
+        None if is_platform_group
+        else PRICECHARTING_CATEGORY_GROUPS.get(category_group or "") if source != "kicksdb" else None
+    )
+    if is_platform_group:
+        # Exact match against the precomputed, indexed column -- not an
+        # ilike-OR (see PRICECHARTING_PLATFORM_GROUPS' own comment on why).
+        params["platform_group"] = f"eq.{category_group}"
+    elif keywords:
+        params["or"] = "(" + ",".join(f"category.ilike.*{kw}*" for kw in keywords) + ")"
+    elif category:
+        params["category"] = f"ilike.*{category}*"
+    if min_price is None and max_price is None:
+        return params
+    # A single representative price column per source, not every tier a
+    # pricecharting_catalog row can carry (loose/cib/new/graded) -- there's
+    # no single "market value" column to filter on, and PostgREST can't
+    # express "whichever of these four is populated" as a plain filter.
+    # loose is the most commonly populated tier in practice; an item priced
+    # only on a different tier won't match a range filter here. Same
+    # approximation _compact_catalog_row already makes for display.
+    price_column = "avg_price_cents" if source == "kicksdb" else "loose_price_cents"
+    min_cents = int(min_price * 100) if min_price is not None else None
+    max_cents = int(max_price * 100) if max_price is not None else None
+    if min_cents is not None and max_cents is not None:
+        params["and"] = f"({price_column}.gte.{min_cents},{price_column}.lte.{max_cents})"
+    elif min_cents is not None:
+        params[price_column] = f"gte.{min_cents}"
+    else:
+        params[price_column] = f"lte.{max_cents}"
+    return params
+
+
+def _compact_catalog_row(row: dict[str, Any], *, source: str) -> dict[str, Any]:
+    # Deliberately matches the shape CatalogSearchResult already returns
+    # (id/title/category/setName/source/lastUpdated/pricing.marketValue) so
+    # the admin frontend's existing search-row renderer and edit drawer work
+    # for browsed rows unchanged.
+    if source == "kicksdb":
+        market_value = (
+            _cents_to_units(row.get("avg_price_cents"))
+            or _cents_to_units(row.get("min_price_cents"))
+            or _cents_to_units(row.get("max_price_cents"))
+        )
+        return {
+            "id": row.get("kicksdb_id"),
+            "title": row.get("title") or "Catalog item",
+            "identifier": row.get("sku"),
+            "category": row.get("category") or row.get("product_type") or "Sneaker",
+            "setName": row.get("brand"),
+            "source": "KicksDB",
+            "lastUpdated": row.get("updated_at"),
+            "imageUrl": row.get("image_url"),
+            "pricing": {"marketValue": market_value, "currency": (row.get("currency") or "USD").upper()},
+        }
+    loose = _cents_to_units(row.get("loose_price_cents"))
+    cib = _cents_to_units(row.get("cib_price_cents"))
+    new = _cents_to_units(row.get("new_price_cents"))
+    graded = _cents_to_units(row.get("graded_price_cents"))
+    market_value = loose or cib or new or graded or _cents_to_units(row.get("market_value_cents"))
+    return {
+        "id": row.get("pricecharting_id"),
+        "title": row.get("product_name") or "Catalog item",
+        "identifier": row.get("upc"),
+        "category": row.get("category") or row.get("console_name") or "Catalog",
+        "setName": row.get("console_name"),
+        "source": "PriceCharting",
+        "lastUpdated": row.get("updated_at"),
+        "imageUrl": None,
+        "pricing": {"marketValue": market_value, "currency": (row.get("currency") or "USD").upper()},
+    }
+
+
+def _cents_to_units(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        cents = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(cents / 100, 2) if cents > 0 else None
 
 
 def _catalog_update_payload(payload: dict[str, Any]) -> dict[str, Any]:

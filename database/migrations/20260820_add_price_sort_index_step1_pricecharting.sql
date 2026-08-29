@@ -1,0 +1,25 @@
+-- STEP 1 of 2 for price-sort support -- run this statement ALONE (its own
+-- "Run" in the SQL editor), not batched with step 2 or anything else.
+-- CREATE INDEX CONCURRENTLY cannot execute inside a transaction block, and
+-- pasting multiple statements together runs them as one implicit
+-- transaction, so combining steps here would fail outright.
+--
+-- Sorting by loose_price_cents today (order=loose_price_cents.asc)
+-- reliably hits a statement timeout (57014, confirmed live) -- there's no
+-- index on the column, and pricecharting_catalog is ~12M rows.
+--
+-- Deliberately does NOT add a matching index on updated_at for "sort by
+-- recency": pricecharting_catalog already had a real production incident
+-- on 2026-08-08 (see 20260808_drop_unused_pricecharting_catalog_indexes
+-- .sql) from index-maintenance overhead on this table's frequent writes
+-- (daily bulk refresh, 15-min comics/coins/sports backfill, hourly
+-- portfolio matching) -- five indexes were emergency-dropped to fix a
+-- crash writing just 51 rows. updated_at changes on every single write to
+-- this table, making an index on it the most expensive kind to maintain
+-- here; loose_price_cents only changes when a row is actually repriced,
+-- and this is a single small B-tree (not one of the bulky GIN indexes that
+-- caused the prior incident), so the risk profile is meaningfully lower.
+-- Monitor pg_stat_user_indexes / write latency after this ships before
+-- adding anything else here.
+create index concurrently if not exists pricecharting_catalog_loose_price_cents_idx
+    on public.pricecharting_catalog (loose_price_cents);

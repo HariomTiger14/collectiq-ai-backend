@@ -48,6 +48,7 @@ CATALOG_COLUMNS = (
     "product_name",
     "console_name",
     "category",
+    "platform_group",
     "upc",
     "asin",
     "epid",
@@ -66,6 +67,42 @@ CATALOG_COLUMNS = (
     "source_downloaded_at",
     "content_hash",
 )
+
+# Mirrors public.compute_platform_group() in
+# 20260820_add_platform_group_step1_schema.sql exactly -- keep both in sync
+# if this mapping changes. console_name is reused across every category
+# (sports cards, comics, funko, etc all store their set name here too, not
+# just video games), so this only matches real platform names; every other
+# row gets None, which is correct -- they're not filterable by platform
+# because they aren't one.
+#
+# Word-boundary matching (\b) rather than plain substring matching, so
+# short platform codes (ds, wii, pc) are safe to include here -- a bare
+# substring match previously had a real collision bug ("nes" matched
+# inside "Finest", pulling sports cards into a video-games filter); \b
+# only matches whole tokens, so that can't happen.
+PLATFORM_GROUP_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("playstation", re.compile(r"\b(playstation|ps1|ps2|ps3|ps4|ps5|psp|vita)\b", re.IGNORECASE)),
+    ("xbox", re.compile(r"\bxbox\b", re.IGNORECASE)),
+    ("nintendo", re.compile(
+        r"\b(nintendo|gamecube|wii|switch|gameboy|nes|snes|n64|3ds|ds)\b", re.IGNORECASE
+    )),
+    ("sega", re.compile(r"\b(sega|genesis|saturn|dreamcast|32x)\b", re.IGNORECASE)),
+    ("atari", re.compile(r"\b(atari|jaguar|lynx|2600|5200|7800)\b", re.IGNORECASE)),
+    ("pc", re.compile(r"\b(pc|windows|commodore|amiga|msx|trs-80|apple)\b", re.IGNORECASE)),
+    ("retro-other", re.compile(
+        r"\b(3do|neo\s*geo|colecovision|intellivision|vectrex|turbo\s*grafx)\b", re.IGNORECASE
+    )),
+]
+
+
+def compute_platform_group(console_name: str | None) -> str | None:
+    if not console_name:
+        return None
+    for group, pattern in PLATFORM_GROUP_PATTERNS:
+        if pattern.search(console_name):
+            return group
+    return None
 
 CATALOG_HISTORY_COLUMNS = (
     "pricecharting_id",
@@ -295,6 +332,7 @@ def to_catalog_row(
         "product_name": product_name,
         "console_name": console_name,
         "category": pick_text(row, TEXT_FIELDS["category"]) or console_name,
+        "platform_group": compute_platform_group(console_name),
         "upc": pick_text(row, TEXT_FIELDS["upc"]),
         "asin": pick_text(row, TEXT_FIELDS["asin"]),
         "epid": pick_text(row, TEXT_FIELDS["epid"]),
@@ -311,6 +349,52 @@ def to_catalog_row(
     normalized_row = normalize_catalog_row(catalog_row)
     normalized_row["content_hash"] = catalog_history_change_hash(normalized_row)
     return normalized_row
+
+
+def to_catalog_row_from_api_product(
+    product: dict[str, Any],
+    source_file: str,
+    source_downloaded_at: str,
+) -> dict[str, Any] | None:
+    """to_catalog_row() for /api/product(s) payloads -- canonicalizes
+    category BEFORE the SCD2 hash is computed.
+
+    The API attaches a short `genre` ("Baseball Card") that the category
+    alias picks up, while the CSV/set paths have no category column at all
+    and fall back to console_name -- the long form ("Baseball Cards 2020
+    Topps Chrome ..."), which ~95% of stored rows already hold and which
+    the 2026-08-29 SCD2 audit fixed as canonical. Feeding the API's short
+    form into the shared hash made every card that alternated between an
+    API path (tier-1/tier-2/api-search) and a CSV path (backfill/tier-3/
+    completed-categories) mint a fake "metadata changed" SCD2 version on
+    each crossing -- ~17% of all history versions were this flap.
+
+    Stripping the API's category aliases here makes every ingestion path
+    resolve category through the same console_name fallback inside
+    to_catalog_row(), which also computes the hash -- so canonicalization
+    is strictly hash-first by construction. raw_payload keeps the original
+    untouched API product (restored after conversion; the hash signature
+    never includes raw_payload, so this cannot affect change detection).
+
+    Only strips when the product actually carries a console name to fall
+    back to -- a payload without one keeps its genre rather than ending up
+    with no category at all.
+    """
+    has_console_name = any(
+        str(product.get(alias) or "").strip()
+        for alias in TEXT_FIELDS["console_name"]
+    )
+    if not has_console_name:
+        return to_catalog_row(product, source_file, source_downloaded_at)
+    stripped = {
+        key: value
+        for key, value in product.items()
+        if key not in TEXT_FIELDS["category"]
+    }
+    row = to_catalog_row(stripped, source_file, source_downloaded_at)
+    if row is not None:
+        row["raw_payload"] = product
+    return row
 
 
 def normalize_catalog_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -333,6 +417,47 @@ def to_catalog_history_row(catalog_row: dict[str, Any]) -> dict[str, Any]:
         column: row.get(column) if row.get(column) != "" else None
         for column in CATALOG_HISTORY_COLUMNS
     }
+
+
+PRICE_OBSERVATION_COLUMNS = (
+    "loose_price_cents",
+    "cib_price_cents",
+    "new_price_cents",
+    "graded_price_cents",
+    "box_only_price_cents",
+    "manual_only_price_cents",
+)
+
+
+def to_price_observation_row(catalog_row: dict[str, Any]) -> dict[str, Any]:
+    """Compact pricecharting_price_history row (Step-2 shadow write).
+
+    Carries exactly the reader contract (_fetch_history_rows): the six
+    price columns, currency, source, and the observation timestamp --
+    observed_at is the provider-download timestamp, which also forms the
+    (pricecharting_id, observed_at) idempotency key, so a retried
+    ingestion of the same input conflicts instead of duplicating."""
+    return {
+        "pricecharting_id": catalog_row.get("pricecharting_id"),
+        "observed_at": source_timestamp(catalog_row.get("source_downloaded_at")),
+        **{column: catalog_row.get(column) for column in PRICE_OBSERVATION_COLUMNS},
+        "currency": catalog_row.get("currency") or "USD",
+        "source_file": catalog_row.get("source_file"),
+    }
+
+
+def prices_differ(catalog_row: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Whether any of the six price columns (or currency) differs between
+    the incoming row and the stored current version. Metadata, category
+    canonicalization, raw_payload, timestamps, and ingestion path play no
+    part -- a version whose prices are unchanged must NOT produce a price
+    observation."""
+    if (catalog_row.get("currency") or "USD") != (current.get("currency") or "USD"):
+        return True
+    return any(
+        catalog_row.get(column) != current.get(column)
+        for column in PRICE_OBSERVATION_COLUMNS
+    )
 
 
 def source_timestamp(source_downloaded_at: Any) -> str:
@@ -462,6 +587,12 @@ class SupabaseCatalogClient:
             "scd2_comparison": 0.0,
             "scd2_insert": 0.0,
         }
+        self.price_history_stats: dict[str, int] = {
+            "attempted": 0,
+            "inserted": 0,
+            "duplicateSkipped": 0,
+            "failed": 0,
+        }
 
     def upsert_rows(self, rows: list[dict[str, Any]], *, batch_size: int) -> int:
         if batch_size <= 0:
@@ -582,6 +713,7 @@ class SupabaseCatalogClient:
                     )
                     rows_to_insert = []
                     changed_ids = []
+                    price_observations = []
                     for row in batch:
                         product_id = str(row.get("pricecharting_id") or "").strip()
                         if not product_id:
@@ -593,8 +725,32 @@ class SupabaseCatalogClient:
                         if current:
                             changed_ids.append(product_id)
                         rows_to_insert.append(history_row)
+                        # Step-2 shadow write: a compact price observation
+                        # for price-bearing events only -- a brand-new item
+                        # (first observation) or a version whose prices
+                        # actually differ from the stored current version.
+                        # Metadata-only versions (incl. category
+                        # canonicalization) write NO observation.
+                        if current is None or prices_differ(row, current):
+                            price_observations.append(to_price_observation_row(row))
 
                     insert_started_at = time.perf_counter()
+                    # Price observations are written BEFORE the legacy
+                    # close/insert on purpose: PostgREST offers no
+                    # cross-request transaction (the legacy close+insert
+                    # pair is already non-atomic today), so consistency
+                    # comes from ordering + idempotency instead. If this
+                    # insert fails, the whole sub-batch fails BEFORE any
+                    # legacy write -- the change hash still differs, so
+                    # the job's normal retry redoes both sides; if the
+                    # legacy write fails after this succeeded, the retry
+                    # re-runs and this insert conflict-skips on the
+                    # (pricecharting_id, observed_at) unique key. Either
+                    # order of failure converges; neither can produce a
+                    # legacy version whose price observation is silently
+                    # unrecoverable.
+                    if price_observations:
+                        self._insert_price_observation_rows(client, price_observations)
                     if changed_ids:
                         self._close_current_history_rows(
                             client,
@@ -645,7 +801,16 @@ class SupabaseCatalogClient:
         response = client.get(
             f"{self.supabase_url}/rest/v1/pricecharting_catalog_history",
             params={
-                "select": "pricecharting_id,change_hash",
+                # change_hash gates whether ANY version is written; the
+                # price columns + currency classify whether the change is
+                # price-bearing (-> also a compact price observation) or
+                # metadata-only (-> legacy version only). Fetched together
+                # so classification costs no extra round trip.
+                "select": (
+                    "pricecharting_id,change_hash,currency,"
+                    "loose_price_cents,cib_price_cents,new_price_cents,"
+                    "graded_price_cents,box_only_price_cents,manual_only_price_cents"
+                ),
                 "is_current": "eq.true",
                 "pricecharting_id": f"in.({','.join(ids)})",
             },
@@ -712,6 +877,49 @@ class SupabaseCatalogClient:
                 f"with HTTP {response.status_code}: {response.text}"
             ) from exc
         return len(rows)
+
+    def _insert_price_observation_rows(
+        self,
+        client: httpx.Client,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        # resolution=ignore-duplicates + return=representation: retried
+        # observations conflict on (pricecharting_id, observed_at) and are
+        # silently skipped by the DATABASE (not application memory); the
+        # representation contains only the genuinely inserted rows, which
+        # is what makes inserted-vs-duplicate observable.
+        self.price_history_stats["attempted"] += len(rows)
+        response = client.post(
+            f"{self.supabase_url}/rest/v1/pricecharting_price_history",
+            params={"on_conflict": "pricecharting_id,observed_at"},
+            headers={
+                **self._headers(),
+                "Prefer": "resolution=ignore-duplicates,return=representation",
+            },
+            json=rows,
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            self.price_history_stats["failed"] += len(rows)
+            raise SystemExit(
+                "Supabase price-history insert failed "
+                f"with HTTP {response.status_code}: {response.text}"
+            ) from exc
+        try:
+            inserted = len(response.json())
+        except ValueError:
+            inserted = len(rows)
+        self.price_history_stats["inserted"] += inserted
+        self.price_history_stats["duplicateSkipped"] += len(rows) - inserted
+        # Batch-level observability only -- one aggregate line per write,
+        # never per row.
+        print(
+            f"  price_history: attempted {len(rows)}, inserted {inserted}, "
+            f"duplicate-skipped {len(rows) - inserted} "
+            f"(run totals: {self.price_history_stats})",
+            flush=True,
+        )
 
     def _upsert(
         self,

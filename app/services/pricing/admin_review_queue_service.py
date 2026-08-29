@@ -240,19 +240,28 @@ class SupabasePricingReviewQueueRepository:
     def is_configured(self) -> bool:
         return bool(self._supabase_url and self._service_role_key)
 
-    def list_items(self, *, limit: int = 200) -> list[PortfolioItem]:
-        payload = self._request(
-            "GET",
-            f"/rest/v1/{self._table_name}",
-            params={
-                "select": "*",
-                # Exclude app-side soft deletes (sync_status='deleted') from
-                # the review queue and admin portfolio listings.
-                "sync_status": "neq.deleted",
-                "limit": str(limit),
-                "order": "updated_at.desc.nullslast,created_at.desc.nullslast",
-            },
-        )
+    def list_items(
+        self,
+        *,
+        limit: int = 200,
+        user_id: str | None = None,
+        offset: int = 0,
+        category: str | None = None,
+    ) -> list[PortfolioItem]:
+        params = {
+            "select": "*",
+            # Exclude app-side soft deletes (sync_status='deleted') from
+            # the review queue and admin portfolio listings.
+            "sync_status": "neq.deleted",
+            "limit": str(limit),
+            "offset": str(offset),
+            "order": "updated_at.desc.nullslast,created_at.desc.nullslast",
+        }
+        if user_id:
+            params["user_id"] = f"eq.{user_id}"
+        if category:
+            params["category"] = f"ilike.*{category}*"
+        payload = self._request("GET", f"/rest/v1/{self._table_name}", params=params)
         if not isinstance(payload, list):
             raise ReviewQueueRepositoryError("Supabase portfolio response shape was invalid.")
         return [
@@ -260,6 +269,87 @@ class SupabasePricingReviewQueueRepository:
             for row in payload
             if isinstance(row, dict) and (item := _portfolio_item_from_row(row)) is not None
         ]
+
+    def count_items(self, *, user_id: str | None = None, category: str | None = None) -> int:
+        # count=estimated, not count=exact: a real exact COUNT(*) over this
+        # whole table under RLS (enabled 20260811) forces a full scan, and
+        # this table has a documented history of breaking production from
+        # exactly this class of expensive-query mistake (statement timeouts
+        # in 20260808_drop_unused_pricecharting_catalog_indexes.sql -- a
+        # different table there, but the same lesson applies here).
+        # PostgREST's estimated mode uses the planner's row estimate for
+        # large tables and only falls back to an exact count when the
+        # result set is already small, which is the right tradeoff for a
+        # pagination total -- doesn't need to be perfectly exact.
+        params: dict[str, str] = {
+            "select": "id",
+            "limit": "1",
+            # Keep pagination totals consistent with list_items: soft-deleted
+            # rows (sync_status='deleted') are invisible to admin surfaces.
+            "sync_status": "neq.deleted",
+        }
+        if user_id:
+            params["user_id"] = f"eq.{user_id}"
+        if category:
+            params["category"] = f"ilike.*{category}*"
+        headers = {
+            "apikey": self._service_role_key,
+            "Authorization": f"Bearer {self._service_role_key}",
+            "Accept": "application/json",
+            "Prefer": "count=estimated",
+        }
+        client = self._client or httpx.Client(timeout=self._timeout_seconds)
+        should_close = self._client is None
+        try:
+            response = client.request(
+                "GET", f"{self._supabase_url}/rest/v1/{self._table_name}", headers=headers, params=params,
+            )
+            response.raise_for_status()
+            return _total_from_content_range(response.headers.get("content-range"))
+        except httpx.HTTPError as error:
+            raise ReviewQueueRepositoryError("Supabase portfolio count request failed.") from error
+        finally:
+            if should_close:
+                client.close()
+
+    def batch_owner_display_names(self, user_ids: list[str]) -> dict[str, str]:
+        # One request across every distinct owner on the page, not one per
+        # item — the same batching approach used for the admin users list.
+        # collector_profiles has no email column (email lives only in
+        # Supabase Auth, with no efficient bulk-by-id lookup), so this uses
+        # display_name as the human-readable "Owner" value instead.
+        ids = [uid for uid in dict.fromkeys(user_ids) if uid]
+        if not ids:
+            return {}
+        try:
+            payload = self._request(
+                "GET",
+                "/rest/v1/collector_profiles",
+                params={"user_id": "in.(" + ",".join(ids) + ")", "select": "user_id,display_name"},
+            )
+        except ReviewQueueRepositoryError:
+            return {}
+        if not isinstance(payload, list):
+            return {}
+        return {
+            str(row["user_id"]): str(row["display_name"])
+            for row in payload
+            if isinstance(row, dict) and row.get("user_id") and row.get("display_name")
+        }
+
+    # Supabase Auth (GoTrue) has no bulk-by-ids admin lookup — only a single-
+    # user GET. Callers should only use this for owners that batch_owner_
+    # display_names() didn't already cover, and should cap how many distinct
+    # owners they're willing to look up this way per page.
+    def get_user_email(self, user_id: str) -> str | None:
+        try:
+            payload = self._request("GET", f"/auth/v1/admin/users/{user_id}")
+        except ReviewQueueRepositoryError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        email = payload.get("email")
+        return str(email) if email else None
 
     def get_item(self, item_id: str) -> PortfolioItem | None:
         payload = self._request(
@@ -277,6 +367,39 @@ class SupabasePricingReviewQueueRepository:
             return None
         row = payload[0]
         return _portfolio_item_from_row(row) if isinstance(row, dict) else None
+
+    def list_valuation_history_for_item(self, item_id: str) -> list[dict[str, Any]]:
+        # Every snapshot ever priced for this item lives here forever --
+        # nothing prunes this table -- so this pages through all of it
+        # instead of an arbitrary recent-N cap, for a real full-history
+        # chart (1M/6M/MAX ranges only mean something if the data behind
+        # them isn't already truncated). Paged in chunks of 500 (under
+        # PostgREST's default max-rows) with a 20-page safety backstop
+        # (10,000 snapshots) against a runaway loop on unexpected data.
+        page_size = 500
+        max_pages = 20
+        rows: list[dict[str, Any]] = []
+        for page in range(max_pages):
+            try:
+                payload = self._request(
+                    "GET",
+                    "/rest/v1/portfolio_valuation_snapshots",
+                    params={
+                        "portfolio_item_id": f"eq.{item_id}",
+                        "select": "*",
+                        "limit": str(page_size),
+                        "offset": str(page * page_size),
+                        "order": "priced_at.desc",
+                    },
+                )
+            except ReviewQueueRepositoryError:
+                break
+            if not isinstance(payload, list):
+                break
+            rows.extend(row for row in payload if isinstance(row, dict))
+            if len(payload) < page_size:
+                break
+        return rows
 
     def update_item_data(self, item_id: str, data: dict[str, Any]) -> PortfolioItem | None:
         current = self.get_item(item_id)
@@ -430,6 +553,17 @@ def _reprice_request_from_item(item: PortfolioItem) -> RepriceRequest:
     )
 
 
+def _total_from_content_range(content_range: str | None) -> int:
+    # PostgREST's Prefer: count=exact returns a Content-Range header shaped
+    # like "0-0/1234" (or "*/1234" for an empty result). Falls back to 0 for
+    # a missing/malformed header rather than raising -- pagination should
+    # degrade to "unknown total", not break the page.
+    if not content_range or "/" not in content_range:
+        return 0
+    total = content_range.rsplit("/", 1)[-1]
+    return int(total) if total.isdigit() else 0
+
+
 def _pricing_payload(data: dict[str, Any]) -> dict[str, Any]:
     pricing = data.get("pricing")
     return pricing if isinstance(pricing, dict) else {}
@@ -440,14 +574,27 @@ def _portfolio_item_from_row(row: dict[str, Any]) -> PortfolioItem | None:
     if not item_id:
         return None
     data = row.get("data") if isinstance(row.get("data"), dict) else {}
+    # The scheduled repricing sweep (batch_repricing_service.py) only ever
+    # writes pricing into raw_json.pricing/raw_json.estimatedValue -- never
+    # the top-level pricing/data columns this used to check exclusively.
+    # Any item priced by that sweep showed as $0/unpriced here despite
+    # being correctly priced (its raw_json was just never consulted).
+    raw = row.get("raw_json") if isinstance(row.get("raw_json"), dict) else {}
     pricing = row.get("pricing") if isinstance(row.get("pricing"), dict) else data.get("pricing")
+    if not isinstance(pricing, dict):
+        pricing = raw.get("pricing")
+    estimated_value = raw.get("estimatedValue")
+    if estimated_value is None:
+        estimated_value = row.get("estimated_value") or row.get("estimated_value_low")
     merged = {
+        **({"estimatedValue": estimated_value} if estimated_value is not None else {}),
         **data,
         **{
             key: value
             for key, value in {
                 "title": _first_value(row, "title", "item_name", "name"),
                 "itemName": _first_value(row, "item_name"),
+                "userId": _first_value(row, "user_id", "owner_id"),
                 "category": _first_value(row, "category", "item_category"),
                 "condition": _first_value(row, "condition"),
                 "brand": _first_value(row, "brand"),

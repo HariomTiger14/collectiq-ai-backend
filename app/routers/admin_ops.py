@@ -5,10 +5,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.core.config import settings
 from app.routers.admin_auth import require_admin_import_token
+from app.services.ops.pipeline_health_service import (
+    AdminOpsObservabilityError,
+    AdminOpsObservabilityService,
+)
 from app.services.health.health_check_service import HealthCheckService
 from app.services.pricing.admin_health_service import PricingHealthError
 from app.services.pricing.admin_health_service import PricingHealthService
@@ -17,6 +21,77 @@ from scripts.import_pricecharting_catalog import PRICECHARTING_CSV_ENV_VARS
 
 router = APIRouter(prefix="/admin/ops", tags=["Admin Operations"])
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
+
+
+@router.get("/readiness")
+def ops_readiness(
+    _admin: None = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    # A fast subset of /admin/ops/summary — just the config-readiness
+    # checklist, which is pure in-memory settings inspection (sub-ms).
+    # The full summary also runs PricingHealthService().health(), which
+    # calls a Supabase RPC (pricecharting_catalog_health_summary) that has
+    # been observed taking ~49s in production against the real catalog
+    # tables (known unindexed-aggregation issue, tracked separately — see
+    # A-to-Z doc §7). Callers that only need readiness (e.g. the admin
+    # console's Dashboard, which never reads summary.pricing or
+    # summary.health) should use this endpoint instead of paying that cost.
+    return {
+        "success": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "readiness": _configuration_readiness(),
+    }
+
+
+@router.get("/pipeline-health")
+def ops_pipeline_health(
+    _admin: None = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    # The Scheduled-jobs board: per-job status merging the run ledger
+    # (ops_cron_runs), data-freshness probes (admin_pipeline_health RPC),
+    # and each job's cadence. See AdminOpsObservabilityService for the
+    # status semantics -- notably 'stale', which fires on dead OUTPUT even
+    # when runs report success (the KicksDB-quota class of silent failure).
+    try:
+        return AdminOpsObservabilityService().pipeline_health()
+    except AdminOpsObservabilityError as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "ops_pipeline_health_unavailable", "message": str(error), "retryable": True},
+        ) from error
+
+
+@router.get("/runs")
+def ops_runs(
+    job: str | None = Query(default=None, max_length=80),
+    limit: int = Query(default=50, ge=1, le=200),
+    _admin: None = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    try:
+        return AdminOpsObservabilityService().runs(job=job, limit=limit)
+    except AdminOpsObservabilityError as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "ops_runs_unavailable", "message": str(error), "retryable": True},
+        ) from error
+
+
+@router.get("/errors")
+def ops_errors(
+    fingerprint: str | None = Query(default=None, max_length=64),
+    limit: int = Query(default=50, ge=1, le=100),
+    _admin: None = Depends(require_admin_import_token),
+) -> dict[str, Any]:
+    # Without a fingerprint: grouped error feed (one row per distinct
+    # route/job + error class). With one: the individual occurrences,
+    # stacks included.
+    try:
+        return AdminOpsObservabilityService().errors(fingerprint=fingerprint, limit=limit)
+    except AdminOpsObservabilityError as error:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "ops_errors_unavailable", "message": str(error), "retryable": True},
+        ) from error
 
 
 @router.get("/summary")

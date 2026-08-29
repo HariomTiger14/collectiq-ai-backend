@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from app.services.ops.observability import recorded_admin_job
 
 from app.routers.admin_auth import require_admin_job_token
 from app.services.alerts.price_alert_evaluation_service import (
@@ -28,6 +29,7 @@ async def evaluate_price_alerts(
 
 
 @router.post("/price-alerts/run")
+@recorded_admin_job("price-alerts-run")
 async def run_price_alert_push_job(
     dry_run: bool = Query(False, alias="dryRun"),
     evaluate: bool = Query(True, alias="evaluate"),
@@ -138,6 +140,79 @@ async def list_push_delivery_history(
                 "retryable": True,
             },
         ) from error
+
+
+@router.get("/audience")
+async def get_push_audience_counts(
+    _admin: None = Depends(require_admin_job_token),
+) -> dict:
+    try:
+        return PriceAlertPushService().audience_counts()
+    except PushNotificationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "push_audience_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+
+
+@router.post("/broadcast")
+async def send_broadcast_push_notification(
+    segment: str = Query(..., pattern="^(all|pro|inactive)$"),
+    title: str = Query(..., min_length=1, max_length=120),
+    body: str = Query(..., min_length=1, max_length=500),
+    dry_run: bool = Query(True, alias="dryRun"),
+    _admin: None = Depends(require_admin_job_token),
+) -> dict:
+    try:
+        summary = PriceAlertPushService().dispatch_broadcast(
+            segment=segment,
+            title=title,
+            body=body,
+            dry_run=dry_run,
+        )
+    except PushNotificationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "push_broadcast_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+    return summary.to_dict()
+
+
+@router.post("/users/{user_id}/send")
+async def send_push_to_user(
+    user_id: str,
+    title: str = Query(..., min_length=1, max_length=120),
+    body: str = Query(..., min_length=1, max_length=500),
+    device_id: str | None = Query(None, alias="deviceId"),
+    dry_run: bool = Query(True, alias="dryRun"),
+    _admin: None = Depends(require_admin_job_token),
+) -> dict:
+    try:
+        summary = PriceAlertPushService().dispatch_to_user(
+            user_id=user_id,
+            title=title,
+            body=body,
+            device_id=device_id,
+            dry_run=dry_run,
+        )
+    except PushNotificationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "push_direct_send_unavailable",
+                "message": str(error),
+                "retryable": True,
+            },
+        ) from error
+    return summary.to_dict()
 
 
 @router.post("/devices/{device_id}/disable")
