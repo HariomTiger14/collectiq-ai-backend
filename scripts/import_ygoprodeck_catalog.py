@@ -10,6 +10,13 @@ everything TCGCSV did plus 243 more -- see
 database/migrations/20260817_create_yugioh_catalog.sql for the full
 reasoning, and import_tcgcsv_yugioh_catalog.py for the fallback source.
 
+IMPORTANT -- after BOTH catalog imports, run
+scripts/rehost_yugioh_images.py: it mirrors every provider-hosted image
+into our own catalog-images bucket (YGOPRODeck's policy requires
+re-hosting instead of hotlinking) and rewrites image_url accordingly.
+New rows land here with provider URLs and stay un-served-to-users until
+that pass runs.
+
 IMPORTANT -- run this AFTER import_tcgcsv_yugioh_catalog.py, not before.
 Both scripts upsert into the same yugioh_catalog table keyed on set_code;
 running TCGCSV first and this second means this script's (better) data
