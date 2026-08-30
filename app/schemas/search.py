@@ -20,6 +20,21 @@ class CatalogSearchPricing(BaseModel):
     gradedPrice: float | None = None
 
 
+class CatalogImage(BaseModel):
+    """One image of a catalog item, for surfaces that can show more than one.
+
+    `label` names the view when an item has several ("Obverse"/"Reverse"
+    for coins, "Angle 2" for sneakers); `credit` carries a required
+    photo-credit line when the source demands one (contributor-photo
+    catalogs like Numista), and must be displayed alongside the image
+    wherever it is set.
+    """
+
+    url: str
+    label: str | None = None
+    credit: str | None = None
+
+
 class CatalogSearchResult(BaseModel):
     id: str
     title: str
@@ -39,6 +54,13 @@ class CatalogSearchResult(BaseModel):
     # catalog search surface -- never as an <img>/Image.network source. See
     # CatalogSearchService.search()'s enrichment pass.
     externalImageUrl: str | None = None
+    # Additional views of the same item, detail surfaces only. Empty for
+    # most items (one photo is the norm); populated where a source really
+    # has several -- sneakers (KicksDB/StockX gallery), coins
+    # (obverse/reverse). imageUrl stays the primary/thumbnail image and is
+    # always the first entry when this is non-empty, so clients that
+    # ignore this field are unaffected.
+    images: list[CatalogImage] = Field(default_factory=list)
     pricing: CatalogSearchPricing = Field(default_factory=CatalogSearchPricing)
 
 

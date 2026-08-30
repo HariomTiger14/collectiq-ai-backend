@@ -31,6 +31,7 @@ from app.services.pricing.pricecharting_listing_service import (
 from app.schemas.search import (
     CatalogDetailResponse,
     CatalogHistoryPoint,
+    CatalogImage,
     CatalogSearchPricing,
     MarketplaceListing,
     CatalogSearchResponse,
@@ -481,6 +482,24 @@ class CatalogSearchService:
             kicksdb_history_points = [
                 _kicksdb_history_row_to_point(row) for row in kicksdb_history_rows
             ]
+            gallery_images = _kicksdb_gallery_images(
+                kicksdb_row, kicksdb_result.imageUrl
+            )
+            if gallery_images:
+                # imageUrl stays primary and leads the list, so clients
+                # that ignore `images` are unaffected.
+                kicksdb_result = kicksdb_result.model_copy(
+                    update={
+                        "images": [
+                            CatalogImage(
+                                url=kicksdb_result.imageUrl, label="View 1"
+                            ),
+                            *gallery_images,
+                        ]
+                        if kicksdb_result.imageUrl
+                        else gallery_images
+                    }
+                )
             kicksdb_listings = _kicksdb_marketplace_listings(kicksdb_row)
             if target_currency:
                 kicksdb_listings = [
@@ -1878,7 +1897,10 @@ class CatalogSearchService:
                 "kicksdb_id,title,brand,model,gender,product_type,category,"
                 "secondary_category,image_url,rank,release_date,currency,"
                 "min_price_cents,max_price_cents,avg_price_cents,product_url,"
-                "sku,variants,updated_at"
+                "sku,variants,updated_at,"
+                # JSON-path select so the (large) rest of raw_payload --
+                # every variant, prices, identifiers -- stays on the server.
+                "gallery:raw_payload->gallery"
             ),
             "kicksdb_id": f"eq.{catalog_id}",
             "limit": "1",
@@ -2110,6 +2132,48 @@ def _int_or_none(value: object) -> int | None:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+_KICKSDB_WIDTH_RE = re.compile(r"[?&]w=(\d+)")
+
+
+def _kicksdb_gallery_images(
+    row: dict[str, Any], primary_url: str | None
+) -> list[CatalogImage]:
+    """Extra sneaker views from the KicksDB/StockX gallery array.
+
+    The gallery routinely lists the SAME photo several times at different
+    render sizes (…White.jpg?w=140… and …White.jpg?w=700…), so entries are
+    grouped by image path and only the widest of each kept -- otherwise a
+    "gallery" of 3 would show one shoe three times. The primary image is
+    excluded (the detail page already shows it above) and the rest are
+    labelled positionally, since StockX doesn't tell us what each angle is.
+    """
+    gallery = row.get("gallery")
+    if not isinstance(gallery, list):
+        return []
+
+    def path_of(url: str) -> str:
+        return url.split("?", 1)[0]
+
+    def width_of(url: str) -> int:
+        match = _KICKSDB_WIDTH_RE.search(url)
+        return int(match.group(1)) if match else 0
+
+    widest: dict[str, str] = {}
+    for entry in gallery:
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        url = entry.strip()
+        key = path_of(url)
+        if key not in widest or width_of(url) > width_of(widest[key]):
+            widest[key] = url
+    primary_path = path_of(primary_url) if primary_url else None
+    extras = [url for key, url in widest.items() if key != primary_path]
+    return [
+        CatalogImage(url=url, label=f"View {index + 2}")
+        for index, url in enumerate(extras)
+    ]
 
 
 # Sort sentinel for rows with no popularity signal (PriceCharting rows,

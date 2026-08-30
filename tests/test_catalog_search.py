@@ -768,6 +768,61 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertEqual(listing.currency, "AUD")
         self.assertEqual(listing.price, round(115 * _exchange_rate("USD", "AUD"), 2))
 
+    def test_kicksdb_detail_exposes_deduplicated_gallery_images(self) -> None:
+        # StockX galleries list the same photo at several render sizes;
+        # only the widest of each distinct photo becomes an extra view, and
+        # the primary image leads the list so imageUrl-only clients are
+        # unaffected.
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "kicksdb_catalog_history" in str(request.url):
+                return httpx.Response(200, json=[])
+            if "kicksdb_catalog" in str(request.url):
+                return httpx.Response(200, json=[{
+                    "kicksdb_id": "kdb-g",
+                    "title": "Saucony Butterfly",
+                    "category": "Sneakers",
+                    "currency": "USD",
+                    "avg_price_cents": 12000,
+                    "image_url": "https://images.stockx.com/images/A.jpg?w=140",
+                    "gallery": [
+                        "https://images.stockx.com/images/A.jpg?w=140",
+                        "https://images.stockx.com/images/A.jpg?w=700",
+                        "https://images.stockx.com/images/A-2.jpg?w=700",
+                        "https://images.stockx.com/images/A-3.jpg?w=700",
+                    ],
+                    "updated_at": "2026-08-30T00:00:00Z",
+                }])
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.detail("kdb-g")
+
+        urls = [image.url for image in response.result.images]
+        self.assertEqual(urls[0], response.result.imageUrl)
+        # A.jpg appears twice in the gallery (two sizes) but is the primary
+        # photo -- it must not reappear as an extra view.
+        self.assertEqual(len(urls), 3)
+        self.assertIn("https://images.stockx.com/images/A-2.jpg?w=700", urls)
+        self.assertIn("https://images.stockx.com/images/A-3.jpg?w=700", urls)
+        self.assertEqual(
+            [image.label for image in response.result.images],
+            ["View 1", "View 2", "View 3"],
+        )
+
+    def test_kicksdb_detail_single_photo_leaves_images_empty(self) -> None:
+        # One photo is the norm; `images` stays empty so the app keeps its
+        # existing single-image layout.
+        service = self._kicksdb_detail_service_with_variants([])
+
+        response = service.detail("kdb-9")
+
+        self.assertEqual(response.result.images, [])
+
     def test_kicksdb_detail_without_variants_returns_no_listings(self) -> None:
         service = self._kicksdb_detail_service_with_variants([])
 
