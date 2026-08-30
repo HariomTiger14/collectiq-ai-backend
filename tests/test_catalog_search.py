@@ -4891,3 +4891,88 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoinImageAttributionTest(unittest.TestCase):
+    # Attribution for a CC BY / CC BY-SA image is a CONDITION OF THE
+    # LICENCE, not a courtesy: shipping such an image without naming the
+    # author is infringement. The API therefore has to hand the client
+    # both the text and a flag saying it MUST be rendered -- a client
+    # cannot be left to infer the obligation from the licence string.
+
+    def _service(self, coin_rows: list[dict]):
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "coin_catalog_images" in url:
+                return httpx.Response(200, json=coin_rows)
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                if "pricecharting_id" in request.url.params:
+                    return httpx.Response(200, json=[{
+                        "pricecharting_id": "coin-9",
+                        "product_name": "2019 D",
+                        "console_name": "Coins Lincoln Shield Penny",
+                        "category": "Coins",
+                        "loose_price_cents": 100,
+                        "currency": "USD",
+                    }])
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        return CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+    def test_cc_licensed_image_carries_required_attribution(self) -> None:
+        service = self._service([
+            {"view": "obverse",
+             "image_url": "https://cdn.example/coins/lincoln-shield-penny-obverse.jpg",
+             "credit": "United States Mint",
+             "attribution_required": False,
+             "attribution_text": None,
+             "attribution_url": None},
+            {"view": "reverse",
+             "image_url": "https://cdn.example/coins/lincoln-shield-penny-reverse.png",
+             "credit": "MisfitMaid",
+             "attribution_required": True,
+             "attribution_text": "MisfitMaid / CC BY-SA 4.0",
+             "attribution_url": "https://commons.wikimedia.org/wiki/File:X.png"},
+        ])
+        detail = service.detail("coin-9").result
+        reverse = detail.images[1]
+        self.assertTrue(reverse.attributionRequired)
+        # attribution_text wins over the bare credit: it names the licence,
+        # which the bare contributor name does not.
+        self.assertEqual(reverse.credit, "MisfitMaid / CC BY-SA 4.0")
+        self.assertEqual(
+            reverse.attributionUrl,
+            "https://commons.wikimedia.org/wiki/File:X.png",
+        )
+
+    def test_public_domain_images_do_not_require_attribution(self) -> None:
+        service = self._service([
+            {"view": "obverse",
+             "image_url": "https://cdn.example/coins/lincoln-shield-penny-obverse.jpg",
+             "credit": "United States Mint",
+             "attribution_required": False,
+             "attribution_text": None,
+             "attribution_url": None},
+            {"view": "reverse",
+             "image_url": "https://cdn.example/coins/lincoln-shield-penny-reverse.jpg",
+             "credit": "United States Mint",
+             "attribution_required": False,
+             "attribution_text": None,
+             "attribution_url": None},
+        ])
+        detail = service.detail("coin-9").result
+        self.assertEqual(len(detail.images), 2)
+        self.assertFalse(any(image.attributionRequired for image in detail.images))
+        self.assertTrue(all(image.attributionUrl is None for image in detail.images))
+        # Credit is still carried for provenance, just not compulsory to show.
+        self.assertEqual(
+            [image.credit for image in detail.images],
+            ["United States Mint", "United States Mint"],
+        )

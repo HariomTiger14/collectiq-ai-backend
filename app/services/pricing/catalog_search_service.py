@@ -652,7 +652,10 @@ class CatalogSearchService:
             "GET",
             "/rest/v1/coin_catalog_images",
             params={
-                "select": "view,image_url,credit",
+                "select": (
+                    "view,image_url,credit,"
+                    "attribution_required,attribution_text,attribution_url"
+                ),
                 "series_key": f"eq.{series_key}",
                 "design_key": "eq.",
                 "limit": "4",
@@ -670,11 +673,21 @@ class CatalogSearchService:
         for view, label in (("obverse", "Obverse"), ("reverse", "Reverse")):
             row = by_view.get(view)
             if row and row.get("image_url"):
+                required = bool(row.get("attribution_required"))
+                # For a CC BY/BY-SA image the stored attribution_text is the
+                # exact string the licence obliges us to show, so it wins over
+                # the free-text credit. Public-domain rows keep the plain
+                # credit, which the client may show or not.
+                credit = _clean(
+                    row.get("attribution_text") if required else row.get("credit")
+                )
                 images.append(
                     CatalogImage(
                         url=str(row["image_url"]),
                         label=label,
-                        credit=_clean(row.get("credit")),
+                        credit=credit,
+                        attributionRequired=required,
+                        attributionUrl=_clean(row.get("attribution_url")),
                     )
                 )
         if not images:

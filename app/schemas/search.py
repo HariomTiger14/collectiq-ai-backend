@@ -28,11 +28,21 @@ class CatalogImage(BaseModel):
     photo-credit line when the source demands one (contributor-photo
     catalogs like Numista), and must be displayed alongside the image
     wherever it is set.
+
+    `attributionRequired` separates "nice to show" from "must show".
+    Public-domain images carry a credit for provenance, but for a
+    CC BY / CC BY-SA image naming the author is a CONDITION OF THE
+    LICENCE -- displaying it is not optional, and a client that hides
+    the credit to save space would be infringing. Clients must render
+    `credit` wherever such an image appears, linking to
+    `attributionUrl` when present.
     """
 
     url: str
     label: str | None = None
     credit: str | None = None
+    attributionRequired: bool = False
+    attributionUrl: str | None = None
 
 
 class CatalogSearchResult(BaseModel):
