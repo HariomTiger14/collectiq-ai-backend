@@ -1,0 +1,221 @@
+{
+  "_comment": "Visually QA'd coin images cleared for production. Each entry is series -> view -> Commons file title (without the File: prefix). Licence, artist and attribution are read live from Commons at ingest time by scripts/ingest_coin_image_manifest.py -- they are NOT copied here, so the recorded provenance can never drift from the source.",
+  "images": {
+    "$10 American Gold Eagle": {
+      "obverse": "Liberty $50 Obverse.png"
+    },
+    "$10 American Platinum Eagle": {
+      "obverse": "Platinum Obverse.png"
+    },
+    "$100 American Gold Eagle": {
+      "obverse": "Liberty $50 Obverse.png"
+    },
+    "$100 American Platinum Eagle": {
+      "obverse": "Platinum Obverse.png",
+      "reverse": "2005 AEPlat Proof Rev.png"
+    },
+    "$25 American Gold Eagle": {
+      "obverse": "Liberty $50 Obverse.png"
+    },
+    "$25 American Platinum Eagle": {
+      "obverse": "Platinum Obverse.png"
+    },
+    "$5 American Gold Eagle": {
+      "obverse": "Liberty $50 Obverse.png"
+    },
+    "$5 Gold Buffalo": {
+      "obverse": "2006 American Buffalo Proof Obverse.jpg"
+    },
+    "$50 American Gold Eagle": {
+      "obverse": "Liberty $50 Obverse.png",
+      "reverse": "Liberty $50 Reverse.png"
+    },
+    "$50 American Platinum Eagle": {
+      "obverse": "Platinum Obverse.png"
+    },
+    "American Silver Eagle": {
+      "obverse": "2022-american-eagle-silver-one-ounce-bullion-coin-obverse.png",
+      "reverse": "Liberty $1 Reverse.png"
+    },
+    "Barber Dime": {
+      "obverse": "1914 Barber Dime NGC MS64plus Obverse.png",
+      "reverse": "1914 Barber Dime NGC MS64plus Reverse.png"
+    },
+    "Barber Half Dollar": {
+      "obverse": "1907-D Barber half obverse.jpg",
+      "reverse": "1907-D Barber half reverse.jpg"
+    },
+    "Barber Quarter": {
+      "obverse": "1914 Barber Quarter NGC AU58 Obverse.png",
+      "reverse": "1914 Barber Quarter NGC AU58 Reverse.png"
+    },
+    "Braided Hair Penny": {
+      "obverse": "NNC-US-1839-1C-Matron Head Cent (obverse).jpg",
+      "reverse": "1850 large cent reverse.jpg"
+    },
+    "Capped Bust Dime": {
+      "obverse": "1834 10C PR (large 4) (obv).jpg",
+      "reverse": "1834 10C PR (large 4) (rev).jpg"
+    },
+    "Capped Bust Half Dime": {
+      "reverse": "1831-5C (clashed rev die) (rev).jpg"
+    },
+    "Capped Bust Half Dollar": {
+      "obverse": "1822 50C PR (obv).jpg",
+      "reverse": "1822 50C PR (rev).jpg"
+    },
+    "Capped Bust Quarter": {
+      "obverse": "1822 25C PR (over 50C) (obv).jpg",
+      "reverse": "1822 25C PR (over 50C) (rev).jpg"
+    },
+    "Chain & Wreath Cent": {
+      "obverse": "NNC-US-1793-1C-Flowing Hair Cent (chain) (obverse).jpg",
+      "reverse": "NNC-US-1793-1C-Flowing Hair Cent (chain) (reverse).jpg"
+    },
+    "Coronet Head Penny": {
+      "obverse": "1817 Large cent obverse.jpg",
+      "reverse": "1817 Large cent reverse.jpg"
+    },
+    "Draped Bust Dime": {
+      "obverse": "1796 dime obverse.jpg",
+      "reverse": "1796 dime reverse.jpg"
+    },
+    "Draped Bust Half Dime": {
+      "obverse": "1796 half dime obverse.jpg",
+      "reverse": "1796 half dime reverse.jpg"
+    },
+    "Draped Bust Half Dollar": {
+      "obverse": "1796 half dollar obverse 15 stars.jpg",
+      "reverse": "1796 half dollar reverse 15 stars.jpg"
+    },
+    "Draped Bust Penny": {
+      "obverse": "1797 large cent obverse.jpg",
+      "reverse": "1797 large cent reverse.jpg"
+    },
+    "Draped Bust Quarter": {
+      "obverse": "1796 quarter obverse.jpg",
+      "reverse": "1796 quarter reverse.jpg"
+    },
+    "Eisenhower Dollar": {
+      "obverse": "1974S Eisenhower Obverse.jpg",
+      "reverse": "1974S Eisenhower Reverse.jpg"
+    },
+    "Franklin Half Dollar": {
+      "obverse": "Franklin Half 1963 D Obverse.png",
+      "reverse": "Franklin Half 1963 D Reverse.png"
+    },
+    "Gold Dollar": {
+      "obverse": "1857 gold dollar obverse.jpg",
+      "reverse": "1857 gold dollar reverse.jpg"
+    },
+    "Indian Head Penny": {
+      "obverse": "NNC-US-1860-1C-Indian Head Cent (wreath & shield) obverse (cropped).jpg",
+      "reverse": "NNC-US-1860-1C-Indian Head Cent (wreath & shield) reverse (cropped).jpg"
+    },
+    "Jefferson Nickel": {
+      "obverse": "Jefferson-Nickel-Unc-Obv.jpg",
+      "reverse": "US Nickel 2013 Rev.png"
+    },
+    "Liberty Cap Penny": {
+      "obverse": "1796 cent obverse.jpg",
+      "reverse": "1796 cent reverse.jpg"
+    },
+    "Liberty Head Gold Double Eagle": {
+      "obverse": "NNC-US-1849-G$20-Liberty Head (Twenty D.) obverse (cropped).jpg",
+      "reverse": "NNC-US-1866-G$20-Liberty Head (motto) reverse (cropped).jpg"
+    },
+    "Liberty Head Gold Eagle": {
+      "obverse": "1856-S eagle obverse.jpg",
+      "reverse": "NNC-US-1866-G$10-Liberty Head (new style & motto) (cropped reverse).jpg"
+    },
+    "Liberty Head Half Eagle": {
+      "obverse": "1895 half eagle obverse.jpg",
+      "reverse": "1839-C $5 Gold Coin, Reverse.jpg"
+    },
+    "Liberty Head Nickel": {
+      "obverse": "Liberty Head Nickel 1883 NoCents Obverse.png",
+      "reverse": "Reverse of 1910 Liberty Head nickel crop.png"
+    },
+    "Lincoln Memorial Penny": {
+      "obverse": "2005 Penny Obv Unc D.png",
+      "reverse": "2005 Penny Rev Unc D.png"
+    },
+    "Lincoln Shield Penny": {
+      "obverse": "2025 Lincoln cent obverse, uncirculated, Denver mint.jpg",
+      "reverse": "US union shield penny reverse.png"
+    },
+    "Lincoln Wheat Penny": {
+      "obverse": "1909 US Penny obverse (cropped).jpg",
+      "reverse": "1 US cent 1956 reverse.jpg"
+    },
+    "Presidential Dollar": {
+      "reverse": "Presidential $1 Reverse.png"
+    },
+    "Roosevelt Dime": {
+      "obverse": "Dime Obverse 13.png",
+      "reverse": "Dime Reverse 13.png"
+    },
+    "Sacagawea Dollar": {
+      "reverse": "2003 Sacagawea Rev.png"
+    },
+    "Seated Liberty Dime": {
+      "obverse": "NNC-US-1860-10C-Seated Liberty (legend) obverse (cropped).jpg",
+      "reverse": "NNC-US-1860-10C-Seated Liberty (legend) reverse (cropped).jpg"
+    },
+    "Seated Liberty Dollar": {
+      "reverse": "Proof 1861 dollar reverse.jpg",
+      "obverse": "1871 Proof Seated Liberty Dollar obverse.jpg"
+    },
+    "Seated Liberty Half Dime": {
+      "obverse": "NNC-US-1855-5C-Seated Liberty (arrows) obverse (cropped).jpg",
+      "reverse": "NNC-US-1855-5C-Seated Liberty (arrows) reverse (cropped).jpg"
+    },
+    "Seated Liberty Half Dollar": {
+      "obverse": "1859-O half dollar obverse.jpg",
+      "reverse": "1859-O half dollar reverse.jpg"
+    },
+    "Seated Liberty Quarter": {
+      "obverse": "NNC-US-1873-25C-Seated Liberty (no arrows) obverse (cropped).jpg",
+      "reverse": "NNC-US-1873-25C-Seated Liberty (no arrows) reverse (cropped).jpg"
+    },
+    "Shield Nickel": {
+      "obverse": "Shield nickel obverse by Howard Spindel.png",
+      "reverse": "Shield nickel without rays reverse by Howard Spindel.png"
+    },
+    "Standing Liberty Quarter": {
+      "obverse": "1918-7-S Standing Liberty quarter obverse.jpg",
+      "reverse": "1918-7-S Standing Liberty quarter reverse.jpg"
+    },
+    "Susan B Anthony Dollar": {
+      "obverse": "1999 SBA Obv P.png",
+      "reverse": "US Anthony dollar coin reverse.jpg"
+    },
+    "Three Cent Nickel": {
+      "obverse": "NNC-US-1865-3C-Three-Cent, Nickel obverse (cropped).jpg",
+      "reverse": "NNC-US-1865-3C-Three-Cent, Nickel reverse (cropped).jpg"
+    },
+    "Three Dollar Gold": {
+      "obverse": "NNC-US-1854-G$3-Indian Princess Head obverse (cropped).jpg",
+      "reverse": "NNC-US-1854-G$3-Indian Princess Head reverse (cropped).jpg"
+    },
+    "Trade Dollar": {
+      "obverse": "1883 proof Trade dollar obverse.jpg",
+      "reverse": "1874-S Trade dollar reverse.jpg"
+    },
+    "Twenty Cent": {
+      "obverse": "1876 Proof Twenty-cent piece obverse.jpg",
+      "reverse": "1876 Proof Twenty-cent piece reverse.jpg"
+    },
+    "Two Cent": {
+      "obverse": "Longacre two cents obverse.jpg",
+      "reverse": "1864 Large Motto Two-cent piece reverse.jpg"
+    },
+    "Walking Liberty Half Dollar": {
+      "obverse": "1940-S Walking Liberty half dollar weakly struck obverse.jpg",
+      "reverse": "Walking Liberty Half Dollar 1945D Reverse.png"
+    },
+    "Washington Quarter": {
+      "obverse": "SemiQ-Revolutionary-War-Obverse-Unc-D.jpg"
+    }
+  }
+}
