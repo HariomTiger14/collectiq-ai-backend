@@ -435,6 +435,8 @@ class CatalogSearchService:
                 result = self._enrich_with_onepiece_image(result)
             if "videogames" in enabled:
                 result = self._enrich_with_video_games_image(result)
+            if "coins" in enabled:
+                result = self._enrich_with_coin_images(result)
             history_points = [_history_row_to_point(row) for row in history_rows]
             if target_currency:
                 result = result.model_copy(
@@ -622,6 +624,70 @@ class CatalogSearchService:
             return []
         return [row for row in payload if isinstance(row, dict)]
 
+    def _enrich_with_coin_images(
+        self, result: CatalogSearchResult
+    ) -> CatalogSearchResult:
+        """Attach obverse/reverse images for a coin.
+
+        Coins are matched at DESIGN level, not per catalogue row: a
+        1970-D and a 1970-S Roosevelt dime are the same picture, so the
+        key is the series (PriceCharting's console_name minus the
+        "Coins " prefix). Images are our own re-hosted copies of
+        public-domain Commons files -- see
+        scripts/import_coin_images.py and the coin_catalog_images
+        migration for why re-hosting is both permitted and preferred.
+
+        Credits ride along per image because a minority of the source
+        files are CC BY-SA, where attribution is a condition of use.
+        """
+        if result.imageUrl or not result.setName:
+            return result
+        console = result.setName.strip()
+        if not console.lower().startswith("coins "):
+            return result
+        series_key = _normalize_coin_series_key(console)
+        if not series_key:
+            return result
+        payload = self._request(
+            "GET",
+            "/rest/v1/coin_catalog_images",
+            params={
+                "select": "view,image_url,credit",
+                "series_key": f"eq.{series_key}",
+                "design_key": "eq.",
+                "limit": "4",
+            },
+        )
+        rows = (
+            [row for row in payload if isinstance(row, dict)]
+            if isinstance(payload, list)
+            else []
+        )
+        if not rows:
+            return result
+        by_view = {str(row.get("view")): row for row in rows}
+        images: list[CatalogImage] = []
+        for view, label in (("obverse", "Obverse"), ("reverse", "Reverse")):
+            row = by_view.get(view)
+            if row and row.get("image_url"):
+                images.append(
+                    CatalogImage(
+                        url=str(row["image_url"]),
+                        label=label,
+                        credit=_clean(row.get("credit")),
+                    )
+                )
+        if not images:
+            return result
+        # Obverse leads: it carries the portrait/date, which is what a
+        # collector recognises the coin by.
+        return result.model_copy(
+            update={
+                "imageUrl": images[0].url,
+                "images": images if len(images) > 1 else [],
+            }
+        )
+
     def _enrich_pokemon_search_thumbnails(
         self, results: list[CatalogSearchResult], enabled: set[str]
     ) -> list[CatalogSearchResult]:
@@ -770,6 +836,7 @@ class CatalogSearchService:
             "lorcana",
             "onepiece",
             "videogames",
+            "coins",
         }
         try:
             payload = self._request(
@@ -2143,6 +2210,16 @@ def _int_or_none(value: object) -> int | None:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_coin_series_key(console_name: str) -> str:
+    """"Coins Mercury Dime" -> "mercury dime", matching the series_key
+    written by scripts/import_coin_images.py."""
+    lowered = (console_name or "").strip().lower()
+    if not lowered.startswith("coins"):
+        return ""
+    remainder = lowered[len("coins"):]
+    return " ".join(re.split(r"[^a-z0-9]+", remainder)).strip()
 
 
 _KICKSDB_WIDTH_RE = re.compile(r"[?&]w=(\d+)")

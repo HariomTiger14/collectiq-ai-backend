@@ -2045,6 +2045,99 @@ class CatalogSearchServiceTest(unittest.TestCase):
         )
 
 
+class CoinImageEnrichmentTest(unittest.TestCase):
+    # Coins are matched at DESIGN level (a 1970-D and 1970-S Roosevelt
+    # dime are the same picture), so the key is the series from
+    # console_name -- not the individual catalogue row -- and each series
+    # carries obverse + reverse, the first real use of images[].
+
+    def _service(self, *, search_row: dict, coin_rows: list[dict]):
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "coin_catalog_images" in url:
+                return httpx.Response(200, json=coin_rows)
+            if "pricecharting_catalog_history" in url:
+                return httpx.Response(200, json=[])
+            if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
+                if "pricecharting_id" in request.url.params:
+                    return httpx.Response(200, json=[search_row])
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        return CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+    _ROW = {
+        "pricecharting_id": "coin-1",
+        "product_name": "1970 D [FS-901]",
+        "console_name": "Coins Roosevelt Dime",
+        "category": "Coins",
+        "loose_price_cents": 250,
+        "currency": "USD",
+    }
+
+    def test_detail_attaches_obverse_and_reverse(self) -> None:
+        service = self._service(
+            search_row=self._ROW,
+            coin_rows=[
+                {"view": "obverse",
+                 "image_url": "https://cdn.example/coins/roosevelt-dime-obverse.jpg",
+                 "credit": None},
+                {"view": "reverse",
+                 "image_url": "https://cdn.example/coins/roosevelt-dime-reverse.jpg",
+                 "credit": "Some Photographer"},
+            ],
+        )
+
+        response = service.detail("coin-1")
+
+        # Obverse leads: it carries the portrait/date a collector
+        # recognises the coin by.
+        self.assertEqual(
+            response.result.imageUrl,
+            "https://cdn.example/coins/roosevelt-dime-obverse.jpg",
+        )
+        self.assertEqual(
+            [image.label for image in response.result.images],
+            ["Obverse", "Reverse"],
+        )
+        # Credits ride per image: some source files are CC BY-SA, where
+        # attribution is a condition of use.
+        self.assertIsNone(response.result.images[0].credit)
+        self.assertEqual(response.result.images[1].credit, "Some Photographer")
+
+    def test_detail_with_only_one_view_sets_image_but_no_gallery(self) -> None:
+        service = self._service(
+            search_row=self._ROW,
+            coin_rows=[
+                {"view": "obverse",
+                 "image_url": "https://cdn.example/coins/roosevelt-dime-obverse.jpg",
+                 "credit": None},
+            ],
+        )
+
+        response = service.detail("coin-1")
+
+        self.assertEqual(
+            response.result.imageUrl,
+            "https://cdn.example/coins/roosevelt-dime-obverse.jpg",
+        )
+        # One image is not a gallery -- the app keeps its single-image
+        # layout rather than showing a one-page pager with dots.
+        self.assertEqual(response.result.images, [])
+
+    def test_detail_without_curated_images_stays_placeholder(self) -> None:
+        service = self._service(search_row=self._ROW, coin_rows=[])
+
+        response = service.detail("coin-1")
+
+        self.assertIsNone(response.result.imageUrl)
+        self.assertEqual(response.result.images, [])
+
+
 class PokemonImageEnrichmentTest(unittest.TestCase):
     # tcgplayer_pokemon_catalog (imported from TCGCSV — see
     # scripts/import_tcgplayer_pokemon_catalog.py) is our own Supabase
