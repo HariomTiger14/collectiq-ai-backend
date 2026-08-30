@@ -281,6 +281,33 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertIsNone(captured["json"]["category_keywords"])
         self.assertEqual(captured["json"]["platform_group_filter"], "__any_platform__")
 
+    def test_search_sends_multiword_query_verbatim_to_kicksdb_rpc(self) -> None:
+        # Word-order independence lives in the RPC (see
+        # 20260830_kicksdb_search_token_matching.sql: the query is split
+        # into prefix-matched tokens ANDed against the table's GIN index,
+        # replacing a literal '%query%' where "574 new balance" and
+        # "new balance grey" both returned nothing). The service's job is
+        # simply to forward the query untouched -- it must not pre-split,
+        # reorder or quote it, which would defeat that.
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                captured.update(json.loads(request.content.decode()))
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        service.search("574 new balance grey", limit=10, source="kicksdb")
+
+        self.assertEqual(captured.get("search_query"), "574 new balance grey")
+
     def test_search_forwards_price_filters_to_kicksdb_rpc(self) -> None:
         captured: dict = {}
 
