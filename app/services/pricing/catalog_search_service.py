@@ -1143,6 +1143,15 @@ class CatalogSearchService:
         # (our detail page -- card search results stay link-only).
         return f"{image_base}/high.webp"
 
+    @staticmethod
+    def _tcgplayer_full_size(image_url: str) -> str:
+        # The TCGCSV import stored TCGplayer's 200px thumbnail URLs; the
+        # same CDN serves the identical photo at _in_1000x1000 (verified
+        # live: 714x1000, HTTP 200 -- vs 403 for other guessed suffixes).
+        # Substitute only the known thumbnail suffix; anything else passes
+        # through untouched.
+        return image_url.replace("_200w.jpg", "_in_1000x1000.jpg")
+
     def _fetch_tcgplayer_rows(self, group_name: str, card_number: str) -> list[dict[str, Any]]:
         params = {
             "select": "product_name,image_url,variant_tag",
@@ -1163,7 +1172,7 @@ class CatalogSearchService:
             for row in self._fetch_tcgplayer_rows(f"{group_name} (Shadowless)", card_number):
                 image_url = row.get("image_url")
                 if image_url:
-                    return str(image_url)
+                    return self._tcgplayer_full_size(str(image_url))
             return None
         # Named error/misprint products (e.g. "Charizard (Black Dot
         # Error)"): only ever an exact match when every word of the
@@ -1179,7 +1188,7 @@ class CatalogSearchService:
                 continue
             product_words = _normalize_variant_words(str(row.get("product_name") or ""))
             if variant_words.issubset(product_words) and row.get("image_url"):
-                return str(row["image_url"])
+                return self._tcgplayer_full_size(str(row["image_url"]))
         return None
 
     def _fetch_tcgplayer_generic_image(self, group_name: str, card_number: str) -> str | None:
@@ -1193,7 +1202,7 @@ class CatalogSearchService:
             # data — either way, no single image we're confident in.
             return None
         image_url = rows[0].get("image_url")
-        return str(image_url) if image_url else None
+        return self._tcgplayer_full_size(str(image_url)) if image_url else None
 
     def _has_sibling_pokemon_rows(
         self, set_name: str, card_number: str, *, exclude_id: str
