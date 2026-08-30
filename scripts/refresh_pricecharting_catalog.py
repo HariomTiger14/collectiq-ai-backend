@@ -35,6 +35,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     summaries: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
     for index, source in enumerate(selected_sources):
         if index > 0 and args.sleep_between_sources_seconds > 0:
             print(
@@ -43,23 +44,39 @@ def main(argv: list[str] | None = None) -> int:
             )
             time.sleep(args.sleep_between_sources_seconds)
 
-        summary = refresh_source(
-            source=source,
-            source_downloaded_at=source_downloaded_at,
-            archive_dir=args.archive_dir,
-            batch_size=args.batch_size,
-            timeout_seconds=args.timeout_seconds,
-            dry_run=args.dry_run,
-            client=client,
-        )
-        summaries.append(summary)
+        # One source's failure must not cost the others their daily
+        # refresh: before this, a single 503 on the first CSV aborted the
+        # whole run and every remaining category went stale for a day
+        # (observed live 2026-08-29). Failures are recorded and the run
+        # still reports failure at the end -- partial progress is kept,
+        # but a partly-failed run never reports success.
+        try:
+            summary = refresh_source(
+                source=source,
+                source_downloaded_at=source_downloaded_at,
+                archive_dir=args.archive_dir,
+                batch_size=args.batch_size,
+                timeout_seconds=args.timeout_seconds,
+                dry_run=args.dry_run,
+                client=client,
+            )
+            summaries.append(summary)
+        except Exception as error:  # noqa: BLE001 - reported, not swallowed
+            print(
+                f"Source {source} failed: {type(error).__name__}: {error}",
+                flush=True,
+            )
+            failures.append({"source": source, "error": f"{type(error).__name__}: {error}"})
 
     print(
         dump_and_report(
             {
-                "success": True,
+                # False when any source failed, so a partly-failed run is
+                # never recorded as a success in the ops ledger.
+                "success": not failures,
                 "dryRun": args.dry_run,
                 "sources": summaries,
+                "failedSources": failures,
                 "inputRows": sum(summary["inputRows"] for summary in summaries),
                 "validRows": sum(summary["validRows"] for summary in summaries),
                 "importedRows": sum(summary["importedRows"] for summary in summaries),
@@ -74,7 +91,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
         flush=True,
     )
-    return 0
+    # Non-zero so the ops ledger records the run as failed and the
+    # Scheduled-jobs board shows it -- the successful sources' data is
+    # already imported either way.
+    return 1 if failures else 0
 
 
 def refresh_source(
@@ -132,16 +152,41 @@ def download_source_to_temp_file(
     temp_path = Path(handle.name)
     handle.close()
 
-    try:
-        with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as http:
-            with http.stream("GET", url, headers={"Accept": "text/csv,*/*"}) as response:
-                response.raise_for_status()
-                with temp_path.open("wb") as output:
-                    for chunk in response.iter_bytes():
-                        output.write(chunk)
-    except Exception:
-        temp_path.unlink(missing_ok=True)
-        raise
+    # PriceCharting generates these CSVs on demand, and the generator
+    # intermittently 503s on the larger ones (observed live 2026-08-29:
+    # one 503 aborted the whole daily refresh). Retry transient failures
+    # -- 5xx, 429 and network/timeout errors -- with a widening backoff,
+    # since the next scheduled attempt is a whole day away. 4xx other
+    # than 429 is a configuration/auth problem and is raised immediately.
+    last_error: Exception | None = None
+    for attempt, backoff_seconds in enumerate((10, 30, 90, 0), start=1):
+        try:
+            with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as http:
+                with http.stream(
+                    "GET", url, headers={"Accept": "text/csv,*/*"}
+                ) as response:
+                    response.raise_for_status()
+                    with temp_path.open("wb") as output:
+                        for chunk in response.iter_bytes():
+                            output.write(chunk)
+            break
+        except httpx.HTTPStatusError as error:
+            status = error.response.status_code
+            if status < 500 and status != 429:
+                temp_path.unlink(missing_ok=True)
+                raise
+            last_error = error
+        except httpx.HTTPError as error:
+            last_error = error
+        if not backoff_seconds:
+            temp_path.unlink(missing_ok=True)
+            raise last_error
+        print(
+            f"  {source_name} download attempt {attempt} failed "
+            f"({type(last_error).__name__}); retrying in {backoff_seconds}s",
+            flush=True,
+        )
+        time.sleep(backoff_seconds)
 
     print(f"Downloaded {source_name}; starting streamed import.", flush=True)
     return temp_path

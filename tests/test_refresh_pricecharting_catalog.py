@@ -1,12 +1,59 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+
+import httpx
 
 from scripts.refresh_pricecharting_catalog import (
     _selected_sources,
     archive_source_file,
+    download_source_to_temp_file,
     import_source_file,
 )
+
+
+class DownloadRetryTest(unittest.TestCase):
+    # PriceCharting generates these CSVs on demand and intermittently
+    # 503s (observed live 2026-08-29, where one 503 aborted the whole
+    # daily refresh and every category went stale for a day).
+
+    def _run(self, responses: list[object]) -> Path:
+        # Counter lives on the instance so it is still readable when the
+        # download raises rather than returning.
+        self.calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            outcome = responses[min(self.calls, len(responses) - 1)]
+            self.calls += 1
+            if isinstance(outcome, int):
+                return httpx.Response(outcome, text="")
+            raise outcome
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.Client
+
+        def client_factory(*args, **kwargs):
+            kwargs["transport"] = transport
+            return real_client(*args, **kwargs)
+
+        with patch.dict("os.environ", {"PRICECHARTING_CSV_POKEMON_URL": "https://x/csv"}), \
+             patch("scripts.refresh_pricecharting_catalog.time.sleep"), \
+             patch("httpx.Client", client_factory):
+            return download_source_to_temp_file(
+                source="pokemon", source_name="pokemon.csv", timeout_seconds=5
+            )
+
+    def test_transient_503_is_retried_then_succeeds(self) -> None:
+        path = self._run([503, 503, 200])
+        self.addCleanup(path.unlink, missing_ok=True)
+        self.assertEqual(self.calls, 3)
+
+    def test_client_error_is_not_retried(self) -> None:
+        # A 401/404 is a configuration problem: retrying just delays the
+        # failure by two minutes.
+        with self.assertRaises(httpx.HTTPStatusError):
+            self._run([404])
+        self.assertEqual(self.calls, 1)
 
 
 class RefreshPriceChartingCatalogTest(unittest.TestCase):
