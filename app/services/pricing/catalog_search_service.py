@@ -335,6 +335,11 @@ class CatalogSearchService:
         # Lorcana-shaped call: no publisher policy exists either way, the
         # optcgapi hotlink and per-row lookup were already in place for
         # the external link). Killable via the 'onepiece' admin flag.
+        # Yu-Gi-Oh is the seventh (owner decision 2026-08-30), enabled
+        # ONLY after the catalog's images were re-hosted into our own
+        # catalog-images bucket (scripts/rehost_yugioh_images.py) --
+        # YGOPRODeck forbids hotlinking outright, so inline display
+        # waited for self-hosted pixels. Killable via 'yugioh'.
         if any(not result.imageUrl for result in results):
             enabled_image_categories = self._fetch_enabled_image_categories()
             # Pokemon thumbnails BEFORE the link-only pass: rows that get
@@ -359,6 +364,10 @@ class CatalogSearchService:
             if "onepiece" in enabled_image_categories:
                 results = [
                     self._enrich_with_onepiece_image(result) for result in results
+                ]
+            if "yugioh" in enabled_image_categories:
+                results = [
+                    self._enrich_with_yugioh_image(result) for result in results
                 ]
             results = [
                 self._resolve_external_image_url(result, enabled_image_categories)
