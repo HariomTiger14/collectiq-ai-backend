@@ -2914,6 +2914,11 @@ class MagicImageEnrichmentTest(unittest.TestCase):
             "Magic Warhammer 40,000": "Warhammer 40,000 Commander",
             "Magic Elves vs Goblins": "Duel Decks: Elves vs. Goblins",
             "Magic Duel Deck: Zendikar vs. Eldrazi": "Duel Decks: Zendikar vs. Eldrazi",
+            "Magic Duel Deck: Elspeth vs Kiora": "Duel Decks: Elspeth vs. Kiora",
+            "Magic Innistrad: Crimson Vow Commander": "Crimson Vow Commander",
+            "Magic Kamigawa: Neon Dynasty Commander": "Neon Dynasty Commander",
+            "Magic Adventures in the Forgotten Realms Commander": "Forgotten Realms Commander",
+            "Magic Teenage Mutant Ninja Turtles Commander": "Teenage Mutant Ninja Turtles",
         }
         for console, expected in cases.items():
             self.assertEqual(_magic_set_name_from_console(console), expected)

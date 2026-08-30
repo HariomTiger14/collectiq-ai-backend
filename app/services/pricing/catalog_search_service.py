@@ -2379,6 +2379,19 @@ _MAGIC_SET_ALIASES = {
     "duel deck: mind vs. might": "Duel Decks: Mind vs. Might",
     "merfolk vs goblins": "Duel Decks: Merfolk vs. Goblins",
     "duel deck: merfolk vs. goblins": "Duel Decks: Merfolk vs. Goblins",
+    # Elspeth vs Kiora is the one Duel Deck PriceCharting spells without
+    # the period in its "Duel Deck:" console form.
+    "duel deck: elspeth vs kiora": "Duel Decks: Elspeth vs. Kiora",
+    # Commander/Art-Series sets where PriceCharting prepends the parent
+    # set name that Scryfall drops (verified: these ARE imported, just
+    # under the shorter name -- not the import gap first suspected).
+    "innistrad: crimson vow commander": "Crimson Vow Commander",
+    "kamigawa: neon dynasty commander": "Neon Dynasty Commander",
+    "kamigawa: neon dynasty art series": "Neon Dynasty Art Series",
+    "adventures in the forgotten realms commander": "Forgotten Realms Commander",
+    # TMNT was a Commander release; PriceCharting's "...Commander" cards
+    # live in Scryfall's base "Teenage Mutant Ninja Turtles" set.
+    "teenage mutant ninja turtles commander": "Teenage Mutant Ninja Turtles",
 }
 
 
