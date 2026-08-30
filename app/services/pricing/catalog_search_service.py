@@ -2313,6 +2313,11 @@ _MAGIC_SET_ALIASES = {
     "lord of the rings": "The Lord of the Rings: Tales of Middle-earth",
     "lord of the rings commander": "Tales of Middle-earth Commander",
     "lord of the rings art series": "Tales of Middle-earth Art Series",
+    # PriceCharting drops the possessive: "Marvel Spider-Man" ->
+    # Scryfall's "Marvel's Spider-Man" (the 's normalizes to "marvels",
+    # so it misses without this). The two "Marvel Super Heroes" sets
+    # already normalize-match and need no alias.
+    "marvel spider-man": "Marvel's Spider-Man",
 }
 
 

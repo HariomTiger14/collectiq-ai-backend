@@ -2897,6 +2897,41 @@ class MagicImageEnrichmentTest(unittest.TestCase):
             "https://cards.scryfall.io/normal/beta-black-lotus.jpg",
         )
 
+    def test_detail_resolves_possessive_set_alias_by_number(self) -> None:
+        # PriceCharting's "Magic Marvel Spider-Man" is Scryfall's
+        # "Marvel's Spider-Man" (the 's normalizes to "marvels"), which
+        # missed until the alias -- live-caught: The Soul Stone #242.
+        search_row = {
+            "pricecharting_id": "8800003",
+            "product_name": "The Soul Stone #242",
+            "console_name": "Magic Marvel Spider-Man",
+            "category": "Magic Marvel Spider-Man",
+            "loose_price_cents": 2077828,
+            "currency": "USD",
+        }
+        number_rows = {
+            ("marvels spider man", "242"): [
+                {"image_url": "https://cards.scryfall.io/normal/soul-stone.jpg"},
+            ],
+        }
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(
+                transport=httpx.MockTransport(
+                    self._handler(search_row=search_row, number_rows=number_rows, name_rows={})
+                )
+            ),
+        )
+
+        response = service.detail("8800003")
+
+        self.assertEqual(
+            response.result.imageUrl,
+            "https://cards.scryfall.io/normal/soul-stone.jpg",
+        )
+
     def test_detail_resolves_renamed_commander_set_alias_by_number(self) -> None:
         # "Magic Lord of the Rings Commander" is Scryfall's "Tales of
         # Middle-earth Commander" -- a numbered modern card that still
