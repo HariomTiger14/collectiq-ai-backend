@@ -2008,7 +2008,7 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
                     },
                     {
                         "pricecharting_id": "2",
-                        "product_name": "Pikachu [Reverse Holo] #25",
+                        "product_name": "Pikachu [1st Edition] #25",
                         "console_name": "Pokemon Stellar Crown",
                         "category": "Pokemon Card",
                         "loose_price_cents": 900,
@@ -2050,7 +2050,7 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
             by_id["3"].imageUrl,
             "https://assets.tcgdex.net/ja/SV/SV2D/027/low.webp",
         )
-        # Variant row: no inline thumbnail (print ambiguity), link-only.
+        # Image-significant variant row: no inline thumbnail, link-only.
         self.assertIsNone(by_id["2"].imageUrl)
         batched = [u for u in tcgdex_requests if "or=" in u]
         self.assertEqual(len(batched), 2)  # one per language, not per row
@@ -2206,13 +2206,14 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
             "https://assets.tcgdex.net/en/sv/sv07/025/high.webp",
         )
 
-    def test_detail_bracketed_variant_row_never_gets_tcgdex_image(self) -> None:
-        # An unstamped base scan on a [Reverse Holo] row would be visibly
-        # wrong -- bracketed rows only ever get the TCGplayer variant-exact
-        # image, never the TCGdex base scan.
+    def test_detail_safe_variant_gets_tcgdex_image(self) -> None:
+        # Stage-1 allowlist (reviewer-approved after visual validation):
+        # reverse holo / reverse / holo / jumbo describe foil treatment or
+        # format, not the card face -- the canonical TCGdex image is
+        # exactly right for them.
         service = self._service(
             search_row={
-                "pricecharting_id": "990003",
+                "pricecharting_id": "990008",
                 "product_name": "Pikachu [Reverse Holo] #25",
                 "console_name": "Pokemon Stellar Crown",
                 "category": "Pokemon Card",
@@ -2222,8 +2223,42 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
             tcgplayer_rows={},
             sibling_rows={
                 "Pokemon Stellar Crown": [
-                    {"pricecharting_id": "990003",
+                    {"pricecharting_id": "990008",
                      "product_name": "Pikachu [Reverse Holo] #25"},
+                ]
+            },
+            tcgdex_rows={
+                ("en", "stellar crown", "25"): [
+                    {"image_url": "https://assets.tcgdex.net/en/sv/sv07/025"}
+                ],
+            },
+        )
+
+        response = service.detail("990008")
+
+        self.assertEqual(
+            response.result.imageUrl,
+            "https://assets.tcgdex.net/en/sv/sv07/025/high.webp",
+        )
+
+    def test_detail_image_significant_variant_never_gets_tcgdex_image(self) -> None:
+        # An unstamped base scan on a [1st Edition] row would be visibly
+        # wrong -- image-significant bracket tags (anything not in
+        # SAFE_VARIANT_TAGS) never get the TCGdex base scan.
+        service = self._service(
+            search_row={
+                "pricecharting_id": "990003",
+                "product_name": "Pikachu [1st Edition] #25",
+                "console_name": "Pokemon Stellar Crown",
+                "category": "Pokemon Card",
+                "loose_price_cents": 900,
+                "currency": "USD",
+            },
+            tcgplayer_rows={},
+            sibling_rows={
+                "Pokemon Stellar Crown": [
+                    {"pricecharting_id": "990003",
+                     "product_name": "Pikachu [1st Edition] #25"},
                 ]
             },
             tcgdex_rows={
