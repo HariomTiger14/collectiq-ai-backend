@@ -814,6 +814,49 @@ class CatalogSearchServiceTest(unittest.TestCase):
             ["View 1", "View 2", "View 3"],
         )
 
+    def test_kicksdb_detail_upgrades_thumbnail_renders_to_full_size(self) -> None:
+        # kicksdb_catalog stores whatever render KicksDB handed us -- often
+        # StockX's 140x100 thumbnail -- while gallery entries are 700x500.
+        # Shown side by side that made the primary photo visibly softer
+        # than the others (found live), so detail upgrades the render.
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "kicksdb_catalog_history" in str(request.url):
+                return httpx.Response(200, json=[])
+            if "kicksdb_catalog" in str(request.url):
+                return httpx.Response(200, json=[{
+                    "kicksdb_id": "kdb-thumb",
+                    "title": "New Balance 574",
+                    "category": "Sneakers",
+                    "currency": "USD",
+                    "avg_price_cents": 19900,
+                    "image_url":
+                        "https://images.stockx.com/images/NB.jpg?w=140&h=100&q=90",
+                    "gallery": [
+                        "https://images.stockx.com/images/NB.jpg?w=140&h=100&q=90",
+                        "https://images.stockx.com/images/NB-2.jpg?w=700&h=500&q=90",
+                    ],
+                    "updated_at": "2026-08-30T00:00:00Z",
+                }])
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.detail("kdb-thumb")
+
+        self.assertEqual(
+            response.result.imageUrl,
+            "https://images.stockx.com/images/NB.jpg?w=700&h=500&q=90",
+        )
+        # Every gallery entry renders at the same size, so no page looks
+        # softer than its neighbours.
+        self.assertTrue(
+            all("w=700&h=500" in image.url for image in response.result.images)
+        )
+
     def test_kicksdb_detail_single_photo_leaves_images_empty(self) -> None:
         # One photo is the norm; `images` stays empty so the app keeps its
         # existing single-image layout.
@@ -1928,9 +1971,11 @@ class CatalogSearchServiceTest(unittest.TestCase):
     ) -> None:
         # KicksDB (sneaker) rows already carry a real imageUrl assigned
         # directly by _kicksdb_row_to_result, not via the publisher-image
-        # enrichment chain. _resolve_external_image_url must leave those
-        # alone -- imageUrl already covers the "show the user a picture"
-        # need, so externalImageUrl should stay unset.
+        # enrichment chain -- _resolve_external_image_url must leave those
+        # alone. externalImageUrl is set from the SAME photo (upgraded to
+        # a full-size render for StockX-hosted URLs) so the row's "View
+        # image" link opens the big picture rather than the list
+        # thumbnail; it must never come from the enrichment chain.
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if "search_pricecharting_catalog" in url:
@@ -1965,7 +2010,12 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertEqual(
             response.results[0].imageUrl, "https://kicksdb.example.com/aj1.jpg"
         )
-        self.assertIsNone(response.results[0].externalImageUrl)
+        # Non-StockX host: passes through untouched (same photo, no
+        # publisher-enrichment URL).
+        self.assertEqual(
+            response.results[0].externalImageUrl,
+            "https://kicksdb.example.com/aj1.jpg",
+        )
 
 
 class PokemonImageEnrichmentTest(unittest.TestCase):

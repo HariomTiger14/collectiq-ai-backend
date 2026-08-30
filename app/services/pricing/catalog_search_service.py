@@ -485,6 +485,14 @@ class CatalogSearchService:
             gallery_images = _kicksdb_gallery_images(
                 kicksdb_row, kicksdb_result.imageUrl
             )
+            # Detail surfaces render big: upgrade the stored render (often
+            # a 140x100 thumbnail) so the primary photo isn't visibly
+            # softer than the gallery shots beside it.
+            detail_primary = _kicksdb_detail_image_url(kicksdb_result.imageUrl)
+            if detail_primary != kicksdb_result.imageUrl:
+                kicksdb_result = kicksdb_result.model_copy(
+                    update={"imageUrl": detail_primary}
+                )
             if gallery_images:
                 # imageUrl stays primary and leads the list, so clients
                 # that ignore `images` are unaffected.
@@ -2050,6 +2058,9 @@ def _kicksdb_row_to_result(row: dict[str, Any], query: str) -> CatalogSearchResu
         attribution="Pricing data by KicksDB",
         lastUpdated=_clean(row.get("updated_at")) or (datetime.utcnow().isoformat() + "Z"),
         imageUrl=_clean(row.get("image_url")),
+        # The stored render is a thumbnail; the "View image" link should
+        # open the full-size photo, not the 140px tile the row shows.
+        externalImageUrl=_kicksdb_detail_image_url(_clean(row.get("image_url"))),
         pricing=pricing,
     )
 
@@ -2135,6 +2146,25 @@ def _int_or_none(value: object) -> int | None:
 
 
 _KICKSDB_WIDTH_RE = re.compile(r"[?&]w=(\d+)")
+# StockX's imgix CDN renders whatever size the URL asks for (verified:
+# w=700&h=500 returns 1400x1000 at dpr=2). kicksdb_catalog stores
+# whatever render KicksDB happened to hand us -- often the 140x100
+# thumbnail -- so detail surfaces upgrade the request rather than
+# displaying a stretched thumbnail next to full-size gallery shots.
+_KICKSDB_DETAIL_WIDTH = 700
+_KICKSDB_DETAIL_HEIGHT = 500
+
+
+def _kicksdb_detail_image_url(url: str | None) -> str | None:
+    if not url:
+        return url
+    if "images.stockx.com" not in url and "stockx-assets" not in url:
+        return url
+    upgraded = re.sub(r"([?&])w=\d+", rf"\g<1>w={_KICKSDB_DETAIL_WIDTH}", url)
+    upgraded = re.sub(
+        r"([?&])h=\d+", rf"\g<1>h={_KICKSDB_DETAIL_HEIGHT}", upgraded
+    )
+    return upgraded
 
 
 def _kicksdb_gallery_images(
@@ -2171,7 +2201,10 @@ def _kicksdb_gallery_images(
     primary_path = path_of(primary_url) if primary_url else None
     extras = [url for key, url in widest.items() if key != primary_path]
     return [
-        CatalogImage(url=url, label=f"View {index + 2}")
+        CatalogImage(
+            url=_kicksdb_detail_image_url(url) or url,
+            label=f"View {index + 2}",
+        )
         for index, url in enumerate(extras)
     ]
 
