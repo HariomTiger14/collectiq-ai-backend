@@ -2897,6 +2897,32 @@ class MagicImageEnrichmentTest(unittest.TestCase):
             "https://cards.scryfall.io/normal/beta-black-lotus.jpg",
         )
 
+    def test_magic_set_aliases_resolve_expected_targets(self) -> None:
+        # Whole-catalog audit fixes (2026-08-30): renamed modern sets and
+        # Duel Decks whose PriceCharting name differs from Scryfall's.
+        from app.services.pricing.catalog_search_service import (
+            _magic_set_name_from_console,
+        )
+
+        cases = {
+            "Magic Marvel Spider-Man": "Marvel's Spider-Man",
+            "Magic The List Reprints": "The List",
+            "Magic M15": "Magic 2015",
+            "Magic Core Set 2012": "Magic 2012",
+            "Magic Brother's War": "The Brothers' War",
+            "Magic Lost Caverns of Ixalan": "The Lost Caverns of Ixalan",
+            "Magic Warhammer 40,000": "Warhammer 40,000 Commander",
+            "Magic Elves vs Goblins": "Duel Decks: Elves vs. Goblins",
+            "Magic Duel Deck: Zendikar vs. Eldrazi": "Duel Decks: Zendikar vs. Eldrazi",
+        }
+        for console, expected in cases.items():
+            self.assertEqual(_magic_set_name_from_console(console), expected)
+        # Unknown sets still pass through unchanged (no over-aliasing).
+        self.assertEqual(
+            _magic_set_name_from_console("Magic Streets of New Capenna"),
+            "Streets of New Capenna",
+        )
+
     def test_detail_resolves_renamed_commander_set_alias_by_number(self) -> None:
         # "Magic Lord of the Rings Commander" is Scryfall's "Tales of
         # Middle-earth Commander" -- a numbered modern card that still
