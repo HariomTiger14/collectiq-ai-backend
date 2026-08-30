@@ -67,6 +67,14 @@ class _Recorder:
 
     @property
     def _configured(self) -> bool:
+        # Same guard as app/services/ops/observability.py: a test run must
+        # never write into the production run ledger. pytest sets
+        # PYTEST_CURRENT_TEST for every test, so this needs no
+        # cooperation from individual tests.
+        if os.getenv("PYTEST_CURRENT_TEST") or os.getenv(
+            "OPS_OBSERVABILITY_DISABLED", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}:
+            return False
         return bool(self.supabase_url and self.service_key)
 
     def start(self) -> None:

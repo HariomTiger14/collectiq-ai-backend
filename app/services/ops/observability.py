@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import os
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -137,7 +138,35 @@ def _post(path: str, payload: dict[str, Any], *, prefer: str) -> Any:
     return _request("POST", path, payload, prefer=prefer)
 
 
+def _observability_writes_disabled() -> bool:
+    """True when this process must not write to the ops tables.
+
+    Tests exercise the admin endpoints through TestClient, which runs the
+    real recorded_admin_job() decorator; with SUPABASE_* present in a
+    developer's .env that wrote straight into PRODUCTION ops_cron_runs.
+    Found live 2026-08-30: the Scheduled-jobs board showed fx-rates-refresh
+    running "3 min ago" with a failure whose traceback was a local path
+    and whose error message was the fixture string "boom" -- six of the
+    fifteen recorded runs for that job were test artifacts, in the very
+    table used to diagnose whether jobs are healthy.
+
+    pytest sets PYTEST_CURRENT_TEST for the duration of every test, which
+    makes this self-enforcing rather than something each test must
+    remember to patch.
+    """
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return True
+    return os.getenv("OPS_OBSERVABILITY_DISABLED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _request(method: str, path: str, payload: dict[str, Any], *, prefer: str) -> Any:
+    if _observability_writes_disabled():
+        return None
     supabase_url = (settings.supabase_url or "").strip().rstrip("/")
     service_key = (settings.supabase_service_role_key or "").strip()
     if not supabase_url or not service_key:
