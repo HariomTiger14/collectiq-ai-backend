@@ -1,6 +1,9 @@
+import os
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+from app.services.ops import observability
 
 from app.services.ops.pipeline_health_service import (
     AdminOpsObservabilityService,
@@ -115,3 +118,36 @@ class RecordedAdminJobTest(unittest.TestCase):
         import hashlib
         fp = lambda msg: hashlib.md5("api|/admin/users/{user_id}|KeyError".encode()).hexdigest()
         self.assertEqual(fp("user 123 missing"), fp("user 456 missing"))
+
+
+class ObservabilityWriteGuardTest(unittest.TestCase):
+    """Test runs must never write into the production ops tables.
+
+    Found live 2026-08-30: the Scheduled-jobs board showed
+    fx-rates-refresh running "3 min ago" with a traceback from a local
+    path and the fixture message "boom" -- test artifacts sitting in the
+    very table used to judge whether jobs are healthy. 13 polluted rows
+    were removed; this keeps them from coming back.
+    """
+
+    def test_writes_are_disabled_under_pytest(self) -> None:
+        # pytest sets PYTEST_CURRENT_TEST for every test, so the guard is
+        # active right now without any patching.
+        self.assertTrue(observability._observability_writes_disabled())
+
+    def test_request_makes_no_http_call_while_guarded(self) -> None:
+        with patch("httpx.request") as request:
+            result = observability._request(
+                "POST", "/rest/v1/ops_cron_runs", {"job_name": "x"},
+                prefer="return=minimal",
+            )
+        request.assert_not_called()
+        self.assertIsNone(result)
+
+    def test_guard_lifts_outside_tests_unless_explicitly_disabled(self) -> None:
+        with patch.dict(os.environ, {"PYTEST_CURRENT_TEST": ""}, clear=False):
+            os.environ.pop("PYTEST_CURRENT_TEST", None)
+            self.assertFalse(observability._observability_writes_disabled())
+            os.environ["OPS_OBSERVABILITY_DISABLED"] = "true"
+            self.assertTrue(observability._observability_writes_disabled())
+            os.environ.pop("OPS_OBSERVABILITY_DISABLED", None)
