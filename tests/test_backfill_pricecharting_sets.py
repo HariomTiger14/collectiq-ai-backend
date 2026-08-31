@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 
+import scripts.import_pricecharting_catalog as catalog_module
+
 from scripts.backfill_pricecharting_sets import (
     API_SEARCH_RESULT_CAP,
     CONSECUTIVE_RATE_LIMIT_ABORT_THRESHOLD,
@@ -1811,3 +1813,79 @@ class MainRunLockIntegrationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CatalogWriteStatsTest(unittest.TestCase):
+    """The run ledger must report REAL write volume, not rows parsed.
+
+    Every tier-3 run recorded catalogRowsWritten == catalogRowsParsed --
+    not because every row was rewritten, but because the summary echoed
+    the parsed count as a placeholder. That made the ledger useless for
+    the one question it was needed for: how much write load these jobs
+    put on the database, versus how much is cheap unchanged-row
+    detection. These lock the accumulator to the real split.
+    """
+
+    def _run(self, rows, existing):
+        posted = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, json=existing)
+            posted.append(json.loads(request.content))
+            return httpx.Response(201, json=[])
+
+        client = catalog_module.SupabaseCatalogClient(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            timeout_seconds=5,
+        )
+        transport = httpx.MockTransport(handler)
+        original = httpx.Client
+
+        def factory(*args, **kwargs):
+            kwargs["transport"] = transport
+            return original(*args, **kwargs)
+
+        with patch.object(catalog_module.httpx, "Client", factory):
+            client.upsert_rows(rows, batch_size=10)
+        return client, posted
+
+    def test_unchanged_rows_are_counted_as_skipped_not_written(self) -> None:
+        client, posted = self._run(
+            rows=[
+                {"pricecharting_id": "1", "content_hash": "aaa"},
+                {"pricecharting_id": "2", "content_hash": "bbb"},
+            ],
+            existing=[
+                {"pricecharting_id": "1", "content_hash": "aaa"},
+                {"pricecharting_id": "2", "content_hash": "bbb"},
+            ],
+        )
+        self.assertEqual(client.catalog_write_stats["written"], 0)
+        self.assertEqual(client.catalog_write_stats["skippedUnchanged"], 2)
+        # nothing should have been sent to the write endpoint at all
+        self.assertEqual(posted, [])
+
+    def test_changed_rows_are_counted_as_written(self) -> None:
+        client, posted = self._run(
+            rows=[
+                {"pricecharting_id": "1", "content_hash": "NEW"},
+                {"pricecharting_id": "2", "content_hash": "bbb"},
+            ],
+            existing=[
+                {"pricecharting_id": "1", "content_hash": "old"},
+                {"pricecharting_id": "2", "content_hash": "bbb"},
+            ],
+        )
+        self.assertEqual(client.catalog_write_stats["written"], 1)
+        self.assertEqual(client.catalog_write_stats["skippedUnchanged"], 1)
+        self.assertEqual(len(posted), 1)
+
+    def test_rows_absent_from_the_table_count_as_written(self) -> None:
+        client, _ = self._run(
+            rows=[{"pricecharting_id": "9", "content_hash": "a"}],
+            existing=[],
+        )
+        self.assertEqual(client.catalog_write_stats["written"], 1)
+        self.assertEqual(client.catalog_write_stats["skippedUnchanged"], 0)

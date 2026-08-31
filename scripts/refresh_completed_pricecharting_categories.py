@@ -130,6 +130,11 @@ def main(argv: list[str] | None = None) -> int:
 
             succeeded_sets += len(chunk)
 
+    catalog_write_stats = (
+        catalog_client.catalog_write_stats
+        if catalog_client is not None
+        else {"written": 0, "skippedUnchanged": 0, "failed": 0}
+    )
     print(
         dump_and_report(
             {
@@ -139,7 +144,18 @@ def main(argv: list[str] | None = None) -> int:
                 "setsRefreshed": succeeded_sets,
                 "failedBatches": failed_batches,
                 "catalogRowsParsed": total_catalog_rows,
-                "catalogRowsWritten": 0 if args.dry_run else total_catalog_rows,
+                # Real split from the client accumulator; rowsWritten used
+                # to echo rowsParsed, hiding how much of each run was a
+                # cheap unchanged-row read versus an actual write.
+                "catalogRowsWritten": (
+                    0 if args.dry_run else catalog_write_stats["written"]
+                ),
+                "catalogRowsSkippedUnchanged": (
+                    0 if args.dry_run else catalog_write_stats["skippedUnchanged"]
+                ),
+                "catalogRowsFailed": (
+                    0 if args.dry_run else catalog_write_stats["failed"]
+                ),
             },
             indent=2,
         ),

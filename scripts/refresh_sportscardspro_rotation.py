@@ -181,6 +181,11 @@ def main(argv: list[str] | None = None) -> int:
                 registry.mark_tier3_refreshed(batch_ids)
             refreshed_ids.extend(batch_ids)
 
+    catalog_write_stats = (
+        catalog_client.catalog_write_stats
+        if catalog_client is not None
+        else {"written": 0, "skippedUnchanged": 0, "failed": 0}
+    )
     print(
         dump_and_report(
             {
@@ -192,7 +197,20 @@ def main(argv: list[str] | None = None) -> int:
                 "rateLimited429s": rate_limit_counter.value,
                 "breakerTripped": breaker.tripped,
                 "catalogRowsParsed": total_catalog_rows,
-                "catalogRowsWritten": 0 if args.dry_run else total_catalog_rows,
+                # Real write/skip split from the client's accumulator, not
+                # a placeholder echo of rowsParsed. Unchanged rows cost a
+                # hash read; only changed rows cost a write -- which is the
+                # number that matters when judging database load, and the
+                # one the ledger previously could not show.
+                "catalogRowsWritten": (
+                    0 if args.dry_run else catalog_write_stats["written"]
+                ),
+                "catalogRowsSkippedUnchanged": (
+                    0 if args.dry_run else catalog_write_stats["skippedUnchanged"]
+                ),
+                "catalogRowsFailed": (
+                    0 if args.dry_run else catalog_write_stats["failed"]
+                ),
             },
             indent=2,
         ),

@@ -593,6 +593,21 @@ class SupabaseCatalogClient:
             "duplicateSkipped": 0,
             "failed": 0,
         }
+        # Same accumulator pattern as price_history_stats, for the catalog
+        # write path. upsert_rows() already computes these three numbers to
+        # decide what to send, but only returned the write count -- so the
+        # cheap/expensive split (unchanged rows cost a hash READ, changed
+        # rows cost a WRITE) was visible in stdout and nowhere else. The
+        # tier-3 rotation summary consequently reported rowsWritten as a
+        # placeholder equal to rowsParsed, which made the run ledger look
+        # like every row was rewritten every cycle. Accumulating here lets
+        # any caller record the real split without changing upsert_rows()'
+        # int return type, which ~15 import scripts depend on.
+        self.catalog_write_stats: dict[str, int] = {
+            "written": 0,
+            "skippedUnchanged": 0,
+            "failed": 0,
+        }
 
     def upsert_rows(self, rows: list[dict[str, Any]], *, batch_size: int) -> int:
         if batch_size <= 0:
@@ -648,6 +663,9 @@ class SupabaseCatalogClient:
                     f"Skipped {skipped} unchanged catalog rows; upserted {total} changed/new rows...",
                     flush=True,
                 )
+        self.catalog_write_stats["written"] += total
+        self.catalog_write_stats["skippedUnchanged"] += skipped
+        self.catalog_write_stats["failed"] += len(failed_ids)
         if failed_ids:
             raise PartialCatalogWriteError(
                 f"{len(failed_ids)} catalog row(s) failed to upsert; {total} succeeded.",
