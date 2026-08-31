@@ -1967,3 +1967,73 @@ class WriteRetryTest(unittest.TestCase):
         self.assertFalse(wrote)
         self.assertEqual(retries, 0)
         self.assertEqual(waits, [])
+
+
+class BlockedResponseTest(unittest.TestCase):
+    """403 must feed the circuit breaker, not just 429.
+
+    On 2026-08-31 sportscardspro.com began returning 403 Forbidden
+    alongside 429s -- both on identical console-uids across retries. The
+    run refreshed 0 of 360 sets and only tripped the breaker because a
+    few 429s happened to appear too. A pure-403 run would have spent all
+    120 throttled requests on an endpoint already refusing us, which is
+    the surest way to turn a temporary block into a durable one.
+
+    429 means "slow down"; 403 means "blocked". Only the first is fixed
+    by waiting longer between requests, so they are counted separately.
+    """
+
+    def _fetch(self, status: int):
+        rate = backfill_module._Counter()
+        blocked = backfill_module._Counter()
+        http = httpx.Client(
+            transport=httpx.MockTransport(lambda r: httpx.Response(status))
+        )
+        result = backfill_module.fetch_batch_csv(
+            http,
+            base_url="https://example.test",
+            token="tok",
+            console_uids=["G1", "G2"],
+            rate_limit_counter=rate,
+            blocked_counter=blocked,
+        )
+        return result, rate.value, blocked.value
+
+    def test_403_increments_the_blocked_counter_only(self) -> None:
+        result, rate, blocked = self._fetch(403)
+        self.assertIsNone(result)
+        self.assertEqual(blocked, 1)
+        self.assertEqual(rate, 0)
+
+    def test_429_increments_the_rate_limit_counter_only(self) -> None:
+        result, rate, blocked = self._fetch(429)
+        self.assertIsNone(result)
+        self.assertEqual(rate, 1)
+        self.assertEqual(blocked, 0)
+
+    def test_other_errors_increment_neither(self) -> None:
+        result, rate, blocked = self._fetch(500)
+        self.assertIsNone(result)
+        self.assertEqual(rate, 0)
+        self.assertEqual(blocked, 0)
+
+    def test_a_run_of_403s_trips_the_breaker(self) -> None:
+        # The behaviour that was missing: consecutive blocked batches must
+        # stop the run even with zero 429s anywhere.
+        breaker = backfill_module._RateLimitCircuitBreaker(3)
+        blocked = backfill_module._Counter()
+        for _ in range(3):
+            before = blocked.value
+            blocked.increment()
+            if blocked.value > before:
+                breaker.record_rate_limited()
+        self.assertTrue(breaker.tripped)
+
+
+class SportsCardsProPacingTest(unittest.TestCase):
+    def test_default_spacing_is_the_measured_100_percent_value(self) -> None:
+        # Their own measurements: ~13% success at 2s, ~80% at 15s, 100% at
+        # 30s. 15s was a "middle ground" that in practice meant a standing
+        # ~1-in-5 batch loss, so this is pinned to the only value with a
+        # measured 100% success rate.
+        self.assertEqual(backfill_module.SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS, 30.0)

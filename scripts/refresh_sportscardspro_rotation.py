@@ -118,6 +118,10 @@ def main(argv: list[str] | None = None) -> int:
     base_url = SOURCE_SITE_BASE_URLS["sportscardspro"]
     breaker = _RateLimitCircuitBreaker(RATE_LIMIT_BREAKER_THRESHOLD)
     rate_limit_counter = _Counter()
+    # 403s are tracked separately from 429s: "blocked" and "slow down" are
+    # different states, and only one of them is fixed by waiting a bit
+    # longer between requests.
+    blocked_counter = _Counter()
     total_catalog_rows = 0
     failed_batches = 0
     # failed_batches lumped fetch failures and write failures into one
@@ -147,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(args.sleep_between_requests_seconds)
             console_uids = [row["console_uid"] for row in chunk]
             before_429s = rate_limit_counter.value
+            before_403s = blocked_counter.value
             csv_text = fetch_batch_csv_with_retry(
                 http,
                 base_url=base_url,
@@ -155,11 +160,20 @@ def main(argv: list[str] | None = None) -> int:
                 max_attempts=args.max_attempts,
                 retry_sleep_seconds=args.sleep_between_requests_seconds,
                 rate_limit_counter=rate_limit_counter,
+                blocked_counter=blocked_counter,
             )
             if csv_text is None:
                 failed_batches += 1
                 failed_fetches += 1
-                if rate_limit_counter.value > before_429s:
+                # Trip on EITHER signal. Previously only 429 counted, so a
+                # run taking pure 403s never tripped and would spend all
+                # 120 throttled requests on an endpoint already refusing
+                # us -- exactly the behaviour most likely to harden a
+                # temporary block.
+                if (
+                    rate_limit_counter.value > before_429s
+                    or blocked_counter.value > before_403s
+                ):
                     breaker.record_rate_limited()
                 continue
             breaker.record_success()
@@ -216,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
                 "failedWrites": failed_writes,
                 "writeRetries": write_retries,
                 "rateLimited429s": rate_limit_counter.value,
+                "blocked403s": blocked_counter.value,
                 "breakerTripped": breaker.tripped,
                 "catalogRowsParsed": total_catalog_rows,
                 # Real write/skip split from the client's accumulator, not
