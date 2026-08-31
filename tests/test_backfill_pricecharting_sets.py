@@ -2,11 +2,13 @@ import json
 import threading
 import time
 import unittest
+from unittest import mock
 from unittest.mock import MagicMock, patch
 
 import httpx
 
 import scripts.import_pricecharting_catalog as catalog_module
+import scripts.backfill_pricecharting_sets as backfill_module
 
 from scripts.backfill_pricecharting_sets import (
     API_SEARCH_RESULT_CAP,
@@ -1889,3 +1891,79 @@ class CatalogWriteStatsTest(unittest.TestCase):
         )
         self.assertEqual(client.catalog_write_stats["written"], 1)
         self.assertEqual(client.catalog_write_stats["skippedUnchanged"], 0)
+
+
+class WriteRetryTest(unittest.TestCase):
+    """A fetched CSV cost a throttled request -- don't discard it on the
+    first write failure.
+
+    ~13% of tier-3 batches failed every run, and fetch failures and write
+    failures shared one counter so nobody could tell which. Write failures
+    are the anticipated Postgres statement timeout under load: transient,
+    and idempotent to retry, because rows that already landed are skipped
+    by the content-hash diff. Giving up re-fetches identical bytes next
+    cycle and spends the sportscardspro budget twice.
+    """
+
+    def _client(self):
+        return mock.MagicMock()
+
+    def test_succeeds_first_time_without_retrying(self) -> None:
+        with mock.patch.object(backfill_module, "write_catalog_rows", return_value=True) as w:
+            wrote, retries = backfill_module.write_catalog_rows_with_retry(
+                self._client(), [{"a": 1}], batch_size=10, attempts=3,
+                backoff_seconds=5, sleep=lambda _: None,
+            )
+        self.assertTrue(wrote)
+        self.assertEqual(retries, 0)
+        self.assertEqual(w.call_count, 1)
+
+    def test_transient_failure_recovers_without_a_refetch(self) -> None:
+        with mock.patch.object(
+            backfill_module, "write_catalog_rows", side_effect=[False, True]
+        ) as w:
+            wrote, retries = backfill_module.write_catalog_rows_with_retry(
+                self._client(), [{"a": 1}], batch_size=10, attempts=3,
+                backoff_seconds=5, sleep=lambda _: None,
+            )
+        self.assertTrue(wrote)
+        self.assertEqual(retries, 1)
+        self.assertEqual(w.call_count, 2)
+
+    def test_gives_up_after_the_attempt_budget(self) -> None:
+        with mock.patch.object(
+            backfill_module, "write_catalog_rows", return_value=False
+        ) as w:
+            wrote, retries = backfill_module.write_catalog_rows_with_retry(
+                self._client(), [{"a": 1}], batch_size=10, attempts=3,
+                backoff_seconds=5, sleep=lambda _: None,
+            )
+        self.assertFalse(wrote)
+        self.assertEqual(w.call_count, 3)
+        self.assertEqual(retries, 2)
+
+    def test_backoff_grows_and_never_uses_the_scraper_throttle(self) -> None:
+        waits: list[float] = []
+        with mock.patch.object(
+            backfill_module, "write_catalog_rows", return_value=False
+        ):
+            backfill_module.write_catalog_rows_with_retry(
+                self._client(), [{"a": 1}], batch_size=10, attempts=4,
+                backoff_seconds=5, sleep=waits.append,
+            )
+        # 5, 10, 15 -- linear in attempt, and unrelated to the 15s
+        # sportscardspro pacing, which protects their servers not our db.
+        self.assertEqual(waits, [5, 10, 15])
+
+    def test_a_single_attempt_never_sleeps(self) -> None:
+        waits: list[float] = []
+        with mock.patch.object(
+            backfill_module, "write_catalog_rows", return_value=False
+        ):
+            wrote, retries = backfill_module.write_catalog_rows_with_retry(
+                self._client(), [{"a": 1}], batch_size=10, attempts=1,
+                backoff_seconds=5, sleep=waits.append,
+            )
+        self.assertFalse(wrote)
+        self.assertEqual(retries, 0)
+        self.assertEqual(waits, [])
