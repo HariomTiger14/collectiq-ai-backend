@@ -819,6 +819,8 @@ def _to_public(row: dict[str, Any]) -> dict[str, Any]:
         "status": row.get("status"),
         "requestedAt": row.get("requested_at"),
         "completedAt": row.get("completed_at"),
+        "scheduledFor": row.get("scheduled_for"),
+        "cancelledAt": row.get("cancelled_at"),
         "exportPath": row.get("export_path"),
         "exportExpiresAt": row.get("export_expires_at"),
         "notes": row.get("notes"),

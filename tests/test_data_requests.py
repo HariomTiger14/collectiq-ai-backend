@@ -197,7 +197,12 @@ class ScheduleDeletionTest(unittest.TestCase):
 
     def test_schedule_writes_a_scheduled_row_with_a_future_date(self) -> None:
         client = _FakeClient()
-        self._service(client).schedule_deletion(user_id="user-1")
+        result = self._service(client).schedule_deletion(user_id="user-1")
+
+        # The app reads scheduledFor off this response to show the date, so a
+        # missing mapping here silently degrades to "no date shown".
+        self.assertIn("scheduledFor", result)
+        self.assertIsNotNone(result["scheduledFor"])
 
         posts = [
             r for r in client.requests
@@ -457,9 +462,10 @@ class _FakeClient:
 
         if "/rest/v1/data_requests" in url:
             if method == "POST":
-                return _response(
-                    [{"id": "new-req", "user_id": kwargs["json"]["user_id"], "type": kwargs["json"]["type"], "status": "open"}]
-                )
+                # PostgREST echoes back the row it inserted, defaults and all,
+                # so the fake must too -- the app reads scheduledFor off this.
+                payload = kwargs["json"]
+                return _response([{"id": "new-req", "status": "open", **payload}])
             if method == "PATCH":
                 # PostgREST echoes the row back only when asked to; the
                 # deletion receipt PATCH uses return=minimal and gets nothing.
