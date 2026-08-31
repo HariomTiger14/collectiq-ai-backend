@@ -150,11 +150,22 @@ API_SEARCH_RESULT_CAP = 100
 # faster --sportscardspro-api-search-sleep-seconds) for roughly an hour of
 # sustained cron cycles, 429s started recurring -- short bursts-only tests
 # can't see a longer-window/aggregate volume limit, only sustained real
-# traffic reveals it. Backed off to 15s (roughly 2x the original 30s
-# baseline, not the ~3x that triggered the recurring 429s) as a more
-# sustainable middle ground. pricecharting.com has no such throttle and
-# stays on the caller's normal --sleep-between-requests-seconds pacing.
-SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS = 15.0
+# traffic reveals it. Backed off to 15s as a middle ground.
+#
+# 2026-08-31: reverted to the original 30s. 15s never actually held. Its
+# own measured success rate above is ~80%, and the tier-3 rotation lost
+# 13-20% of its batches every run for weeks -- matching that 80% almost
+# exactly, so the "middle ground" was really a standing 1-in-5 failure
+# rate that had been normalised. Tonight it escalated: sportscardspro.com
+# began returning 403 Forbidden alongside the 429s (both on identical
+# console-uids across retries), a run refreshed 0 of 360 sets, and the
+# breaker tripped. 403 is a block, not a "slow down".
+#
+# 30s is the only spacing here with a measured 100% success rate, so the
+# throughput lost is mostly the throughput that was being wasted on
+# retries anyway. pricecharting.com has no such throttle and stays on the
+# caller's normal --sleep-between-requests-seconds pacing.
+SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS = 30.0
 SPORTSCARDSPRO_DEFAULT_MAX_ATTEMPTS = 3
 
 # The console_uid resolve step is fully serial at SPORTSCARDSPRO_DEFAULT_SLEEP_
@@ -1170,6 +1181,7 @@ def fetch_batch_csv(
     token: str,
     console_uids: list[str],
     rate_limit_counter: "_Counter | None" = None,
+    blocked_counter: "_Counter | None" = None,
 ) -> str | None:
     try:
         response = http.get(
@@ -1183,8 +1195,17 @@ def fetch_batch_csv(
             f"{_redact_token(str(exc), token)}",
             flush=True,
         )
-        if rate_limit_counter is not None and exc.response.status_code == 429:
+        status = exc.response.status_code
+        if rate_limit_counter is not None and status == 429:
             rate_limit_counter.increment()
+        # 403 is Cloudflare refusing us outright, not asking us to slow
+        # down. It has to feed the breaker too: on 2026-08-31 a run took
+        # 403s on every batch, and only tripped because a few 429s
+        # happened to appear alongside them. A pure-403 run would have
+        # burned all 120 throttled requests against a blocked endpoint --
+        # the surest way to turn a temporary block into a durable one.
+        if blocked_counter is not None and status == 403:
+            blocked_counter.increment()
         return None
     except httpx.HTTPError as exc:
         print(
@@ -1205,6 +1226,7 @@ def fetch_batch_csv_with_retry(
     max_attempts: int,
     retry_sleep_seconds: float,
     rate_limit_counter: "_Counter | None" = None,
+    blocked_counter: "_Counter | None" = None,
 ) -> str | None:
     # A single 30s-paced request already succeeds ~100% of the time
     # (confirmed live), so this retry exists purely as a safety margin for
@@ -1217,6 +1239,7 @@ def fetch_batch_csv_with_retry(
             token=token,
             console_uids=console_uids,
             rate_limit_counter=rate_limit_counter,
+            blocked_counter=blocked_counter,
         )
         if csv_text is not None:
             return csv_text
