@@ -112,6 +112,11 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dry_run and checked_ids:
         reader.mark_tier1_checked(checked_ids)
 
+    catalog_write_stats = (
+        catalog_client.catalog_write_stats
+        if catalog_client is not None
+        else {"written": 0, "skippedUnchanged": 0, "failed": 0}
+    )
     print(
         dump_and_report(
             {
@@ -120,7 +125,17 @@ def main(argv: list[str] | None = None) -> int:
                 "candidates": len(candidates),
                 "refreshedSets": len(refreshed_ids) if written else 0,
                 "skippedNotEligible": skipped,
-                "catalogRowsWritten": 0 if args.dry_run or not written else len(catalog_rows),
+                # Was len(catalog_rows) -- every parsed row, not the rows
+                # actually written. The accumulator reports the real split.
+                "catalogRowsWritten": (
+                    0 if args.dry_run else catalog_write_stats["written"]
+                ),
+                "catalogRowsSkippedUnchanged": (
+                    0 if args.dry_run else catalog_write_stats["skippedUnchanged"]
+                ),
+                "catalogRowsFailed": (
+                    0 if args.dry_run else catalog_write_stats["failed"]
+                ),
             },
             indent=2,
         ),
