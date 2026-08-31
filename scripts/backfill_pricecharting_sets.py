@@ -1086,6 +1086,46 @@ def chunked(items: list[Any], size: int) -> list[list[Any]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
+def write_catalog_rows_with_retry(
+    catalog_client: SupabaseCatalogClient,
+    catalog_rows: list[dict[str, Any]],
+    *,
+    batch_size: int,
+    attempts: int,
+    backoff_seconds: float,
+    sleep: Any = time.sleep,
+) -> tuple[bool, int]:
+    """write_catalog_rows() with bounded retries. Returns (wrote, retries).
+
+    The CSV behind these rows already cost a throttled sportscardspro
+    request. Giving up on the first write failure means re-fetching
+    identical bytes next cycle -- paying that budget twice for data we
+    already hold. The failure this guards is a Postgres statement timeout
+    under load (see write_catalog_rows), which is transient, and upserts
+    are idempotent: rows that already landed are skipped by the
+    content-hash diff, so a retry redoes almost nothing.
+
+    Backoff is deliberately NOT the sportscardspro pacing interval. That
+    delay exists to protect their servers; this contention is our own
+    database, and coupling the two would make write pressure cost
+    throttle budget it has nothing to do with.
+    """
+    retries = 0
+    for attempt in range(1, max(1, attempts) + 1):
+        if write_catalog_rows(catalog_client, catalog_rows, batch_size=batch_size):
+            return True, retries
+        if attempt < attempts:
+            retries += 1
+            wait = backoff_seconds * attempt
+            print(
+                f"  Catalog write failed; retrying ({attempt + 1}/{attempts}) "
+                f"in {wait:.0f}s without re-fetching...",
+                flush=True,
+            )
+            sleep(wait)
+    return False, retries
+
+
 def write_catalog_rows(
     catalog_client: SupabaseCatalogClient,
     catalog_rows: list[dict[str, Any]],

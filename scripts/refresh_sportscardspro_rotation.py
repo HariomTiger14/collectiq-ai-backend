@@ -60,6 +60,7 @@ from scripts.backfill_pricecharting_sets import (
     _RateLimitCircuitBreaker,
     fetch_batch_csv_with_retry,
     write_catalog_rows,
+    write_catalog_rows_with_retry,
 )
 from scripts.import_pricecharting_catalog import (
     SupabaseCatalogClient,
@@ -119,6 +120,13 @@ def main(argv: list[str] | None = None) -> int:
     rate_limit_counter = _Counter()
     total_catalog_rows = 0
     failed_batches = 0
+    # failed_batches lumped fetch failures and write failures into one
+    # number, so the ledger could not say whether a run's ~13% loss was
+    # sportscardspro throttling us or Postgres timing out on a 12M-row
+    # table -- opposite problems with opposite fixes. Count them apart.
+    failed_fetches = 0
+    failed_writes = 0
+    write_retries = 0
     refreshed_ids: list[str] = []
 
     with httpx.Client(
@@ -150,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             if csv_text is None:
                 failed_batches += 1
+                failed_fetches += 1
                 if rate_limit_counter.value > before_429s:
                     breaker.record_rate_limited()
                 continue
@@ -164,10 +173,19 @@ def main(argv: list[str] | None = None) -> int:
 
             if not args.dry_run and catalog_rows:
                 assert catalog_client is not None
-                if not write_catalog_rows(
-                    catalog_client, catalog_rows, batch_size=args.catalog_batch_size
-                ):
+                # Retrying a write costs no sportscardspro request;
+                # giving up costs a full re-fetch of bytes we already have.
+                wrote, retried = write_catalog_rows_with_retry(
+                    catalog_client,
+                    catalog_rows,
+                    batch_size=args.catalog_batch_size,
+                    attempts=args.write_attempts,
+                    backoff_seconds=args.write_retry_seconds,
+                )
+                write_retries += retried
+                if not wrote:
                     failed_batches += 1
+                    failed_writes += 1
                     continue
             # Stamp each batch as soon as its write lands, not in one
             # PATCH at the end of the run: a run is ~55 minutes long, and
@@ -194,6 +212,9 @@ def main(argv: list[str] | None = None) -> int:
                 "setsConsidered": len(rows),
                 "setsRefreshed": len(refreshed_ids),
                 "failedBatches": failed_batches,
+                "failedFetches": failed_fetches,
+                "failedWrites": failed_writes,
+                "writeRetries": write_retries,
                 "rateLimited429s": rate_limit_counter.value,
                 "breakerTripped": breaker.tripped,
                 "catalogRowsParsed": total_catalog_rows,
@@ -319,6 +340,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="sportscardspro.com Cloudflare pacing -- see backfill_pricecharting_sets.py.",
     )
     parser.add_argument("--max-attempts", type=int, default=SPORTSCARDSPRO_DEFAULT_MAX_ATTEMPTS)
+    parser.add_argument(
+        "--write-attempts",
+        type=int,
+        default=3,
+        help=(
+            "Catalog write attempts per already-fetched batch before giving "
+            "up. Retrying costs no sportscardspro request; giving up costs a "
+            "full re-fetch next cycle."
+        ),
+    )
+    parser.add_argument(
+        "--write-retry-seconds",
+        type=float,
+        default=5.0,
+        help="Base backoff between catalog write retries (multiplied by attempt).",
+    )
     parser.add_argument("--api-token", default="", help="Defaults to PRICECHARTING_API_TOKEN.")
     parser.add_argument("--supabase-url", default="", help="Defaults to SUPABASE_URL.")
     parser.add_argument(
