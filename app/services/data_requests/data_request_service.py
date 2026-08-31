@@ -8,26 +8,41 @@ Two audiences:
 
 **Export** is a JSON bundle of every user-scoped table, uploaded to Supabase
 Storage and handed back as a time-limited signed URL -- not a multi-file zip
-with actual image binaries. Portfolio photos are written directly by the
-mobile app to its own Storage bucket/path convention, which this backend has
-never had visibility into (confirmed: no image upload/list/delete code
-exists anywhere in this repo). Bundling real image files is a real,
+with actual image binaries. Bundling real image files is a real,
 consciously-scoped-out gap, not silently pretended away -- the export
 includes each portfolio item's own stored image metadata/URLs exactly as the
 app already wrote them, and `imagesIncluded` is `false` in the receipt so
 nothing overclaims completeness.
 
-**Deletion** hard-deletes every user-scoped row across the tables below,
-then deletes the Supabase Auth user itself via the Auth Admin API.
-`admin_audit_events` is deliberately EXCLUDED -- it is the platform's own
-compliance record of admin actions (who did what, when), not the user's
-personal data; erasing rows that merely reference the user as a target would
-destroy the audit trail it exists to protect.
+**Deletion** hard-deletes every user-scoped row across the tables below, the
+user's Storage objects, and finally the Supabase Auth user itself via the
+Auth Admin API. `admin_audit_events` is deliberately EXCLUDED -- it is the
+platform's own compliance record of admin actions (who did what, when), not
+the user's personal data; erasing rows that merely reference the user as a
+target would destroy the audit trail it exists to protect.
+
+Deletion runs in two shapes:
+  - **scheduled** (the app): the user confirms in-app, the row is written
+    with status='scheduled' and a `scheduled_for` date, and nothing is
+    touched until then. Signing back in cancels it. A cron purges what is
+    due. Apple's guideline 5.1.1(v) requires deletion to be initiated in-app
+    and to actually happen without a human approving it.
+  - **immediate** (the admin console): the existing process_request path,
+    unchanged.
+
+Storage note: images ARE now deleted. Earlier revisions of this module said
+the backend had no visibility into the app's bucket layout; that was wrong --
+the app writes to the same `collectiq-portfolio-images` bucket this module
+already uses, under `users/<user_id>/...` (see CloudStoragePaths in the
+mobile repo). Support attachments live under `support-attachments/<message
+_id>/` and are NOT user-prefixed, so they are resolved through the user's
+tickets rather than by path.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -39,6 +54,23 @@ from app.services.admin_audit_service import AdminAuditService
 EXPORT_STORAGE_BUCKET = "collectiq-portfolio-images"
 EXPORT_STORAGE_PREFIX = "data-exports"
 EXPORT_URL_EXPIRES_SECONDS = 60 * 60 * 72  # 72h
+
+# How long a user has to change their mind before a scheduled deletion is
+# actually carried out. 30 days is what Instagram/X/LinkedIn use and what
+# users have been trained to expect; short enough to still read as deletion.
+DELETION_GRACE_PERIOD_DAYS = 30
+
+# Everything the mobile app uploads lands under users/<user_id>/ in the same
+# bucket (portfolio images, gallery variants, profile avatar) -- see
+# CloudStoragePaths in the mobile repo. Deleting that prefix is what makes
+# "your images are deleted" true.
+USER_STORAGE_PREFIX = "users"
+# Support attachments are keyed by message id, not user id, so they cannot be
+# found by prefix -- they are resolved via the user's tickets instead.
+SUPPORT_ATTACHMENT_PREFIX = "support-attachments"
+# Supabase Storage list() is paginated; also caps a runaway walk.
+_STORAGE_PAGE_SIZE = 100
+_STORAGE_MAX_OBJECTS = 20_000
 
 # Tables holding a LIST of rows per user (0..N), deleted/exported by user_id.
 _USER_SCOPED_LIST_TABLES = (
@@ -54,6 +86,29 @@ _USER_SCOPED_LIST_TABLES = (
 _USER_SCOPED_SINGLE_ROW_TABLES = (
     "collector_profiles",
     "user_subscriptions",
+)
+
+# Deleted but NOT exported.
+#
+# support_tickets: the user's own support history. It carries user_id but has
+# no FK to auth.users, so deleting the auth user does not cascade it -- it
+# would have survived deletion entirely. Its support_messages cascade on
+# ticket_id, and support_message_attachments cascade from those, so removing
+# the ticket rows clears the whole thread.
+#
+# user_scan_usage: quota counters. This one DOES cascade (it declares
+# `references auth.users (id) on delete cascade`), so it is already covered
+# when the auth user goes -- listed explicitly anyway so deletion does not
+# silently depend on an FK staying in place.
+_DELETION_ONLY_TABLES = (
+    "support_tickets",
+    "user_scan_usage",
+)
+
+_ALL_DELETION_TABLES = (
+    *_USER_SCOPED_LIST_TABLES,
+    *_USER_SCOPED_SINGLE_ROW_TABLES,
+    *_DELETION_ONLY_TABLES,
 )
 
 
@@ -148,6 +203,90 @@ class DataRequestService:
             raise DataRequestError("Could not create the data request.")
         return _to_public(rows[0])
 
+    def schedule_deletion(
+        self,
+        *,
+        user_id: str,
+        grace_period_days: int = DELETION_GRACE_PERIOD_DAYS,
+    ) -> dict[str, Any]:
+        """Start the grace period. Nothing is deleted here.
+
+        Idempotent: confirming twice returns the deletion already scheduled
+        rather than moving the date, so a double-tap cannot extend or shorten
+        the window.
+        """
+        existing = self._scheduled_deletion_row(user_id)
+        if existing is not None:
+            return _to_public(existing)
+
+        now = datetime.now(timezone.utc)
+        scheduled_for = now + timedelta(days=grace_period_days)
+        rows = self._request(
+            "POST",
+            "/rest/v1/data_requests",
+            json_payload={
+                "user_id": user_id,
+                "type": "deletion",
+                "status": "scheduled",
+                "scheduled_for": scheduled_for.isoformat(),
+            },
+            extra_headers={"Prefer": "return=representation"},
+        )
+        if not isinstance(rows, list) or not rows:
+            raise DataRequestError("Could not schedule the account deletion.")
+        return _to_public(rows[0])
+
+    def cancel_deletion(self, *, user_id: str) -> dict[str, Any]:
+        """Cancel a pending deletion. This is what signing back in offers."""
+        existing = self._scheduled_deletion_row(user_id)
+        if existing is None:
+            raise DataRequestNotFoundError(
+                "No scheduled deletion to cancel for this account."
+            )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        rows = self._request(
+            "PATCH",
+            "/rest/v1/data_requests",
+            params={"id": f"eq.{existing['id']}"},
+            json_payload={
+                "status": "cancelled",
+                "cancelled_at": now_iso,
+                "updated_at": now_iso,
+            },
+            extra_headers={"Prefer": "return=representation"},
+        )
+        if not isinstance(rows, list) or not rows:
+            raise DataRequestError("Could not cancel the account deletion.")
+        return _to_public(rows[0])
+
+    def deletion_status(self, user_id: str) -> dict[str, Any]:
+        """What the app gates its launch screen on."""
+        row = self._scheduled_deletion_row(user_id)
+        if row is None:
+            return {"scheduled": False, "scheduledFor": None, "requestId": None}
+        return {
+            "scheduled": True,
+            "scheduledFor": row.get("scheduled_for"),
+            "requestId": row.get("id"),
+        }
+
+    def _scheduled_deletion_row(self, user_id: str) -> dict[str, Any] | None:
+        rows = self._request(
+            "GET",
+            "/rest/v1/data_requests",
+            params={
+                "user_id": f"eq.{user_id}",
+                "type": "eq.deletion",
+                "status": "eq.scheduled",
+                "select": "*",
+                "order": "requested_at.desc",
+                "limit": "1",
+            },
+        )
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        return None
+
     def list_my_requests(self, user_id: str) -> list[dict[str, Any]]:
         rows = self._request(
             "GET",
@@ -209,6 +348,68 @@ class DataRequestService:
                 metadata={"requestId": request_id, **result.get("receipt", {})},
             )
         return {"success": True, "dryRun": dry_run, "requestId": request_id, **result}
+
+    def purge_due(
+        self,
+        *,
+        limit: int = 50,
+        dry_run: bool = True,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Carry out every scheduled deletion whose grace period has elapsed.
+
+        Driven by the purge cron. One failing account must not stop the rest,
+        so each is caught and reported individually; a failed row is left
+        `scheduled` so the next run retries it rather than stranding a user
+        half-deleted with no further attempts.
+        """
+        reference = now or datetime.now(timezone.utc)
+        rows = self._request(
+            "GET",
+            "/rest/v1/data_requests",
+            params={
+                "type": "eq.deletion",
+                "status": "eq.scheduled",
+                "scheduled_for": f"lte.{reference.isoformat()}",
+                "select": "*",
+                "order": "scheduled_for.asc",
+                "limit": str(limit),
+            },
+        )
+        due = rows if isinstance(rows, list) else []
+
+        processed: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        for row in due:
+            request_id = str(row.get("id") or "")
+            try:
+                result = self._process_deletion(row, dry_run=dry_run)
+                if not dry_run:
+                    self._audit_service.record(
+                        action="data_request.deletion_processed",
+                        status="success",
+                        target_type="user",
+                        target_id=str(row.get("user_id") or ""),
+                        actor="deletion_purge_cron",
+                        metadata={
+                            "requestId": request_id,
+                            "scheduledFor": row.get("scheduled_for"),
+                            **result.get("receipt", {}),
+                        },
+                    )
+                processed.append({"requestId": request_id, **result})
+            except DataRequestError as error:
+                failed.append({"requestId": request_id, "error": str(error)})
+
+        return {
+            "success": True,
+            "dryRun": dry_run,
+            "dueCount": len(due),
+            "processedCount": len(processed),
+            "failedCount": len(failed),
+            "processed": processed,
+            "failed": failed,
+        }
 
     # -- export --------------------------------------------------------
 
@@ -306,20 +507,27 @@ class DataRequestService:
     def _process_deletion(self, row: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
         user_id = str(row.get("user_id") or "")
         counts = {}
-        for table in (*_USER_SCOPED_LIST_TABLES, *_USER_SCOPED_SINGLE_ROW_TABLES):
+        for table in _ALL_DELETION_TABLES:
             counts[table] = len(self._fetch_all_for_user(table, user_id))
+
+        # Resolved before any row is deleted: attachment paths are only
+        # reachable through the user's tickets, and deleting support_tickets
+        # cascades those rows away. Collect first, delete second, or the
+        # files are orphaned in the bucket with nothing left pointing at them.
+        storage_paths = self._user_storage_paths(user_id)
 
         if dry_run:
             return {
                 "preview": {
                     "tableCounts": counts,
+                    "storageObjectCount": len(storage_paths),
                     "authAccountWillBeDeleted": True,
                     "auditEventsExcluded": True,
                 },
             }
 
         deleted_counts: dict[str, int] = {}
-        for table in (*_USER_SCOPED_LIST_TABLES, *_USER_SCOPED_SINGLE_ROW_TABLES):
+        for table in _ALL_DELETION_TABLES:
             deleted_counts[table] = counts.get(table, 0)
             self._request(
                 "DELETE",
@@ -328,10 +536,12 @@ class DataRequestService:
                 extra_headers={"Prefer": "return=minimal"},
             )
 
+        storage_deleted = self._delete_storage_paths(storage_paths)
         auth_deleted = self._delete_auth_user(user_id)
         now_iso = datetime.now(timezone.utc).isoformat()
         receipt = {
             "tableCounts": deleted_counts,
+            "storageObjectsDeleted": storage_deleted,
             "authAccountDeleted": auth_deleted,
             "auditEventsExcluded": True,
         }
@@ -348,6 +558,131 @@ class DataRequestService:
             extra_headers={"Prefer": "return=minimal"},
         )
         return {"receipt": receipt}
+
+    # -- storage ---------------------------------------------------------
+
+    def _user_storage_paths(self, user_id: str) -> list[str]:
+        """Every Storage object belonging to this user, across both layouts.
+
+        Two prefixes are user-keyed and can be walked directly; support
+        attachments are keyed by message id, so they are resolved through the
+        user's tickets instead.
+        """
+        safe_user = _safe_path_segment(user_id)
+        paths: list[str] = []
+        paths.extend(self._list_storage_objects(f"{USER_STORAGE_PREFIX}/{safe_user}"))
+        paths.extend(self._list_storage_objects(f"{EXPORT_STORAGE_PREFIX}/{user_id}"))
+        paths.extend(self._support_attachment_paths(user_id))
+        # A prior export bundle can appear both by prefix walk and via
+        # export_path; de-duplicate while keeping order stable for tests.
+        seen: set[str] = set()
+        unique: list[str] = []
+        for path in paths:
+            if path and path not in seen:
+                seen.add(path)
+                unique.append(path)
+        return unique
+
+    def _support_attachment_paths(self, user_id: str) -> list[str]:
+        ticket_ids = [
+            str(row["id"])
+            for row in self._select(
+                "support_tickets", {"user_id": f"eq.{user_id}", "select": "id"}
+            )
+            if row.get("id")
+        ]
+        if not ticket_ids:
+            return []
+        message_ids = [
+            str(row["id"])
+            for row in self._select(
+                "support_messages",
+                {"ticket_id": f"in.({','.join(ticket_ids)})", "select": "id"},
+            )
+            if row.get("id")
+        ]
+        if not message_ids:
+            return []
+        return [
+            str(row["file_path"])
+            for row in self._select(
+                "support_message_attachments",
+                {
+                    "message_id": f"in.({','.join(message_ids)})",
+                    "select": "file_path",
+                },
+            )
+            if row.get("file_path")
+        ]
+
+    def _select(self, table: str, params: dict[str, str]) -> list[dict[str, Any]]:
+        rows = self._request("GET", f"/rest/v1/{table}", params=params)
+        return rows if isinstance(rows, list) else []
+
+    def _list_storage_objects(self, prefix: str) -> list[str]:
+        """Recursively list objects under a prefix.
+
+        Supabase Storage list() is one directory level at a time and returns
+        folders as entries with a null id, so this walks rather than assuming
+        a flat namespace -- portfolio gallery variants nest a level deeper
+        than the primary image (users/<id>/portfolio_images/<item>/00-front.jpg).
+        """
+        found: list[str] = []
+        pending = [prefix.strip("/")]
+        while pending:
+            current = pending.pop()
+            offset = 0
+            while True:
+                payload = self._request(
+                    "POST",
+                    f"/storage/v1/object/list/{EXPORT_STORAGE_BUCKET}",
+                    json_payload={
+                        "prefix": f"{current}/" if current else "",
+                        "limit": _STORAGE_PAGE_SIZE,
+                        "offset": offset,
+                    },
+                )
+                entries = payload if isinstance(payload, list) else []
+                for entry in entries:
+                    name = (entry or {}).get("name")
+                    if not name:
+                        continue
+                    full = f"{current}/{name}" if current else str(name)
+                    # Folders come back with a null id and no metadata.
+                    if entry.get("id") is None:
+                        pending.append(full)
+                    else:
+                        found.append(full)
+                if len(found) >= _STORAGE_MAX_OBJECTS:
+                    return found[:_STORAGE_MAX_OBJECTS]
+                if len(entries) < _STORAGE_PAGE_SIZE:
+                    break
+                offset += _STORAGE_PAGE_SIZE
+        return found
+
+    def _delete_storage_paths(self, paths: list[str]) -> int:
+        """Delete objects in batches. Returns how many were requested.
+
+        Storage failures must not abort the purge: the database rows and the
+        auth user still have to go, and an orphaned image with no account and
+        no row pointing at it is a far smaller problem than a half-deleted
+        account that never completes.
+        """
+        if not paths:
+            return 0
+        deleted = 0
+        for start in range(0, len(paths), _STORAGE_PAGE_SIZE):
+            batch = paths[start : start + _STORAGE_PAGE_SIZE]
+            try:
+                self._request(
+                    "DELETE",
+                    f"/storage/v1/object/{EXPORT_STORAGE_BUCKET}",
+                    json_payload={"prefixes": batch},
+                )
+                deleted += len(batch)
+            except DataRequestError:
+                continue
+        return deleted
 
     def _delete_auth_user(self, user_id: str) -> bool:
         try:
@@ -453,6 +788,20 @@ class DataRequestService:
             return response.json()
         except (httpx.HTTPError, ValueError) as error:
             raise DataRequestError(f"Supabase data-request call failed: {error}") from error
+
+
+def _safe_path_segment(value: str) -> str:
+    """Mirror of CloudStoragePaths.safePathSegment in the mobile app.
+
+    The app lowercases and slugifies each path segment before uploading, so
+    the backend has to apply the identical transform or it walks a prefix
+    that does not exist. Supabase user ids are already lowercase hex with
+    hyphens, which this leaves untouched -- it exists so the two stay in
+    step if either side ever changes.
+    """
+    lowered = (value or "").strip().lower()
+    slug = re.sub(r"[^a-z0-9_-]", "-", lowered)
+    return re.sub(r"-+", "-", slug)
 
 
 def _total_from_content_range(content_range: str | None) -> int:

@@ -448,6 +448,34 @@ services:
       - key: ADMIN_IMPORT_TOKEN
         sync: false
 
+  # App-facing: carries out account deletions whose 30-day grace period has
+  # elapsed. The app schedules its own deletion (Apple 5.1.1(v) requires that
+  # it be initiated in-app with no human approving it) and the user can cancel
+  # by signing back in until this runs.
+  #
+  # Daily, not hourly: the grace period is measured in days, so the only thing
+  # a tighter cadence buys is deleting somebody a few hours earlier. Runs at
+  # 02:10 UTC, away from the pricing crons.
+  #
+  # dryRun=false -- a no-op cron would leave every scheduled deletion pending
+  # forever, which is exactly the "deletion that never happens" failure this
+  # whole feature exists to avoid. Uses ADMIN_JOB_TOKEN like the other
+  # app-facing curl crons. Internal Supabase reads/writes plus Storage
+  # deletes only, so it consumes none of the external provider quota the
+  # catalog crons are pacing against.
+  - type: cron
+    name: packlox-purge-scheduled-deletions-sit
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    schedule: "10 2 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: 'curl -fsS -X POST "https://api-sit.packlox.com/admin/data-requests/purge-due?dryRun=false&limit=200" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"'
+    envVars:
+      - key: ADMIN_JOB_TOKEN
+        sync: false
+
   # App-facing: links portfolio_items to their matched pricecharting_catalog
   # row (via the existing search_pricecharting_catalog RPC, confidence>=0.90
   # only -- prefix/exact/product-name-substring matches, never a loose
