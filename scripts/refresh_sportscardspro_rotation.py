@@ -107,9 +107,19 @@ def main(argv: list[str] | None = None) -> int:
         service_role_key=service_role_key,
         timeout_seconds=args.timeout_seconds,
     )
+    copy_writer = None
+    if args.copy_writer and not args.dry_run:
+        from scripts.tier3_copy_writer import CopyCatalogWriter
+
+        database_url = os.getenv("DATABASE_URL", "")
+        if not database_url:
+            raise SystemExit("--copy-writer requires DATABASE_URL.")
+        copy_writer = CopyCatalogWriter(database_url)
+        print("Using COPY writer (direct Postgres) for catalog writes.", flush=True)
+
     catalog_client = (
         None
-        if args.dry_run
+        if args.dry_run or copy_writer is not None
         else SupabaseCatalogClient(
             supabase_url=supabase_url,
             service_role_key=service_role_key,
@@ -280,16 +290,21 @@ def main(argv: list[str] | None = None) -> int:
             total_catalog_rows += len(catalog_rows)
 
             if not args.dry_run and catalog_rows:
-                assert catalog_client is not None
-                # Retrying a write costs no sportscardspro request;
-                # giving up costs a full re-fetch of bytes we already have.
-                wrote, retried = write_catalog_rows_with_retry(
-                    catalog_client,
-                    catalog_rows,
-                    batch_size=args.catalog_batch_size,
-                    attempts=args.write_attempts,
-                    backoff_seconds=args.write_retry_seconds,
-                )
+                if copy_writer is not None:
+                    # One transaction, so there is no partial-write state to
+                    # retry around: it either lands or it does not.
+                    wrote, retried = copy_writer.write(catalog_rows), 0
+                else:
+                    assert catalog_client is not None
+                    # Retrying a write costs no sportscardspro request;
+                    # giving up costs a full re-fetch of bytes we already have.
+                    wrote, retried = write_catalog_rows_with_retry(
+                        catalog_client,
+                        catalog_rows,
+                        batch_size=args.catalog_batch_size,
+                        attempts=args.write_attempts,
+                        backoff_seconds=args.write_retry_seconds,
+                    )
                 write_retries += retried
                 if not wrote:
                     failed_batches += 1
@@ -307,11 +322,14 @@ def main(argv: list[str] | None = None) -> int:
                 registry.mark_tier3_refreshed(batch_ids)
             refreshed_ids.extend(batch_ids)
 
+    writer_with_stats = copy_writer or catalog_client
     catalog_write_stats = (
-        catalog_client.catalog_write_stats
-        if catalog_client is not None
+        writer_with_stats.catalog_write_stats
+        if writer_with_stats is not None
         else {"written": 0, "skippedUnchanged": 0, "failed": 0}
     )
+    if copy_writer is not None:
+        copy_writer.close()
     print(
         dump_and_report(
             {
@@ -573,6 +591,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "still lost ~15%% of writes to 57014 (one failure was on a "
         "59-row sub-batch), while 40 wrote 1,065 rows with zero failures "
         "and zero retries.",
+    )
+    parser.add_argument(
+        "--copy-writer",
+        action="store_true",
+        help="Write via COPY + a single server-side merge over a direct "
+        "DATABASE_URL connection instead of PostgREST. Measured 2026-09-01: "
+        "~2.5-3x faster end to end, and the write becomes one transaction "
+        "rather than ~375 statements racing the hourly tier-1 job (which is "
+        "what produces the 57014 timeouts). Needs psycopg and DATABASE_URL, "
+        "so it is opt-in and laptop-only -- Render's cron path has neither.",
     )
     parser.add_argument(
         "--max-isolation-requests",
