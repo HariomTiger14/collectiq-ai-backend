@@ -128,7 +128,6 @@ def main(argv: list[str] | None = None) -> int:
         print(dump_and_report({"success": True, "setsConsidered": 0}, indent=2), flush=True)
         return 0
 
-    source_downloaded_at = datetime.now(timezone.utc).isoformat()
     base_url = SOURCE_SITE_BASE_URLS["sportscardspro"]
     breaker = _RateLimitCircuitBreaker(RATE_LIMIT_BREAKER_THRESHOLD)
     rate_limit_counter = _Counter()
@@ -259,6 +258,15 @@ def main(argv: list[str] | None = None) -> int:
                 salvaged_sets += len(live_chunk)
                 breaker.record_success()
 
+            # Stamped per batch, not once per run. It becomes the history
+            # row's valid_from and the value used to close the previous
+            # current row, so a run-wide stamp goes stale as the run gets
+            # longer: a multi-hour catch-up would try to close a row that
+            # tier-1 (hourly, same table) wrote AFTER this run started,
+            # producing valid_to < valid_from and a 23514 violation against
+            # pricecharting_catalog_history_valid_window_check. Measured
+            # 2026-09-01: 30 such failures in a 5.5-hour run.
+            source_downloaded_at = datetime.now(timezone.utc).isoformat()
             catalog_rows: list[dict[str, Any]] = []
             for text in csv_texts:
                 catalog_rows.extend(
