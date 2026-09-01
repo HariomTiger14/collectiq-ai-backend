@@ -1182,7 +1182,13 @@ def fetch_batch_csv(
     console_uids: list[str],
     rate_limit_counter: "_Counter | None" = None,
     blocked_counter: "_Counter | None" = None,
+    status_sink: list[int] | None = None,
 ) -> str | None:
+    """status_sink, when given, receives the HTTP status of a failed
+    response. Callers need it to tell the three failure modes apart: 429
+    (slow down), 403 (Cloudflare refusing us), and anything else -- which
+    for this endpoint means a specific console_uid its backend cannot
+    serve, and is worth isolating rather than abandoning the batch."""
     try:
         response = http.get(
             f"{base_url}/price-guide/download-custom",
@@ -1196,6 +1202,8 @@ def fetch_batch_csv(
             flush=True,
         )
         status = exc.response.status_code
+        if status_sink is not None:
+            status_sink.append(status)
         if rate_limit_counter is not None and status == 429:
             rate_limit_counter.increment()
         # 403 is Cloudflare refusing us outright, not asking us to slow
@@ -1227,6 +1235,7 @@ def fetch_batch_csv_with_retry(
     retry_sleep_seconds: float,
     rate_limit_counter: "_Counter | None" = None,
     blocked_counter: "_Counter | None" = None,
+    status_sink: list[int] | None = None,
 ) -> str | None:
     # A single 30s-paced request already succeeds ~100% of the time
     # (confirmed live), so this retry exists purely as a safety margin for
@@ -1240,6 +1249,7 @@ def fetch_batch_csv_with_retry(
             console_uids=console_uids,
             rate_limit_counter=rate_limit_counter,
             blocked_counter=blocked_counter,
+            status_sink=status_sink,
         )
         if csv_text is not None:
             return csv_text

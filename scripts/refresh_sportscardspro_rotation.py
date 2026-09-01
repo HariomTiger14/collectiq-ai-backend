@@ -58,6 +58,7 @@ from scripts.backfill_pricecharting_sets import (
     SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS,
     _Counter,
     _RateLimitCircuitBreaker,
+    fetch_batch_csv,
     fetch_batch_csv_with_retry,
     write_catalog_rows,
     write_catalog_rows_with_retry,
@@ -70,6 +71,19 @@ from scripts.import_pricecharting_catalog import (
 
 SOURCE_FILE_TAG = "sportscardspro-tier3-refresh"
 REGISTRY_PAGE_SIZE = 1000
+
+# Sets that have failed this many times in a row stop being queued. They are
+# not deleted -- tier3_last_error keeps the reason, and tier3_rotation_status
+# surfaces them as "poisoned" -- but they no longer occupy the head of a
+# NULLS FIRST queue forever. See the 20260901 migration for the G37119 case
+# that motivated this.
+TIER3_MAX_FAILURES = 3
+
+# Extra requests allowed to pinpoint the bad set inside ONE failed batch.
+# Halving finds a single offender in ~2*log2(batch_size) requests (~10 at
+# batch 25), so this is a generous ceiling that still bounds the worst case
+# of a batch where many sets are dead.
+DEFAULT_MAX_ISOLATION_REQUESTS = 12
 # Trip after this many consecutive rate-limited batches. Low on purpose:
 # the backfill's live testing showed 429s recur in clusters once the
 # sustained-volume limit is hit, and continuing just extends the cluster.
@@ -131,6 +145,11 @@ def main(argv: list[str] | None = None) -> int:
     failed_fetches = 0
     failed_writes = 0
     write_retries = 0
+    # Sets the endpoint refused individually, and healthy sets recovered from
+    # a batch that would previously have been discarded whole.
+    dead_sets = 0
+    salvaged_sets = 0
+    isolation_requests = 0
     refreshed_ids: list[str] = []
 
     with httpx.Client(
@@ -152,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
             console_uids = [row["console_uid"] for row in chunk]
             before_429s = rate_limit_counter.value
             before_403s = blocked_counter.value
+            status_sink: list[int] = []
             csv_text = fetch_batch_csv_with_retry(
                 http,
                 base_url=base_url,
@@ -161,28 +181,94 @@ def main(argv: list[str] | None = None) -> int:
                 retry_sleep_seconds=args.sleep_between_requests_seconds,
                 rate_limit_counter=rate_limit_counter,
                 blocked_counter=blocked_counter,
+                status_sink=status_sink,
             )
-            if csv_text is None:
-                failed_batches += 1
-                failed_fetches += 1
+
+            csv_texts: list[str] = []
+            live_chunk = chunk
+            if csv_text is not None:
+                csv_texts = [csv_text]
+                breaker.record_success()
+            else:
                 # Trip on EITHER signal. Previously only 429 counted, so a
                 # run taking pure 403s never tripped and would spend all
                 # 120 throttled requests on an endpoint already refusing
                 # us -- exactly the behaviour most likely to harden a
                 # temporary block.
-                if (
+                throttled = (
                     rate_limit_counter.value > before_429s
                     or blocked_counter.value > before_403s
-                ):
-                    breaker.record_rate_limited()
-                continue
-            breaker.record_success()
+                )
+                status = status_sink[-1] if status_sink else 0
+                if throttled or not status:
+                    # Endpoint-wide refusal, or a transport error that never
+                    # produced a status. Either way the batch says nothing
+                    # about any individual set, so there is nothing to isolate.
+                    failed_batches += 1
+                    failed_fetches += 1
+                    if throttled:
+                        breaker.record_rate_limited()
+                    continue
 
-            catalog_rows = [
-                to_catalog_row(row, SOURCE_FILE_TAG, source_downloaded_at)
-                for row in load_rows_from_text(csv_text)
-            ]
-            catalog_rows = [row for row in catalog_rows if row is not None]
+                # The endpoint answered and refused THIS combination of
+                # console_uids -- historically one set removed upstream
+                # taking its whole batch down with it (see the 20260901
+                # migration). Salvage the healthy sets instead of discarding
+                # the batch and re-fetching all of them next run.
+                isolation_budget = [args.max_isolation_requests]
+                try:
+                    csv_texts, dead_rows = _isolate_failed_batch(
+                        http,
+                        base_url=base_url,
+                        token=token,
+                        rows=chunk,
+                        sleep_seconds=args.sleep_between_requests_seconds,
+                        rate_limit_counter=rate_limit_counter,
+                        blocked_counter=blocked_counter,
+                        budget=isolation_budget,
+                    )
+                except _ThrottleAbort as exc:
+                    print(f"  Isolation abandoned: {exc}", flush=True)
+                    failed_batches += 1
+                    failed_fetches += 1
+                    breaker.record_rate_limited()
+                    continue
+                finally:
+                    isolation_requests += (
+                        args.max_isolation_requests - isolation_budget[0]
+                    )
+
+                if dead_rows:
+                    dead_ids = [row["registry_id"] for row in dead_rows]
+                    dead_sets += len(dead_ids)
+                    if not args.dry_run:
+                        registry.record_tier3_failures(
+                            dead_ids,
+                            error=f"download-custom refused this set (HTTP {status})",
+                        )
+                    dead_id_set = {row["registry_id"] for row in dead_rows}
+                    live_chunk = [
+                        row for row in chunk if row["registry_id"] not in dead_id_set
+                    ]
+
+                if not csv_texts:
+                    # Every set in the batch was refused individually.
+                    failed_batches += 1
+                    failed_fetches += 1
+                    continue
+                salvaged_sets += len(live_chunk)
+                breaker.record_success()
+
+            catalog_rows: list[dict[str, Any]] = []
+            for text in csv_texts:
+                catalog_rows.extend(
+                    row
+                    for row in (
+                        to_catalog_row(raw, SOURCE_FILE_TAG, source_downloaded_at)
+                        for raw in load_rows_from_text(text)
+                    )
+                    if row is not None
+                )
             total_catalog_rows += len(catalog_rows)
 
             if not args.dry_run and catalog_rows:
@@ -208,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:
             # 220 throttled requests re-fetching sets whose data already
             # landed. A failed batch is simply never stamped, keeping its
             # sets at the front of the rotation.
-            batch_ids = [row["registry_id"] for row in chunk]
+            batch_ids = [row["registry_id"] for row in live_chunk]
             if not args.dry_run:
                 registry.mark_tier3_refreshed(batch_ids)
             refreshed_ids.extend(batch_ids)
@@ -231,6 +317,9 @@ def main(argv: list[str] | None = None) -> int:
                 "writeRetries": write_retries,
                 "rateLimited429s": rate_limit_counter.value,
                 "blocked403s": blocked_counter.value,
+                "deadSetsIsolated": dead_sets,
+                "setsSalvagedFromFailedBatches": salvaged_sets,
+                "isolationRequests": isolation_requests,
                 "breakerTripped": breaker.tripped,
                 "catalogRowsParsed": total_catalog_rows,
                 # Real write/skip split from the client's accumulator, not
@@ -255,6 +344,94 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+class _ThrottleAbort(Exception):
+    """Raised when batch isolation runs into a 429/403.
+
+    Those two mean the endpoint is refusing us generally, not that one set
+    is bad. Probing individual console_uids in that state burns throttled
+    requests against a door already shut -- the surest way to turn a
+    temporary block into a durable one -- so isolation unwinds and lets the
+    breaker handle it.
+    """
+
+
+def _isolate_failed_batch(
+    http: httpx.Client,
+    *,
+    base_url: str,
+    token: str,
+    rows: list[dict[str, Any]],
+    sleep_seconds: float,
+    rate_limit_counter: _Counter,
+    blocked_counter: _Counter,
+    budget: list[int],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Split a failed batch to salvage its healthy sets and pinpoint the
+    set(s) the endpoint cannot serve.
+
+    download-custom fails the ENTIRE request, so one dead console_uid
+    destroys every set batched with it -- at --batch-size 25 that is 24
+    healthy sets discarded per dead one, re-fetched from scratch next run.
+    Halving costs ~2*log2(n) requests to find one offender instead of n,
+    and hands back CSV for everything else.
+
+    Returns (csv_texts, dead_rows). ``budget`` is a one-element list used as
+    a shared mutable countdown so the recursion cannot exceed its allowance.
+    """
+    if not rows or budget[0] <= 0:
+        return [], []
+    budget[0] -= 1
+    if sleep_seconds > 0:
+        time.sleep(sleep_seconds)
+    status_sink: list[int] = []
+    csv_text = fetch_batch_csv(
+        http,
+        base_url=base_url,
+        token=token,
+        console_uids=[row["console_uid"] for row in rows],
+        rate_limit_counter=rate_limit_counter,
+        blocked_counter=blocked_counter,
+        status_sink=status_sink,
+    )
+    if csv_text is not None:
+        return [csv_text], []
+
+    status = status_sink[-1] if status_sink else 0
+    if status in (429, 403):
+        raise _ThrottleAbort(f"HTTP {status} during isolation")
+    if len(rows) == 1:
+        row = rows[0]
+        print(
+            f"  Dead set isolated: {row['console_uid']} "
+            f"({row.get('set_name') or '?'}) -- HTTP {status or 'error'}.",
+            flush=True,
+        )
+        return [], [row]
+
+    mid = len(rows) // 2
+    left_csv, left_dead = _isolate_failed_batch(
+        http,
+        base_url=base_url,
+        token=token,
+        rows=rows[:mid],
+        sleep_seconds=sleep_seconds,
+        rate_limit_counter=rate_limit_counter,
+        blocked_counter=blocked_counter,
+        budget=budget,
+    )
+    right_csv, right_dead = _isolate_failed_batch(
+        http,
+        base_url=base_url,
+        token=token,
+        rows=rows[mid:],
+        sleep_seconds=sleep_seconds,
+        rate_limit_counter=rate_limit_counter,
+        blocked_counter=blocked_counter,
+        budget=budget,
+    )
+    return left_csv + right_csv, left_dead + right_dead
+
+
 class Tier3RegistryClient:
     def __init__(self, *, supabase_url: str, service_role_key: str, timeout_seconds: float) -> None:
         self.supabase_url = supabase_url.strip().rstrip("/")
@@ -266,7 +443,13 @@ class Tier3RegistryClient:
     def fetch_rotation_rows(self, *, limit: int) -> list[dict[str, Any]]:
         """Oldest-refreshed completed sportscardspro sets, never-refreshed
         first. nullsfirst makes the initial full cycle drain every
-        never-stamped set before any second visit happens."""
+        never-stamped set before any second visit happens.
+
+        Ordered by tier3_failure_count first, and sets at or above
+        TIER3_MAX_FAILURES are dropped entirely. Without that, a set the
+        endpoint can never serve keeps tier3_refreshed_at NULL forever and
+        so parks permanently at the head of a NULLS FIRST queue -- retried
+        first on every run, taking its whole batch down each time."""
         rows: list[dict[str, Any]] = []
         offset = 0
         with httpx.Client(timeout=self.timeout_seconds) as client:
@@ -279,7 +462,12 @@ class Tier3RegistryClient:
                         "source_site": "eq.sportscardspro",
                         "last_fetch_status": "eq.success",
                         "console_uid": "not.is.null",
-                        "order": "tier3_refreshed_at.asc.nullsfirst,registry_id.asc",
+                        "tier3_failure_count": f"lt.{TIER3_MAX_FAILURES}",
+                        "order": (
+                            "tier3_failure_count.asc,"
+                            "tier3_refreshed_at.asc.nullsfirst,"
+                            "registry_id.asc"
+                        ),
                         "limit": str(page_limit),
                         "offset": str(offset),
                     },
@@ -303,7 +491,35 @@ class Tier3RegistryClient:
                 response = client.patch(
                     f"{self.supabase_url}/rest/v1/pricecharting_set_registry",
                     params={"registry_id": f"in.({','.join(chunk)})"},
-                    json={"tier3_refreshed_at": stamped_at},
+                    # Reset the failure counter: it counts CONSECUTIVE
+                    # failures, so a set that recovers must not stay one
+                    # strike from being dropped from the queue for good.
+                    json={
+                        "tier3_refreshed_at": stamped_at,
+                        "tier3_attempted_at": stamped_at,
+                        "tier3_failure_count": 0,
+                        "tier3_last_error": None,
+                    },
+                    headers={**self._headers(), "Prefer": "return=minimal"},
+                )
+                response.raise_for_status()
+
+    def record_tier3_failures(self, registry_ids: list[str], *, error: str) -> None:
+        """Increment the failure counter for sets the endpoint refused.
+
+        Goes through an RPC rather than a PATCH because the increment has to
+        be atomic: the backfill cron shares this throttle budget and can be
+        mid-run, and a read-modify-write would drop failures exactly when
+        they cluster.
+        """
+        if not registry_ids:
+            return
+        with httpx.Client(timeout=self.timeout_seconds) as client:
+            for index in range(0, len(registry_ids), REGISTRY_PAGE_SIZE):
+                chunk = registry_ids[index : index + REGISTRY_PAGE_SIZE]
+                response = client.post(
+                    f"{self.supabase_url}/rest/v1/rpc/tier3_record_failure",
+                    json={"p_registry_ids": chunk, "p_error": error},
                     headers={**self._headers(), "Prefer": "return=minimal"},
                 )
                 response.raise_for_status()
@@ -340,12 +556,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--catalog-batch-size",
         type=int,
-        default=150,
+        default=40,
         help="Rows per catalog upsert. 500 (the completed-categories "
         "default) was observed hitting the database statement timeout "
         "(57014) here -- each upserted row updates five GIN trigram "
         "indexes plus the browse btrees, and sports-card batches skew "
-        "large. 150 keeps every sub-batch comfortably under it.",
+        "large. 150 was not low enough either: measured 2026-09-01, it "
+        "still lost ~15%% of writes to 57014 (one failure was on a "
+        "59-row sub-batch), while 40 wrote 1,065 rows with zero failures "
+        "and zero retries.",
+    )
+    parser.add_argument(
+        "--max-isolation-requests",
+        type=int,
+        default=DEFAULT_MAX_ISOLATION_REQUESTS,
+        help="Extra requests allowed to pinpoint the bad set inside one "
+        "failed batch. download-custom fails the whole request, so without "
+        "isolation a single set removed upstream discards every set "
+        "batched with it.",
     )
     parser.add_argument("--timeout-seconds", type=float, default=60)
     parser.add_argument(
