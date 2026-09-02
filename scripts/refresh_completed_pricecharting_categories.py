@@ -29,6 +29,7 @@ from typing import Any
 
 import httpx
 
+from scripts._shared_rate_limiter import PRICECHARTING_CSV, SharedRateLimiter
 from scripts._ops_run_recorder import dump_and_report, run_with_recorder
 from scripts.backfill_pricecharting_sets import (
     CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
@@ -101,9 +102,14 @@ def main(argv: list[str] | None = None) -> int:
         follow_redirects=True,
         headers=REQUEST_HEADERS,
     ) as http:
+        csv_limiter = SharedRateLimiter(
+            PRICECHARTING_CSV,
+            fallback_interval_seconds=args.sleep_between_requests_seconds,
+        )
         for index, chunk in enumerate(chunked(rows, args.batch_size)):
-            if index > 0 and args.sleep_between_requests_seconds > 0:
-                time.sleep(args.sleep_between_requests_seconds)
+            # Shared with the tier-3 rotation and the sets backfill: this job
+            # runs ~3.8h from 04:45 and overlaps them.
+            csv_limiter.acquire()
             console_uids = [row["console_uid"] for row in chunk]
             print(f"Fetching batch of {len(chunk)} sets...", flush=True)
             csv_text = fetch_batch_csv(
