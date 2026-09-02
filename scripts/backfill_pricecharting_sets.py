@@ -549,7 +549,9 @@ def _run_backfill(
                         token=token,
                         console_uids=console_uids,
                         max_attempts=args.sportscardspro_max_attempts,
-                        retry_sleep_seconds=args.sportscardspro_sleep_seconds,
+                        # A retry is another CSV call and counts against the
+                        # same published limit as the original.
+                        retry_sleep_seconds=args.csv_sleep_seconds,
                         rate_limit_counter=sportscardspro_429_counter,
                     )
                     if is_sportscardspro
@@ -1285,10 +1287,11 @@ def fetch_batch_csv_with_retry(
     blocked_counter: "_Counter | None" = None,
     status_sink: list[int] | None = None,
 ) -> str | None:
-    # A single 30s-paced request already succeeds ~100% of the time
-    # (confirmed live), so this retry exists purely as a safety margin for
-    # occasional misses -- recovering within the same run instead of
-    # waiting a full 15-minute cron cycle for the next attempt.
+    # Retries are a safety margin for occasional misses, recovering inside the
+    # same run rather than waiting for the next cron cycle. retry_sleep_seconds
+    # must be the CSV interval, not a shorter "we're just retrying" pause: a
+    # retry is a CSV call and counts against the published 1-per-10-minutes
+    # limit exactly like the attempt it follows.
     for attempt in range(1, max_attempts + 1):
         csv_text = fetch_batch_csv(
             http,

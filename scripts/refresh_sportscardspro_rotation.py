@@ -80,10 +80,18 @@ REGISTRY_PAGE_SIZE = 1000
 TIER3_MAX_FAILURES = 3
 
 # Extra requests allowed to pinpoint the bad set inside ONE failed batch.
-# Halving finds a single offender in ~2*log2(batch_size) requests (~10 at
-# batch 25), so this is a generous ceiling that still bounds the worst case
-# of a batch where many sets are dead.
-DEFAULT_MAX_ISOLATION_REQUESTS = 12
+#
+# Sized against the CSV budget, not against how neatly bisection converges.
+# At the published 1-call-per-10-minutes limit the account gets ~144 CSV calls
+# a day, so a full bisection of a 100-set batch (~14 probes) would cost 2.3
+# hours and ~10% of the day's entire budget to quarantine one dead set. That
+# was cheap at 30s pacing; it is not now.
+#
+# 4 probes narrows a 100-set batch to ~6 sets, which is enough: those sets stop
+# being stamped, their tier3_failure_count climbs, and TIER3_MAX_FAILURES
+# retires them within a few cycles. Slightly blunter than pinpointing one
+# offender, and roughly a quarter of the cost.
+DEFAULT_MAX_ISOLATION_REQUESTS = 4
 # Trip after this many consecutive rate-limited batches. Low on purpose:
 # the backfill's live testing showed 429s recur in clusters once the
 # sustained-volume limit is hit, and continuing just extends the cluster.

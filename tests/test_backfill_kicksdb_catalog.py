@@ -1,9 +1,12 @@
 import base64
 import json
 import unittest
+from unittest import mock
 from unittest.mock import patch
 
 import httpx
+
+import scripts.backfill_kicksdb_catalog as kicksdb_module
 
 from scripts.backfill_kicksdb_catalog import (
     API_RESULT_CAP,
@@ -110,6 +113,7 @@ class FetchSegmentTest(unittest.TestCase):
         products, requests_used = fetch_segment(
             http, api_base="https://api.kicks.dev", api_key="tok", segment=segment,
             page_size=2, request_budget=budget,
+            request_delay_seconds=0,  # tests must not sleep on the real rate limit
         )
 
         # meta.total=2 with page_size=2 means page 1 alone satisfies the cap.
@@ -131,6 +135,7 @@ class FetchSegmentTest(unittest.TestCase):
         products, requests_used = fetch_segment(
             http, api_base="https://api.kicks.dev", api_key="tok", segment=segment,
             page_size=100, request_budget=budget,
+            request_delay_seconds=0,  # tests must not sleep on the real rate limit
         )
 
         self.assertEqual(len(products), 1)
@@ -147,6 +152,7 @@ class FetchSegmentTest(unittest.TestCase):
         products, requests_used = fetch_segment(
             http, api_base="https://api.kicks.dev", api_key="tok", segment=segment,
             page_size=1, request_budget=budget,
+            request_delay_seconds=0,  # tests must not sleep on the real rate limit
         )
 
         self.assertEqual(requests_used, 2)
@@ -167,6 +173,7 @@ class FetchSegmentTest(unittest.TestCase):
         products, requests_used = fetch_segment(
             http, api_base="https://api.kicks.dev", api_key="tok", segment=segment,
             page_size=1, request_budget=budget,
+            request_delay_seconds=0,  # tests must not sleep on the real rate limit
         )
 
         self.assertEqual(requests_used, API_RESULT_CAP)
@@ -322,3 +329,52 @@ def _b64_json(payload: dict) -> str:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KicksDbRateLimitTest(unittest.TestCase):
+    """kicks.dev documents 60 requests/minute per API key. Until 2026-09-02
+    this script had no delay between requests at all -- the only sleep in the
+    file was the retry -- so a --max-requests 1100 cron run fired as fast as
+    the network allowed. The isolated mid-run 500s that were attributed to
+    flaky servers, and answered with a retry, are what rate limiting looks
+    like.
+    """
+
+    def setUp(self):
+        kicksdb_module._last_kicksdb_request_at[0] = None
+
+    def test_default_delay_matches_the_documented_limit(self):
+        self.assertEqual(
+            kicksdb_module.DEFAULT_REQUEST_DELAY_SECONDS,
+            60.0 / kicksdb_module.KICKSDB_RATE_LIMIT_PER_MINUTE,
+        )
+        self.assertGreaterEqual(kicksdb_module.DEFAULT_REQUEST_DELAY_SECONDS, 1.0)
+
+    def test_pacing_holds_across_calls(self):
+        slept = []
+        with mock.patch.object(kicksdb_module.time, "sleep", slept.append):
+            with mock.patch.object(
+                kicksdb_module.time, "monotonic", side_effect=[0.0, 0.1, 0.1]
+            ):
+                kicksdb_module.pace_kicksdb_request(1.0)   # first call is free
+                kicksdb_module.pace_kicksdb_request(1.0)   # 0.1s later -> wait 0.9s
+        self.assertEqual(len(slept), 1)
+        self.assertAlmostEqual(slept[0], 0.9, places=6)
+
+    def test_no_sleep_once_the_interval_has_already_elapsed(self):
+        slept = []
+        with mock.patch.object(kicksdb_module.time, "sleep", slept.append):
+            with mock.patch.object(
+                kicksdb_module.time, "monotonic", side_effect=[0.0, 5.0, 5.0]
+            ):
+                kicksdb_module.pace_kicksdb_request(1.0)
+                kicksdb_module.pace_kicksdb_request(1.0)
+        self.assertEqual(slept, [])
+
+    def test_zero_delay_disables_pacing(self):
+        # Tests and one-off local runs opt out; production must not.
+        slept = []
+        with mock.patch.object(kicksdb_module.time, "sleep", slept.append):
+            kicksdb_module.pace_kicksdb_request(0)
+            kicksdb_module.pace_kicksdb_request(0)
+        self.assertEqual(slept, [])
