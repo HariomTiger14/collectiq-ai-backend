@@ -47,11 +47,48 @@ DEFAULT_MAX_REQUESTS = 120
 # meta.total=1000 regardless of how many pages were requested).
 API_RESULT_CAP = 1000
 
-# A handful of live cron runs have seen isolated 500s from kicks.dev mid-
-# segment (e.g. New Balance, Reebok) that succeed again on the next page --
-# retry transient server errors once before giving up on the segment.
+# kicks.dev documents 60 requests per minute per API key
+# (https://docs.kicks.dev/rate-limiting-1376876m0), i.e. one per second.
+#
+# Until 2026-09-02 this script had NO delay between requests at all -- the only
+# sleep in the file was the retry below -- so a --max-requests 1100 cron run
+# fired as fast as the network allowed, many times over the documented limit.
+#
+# The comment that used to sit here read: "A handful of live cron runs have
+# seen isolated 500s from kicks.dev mid-segment (e.g. New Balance, Reebok)
+# that succeed again on the next page -- retry transient server errors once."
+# Isolated mid-run failures that recover on the very next request are what
+# rate limiting looks like; treating them as flaky servers and adding a retry
+# made the overage slightly worse. Kept as a note because the retry is still
+# worth having, and because this is the same mistake that got the
+# sportscardspro CSV endpoint blocked (see CSV_DOWNLOAD_MIN_INTERVAL_SECONDS
+# in backfill_pricecharting_sets.py).
+KICKSDB_RATE_LIMIT_PER_MINUTE = 60
+DEFAULT_REQUEST_DELAY_SECONDS = 60.0 / KICKSDB_RATE_LIMIT_PER_MINUTE  # 1.0s
+
 PAGE_FETCH_ATTEMPTS = 2
 PAGE_FETCH_RETRY_DELAY_SECONDS = 2.0
+
+# Monotonic timestamp of the last kicks.dev request, so pacing holds across
+# pages AND segments -- a per-loop sleep would reset at every segment boundary
+# and let bursts through exactly where the 500s were observed.
+# None, not 0.0: a falsy sentinel would make pacing silently no-op whenever
+# time.monotonic() returned 0 -- rare in production, but the kind of quiet
+# failure that lets an overage run undetected, which is exactly how we got here.
+_last_kicksdb_request_at: list[float | None] = [None]
+
+
+def pace_kicksdb_request(min_interval_seconds: float) -> None:
+    """Block until at least min_interval_seconds has passed since the last
+    kicks.dev request. Counts retries too: a retry is a request."""
+    if min_interval_seconds <= 0:
+        return
+    last = _last_kicksdb_request_at[0]
+    if last is not None:
+        elapsed = time.monotonic() - last
+        if elapsed < min_interval_seconds:
+            time.sleep(min_interval_seconds - elapsed)
+    _last_kicksdb_request_at[0] = time.monotonic()
 
 # The general "sneakers-by-rank" segment plus the 9 brands confirmed live to
 # each independently hit the 1,000-result cap on their own (i.e. each has
@@ -221,6 +258,7 @@ def main(argv: list[str] | None = None) -> int:
                 segment=segment,
                 page_size=args.page_size,
                 request_budget=request_budget,
+                request_delay_seconds=args.request_delay_seconds,
             )
             print(
                 f"  {segment['label']}: {len(products)} products "
@@ -288,6 +326,7 @@ def fetch_segment(
     segment: dict[str, str],
     page_size: int,
     request_budget: RequestBudget,
+    request_delay_seconds: float = DEFAULT_REQUEST_DELAY_SECONDS,
 ) -> tuple[list[dict[str, Any]], int]:
     products: list[dict[str, Any]] = []
     requests_used = 0
@@ -314,6 +353,7 @@ def fetch_segment(
                 if attempt > 0:
                     time.sleep(PAGE_FETCH_RETRY_DELAY_SECONDS)
                 try:
+                    pace_kicksdb_request(request_delay_seconds)
                     response = http.get(
                         f"{api_base}/v3/stockx/products",
                         params=params,
@@ -692,6 +732,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Hard cap on HTTP requests this run can make, across all segments.",
     )
     parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE)
+    parser.add_argument(
+        "--request-delay-seconds",
+        type=float,
+        default=DEFAULT_REQUEST_DELAY_SECONDS,
+        help="Minimum seconds between kicks.dev requests. Defaults to their "
+        "documented 60/minute limit. Lowering it risks the rate limiting "
+        "previously misread as intermittent 500s.",
+    )
     parser.add_argument("--catalog-batch-size", type=int, default=100)
     parser.add_argument("--timeout-seconds", type=float, default=30)
     parser.add_argument("--api-base", default=DEFAULT_API_BASE)
