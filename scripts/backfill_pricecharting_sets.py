@@ -165,6 +165,27 @@ API_SEARCH_RESULT_CAP = 100
 # throughput lost is mostly the throughput that was being wasted on
 # retries anyway. pricecharting.com has no such throttle and stays on the
 # caller's normal --sleep-between-requests-seconds pacing.
+# sportscardspro.com/pricecharting.com publish their limits at
+# /api-documentation:
+#
+#   "The API is limited to 1 call every second. Any more than that and your
+#    calls will be blocked and your account permissions revoked if it persists."
+#   "CSV calls are limited to one every 10 minutes."
+#
+# The CSV limit is the one that matters here: /price-guide/download-custom is a
+# CSV call, not an API call. Everything in this repo paced it at 2s
+# (pricecharting) or 30s (sportscardspro) -- 300x and 20x over the published
+# limit respectively -- until 2026-09-02, which is the most likely explanation
+# for the Cloudflare challenge that started blocking the download path from
+# Render around 31 August while /api/products (comfortably inside the 1/sec
+# API limit) kept working from the same host.
+#
+# The throughput lost is far less than it looks: download-custom accepts ~100
+# console_uids per request, so 144 compliant calls/day still covers ~14,400
+# sets -- a faster full cycle than the old 30s pacing achieved at batch 3.
+# The fix for slow bulk transfer is more sets per request, not more requests.
+CSV_DOWNLOAD_MIN_INTERVAL_SECONDS = 600.0
+
 SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS = 30.0
 SPORTSCARDSPRO_DEFAULT_MAX_ATTEMPTS = 3
 
@@ -188,7 +209,13 @@ SPORTSCARDSPRO_DEFAULT_SLOW_PATH_LIMIT = 20
 # (--batch-size, default 150) regardless of instance size, so no single
 # batch's parsed rows (each held in memory, plus a duplicated raw_payload
 # per row) can blow past the memory limit.
-SPORTSCARDSPRO_DEFAULT_BATCH_SIZE = 3
+# Raised from 3 once pacing moved to the published 10-minute CSV interval:
+# with 144 calls a day, sets-per-call is the only throughput lever left. 100 is
+# the largest size confirmed working live (URL ~1,005 chars, well inside
+# limits). Memory, which is what forced 3 on a 512Mi Render instance, is not a
+# constraint at 1 call per 10 minutes -- and the COPY writer streams rather
+# than accumulating.
+SPORTSCARDSPRO_DEFAULT_BATCH_SIZE = 100
 
 # Hard ceiling on how many /api/products searches the controlled-overlap
 # scheduler (see _resolve_via_api_for_small_sets_overlapped) allows in
@@ -497,11 +524,12 @@ def _run_backfill(
         for source_site, rows in group_by_site(resolved).items():
             base_url = SOURCE_SITE_BASE_URLS[source_site]
             is_sportscardspro = source_site == "sportscardspro"
-            site_sleep_seconds = (
-                args.sportscardspro_sleep_seconds
-                if is_sportscardspro
-                else args.sleep_between_requests_seconds
-            )
+            # CSV pacing is deliberately NOT the page-resolve pacing. Set
+            # pages are ordinary HTML fetches; download-custom is a CSV call
+            # and carries the published 1-per-10-minutes limit. Sharing one
+            # flag between them is how the CSV limit came to be exceeded by
+            # 300x on pricecharting and 20x on sportscardspro.
+            site_sleep_seconds = args.csv_sleep_seconds
             site_batch_size = (
                 args.sportscardspro_batch_size if is_sportscardspro else args.batch_size
             )
@@ -1310,7 +1338,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--sleep-between-requests-seconds",
         type=float,
         default=2.0,
-        help="Self-imposed pace between set-page resolves and batch CSV requests.",
+        help="Pace between set-page (console_uid) HTML resolves. NOT used for "
+        "CSV downloads -- see --csv-sleep-seconds.",
+    )
+    parser.add_argument(
+        "--csv-sleep-seconds",
+        type=float,
+        default=CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
+        help="Pace between /price-guide/download-custom calls. Defaults to the "
+        "published limit of one CSV call every 10 minutes. Do not lower this "
+        "without a written exception -- the vendor documents revoking account "
+        "permissions for persistent limit violations.",
     )
     parser.add_argument(
         "--console-resolve-concurrency",

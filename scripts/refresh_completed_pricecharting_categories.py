@@ -31,6 +31,7 @@ import httpx
 
 from scripts._ops_run_recorder import dump_and_report, run_with_recorder
 from scripts.backfill_pricecharting_sets import (
+    CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
     REQUEST_HEADERS,
     SOURCE_SITE_BASE_URLS,
     chunked,
@@ -222,7 +223,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--sleep-between-requests-seconds",
         type=float,
-        default=2.0,
+        default=CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
         help="Pacing between download-custom batches (pricecharting.com is unthrottled).",
     )
     parser.add_argument("--api-token", default="", help="Defaults to PRICECHARTING_API_TOKEN.")

@@ -12,6 +12,12 @@
 # sleep, a dead network -- costs at most the in-flight batch. Run it again
 # and it continues from exactly where it stopped.
 #
+# Pacing comes from the script default: one download-custom call every 10
+# minutes, the vendor's published CSV limit. At BATCH=100 that is ~14,400
+# sets/day, so a full 17,691-set cycle needs ~30h of wall clock -- fine for a
+# cron, long for a laptop. Do not lower the pacing to compensate; raise the
+# batch or accept a longer cycle.
+#
 # Writes go through --copy-writer (COPY + one server-side merge over a direct
 # DATABASE_URL connection) rather than PostgREST. Measured on a quiet database
 # 2026-09-02: ~27 written rows/sec vs ~11 on the REST path, and the write is
@@ -26,7 +32,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 SETS=${1:-1000}
-BATCH=25
+BATCH=100
 
 eval "$(.venv/bin/python -c "
 from dotenv import dotenv_values
