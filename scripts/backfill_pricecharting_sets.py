@@ -1121,9 +1121,29 @@ def write_catalog_rows_with_retry(
     database, and coupling the two would make write pressure cost
     throttle budget it has nothing to do with.
     """
+    # "failed" and "skippedUnchanged" are cumulative counters on the client,
+    # so a retry re-counts rows the previous attempt already tallied: the
+    # failed sub-batch is counted again, and every unchanged row it re-reads
+    # is skipped again. Left alone that makes the ledger self-contradictory
+    # -- a 2026-09-01 tier-3 run reported catalogRowsFailed 31,766 with
+    # failedWrites 0, and skippedUnchanged (3,023,794) larger than
+    # catalogRowsParsed (1,908,562), which cannot describe real rows.
+    #
+    # "written" is genuinely cumulative (each attempt writes DIFFERENT rows --
+    # what already landed is skipped by the content-hash diff), so only the
+    # two re-counted fields are rebased, and only once the batch succeeds.
+    stats = getattr(catalog_client, "catalog_write_stats", None)
+    baseline = dict(stats) if stats is not None else None
+
     retries = 0
     for attempt in range(1, max(1, attempts) + 1):
+        before_attempt = dict(stats) if stats is not None else None
         if write_catalog_rows(catalog_client, catalog_rows, batch_size=batch_size):
+            if stats is not None and baseline is not None and before_attempt is not None:
+                for key in ("failed", "skippedUnchanged"):
+                    if key in stats:
+                        this_attempt = stats[key] - before_attempt.get(key, 0)
+                        stats[key] = baseline.get(key, 0) + this_attempt
             return True, retries
         if attempt < attempts:
             retries += 1

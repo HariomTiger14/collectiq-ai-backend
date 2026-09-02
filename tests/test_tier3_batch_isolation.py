@@ -113,3 +113,71 @@ class Tier3BatchIsolationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetryStatsRebasingTest(unittest.TestCase):
+    """A retry must not re-count rows the failed attempt already tallied.
+
+    Observed on a real tier-3 run 2026-09-01: catalogRowsFailed 31,766 with
+    failedWrites 0, and skippedUnchanged (3,023,794) exceeding
+    catalogRowsParsed (1,908,562) -- impossible for real rows, and it made
+    the ledger read as data loss when nothing had been lost.
+    """
+
+    def _client(self):
+        client = mock.MagicMock()
+        client.catalog_write_stats = {"written": 0, "skippedUnchanged": 0, "failed": 0}
+        return client
+
+    def test_failed_attempt_is_not_counted_once_a_retry_succeeds(self):
+        from scripts.backfill_pricecharting_sets import write_catalog_rows_with_retry
+
+        client = self._client()
+        calls = {"n": 0}
+
+        def fake_write(c, rows, *, batch_size):
+            calls["n"] += 1
+            if calls["n"] == 1:  # attempt 1: everything fails
+                c.catalog_write_stats["failed"] += 100
+                c.catalog_write_stats["skippedUnchanged"] += 900
+                return False
+            c.catalog_write_stats["written"] += 100          # attempt 2 succeeds
+            c.catalog_write_stats["skippedUnchanged"] += 900
+            return True
+
+        with mock.patch(
+            "scripts.backfill_pricecharting_sets.write_catalog_rows", fake_write
+        ):
+            wrote, retries = write_catalog_rows_with_retry(
+                client, [{"pricecharting_id": "x"}],
+                batch_size=10, attempts=3, backoff_seconds=0, sleep=lambda _: None,
+            )
+
+        self.assertTrue(wrote)
+        self.assertEqual(retries, 1)
+        self.assertEqual(client.catalog_write_stats["failed"], 0)
+        self.assertEqual(client.catalog_write_stats["skippedUnchanged"], 900)
+        # written stays cumulative: each attempt writes DIFFERENT rows.
+        self.assertEqual(client.catalog_write_stats["written"], 100)
+
+    def test_exhausted_attempts_keep_the_failure_visible(self):
+        from scripts.backfill_pricecharting_sets import write_catalog_rows_with_retry
+
+        client = self._client()
+
+        def always_fail(c, rows, *, batch_size):
+            c.catalog_write_stats["failed"] += 50
+            return False
+
+        with mock.patch(
+            "scripts.backfill_pricecharting_sets.write_catalog_rows", always_fail
+        ):
+            wrote, _ = write_catalog_rows_with_retry(
+                client, [{"pricecharting_id": "x"}],
+                batch_size=10, attempts=3, backoff_seconds=0, sleep=lambda _: None,
+            )
+
+        self.assertFalse(wrote)
+        # Nothing is rebased on failure -- a genuinely lost batch must not be
+        # quietly zeroed by the same code that hides retry noise.
+        self.assertGreater(client.catalog_write_stats["failed"], 0)

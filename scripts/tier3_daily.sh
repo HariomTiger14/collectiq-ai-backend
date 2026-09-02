@@ -12,6 +12,12 @@
 # sleep, a dead network -- costs at most the in-flight batch. Run it again
 # and it continues from exactly where it stopped.
 #
+# Writes go through --copy-writer (COPY + one server-side merge over a direct
+# DATABASE_URL connection) rather than PostgREST. Measured on a quiet database
+# 2026-09-02: ~27 written rows/sec vs ~11 on the REST path, and the write is
+# one transaction instead of ~375 statements contending with the hourly
+# tier-1 job -- which is what produced the 57014 timeouts.
+#
 # Sizing: measured 2026-09-01 at ~8.2 sets/min, so sets/60/8.2 ~= hours. The
 # full large-set half is 17,691 sets, i.e. ~18 days at the default. Render
 # cycled it every 2-3 days; this is the cost of running it by hand.
@@ -58,7 +64,7 @@ caffeinate -is .venv/bin/python -m scripts.refresh_sportscardspro_rotation \
   --api-token "$PRICECHARTING_API_KEY" \
   --max-requests "$REQUESTS" \
   --batch-size "$BATCH" \
-  --catalog-batch-size 200 2>&1 \
+  --copy-writer 2>&1 \
   | sed -E "s/${PRICECHARTING_API_KEY}/[REDACTED]/g"
 
 echo
