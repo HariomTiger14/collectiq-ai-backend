@@ -326,11 +326,15 @@ services:
   #   completed-categories    23 calls once daily        =  23  (overlaps tier3)
   #   backfill                ~1 call/run, usually idle  =  ~4
   #
-  # That totals over 144 if they run concurrently, which they can. Until a
-  # shared rate limiter exists, the schedules below are the only thing keeping
-  # them apart, and tier3 at 16 x 10min = 160 min inside a 3-hour window is
-  # what leaves room for the others. Do not raise --max-requests past 16
-  # without re-doing this arithmetic.
+  # That totals over 144 if they run concurrently, which they can -- and the
+  # schedules guarantee overlap. As of the 20260902 provider_rate_limits
+  # migration this is enforced rather than hoped for: every CSV caller takes a
+  # slot from acquire_rate_limit_slot('pricecharting:csv'), which serialises
+  # them on one row, so concurrent jobs queue instead of doubling the rate.
+  #
+  # --max-requests is therefore a CEILING, not a promise: a run that contends
+  # with another job simply covers fewer sets rather than breaching the limit.
+  # Raising it no longer risks the limit, only a longer run.
   - type: cron
     name: packlox-tier3-sportscardspro-rotation-sit
     runtime: python

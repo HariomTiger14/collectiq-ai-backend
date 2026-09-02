@@ -103,6 +103,7 @@ class _StartRateLimiter:
             self._next_allowed_start = now + self._min_interval_seconds
 
 
+from scripts._shared_rate_limiter import PRICECHARTING_CSV, SharedRateLimiter
 from scripts._ops_run_recorder import dump_and_report, run_with_recorder
 from scripts.import_pricecharting_catalog import (
     TEXT_FIELDS,
@@ -530,12 +531,14 @@ def _run_backfill(
             # flag between them is how the CSV limit came to be exceeded by
             # 300x on pricecharting and 20x on sportscardspro.
             site_sleep_seconds = args.csv_sleep_seconds
+            csv_limiter = SharedRateLimiter(
+                PRICECHARTING_CSV, fallback_interval_seconds=site_sleep_seconds
+            )
             site_batch_size = (
                 args.sportscardspro_batch_size if is_sportscardspro else args.batch_size
             )
             for index, chunk in enumerate(chunked(rows, site_batch_size)):
-                if index > 0 and site_sleep_seconds > 0:
-                    time.sleep(site_sleep_seconds)
+                csv_limiter.acquire()
                 console_uids = [row["console_uid"] for row in chunk]
                 print(
                     f"Fetching {source_site} batch of {len(chunk)} sets...",

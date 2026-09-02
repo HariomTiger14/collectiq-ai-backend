@@ -50,6 +50,7 @@ from typing import Any
 import httpx
 
 from scripts._ops_run_recorder import dump_and_report, run_with_recorder
+from scripts._shared_rate_limiter import PRICECHARTING_CSV, SharedRateLimiter
 from scripts.backfill_pricecharting_sets import (
     REQUEST_HEADERS,
     SOURCE_SITE_BASE_URLS,
@@ -147,6 +148,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     base_url = SOURCE_SITE_BASE_URLS["sportscardspro"]
+    csv_limiter = SharedRateLimiter(
+        PRICECHARTING_CSV,
+        fallback_interval_seconds=args.sleep_between_requests_seconds,
+    )
     breaker = _RateLimitCircuitBreaker(RATE_LIMIT_BREAKER_THRESHOLD)
     rate_limit_counter = _Counter()
     # 403s are tracked separately from 429s: "blocked" and "slow down" are
@@ -183,8 +188,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 break
             chunk = rows[index : index + args.batch_size]
-            if index > 0:
-                time.sleep(args.sleep_between_requests_seconds)
+            # Account-wide, not per-run: the categories refresh and the sets
+            # backfill draw on the same published CSV limit and overlap this
+            # job for most of the day.
+            csv_limiter.acquire()
             console_uids = [row["console_uid"] for row in chunk]
             before_429s = rate_limit_counter.value
             before_403s = blocked_counter.value
@@ -399,6 +406,7 @@ def _isolate_failed_batch(
     rate_limit_counter: _Counter,
     blocked_counter: _Counter,
     budget: list[int],
+    limiter: Any = None,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """Split a failed batch to salvage its healthy sets and pinpoint the
     set(s) the endpoint cannot serve.
@@ -415,7 +423,9 @@ def _isolate_failed_batch(
     if not rows or budget[0] <= 0:
         return [], []
     budget[0] -= 1
-    if sleep_seconds > 0:
+    if limiter is not None:
+        limiter.acquire()
+    elif sleep_seconds > 0:
         time.sleep(sleep_seconds)
     status_sink: list[int] = []
     csv_text = fetch_batch_csv(
@@ -452,6 +462,7 @@ def _isolate_failed_batch(
         rate_limit_counter=rate_limit_counter,
         blocked_counter=blocked_counter,
         budget=budget,
+        limiter=limiter,
     )
     right_csv, right_dead = _isolate_failed_batch(
         http,
@@ -462,6 +473,7 @@ def _isolate_failed_batch(
         rate_limit_counter=rate_limit_counter,
         blocked_counter=blocked_counter,
         budget=budget,
+        limiter=limiter,
     )
     return left_csv + right_csv, left_dead + right_dead
 

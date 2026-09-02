@@ -34,6 +34,8 @@ from typing import Any
 
 import httpx
 
+from scripts._shared_rate_limiter import KICKSDB_API, SharedRateLimiter
+
 from scripts._ops_run_recorder import dump_and_report, run_with_recorder
 
 
@@ -231,6 +233,9 @@ def main(argv: list[str] | None = None) -> int:
     segments = load_segments(args.segments_json)
     source_downloaded_at = datetime.now(timezone.utc).isoformat()
     request_budget = RequestBudget(args.max_requests)
+    kicksdb_limiter = SharedRateLimiter(
+        KICKSDB_API, fallback_interval_seconds=args.request_delay_seconds
+    )
 
     # Rows (each carrying a full raw_payload + per-size variants) are written
     # to Supabase segment-by-segment instead of being accumulated across all
@@ -259,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
                 page_size=args.page_size,
                 request_budget=request_budget,
                 request_delay_seconds=args.request_delay_seconds,
+                kicksdb_limiter=kicksdb_limiter,
             )
             print(
                 f"  {segment['label']}: {len(products)} products "
@@ -327,6 +333,7 @@ def fetch_segment(
     page_size: int,
     request_budget: RequestBudget,
     request_delay_seconds: float = DEFAULT_REQUEST_DELAY_SECONDS,
+    kicksdb_limiter: Any = None,
 ) -> tuple[list[dict[str, Any]], int]:
     products: list[dict[str, Any]] = []
     requests_used = 0
@@ -353,7 +360,12 @@ def fetch_segment(
                 if attempt > 0:
                     time.sleep(PAGE_FETCH_RETRY_DELAY_SECONDS)
                 try:
-                    pace_kicksdb_request(request_delay_seconds)
+                    # Shared limiter first; pace_kicksdb_request remains the
+                    # in-process floor if the limiter itself is unavailable.
+                    if kicksdb_limiter is not None:
+                        kicksdb_limiter.acquire()
+                    else:
+                        pace_kicksdb_request(request_delay_seconds)
                     response = http.get(
                         f"{api_base}/v3/stockx/products",
                         params=params,
