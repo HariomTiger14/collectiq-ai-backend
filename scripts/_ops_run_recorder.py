@@ -25,6 +25,7 @@ Design constraints, in order:
 import hashlib
 import json
 import os
+import re
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -56,6 +57,35 @@ def run_with_recorder(job_name: str, main: Callable[[], int]) -> int:
         raise
     recorder.finish_succeeded(exit_code)
     return exit_code
+
+
+# Credentials reach tracebacks through URLs: httpx puts the full request URL in
+# HTTPStatusError, and the providers here authenticate with a query parameter
+# rather than a header. A real example, ops_cron_runs 2026-08-29:
+#
+#   httpx.HTTPStatusError: Server error '503 Service Unavailable' for url
+#   'https://www.pricecharting.com/price-guide/download-custom?t=<live token>'
+#
+# which stored a live API token in the ledger -- readable by anything with
+# database access, and copied again into ops_error_events. Redacting here
+# rather than per-script is deliberate: _redact_token() in
+# backfill_pricecharting_sets.py covers only print() calls in that one file and
+# needs the token passed in, so every other job leaked by default.
+#
+# Matches on the PARAMETER NAME rather than on known secret values, so it also
+# covers credentials this module never sees.
+_SECRET_QUERY_PARAMS = re.compile(
+    r"([?&](?:t|key|token|api[-_]?key|apikey|access[-_]?token|password|secret)=)"
+    r"""[^&\s"'>]+""",
+    re.IGNORECASE,
+)
+
+
+def scrub_secrets(text: str) -> str:
+    """Redact credential-bearing query parameters from arbitrary text."""
+    if not text:
+        return text
+    return _SECRET_QUERY_PARAMS.sub(r"\1[REDACTED]", text)
 
 
 class _Recorder:
@@ -100,7 +130,7 @@ class _Recorder:
         self._finish("succeeded", summary=_summary, error=None, exit_code=exit_code)
 
     def finish_failed(self, error: BaseException) -> None:
-        stack = "".join(traceback.format_exception(error))[-_STACK_CAP:]
+        stack = scrub_secrets("".join(traceback.format_exception(error)))[-_STACK_CAP:]
         self._finish("failed", summary=_summary, error=stack, exit_code=None)
         self._record_error_event(error, stack)
 
