@@ -16,12 +16,14 @@ Usage:
 
 import argparse
 import os
+import time
 
 import httpx
 
 from scripts.backfill_pricecharting_sets import (
     SOURCE_SITE_BASE_URLS,
     chunked,
+    CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
     fetch_batch_csv,
     group_by_site,
 )
@@ -85,7 +87,13 @@ def main() -> int:
     with httpx.Client(timeout=args.timeout_seconds, follow_redirects=True) as http:
         for source_site, rows in group_by_site(failed_rows).items():
             base_url = SOURCE_SITE_BASE_URLS[source_site]
-            for chunk in chunked(rows, args.batch_size):
+            for index, chunk in enumerate(chunked(rows, args.batch_size)):
+                # Paced like every other CSV caller. This is a manual
+                # diagnostic, but it hits the same endpoint on the same
+                # account, and an unpaced loop here would breach the published
+                # limit just as effectively as a cron doing it.
+                if index > 0:
+                    time.sleep(CSV_DOWNLOAD_MIN_INTERVAL_SECONDS)
                 console_uids = [row["console_uid"] for row in chunk]
                 csv_text = fetch_batch_csv(
                     http, base_url=base_url, token=token, console_uids=console_uids
