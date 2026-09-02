@@ -53,9 +53,9 @@ from scripts._ops_run_recorder import dump_and_report, run_with_recorder
 from scripts.backfill_pricecharting_sets import (
     REQUEST_HEADERS,
     SOURCE_SITE_BASE_URLS,
+    CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
     SPORTSCARDSPRO_DEFAULT_BATCH_SIZE,
     SPORTSCARDSPRO_DEFAULT_MAX_ATTEMPTS,
-    SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS,
     _Counter,
     _RateLimitCircuitBreaker,
     fetch_batch_csv,
@@ -615,8 +615,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--sleep-between-requests-seconds",
         type=float,
-        default=SPORTSCARDSPRO_DEFAULT_SLEEP_SECONDS,
-        help="sportscardspro.com Cloudflare pacing -- see backfill_pricecharting_sets.py.",
+        default=CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
+        help="Pace between download-custom calls. Defaults to the vendor's "
+        "published limit of one CSV call every 10 minutes (see "
+        "backfill_pricecharting_sets.py). The old 30s default was 20x over it.",
     )
     parser.add_argument("--max-attempts", type=int, default=SPORTSCARDSPRO_DEFAULT_MAX_ATTEMPTS)
     parser.add_argument(
