@@ -9,7 +9,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Iterator
 
 import httpx
 
@@ -302,8 +302,40 @@ def download_env_sources(
 
 
 def load_rows_from_text(csv_text: str) -> list[dict[str, str]]:
+    """Whole-file parse. Fine for the small per-category CSVs; for a sports
+    batch use iter_rows_from_text() instead -- see the note there."""
     handle = io.StringIO(csv_text)
     return [dict(row) for row in csv.DictReader(handle)]
+
+
+def iter_rows_from_text(csv_text: str) -> "Iterator[dict[str, str]]":
+    """Row-at-a-time parse, so a caller can convert and write in chunks
+    without ever holding the whole file as dicts.
+
+    Sports sets average ~636 rows, so a 100-set download-custom batch parses
+    to ~63,600 dicts. Materialising those at once is what forced the tier-3
+    rotation down to tiny batch sizes: a 20-set batch (~12,700 rows) already
+    OOM-killed a 512Mi Render instance. Peak memory here is one chunk rather
+    than one batch, which is what makes batch 100 affordable on the small
+    plan -- the fetch limit (one CSV call per 10 minutes) then becomes the
+    only constraint, which is the one we cannot engineer around."""
+    for row in csv.DictReader(io.StringIO(csv_text)):
+        yield dict(row)
+
+
+def chunked_iter(rows: "Iterable[Any]", size: int) -> "Iterator[list[Any]]":
+    """Group an iterator into lists of at most `size`, without buffering the
+    whole input."""
+    if size <= 0:
+        raise ValueError("size must be greater than zero")
+    chunk: list[Any] = []
+    for row in rows:
+        chunk.append(row)
+        if len(chunk) >= size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
 
 
 def dedupe_catalog_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
