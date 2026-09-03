@@ -60,6 +60,36 @@ def main() -> int:
     )
     print(f"csv text   : {_mb(len(csv_text))} for {ROWS:,} rows (~100 sets)")
 
+    def gen():
+        for raw in iter_rows_from_text(csv_text):
+            row = to_catalog_row(raw, "probe", STAMP)
+            if row is not None:
+                yield row
+
+    # Chunked FIRST, smallest first, printed as we go.
+    #
+    # The first version of this probe measured the whole-batch parse first and
+    # was OOM-killed on a 256Mi instance before reaching any chunked figure --
+    # so it proved the old path dies here while telling us nothing about the
+    # path that replaced it. Measure the safe cases first, flush each result,
+    # and leave the one that might kill the process until last.
+    print()
+    results = {}
+    for chunk_rows in (5_000, 10_000, 20_000):
+        tracemalloc.start()
+        for chunk in chunked_iter(gen(), chunk_rows):
+            del chunk
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        results[chunk_rows] = peak
+        verdict = ""
+        if limit:
+            verdict = "  OK" if peak < limit * 0.5 else "  TIGHT"
+        print(f"  chunked @ {chunk_rows:>6,} : {_mb(peak)}{verdict}", flush=True)
+
+    print(flush=True)
+    print("  now measuring the OLD whole-batch path -- if this is the last line", flush=True)
+    print("  you see, it was OOM-killed, which is itself the result.", flush=True)
     tracemalloc.start()
     whole = [
         r
@@ -69,26 +99,7 @@ def main() -> int:
     _, peak_whole = tracemalloc.get_traced_memory()
     tracemalloc.stop()
     del whole
-
-    def gen():
-        for raw in iter_rows_from_text(csv_text):
-            row = to_catalog_row(raw, "probe", STAMP)
-            if row is not None:
-                yield row
-
-    results = {}
-    for chunk_rows in (5_000, 10_000, 20_000):
-        tracemalloc.start()
-        for chunk in chunked_iter(gen(), chunk_rows):
-            del chunk
-        _, peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
-        results[chunk_rows] = peak
-
-    print()
-    print(f"  whole batch (old behaviour) : {_mb(peak_whole)}")
-    for chunk_rows, peak in results.items():
-        print(f"  chunked @ {chunk_rows:>6,}            : {_mb(peak)}")
+    print(f"  whole batch (old)  : {_mb(peak_whole)}", flush=True)
 
     if limit:
         best = min(results.values())
