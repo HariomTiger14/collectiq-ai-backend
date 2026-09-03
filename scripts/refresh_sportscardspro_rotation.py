@@ -66,7 +66,8 @@ from scripts.backfill_pricecharting_sets import (
 )
 from scripts.import_pricecharting_catalog import (
     SupabaseCatalogClient,
-    load_rows_from_text,
+    chunked_iter,
+    iter_rows_from_text,
     to_catalog_row,
 )
 
@@ -292,34 +293,54 @@ def main(argv: list[str] | None = None) -> int:
             # pricecharting_catalog_history_valid_window_check. Measured
             # 2026-09-01: 30 such failures in a 5.5-hour run.
             source_downloaded_at = datetime.now(timezone.utc).isoformat()
-            catalog_rows: list[dict[str, Any]] = []
-            for text in csv_texts:
-                catalog_rows.extend(
-                    row
-                    for row in (
-                        to_catalog_row(raw, SOURCE_FILE_TAG, source_downloaded_at)
-                        for raw in load_rows_from_text(text)
-                    )
-                    if row is not None
-                )
-            total_catalog_rows += len(catalog_rows)
+            # Parse and write in chunks rather than materialising the batch.
+            # A 100-set batch is ~63,600 rows; holding those as dicts is what
+            # forced batch sizes down to single digits -- a 20-set batch
+            # (~12,700 rows) already OOM-killed a 512Mi instance. Peak memory
+            # here is one chunk, so batch size is bounded by the fetch limit
+            # (one CSV call per 10 minutes) rather than by RAM.
+            #
+            # Splitting a batch across writes is safe: the history gate
+            # compares against the CURRENT history row, so if the same
+            # pricecharting_id appears in two chunks the second sees the
+            # version the first just wrote and skips it instead of creating a
+            # duplicate. A failed chunk fails the batch and the set is never
+            # stamped, so the retry re-fetches and the already-written chunks
+            # become content-hash no-ops.
+            def _iter_catalog_rows():
+                for text in csv_texts:
+                    for raw in iter_rows_from_text(text):
+                        row = to_catalog_row(raw, SOURCE_FILE_TAG, source_downloaded_at)
+                        if row is not None:
+                            yield row
 
-            if not args.dry_run and catalog_rows:
-                if copy_writer is not None:
-                    # One transaction, so there is no partial-write state to
-                    # retry around: it either lands or it does not.
-                    wrote, retried = copy_writer.write(catalog_rows), 0
-                else:
-                    assert catalog_client is not None
-                    # Retrying a write costs no sportscardspro request;
-                    # giving up costs a full re-fetch of bytes we already have.
-                    wrote, retried = write_catalog_rows_with_retry(
-                        catalog_client,
-                        catalog_rows,
-                        batch_size=args.catalog_batch_size,
-                        attempts=args.write_attempts,
-                        backoff_seconds=args.write_retry_seconds,
-                    )
+            wrote, retried = True, 0
+            if args.dry_run:
+                total_catalog_rows += sum(1 for _ in _iter_catalog_rows())
+            else:
+                for chunk in chunked_iter(_iter_catalog_rows(), args.ingest_chunk_rows):
+                    total_catalog_rows += len(chunk)
+                    if copy_writer is not None:
+                        # One transaction per chunk: it either lands or it
+                        # does not, so there is no partial state to reason
+                        # about on retry.
+                        chunk_wrote, chunk_retried = copy_writer.write(chunk), 0
+                    else:
+                        assert catalog_client is not None
+                        # Retrying a write costs no sportscardspro request;
+                        # giving up costs a full re-fetch of bytes we hold.
+                        chunk_wrote, chunk_retried = write_catalog_rows_with_retry(
+                            catalog_client,
+                            chunk,
+                            batch_size=args.catalog_batch_size,
+                            attempts=args.write_attempts,
+                            backoff_seconds=args.write_retry_seconds,
+                        )
+                    retried += chunk_retried
+                    if not chunk_wrote:
+                        wrote = False
+                        break
+
                 write_retries += retried
                 if not wrote:
                     failed_batches += 1
@@ -621,6 +642,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "rather than ~375 statements racing the hourly tier-1 job (which is "
         "what produces the 57014 timeouts). Needs psycopg and DATABASE_URL, "
         "so it is opt-in and laptop-only -- Render's cron path has neither.",
+    )
+    parser.add_argument(
+        "--ingest-chunk-rows",
+        type=int,
+        default=10_000,
+        help="Rows held in memory before writing. Bounds peak memory "
+        "independently of --batch-size, so a 100-set batch (~63,600 rows) "
+        "fits on a 512Mi instance. 10,000 is ~7 chunks per batch, against "
+        "the 375 round trips the old per-sub-batch REST path made.",
     )
     parser.add_argument(
         "--max-isolation-requests",
