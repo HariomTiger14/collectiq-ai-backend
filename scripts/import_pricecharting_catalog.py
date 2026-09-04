@@ -13,6 +13,8 @@ from typing import Any, Iterable, Iterator
 
 import httpx
 
+from scripts._shared_rate_limiter import PRICECHARTING_CSV, SharedRateLimiter
+
 
 PRICE_FIELDS = {
     "loose_price_cents": ["loose-price", "loosePrice", "loose price"],
@@ -275,18 +277,38 @@ def download_env_sources(
     timeout_seconds: float,
     source_filter: str | None = None,
 ) -> list[CatalogSource]:
+    # Imported lazily: backfill_pricecharting_sets imports this module at
+    # module level, so a top-level import here would be circular.
+    from scripts.backfill_pricecharting_sets import (
+        CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
+        REQUEST_HEADERS,
+    )
+
     sources: list[CatalogSource] = []
     if source_filter is not None and source_filter not in PRICECHARTING_CSV_ENV_VARS:
         allowed_sources = ", ".join(sorted(PRICECHARTING_CSV_ENV_VARS))
         raise SystemExit(f"Unsupported source. Use one of: {allowed_sources}.")
 
-    with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as client:
+    # These are download-custom URLs like every other CSV call, so they are
+    # bound by the same published limit of one CSV call per 10 minutes, and
+    # they share it with the crons. Downloading all five categories back to
+    # back -- which is what the documented --from-env command used to do --
+    # breaches that limit five times over in a few seconds.
+    csv_limiter = SharedRateLimiter(
+        PRICECHARTING_CSV,
+        fallback_interval_seconds=CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
+    )
+
+    with httpx.Client(
+        timeout=timeout_seconds, follow_redirects=True, headers=REQUEST_HEADERS
+    ) as client:
         for category, env_name in PRICECHARTING_CSV_ENV_VARS.items():
             if source_filter is not None and category != source_filter:
                 continue
             url = os.getenv(env_name, "").strip()
             if not url:
                 continue
+            csv_limiter.acquire()
             print(f"Downloading {category} CSV...", flush=True)
             response = client.get(url, headers={"Accept": "text/csv,*/*"})
             response.raise_for_status()
