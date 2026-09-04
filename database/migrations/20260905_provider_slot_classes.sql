@@ -92,9 +92,22 @@ set search_path = public
 as $$
 declare
   -- How long after its last ask an essential class still counts as alive.
-  -- Must exceed the interval, or an essential job sleeping out the gate
-  -- would go stale between asks and let bulk take the slot it is waiting
-  -- for. 610s interval -> 900s window leaves ~5 minutes of slack.
+  --
+  -- The invariant this must satisfy:
+  --
+  --     active_window > global_interval + worst-case wake-up jitter
+  --
+  -- An essential caller that is refused sleeps until the next slot and asks
+  -- again about one interval later. If the window were shorter than that it
+  -- would go stale between its own asks and lose the slot it was waiting
+  -- for -- the exact failure the liveness signal exists to prevent.
+  --
+  -- 900 = 610s interval + 290s allowance for scheduler, network and
+  -- container-runtime jitter. Two consequences are deliberate: an essential
+  -- worker stalled for more than ~290s beyond its expected wake-up loses
+  -- priority (at that point it is not healthy), and one doing non-CSV work
+  -- for over 900s between legitimate CSV calls also lapses (it is not
+  -- waiting for CSV capacity during that time, so bulk should have it).
   c_active_window  constant interval := interval '900 seconds';
 
   v_interval   numeric;

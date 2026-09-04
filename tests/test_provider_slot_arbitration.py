@@ -113,6 +113,21 @@ class ProviderSlotArbitrationTest(unittest.TestCase):
         self.open_slot(700)
         self.assertEqual(self.ask("tier3")["reason"], "POLICY_BLOCKED")
 
+    def test_essential_arriving_mid_interval_wins_the_slot_it_waited_for(self):
+        """The whole design in one sequence. Bulk holds the slot at T=0. An
+        essential job arrives at T=590, is refused by the global gate, but
+        its ask registers liveness. At T=610 the slot opens: bulk must be
+        turned away and the essential job must get it. If this passes
+        transactionally, the priority mechanism does what it claims."""
+        self.open_slot(590)                       # bulk took a slot 590s ago
+        first = self.ask("essential_categories")  # refused, but marks liveness
+        self.assertEqual(first["reason"], "RATE_LIMITED")
+
+        self.open_slot(610)                       # the slot is now open
+        self.assertEqual(self.ask("tier3")["reason"], "POLICY_BLOCKED")
+        self.assertEqual(self.ask("backfill")["reason"], "POLICY_BLOCKED")
+        self.assertTrue(self.ask("essential_categories")["granted"])
+
     def test_a_dead_essential_container_stops_blocking_on_its_own(self):
         """No reaping: the timestamp simply goes stale."""
         self.open_slot()
