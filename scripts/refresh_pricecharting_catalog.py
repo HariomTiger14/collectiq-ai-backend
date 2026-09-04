@@ -13,6 +13,8 @@ from typing import Any
 import httpx
 
 from scripts._ops_run_recorder import dump_and_report, run_with_recorder
+from scripts._shared_rate_limiter import PRICECHARTING_CSV, SharedRateLimiter
+from scripts.backfill_pricecharting_sets import REQUEST_HEADERS
 from scripts.import_pricecharting_catalog import PRICECHARTING_CSV_ENV_VARS
 from scripts.import_pricecharting_catalog import SupabaseCatalogClient
 from scripts.import_pricecharting_catalog import to_catalog_row
@@ -34,16 +36,18 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
         )
 
+    # Pacing goes through the account-wide limiter rather than a local
+    # sleep. A local sleep only spaces THIS run's downloads; it cannot see
+    # the tier-3 rotation or the sets backfill, which hit the same CSV
+    # endpoint on the same account and can land inside this run's window.
+    csv_limiter = SharedRateLimiter(
+        PRICECHARTING_CSV,
+        fallback_interval_seconds=args.sleep_between_sources_seconds,
+    )
+
     summaries: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
-    for index, source in enumerate(selected_sources):
-        if index > 0 and args.sleep_between_sources_seconds > 0:
-            print(
-                f"Waiting {args.sleep_between_sources_seconds}s before next CSV download...",
-                flush=True,
-            )
-            time.sleep(args.sleep_between_sources_seconds)
-
+    for source in selected_sources:
         # One source's failure must not cost the others their daily
         # refresh: before this, a single 503 on the first CSV aborted the
         # whole run and every remaining category went stale for a day
@@ -59,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=args.timeout_seconds,
                 dry_run=args.dry_run,
                 client=client,
+                csv_limiter=csv_limiter,
             )
             summaries.append(summary)
         except Exception as error:  # noqa: BLE001 - reported, not swallowed
@@ -106,6 +111,7 @@ def refresh_source(
     timeout_seconds: float,
     dry_run: bool,
     client: SupabaseCatalogClient | None,
+    csv_limiter: SharedRateLimiter | None = None,
 ) -> dict[str, Any]:
     print(f"Refreshing PriceCharting source: {source}", flush=True)
     source_name = f"{source}.csv"
@@ -113,6 +119,7 @@ def refresh_source(
         source=source,
         source_name=source_name,
         timeout_seconds=timeout_seconds,
+        csv_limiter=csv_limiter,
     )
     try:
         archive_path = archive_source_file(
@@ -141,6 +148,7 @@ def download_source_to_temp_file(
     source: str,
     source_name: str,
     timeout_seconds: float,
+    csv_limiter: SharedRateLimiter | None = None,
 ) -> Path:
     env_name = PRICECHARTING_CSV_ENV_VARS[source]
     url = os.getenv(env_name, "").strip()
@@ -160,10 +168,14 @@ def download_source_to_temp_file(
     # than 429 is a configuration/auth problem and is raised immediately.
     last_error: Exception | None = None
     for attempt, backoff_seconds in enumerate((10, 30, 90, 0), start=1):
+        # Every attempt is a CSV call, retries included. The old 10/30/90s
+        # backoff re-requested well inside the one-per-10-minutes limit.
+        if csv_limiter is not None:
+            csv_limiter.acquire()
         try:
             with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as http:
                 with http.stream(
-                    "GET", url, headers={"Accept": "text/csv,*/*"}
+                    "GET", url, headers={**REQUEST_HEADERS, "Accept": "text/csv,*/*"}
                 ) as response:
                     response.raise_for_status()
                     with temp_path.open("wb") as output:
@@ -183,10 +195,11 @@ def download_source_to_temp_file(
             raise last_error
         print(
             f"  {source_name} download attempt {attempt} failed "
-            f"({type(last_error).__name__}); retrying in {backoff_seconds}s",
+            f"({type(last_error).__name__}); retrying",
             flush=True,
         )
-        time.sleep(backoff_seconds)
+        if csv_limiter is None:
+            time.sleep(backoff_seconds)
 
     print(f"Downloaded {source_name}; starting streamed import.", flush=True)
     return temp_path

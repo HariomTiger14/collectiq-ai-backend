@@ -16,16 +16,17 @@ Usage:
 
 import argparse
 import os
-import time
 
 import httpx
 
+from scripts._shared_rate_limiter import PRICECHARTING_CSV, SharedRateLimiter
 from scripts.backfill_pricecharting_sets import (
     SOURCE_SITE_BASE_URLS,
     chunked,
     CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
     fetch_batch_csv,
     group_by_site,
+    REQUEST_HEADERS,
 )
 from scripts.import_pricecharting_catalog import (
     MAX_PLAUSIBLE_PRICE_CENTS,
@@ -84,16 +85,23 @@ def main() -> int:
         return 0
 
     hits = 0
-    with httpx.Client(timeout=args.timeout_seconds, follow_redirects=True) as http:
+    # Shared, not local: this diagnostic hits the same endpoint on the same
+    # account as the crons, and a local sleep cannot see them.
+    csv_limiter = SharedRateLimiter(
+        PRICECHARTING_CSV,
+        fallback_interval_seconds=CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
+    )
+    with httpx.Client(
+        timeout=args.timeout_seconds, follow_redirects=True, headers=REQUEST_HEADERS
+    ) as http:
         for source_site, rows in group_by_site(failed_rows).items():
             base_url = SOURCE_SITE_BASE_URLS[source_site]
-            for index, chunk in enumerate(chunked(rows, args.batch_size)):
+            for chunk in chunked(rows, args.batch_size):
                 # Paced like every other CSV caller. This is a manual
                 # diagnostic, but it hits the same endpoint on the same
                 # account, and an unpaced loop here would breach the published
                 # limit just as effectively as a cron doing it.
-                if index > 0:
-                    time.sleep(CSV_DOWNLOAD_MIN_INTERVAL_SECONDS)
+                csv_limiter.acquire()
                 console_uids = [row["console_uid"] for row in chunk]
                 csv_text = fetch_batch_csv(
                     http, base_url=base_url, token=token, console_uids=console_uids
