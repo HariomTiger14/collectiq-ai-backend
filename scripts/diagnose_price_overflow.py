@@ -19,7 +19,12 @@ import os
 
 import httpx
 
-from scripts._shared_rate_limiter import PRICECHARTING_CSV, SharedRateLimiter
+from scripts._shared_rate_limiter import (
+    BULK_MAX_SLOT_WAIT_SECONDS,
+    CLASS_BACKFILL,
+    PRICECHARTING_CSV,
+    SharedRateLimiter,
+)
 from scripts.backfill_pricecharting_sets import (
     SOURCE_SITE_BASE_URLS,
     chunked,
@@ -89,6 +94,7 @@ def main() -> int:
     # account as the crons, and a local sleep cannot see them.
     csv_limiter = SharedRateLimiter(
         PRICECHARTING_CSV,
+        slot_class=CLASS_BACKFILL,
         fallback_interval_seconds=CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
     )
     with httpx.Client(
@@ -101,7 +107,8 @@ def main() -> int:
                 # diagnostic, but it hits the same endpoint on the same
                 # account, and an unpaced loop here would breach the published
                 # limit just as effectively as a cron doing it.
-                csv_limiter.acquire()
+                if not csv_limiter.acquire(max_wait_seconds=BULK_MAX_SLOT_WAIT_SECONDS):
+                    break
                 console_uids = [row["console_uid"] for row in chunk]
                 csv_text = fetch_batch_csv(
                     http, base_url=base_url, token=token, console_uids=console_uids

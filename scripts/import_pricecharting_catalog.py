@@ -13,7 +13,11 @@ from typing import Any, Iterable, Iterator
 
 import httpx
 
-from scripts._shared_rate_limiter import PRICECHARTING_CSV, SharedRateLimiter
+from scripts._shared_rate_limiter import (
+    CLASS_ESSENTIAL_CATALOG,
+    PRICECHARTING_CSV,
+    SharedRateLimiter,
+)
 
 
 PRICE_FIELDS = {
@@ -296,6 +300,7 @@ def download_env_sources(
     # breaches that limit five times over in a few seconds.
     csv_limiter = SharedRateLimiter(
         PRICECHARTING_CSV,
+        slot_class=CLASS_ESSENTIAL_CATALOG,
         fallback_interval_seconds=CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
     )
 

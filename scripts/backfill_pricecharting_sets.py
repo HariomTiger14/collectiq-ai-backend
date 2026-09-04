@@ -103,7 +103,12 @@ class _StartRateLimiter:
             self._next_allowed_start = now + self._min_interval_seconds
 
 
-from scripts._shared_rate_limiter import PRICECHARTING_CSV, SharedRateLimiter
+from scripts._shared_rate_limiter import (
+    BULK_MAX_SLOT_WAIT_SECONDS,
+    CLASS_BACKFILL,
+    PRICECHARTING_CSV,
+    SharedRateLimiter,
+)
 from scripts._ops_run_recorder import dump_and_report, run_with_recorder
 from scripts.import_pricecharting_catalog import (
     TEXT_FIELDS,
@@ -532,13 +537,20 @@ def _run_backfill(
             # 300x on pricecharting and 20x on sportscardspro.
             site_sleep_seconds = args.csv_sleep_seconds
             csv_limiter = SharedRateLimiter(
-                PRICECHARTING_CSV, fallback_interval_seconds=site_sleep_seconds
+                PRICECHARTING_CSV,
+                slot_class=CLASS_BACKFILL,
+                fallback_interval_seconds=site_sleep_seconds,
             )
             site_batch_size = (
                 args.sportscardspro_batch_size if is_sportscardspro else args.batch_size
             )
             for index, chunk in enumerate(chunked(rows, site_batch_size)):
-                csv_limiter.acquire()
+                if not csv_limiter.acquire(max_wait_seconds=BULK_MAX_SLOT_WAIT_SECONDS):
+                    # Out of daily CSV budget, or parked behind an essential
+                    # job. The API-search pre-pass above already ran, so the
+                    # run is not wasted; the rest of these sets stay claimed
+                    # for the next one.
+                    break
                 console_uids = [row["console_uid"] for row in chunk]
                 print(
                     f"Fetching {source_site} batch of {len(chunk)} sets...",

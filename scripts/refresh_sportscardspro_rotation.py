@@ -50,7 +50,12 @@ from typing import Any
 import httpx
 
 from scripts._ops_run_recorder import dump_and_report, run_with_recorder
-from scripts._shared_rate_limiter import PRICECHARTING_CSV, SharedRateLimiter
+from scripts._shared_rate_limiter import (
+    BULK_MAX_SLOT_WAIT_SECONDS,
+    CLASS_TIER3,
+    PRICECHARTING_CSV,
+    SharedRateLimiter,
+)
 from scripts.backfill_pricecharting_sets import (
     REQUEST_HEADERS,
     SOURCE_SITE_BASE_URLS,
@@ -151,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
     base_url = SOURCE_SITE_BASE_URLS["sportscardspro"]
     csv_limiter = SharedRateLimiter(
         PRICECHARTING_CSV,
+        slot_class=CLASS_TIER3,
         fallback_interval_seconds=args.sleep_between_requests_seconds,
     )
     breaker = _RateLimitCircuitBreaker(RATE_LIMIT_BREAKER_THRESHOLD)
@@ -192,7 +198,11 @@ def main(argv: list[str] | None = None) -> int:
             # Account-wide, not per-run: the categories refresh and the sets
             # backfill draw on the same published CSV limit and overlap this
             # job for most of the day.
-            csv_limiter.acquire()
+            if not csv_limiter.acquire(max_wait_seconds=BULK_MAX_SLOT_WAIT_SECONDS):
+                # tier-3 is the residual consumer: it yields to the daily
+                # refreshes and resumes next run. The rotation queue is
+                # ordered, so nothing is lost by stopping here.
+                break
             console_uids = [row["console_uid"] for row in chunk]
             before_429s = rate_limit_counter.value
             before_403s = blocked_counter.value
@@ -445,7 +455,10 @@ def _isolate_failed_batch(
         return [], []
     budget[0] -= 1
     if limiter is not None:
-        limiter.acquire()
+        if not limiter.acquire(max_wait_seconds=BULK_MAX_SLOT_WAIT_SECONDS):
+            # Same "not attempted" signal as the budget guard above: these
+            # rows stay pending rather than being recorded as failures.
+            return [], []
     elif sleep_seconds > 0:
         time.sleep(sleep_seconds)
     status_sink: list[int] = []

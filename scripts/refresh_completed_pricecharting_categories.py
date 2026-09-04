@@ -29,7 +29,11 @@ from typing import Any
 
 import httpx
 
-from scripts._shared_rate_limiter import PRICECHARTING_CSV, SharedRateLimiter
+from scripts._shared_rate_limiter import (
+    CLASS_ESSENTIAL_CATEGORIES,
+    PRICECHARTING_CSV,
+    SharedRateLimiter,
+)
 from scripts._ops_run_recorder import dump_and_report, run_with_recorder
 from scripts.backfill_pricecharting_sets import (
     CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
@@ -104,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     ) as http:
         csv_limiter = SharedRateLimiter(
             PRICECHARTING_CSV,
+            slot_class=CLASS_ESSENTIAL_CATEGORIES,
             fallback_interval_seconds=args.sleep_between_requests_seconds,
         )
         for index, chunk in enumerate(chunked(rows, args.batch_size)):
