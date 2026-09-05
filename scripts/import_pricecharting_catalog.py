@@ -13,7 +13,7 @@ from typing import Any, Iterable, Iterator
 
 import httpx
 
-from scripts._ops_run_recorder import record_db_timeout
+from scripts._ops_run_recorder import record_db_failure
 from scripts._shared_rate_limiter import (
     CLASS_ESSENTIAL_CATALOG,
     PRICECHARTING_CSV,
@@ -945,7 +945,7 @@ class SupabaseCatalogClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            record_db_timeout(
+            record_db_failure(
                 operation="history_close",
                 row_count=len(pricecharting_ids),
                 status_code=response.status_code,
@@ -972,7 +972,7 @@ class SupabaseCatalogClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            record_db_timeout(
+            record_db_failure(
                 operation="history_insert",
                 row_count=len(rows),
                 status_code=response.status_code,
@@ -1010,7 +1010,7 @@ class SupabaseCatalogClient:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             self.price_history_stats["failed"] += len(rows)
-            record_db_timeout(
+            record_db_failure(
                 operation="price_observation_insert",
                 row_count=len(rows),
                 status_code=response.status_code,
@@ -1065,7 +1065,7 @@ class SupabaseCatalogClient:
                     # the event carries the real row count and operation --
                     # and so no outer layer records it again as it becomes a
                     # PartialCatalogWriteError and then a False return.
-                    record_db_timeout(
+                    record_db_failure(
                         operation=f"{label}_upsert",
                         row_count=len(batch),
                         status_code=response.status_code,

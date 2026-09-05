@@ -97,7 +97,6 @@ def main(argv: list[str] | None = None) -> int:
         print(dump_and_report({"success": True, "setsConsidered": 0}, indent=2), flush=True)
         return 0
 
-    source_downloaded_at = datetime.now(timezone.utc).isoformat()
     base_url = SOURCE_SITE_BASE_URLS["pricecharting"]
     total_catalog_rows = 0
     failed_batches = 0
@@ -117,6 +116,16 @@ def main(argv: list[str] | None = None) -> int:
             # Shared with the tier-3 rotation and the sets backfill: this job
             # runs ~3.8h from 04:45 and overlaps them.
             csv_limiter.acquire()
+            # Stamped per batch, not once per run -- the same fix tier-3
+            # already carries. It becomes the history row's valid_from AND
+            # the valid_to used to close the previous current row, so a
+            # run-wide stamp goes stale as the run gets longer. This job
+            # averages 92 minutes and has run 221, while tier-1 rewrites the
+            # same rows hourly: closing one of those with a timestamp from
+            # when this run STARTED gives valid_to < valid_from and a 23514
+            # against pricecharting_catalog_history_valid_window_check.
+            # Observed 2026-09-05: 600 history rows lost in a single batch.
+            source_downloaded_at = datetime.now(timezone.utc).isoformat()
             console_uids = [row["console_uid"] for row in chunk]
             print(f"Fetching batch of {len(chunk)} sets...", flush=True)
             csv_download = fetch_batch_csv_file(

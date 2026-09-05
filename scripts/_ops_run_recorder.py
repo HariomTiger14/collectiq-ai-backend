@@ -42,6 +42,17 @@ _active: "_Recorder | None" = None
 # SQLSTATE. PostgREST forwards it as an HTTP 500 whose JSON body carries the
 # code, so it can be detected structurally rather than by matching prose.
 SQLSTATE_STATEMENT_TIMEOUT = "57014"
+SQLSTATE_CHECK_VIOLATION = "23514"
+
+# Only these reach the board. Recording every caught error would bury the
+# signal; these two are specific, diagnosable, and both were losing writes
+# silently -- 57014 to lock/index contention on a 25 GB table, and 23514 to
+# the SCD2 valid-window check when a long run closes a row that a
+# concurrently-running job rewrote after it started.
+RECORDED_SQLSTATES = {
+    SQLSTATE_STATEMENT_TIMEOUT: "statement timeout",
+    SQLSTATE_CHECK_VIOLATION: "check constraint violation",
+}
 
 
 def report_summary(summary: dict[str, Any]) -> None:
@@ -129,7 +140,7 @@ def build_db_failure_event(
     }
 
 
-def record_db_timeout(
+def record_db_failure(
     *,
     operation: str,
     row_count: int,
@@ -137,17 +148,16 @@ def record_db_timeout(
     body: str,
     context: dict[str, Any] | None = None,
 ) -> bool:
-    """Record ONE ops_error_events row for a statement-timeout write failure.
+    """Record ONE ops_error_events row for a diagnosable write failure.
 
     Called at the narrowest point -- inside the helper that owns the failing
     request -- so the exception can propagate through PartialCatalogWriteError
     and write_catalog_rows without any layer recording it again.
 
-    Only 57014 is recorded. Every caught error becoming an event would turn
-    the board into noise; this is the specific failure being diagnosed.
-    Returns True when an event was written."""
+    Only the SQLSTATEs in RECORDED_SQLSTATES are recorded; everything else is
+    left to the run summary. Returns True when an event was written."""
     sqlstate = sqlstate_of(body)
-    if sqlstate != SQLSTATE_STATEMENT_TIMEOUT:
+    if sqlstate not in RECORDED_SQLSTATES:
         return False
     recorder = _active
     if recorder is None or not recorder._configured:
@@ -163,7 +173,7 @@ def record_db_timeout(
                 sqlstate=sqlstate,
                 status_code=status_code,
                 body=body,
-                context=context,
+                context={"failureKind": RECORDED_SQLSTATES[sqlstate], **(context or {})},
             ),
             headers={"Prefer": "return=minimal"},
         )

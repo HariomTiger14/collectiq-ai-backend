@@ -20,9 +20,10 @@ import httpx
 
 from scripts import _ops_run_recorder as recorder_module
 from scripts._ops_run_recorder import (
+    SQLSTATE_CHECK_VIOLATION,
     SQLSTATE_STATEMENT_TIMEOUT,
     build_db_failure_event,
-    record_db_timeout,
+    record_db_failure,
     sqlstate_of,
 )
 from scripts.import_pricecharting_catalog import SupabaseCatalogClient
@@ -113,7 +114,7 @@ class RecordingTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def _record(self, body, **kw):
-        return record_db_timeout(
+        return record_db_failure(
             operation=kw.pop("operation", "catalog_upsert"),
             row_count=kw.pop("row_count", 39),
             status_code=kw.pop("status_code", 500),
@@ -127,11 +128,23 @@ class RecordingTest(unittest.TestCase):
         self.assertEqual(path, "/rest/v1/ops_error_events")
         self.assertEqual(payload["error_class"], "PostgresError57014")
 
-    def test_other_database_errors_are_not_recorded(self):
-        """23514 is the SCD2 valid-window violation -- a real bug, but not
-        the failure this hook exists to diagnose. Recording everything would
-        make the board useless."""
-        self.assertFalse(self._record('{"code":"23514"}'))
+    def test_the_scd2_valid_window_violation_is_also_recorded(self):
+        """23514 turned out to be the LARGER of the two silent failures:
+        600 history rows lost in one batch on 2026-09-05, against ~90 rows
+        from timeouts across the whole run."""
+        self.assertTrue(self._record('{"code":"23514"}'))
+        self.assertEqual(len(self.fake.posts), 1)
+        payload = self.fake.posts[0][1]
+        self.assertEqual(payload["error_class"], "PostgresError23514")
+        self.assertEqual(
+            payload["context"]["failureKind"], "check constraint violation"
+        )
+
+    def test_undiagnosed_sqlstates_are_still_left_alone(self):
+        """The list stays short on purpose -- an event for every caught
+        error would bury the two we actually act on."""
+        self.assertFalse(self._record('{"code":"23505"}'))   # duplicate key
+        self.assertFalse(self._record('{"code":"42703"}'))   # undefined column
         self.assertEqual(self.fake.posts, [])
 
     def test_successful_writes_record_nothing(self):

@@ -30,7 +30,6 @@ DEFAULT_SOURCE_ORDER = ("video_games", "pokemon", "magic", "yugioh", "one_piece"
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     selected_sources = _selected_sources(args.sources)
-    source_downloaded_at = datetime.now(timezone.utc).isoformat()
     client = None
     if not args.dry_run:
         client = SupabaseCatalogClient(
@@ -53,6 +52,10 @@ def main(argv: list[str] | None = None) -> int:
     summaries: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
     for source in selected_sources:
+        # Per source, not once per run: sources are 610s apart and this job
+        # averages 60 minutes, so a run-wide stamp would try to close rows
+        # that tier-1 rewrote in the meantime (23514, valid_to < valid_from).
+        source_downloaded_at = datetime.now(timezone.utc).isoformat()
         # One source's failure must not cost the others their daily
         # refresh: before this, a single 503 on the first CSV aborted the
         # whole run and every remaining category went stale for a day
