@@ -35,6 +35,7 @@ from scripts.backfill_pricecharting_sets import (
     fetch_batch_csv_file,
     write_catalog_rows_with_retry,
 )
+from scripts.refresh_sportscardspro_rotation import TIER3_MAX_FAILURES
 from scripts.import_pricecharting_catalog import (
     SupabaseCatalogClient,
     chunked_iter,
@@ -128,9 +129,17 @@ def main(argv=None) -> int:
             "source_site": "eq.sportscardspro",
             "console_uid": "not.is.null",
             "last_fetch_status": "eq.success",
-            # Biggest-first would need a row count we do not store; ordering
-            # by refresh age at least avoids cherry-picking small sets.
-            "order": "tier3_refreshed_at.asc.nullsfirst",
+            # Must match the rotation's own filter. Sets confirmed dead
+            # upstream keep tier3_refreshed_at NULL forever, so under
+            # nullsfirst they sort to the very front of every sample -- and
+            # download-custom fails the ENTIRE request if one uid in it
+            # cannot be served, so omitting this filter 503s every batch.
+            "tier3_failure_count": f"lt.{TIER3_MAX_FAILURES}",
+            "order": (
+                "tier3_failure_count.asc,"
+                "tier3_refreshed_at.asc.nullsfirst,"
+                "registry_id.asc"
+            ),
             "limit": str(args.sets),
         },
         headers=headers,
