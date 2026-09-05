@@ -350,6 +350,22 @@ def iter_rows_from_text(csv_text: str) -> "Iterator[dict[str, str]]":
         yield dict(row)
 
 
+def iter_rows_from_file(
+    path: "Path", *, encoding: str = "utf-8"
+) -> "Iterator[dict[str, str]]":
+    """Row-at-a-time parse straight off disk.
+
+    iter_rows_from_text() still holds the whole CSV as a str, and copies it
+    again into a StringIO. For a 300-set download-custom batch that is ~28 MB
+    twice over, on top of the bytes httpx already buffered -- measured at a
+    229 MB peak against a 256 MB container. Reading from the file keeps the
+    body out of the heap entirely, so peak memory tracks the ingest chunk
+    size rather than the size of the download."""
+    with open(path, "r", encoding=encoding, errors="replace", newline="") as handle:
+        for row in csv.DictReader(handle):
+            yield dict(row)
+
+
 def chunked_iter(rows: "Iterable[Any]", size: int) -> "Iterator[list[Any]]":
     """Group an iterator into lists of at most `size`, without buffering the
     whole input."""

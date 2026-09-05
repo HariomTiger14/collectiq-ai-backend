@@ -4,10 +4,12 @@ import json
 import os
 import queue
 import re
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterable, NamedTuple
 
 import httpx
 
@@ -114,7 +116,8 @@ from scripts.import_pricecharting_catalog import (
     TEXT_FIELDS,
     PartialCatalogWriteError,
     SupabaseCatalogClient,
-    load_rows_from_text,
+    chunked_iter,
+    iter_rows_from_file,
     pick_text,
     to_catalog_row,
     to_catalog_row_from_api_product,
@@ -557,8 +560,8 @@ def _run_backfill(
                     flush=True,
                 )
                 csv_fetch_started_at = time.perf_counter()
-                csv_text = (
-                    fetch_batch_csv_with_retry(
+                csv_download = (
+                    fetch_batch_csv_file_with_retry(
                         http,
                         base_url=base_url,
                         token=token,
@@ -570,34 +573,59 @@ def _run_backfill(
                         rate_limit_counter=sportscardspro_429_counter,
                     )
                     if is_sportscardspro
-                    else fetch_batch_csv(
+                    else fetch_batch_csv_file(
                         http, base_url=base_url, token=token, console_uids=console_uids
                     )
                 )
                 phase_seconds["csv_fetch"] += time.perf_counter() - csv_fetch_started_at
-                if csv_text is None:
+                if csv_download is None:
                     failed_rows.extend(chunk)
                     continue
 
-                catalog_rows = [
-                    to_catalog_row(row, f"{source_site}-set-backfill", source_downloaded_at)
-                    for row in load_rows_from_text(csv_text)
-                ]
-                catalog_rows = [row for row in catalog_rows if row is not None]
-                total_catalog_rows += len(catalog_rows)
+                # Parse and write in bounded chunks straight off disk. This
+                # used to build the whole batch as dicts before writing any
+                # of it, which at --batch-size 300 is ~228,000 rows -- the
+                # same materialisation tier-3 was moved off, still here.
+                def _iter_catalog_rows(download=csv_download):
+                    for raw in iter_rows_from_file(
+                        download.path, encoding=download.encoding
+                    ):
+                        catalog_row = to_catalog_row(
+                            raw, f"{source_site}-set-backfill", source_downloaded_at
+                        )
+                        if catalog_row is not None:
+                            yield catalog_row
+
+                batch_row_count = 0
+                write_elapsed = 0.0
+                write_ok = True
+                try:
+                    if args.dry_run:
+                        batch_row_count = sum(1 for _ in _iter_catalog_rows())
+                    else:
+                        assert catalog_client is not None
+                        for ingest_chunk in chunked_iter(
+                            _iter_catalog_rows(), args.ingest_chunk_rows
+                        ):
+                            batch_row_count += len(ingest_chunk)
+                            write_started_at = time.perf_counter()
+                            write_ok = write_catalog_rows(
+                                catalog_client,
+                                ingest_chunk,
+                                batch_size=args.catalog_batch_size,
+                            )
+                            write_elapsed += time.perf_counter() - write_started_at
+                            if not write_ok:
+                                break
+                finally:
+                    cleanup_csv_downloads([csv_download])
+
+                total_catalog_rows += batch_row_count
                 print(
-                    f"  Parsed {len(catalog_rows)} catalog rows from this batch.",
+                    f"  Parsed {batch_row_count} catalog rows from this batch.",
                     flush=True,
                 )
-                if not args.dry_run and catalog_rows:
-                    assert catalog_client is not None
-                    write_started_at = time.perf_counter()
-                    write_ok = write_catalog_rows(
-                        catalog_client,
-                        catalog_rows,
-                        batch_size=args.catalog_batch_size,
-                    )
-                    write_elapsed = time.perf_counter() - write_started_at
+                if not args.dry_run and batch_row_count:
                     phase_seconds["catalog_write"] += write_elapsed
                     catalog_write_events.append(
                         {
@@ -605,13 +633,16 @@ def _run_backfill(
                                 row.get("set_name") or row.get("console_uid") for row in chunk
                             ],
                             "sourceSite": source_site,
-                            "rowCount": len(catalog_rows),
+                            "rowCount": batch_row_count,
                             "elapsedSeconds": write_elapsed,
                         }
                     )
-                    if not write_ok:
-                        failed_rows.extend(chunk)
-                        continue
+                if not write_ok:
+                    # A partly-written batch is never stamped: the sets stay
+                    # claimable and the retry re-fetches, where the rows that
+                    # did land become content-hash no-ops.
+                    failed_rows.extend(chunk)
+                    continue
 
                 succeeded_ids.extend(row["registry_id"] for row in chunk)
 
@@ -1239,6 +1270,118 @@ def write_catalog_rows(
     return True
 
 
+class CsvDownload(NamedTuple):
+    """A downloaded CSV body on disk. The caller owns the file and must
+    delete it -- use cleanup_csv_downloads() in a finally block."""
+
+    path: Path
+    encoding: str
+
+
+def cleanup_csv_downloads(downloads: "Iterable[CsvDownload | None]") -> None:
+    """Delete downloaded CSV temp files. Safe to call twice, and safe on a
+    partially-built list, so it can go straight in a finally block."""
+    for download in downloads:
+        if download is None:
+            continue
+        try:
+            download.path.unlink(missing_ok=True)
+        except OSError as exc:  # noqa: BLE001 -- cleanup must never mask the real error
+            print(f"  Could not remove temp CSV {download.path}: {exc}", flush=True)
+
+
+def fetch_batch_csv_file(
+    http: httpx.Client,
+    *,
+    base_url: str,
+    token: str,
+    console_uids: list[str],
+    rate_limit_counter: "_Counter | None" = None,
+    blocked_counter: "_Counter | None" = None,
+    status_sink: list[int] | None = None,
+) -> CsvDownload | None:
+    """Stream the batch CSV to a temp file instead of into memory.
+
+    Same request, same error semantics and same status_sink contract as
+    fetch_batch_csv -- the only difference is where the body lands. A
+    300-set batch is ~28 MB; holding it as bytes AND as a str AND as a
+    StringIO copy is what put a 256 MB container at a 229 MB peak.
+
+    Returns None on any failure, having removed the partial file. On
+    success the caller owns the file.
+    """
+    handle, temp_name = tempfile.mkstemp(prefix="pricecharting-batch-", suffix=".csv")
+    os.close(handle)
+    temp_path = Path(temp_name)
+    try:
+        with http.stream(
+            "GET",
+            f"{base_url}/price-guide/download-custom",
+            params={"t": token, "console-uids": ",".join(console_uids)},
+        ) as response:
+            if response.status_code >= 400:
+                # The body has to be read before raise_for_status() can
+                # render it, and before .text is legal on a streamed
+                # response at all.
+                response.read()
+            response.raise_for_status()
+            encoding = response.encoding or "utf-8"
+            with temp_path.open("wb") as output:
+                for block in response.iter_bytes():
+                    output.write(block)
+    except httpx.HTTPStatusError as exc:
+        temp_path.unlink(missing_ok=True)
+        _record_csv_failure(
+            exc,
+            token=token,
+            console_uids=console_uids,
+            rate_limit_counter=rate_limit_counter,
+            blocked_counter=blocked_counter,
+            status_sink=status_sink,
+        )
+        return None
+    except (httpx.HTTPError, OSError) as exc:
+        temp_path.unlink(missing_ok=True)
+        print(
+            f"  Batch download failed for {len(console_uids)} sets: "
+            f"{_redact_token(str(exc), token)}",
+            flush=True,
+        )
+        return None
+    return CsvDownload(temp_path, encoding)
+
+
+def _record_csv_failure(
+    exc: httpx.HTTPStatusError,
+    *,
+    token: str,
+    console_uids: list[str],
+    rate_limit_counter: "_Counter | None",
+    blocked_counter: "_Counter | None",
+    status_sink: list[int] | None,
+) -> None:
+    """The failure bookkeeping both fetch paths share, so the streaming and
+    in-memory versions can never drift on what a 429 or a 403 means."""
+    print(
+        f"  Batch download failed for {len(console_uids)} sets: "
+        f"{_redact_token(str(exc), token)}",
+        flush=True,
+    )
+    status = exc.response.status_code
+    if status_sink is not None:
+        status_sink.append(status)
+    if rate_limit_counter is not None and status == 429:
+        rate_limit_counter.increment()
+    # 403 is Cloudflare refusing us outright, not asking us to slow
+    # down. It has to feed the breaker too: on 2026-08-31 a run took
+    # 403s on every batch, and only tripped because a few 429s
+    # happened to appear alongside them. A pure-403 run would have
+    # burned all 120 throttled requests against a blocked endpoint --
+    # the surest way to turn a temporary block into a durable one.
+    if blocked_counter is not None and status == 403:
+        blocked_counter.increment()
+
+
 def fetch_batch_csv(
     http: httpx.Client,
     *,
@@ -1253,7 +1396,11 @@ def fetch_batch_csv(
     response. Callers need it to tell the three failure modes apart: 429
     (slow down), 403 (Cloudflare refusing us), and anything else -- which
     for this endpoint means a specific console_uid its backend cannot
-    serve, and is worth isolating rather than abandoning the batch."""
+    serve, and is worth isolating rather than abandoning the batch.
+
+    Returns the whole body as a str. Only for callers whose batches are
+    small; anything fetching hundreds of sets should use
+    fetch_batch_csv_file() instead."""
     try:
         response = http.get(
             f"{base_url}/price-guide/download-custom",
@@ -1261,24 +1408,14 @@ def fetch_batch_csv(
         )
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        print(
-            f"  Batch download failed for {len(console_uids)} sets: "
-            f"{_redact_token(str(exc), token)}",
-            flush=True,
+        _record_csv_failure(
+            exc,
+            token=token,
+            console_uids=console_uids,
+            rate_limit_counter=rate_limit_counter,
+            blocked_counter=blocked_counter,
+            status_sink=status_sink,
         )
-        status = exc.response.status_code
-        if status_sink is not None:
-            status_sink.append(status)
-        if rate_limit_counter is not None and status == 429:
-            rate_limit_counter.increment()
-        # 403 is Cloudflare refusing us outright, not asking us to slow
-        # down. It has to feed the breaker too: on 2026-08-31 a run took
-        # 403s on every batch, and only tripped because a few 429s
-        # happened to appear alongside them. A pure-403 run would have
-        # burned all 120 throttled requests against a blocked endpoint --
-        # the surest way to turn a temporary block into a durable one.
-        if blocked_counter is not None and status == 403:
-            blocked_counter.increment()
         return None
     except httpx.HTTPError as exc:
         print(
@@ -1319,6 +1456,43 @@ def fetch_batch_csv_with_retry(
         )
         if csv_text is not None:
             return csv_text
+        if attempt < max_attempts:
+            print(
+                f"  Retrying batch download (attempt {attempt + 1}/{max_attempts}) "
+                f"after {retry_sleep_seconds:.0f}s...",
+                flush=True,
+            )
+            time.sleep(retry_sleep_seconds)
+    return None
+
+
+def fetch_batch_csv_file_with_retry(
+    http: httpx.Client,
+    *,
+    base_url: str,
+    token: str,
+    console_uids: list[str],
+    max_attempts: int,
+    retry_sleep_seconds: float,
+    rate_limit_counter: "_Counter | None" = None,
+    blocked_counter: "_Counter | None" = None,
+    status_sink: list[int] | None = None,
+) -> CsvDownload | None:
+    """Streaming counterpart of fetch_batch_csv_with_retry. Same retry
+    policy -- a retry is a CSV call and waits the full published interval,
+    not a shorter "we're just retrying" pause."""
+    for attempt in range(1, max_attempts + 1):
+        download = fetch_batch_csv_file(
+            http,
+            base_url=base_url,
+            token=token,
+            console_uids=console_uids,
+            rate_limit_counter=rate_limit_counter,
+            blocked_counter=blocked_counter,
+            status_sink=status_sink,
+        )
+        if download is not None:
+            return download
         if attempt < max_attempts:
             print(
                 f"  Retrying batch download (attempt {attempt + 1}/{max_attempts}) "
@@ -1445,6 +1619,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--console-resolve-concurrency. Default 1 preserves the original "
             "fully-serial behavior."
         ),
+    )
+    parser.add_argument(
+        "--ingest-chunk-rows",
+        type=int,
+        default=10_000,
+        help="Rows held in memory before writing. Bounds peak memory "
+        "independently of --batch-size, so a 300-set batch (~228,000 rows) "
+        "costs one chunk rather than the whole download.",
     )
     parser.add_argument("--api-token", default="", help="Defaults to PRICECHARTING_API_TOKEN.")
     parser.add_argument("--supabase-url", default="", help="Defaults to SUPABASE_URL.")

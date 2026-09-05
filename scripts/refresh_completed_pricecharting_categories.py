@@ -40,12 +40,14 @@ from scripts.backfill_pricecharting_sets import (
     REQUEST_HEADERS,
     SOURCE_SITE_BASE_URLS,
     chunked,
-    fetch_batch_csv,
+    cleanup_csv_downloads,
+    fetch_batch_csv_file,
     write_catalog_rows,
 )
 from scripts.import_pricecharting_catalog import (
     SupabaseCatalogClient,
-    load_rows_from_text,
+    chunked_iter,
+    iter_rows_from_file,
     to_catalog_row,
 )
 
@@ -117,28 +119,55 @@ def main(argv: list[str] | None = None) -> int:
             csv_limiter.acquire()
             console_uids = [row["console_uid"] for row in chunk]
             print(f"Fetching batch of {len(chunk)} sets...", flush=True)
-            csv_text = fetch_batch_csv(
+            csv_download = fetch_batch_csv_file(
                 http, base_url=base_url, token=token, console_uids=console_uids
             )
-            if csv_text is None:
+            if csv_download is None:
                 failed_batches += 1
                 continue
 
-            catalog_rows = [
-                to_catalog_row(row, "pricecharting-completed-category-refresh", source_downloaded_at)
-                for row in load_rows_from_text(csv_text)
-            ]
-            catalog_rows = [row for row in catalog_rows if row is not None]
-            total_catalog_rows += len(catalog_rows)
-            print(f"  Parsed {len(catalog_rows)} catalog rows from this batch.", flush=True)
-
-            if not args.dry_run and catalog_rows:
-                assert catalog_client is not None
-                if not write_catalog_rows(
-                    catalog_client, catalog_rows, batch_size=args.catalog_batch_size
+            def _iter_catalog_rows(download=csv_download):
+                for raw in iter_rows_from_file(
+                    download.path, encoding=download.encoding
                 ):
-                    failed_batches += 1
-                    continue
+                    catalog_row = to_catalog_row(
+                        raw,
+                        "pricecharting-completed-category-refresh",
+                        source_downloaded_at,
+                    )
+                    if catalog_row is not None:
+                        yield catalog_row
+
+            # Chunked off disk rather than one list per batch: at
+            # --batch-size 300 a sports-sized batch is ~228,000 rows, and
+            # holding those as dicts alongside the response body is what put
+            # a 256 MB container at a 229 MB peak.
+            batch_row_count = 0
+            write_ok = True
+            try:
+                if args.dry_run:
+                    batch_row_count = sum(1 for _ in _iter_catalog_rows())
+                else:
+                    assert catalog_client is not None
+                    for ingest_chunk in chunked_iter(
+                        _iter_catalog_rows(), args.ingest_chunk_rows
+                    ):
+                        batch_row_count += len(ingest_chunk)
+                        if not write_catalog_rows(
+                            catalog_client,
+                            ingest_chunk,
+                            batch_size=args.catalog_batch_size,
+                        ):
+                            write_ok = False
+                            break
+            finally:
+                cleanup_csv_downloads([csv_download])
+
+            total_catalog_rows += batch_row_count
+            print(f"  Parsed {batch_row_count} catalog rows from this batch.", flush=True)
+            if not write_ok:
+                failed_batches += 1
+                continue
 
             succeeded_sets += len(chunk)
 
@@ -231,6 +260,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=150, help="Sets per download-custom request.")
     parser.add_argument("--catalog-batch-size", type=int, default=500)
     parser.add_argument("--timeout-seconds", type=float, default=30)
+    parser.add_argument(
+        "--ingest-chunk-rows",
+        type=int,
+        default=10_000,
+        help="Rows held in memory before writing, independent of --batch-size.",
+    )
     parser.add_argument(
         "--sleep-between-requests-seconds",
         type=float,

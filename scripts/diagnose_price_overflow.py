@@ -29,7 +29,8 @@ from scripts.backfill_pricecharting_sets import (
     SOURCE_SITE_BASE_URLS,
     chunked,
     CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
-    fetch_batch_csv,
+    cleanup_csv_downloads,
+    fetch_batch_csv_file,
     group_by_site,
     REQUEST_HEADERS,
 )
@@ -37,7 +38,7 @@ from scripts.import_pricecharting_catalog import (
     MAX_PLAUSIBLE_PRICE_CENTS,
     PRICE_FIELDS,
     TEXT_FIELDS,
-    load_rows_from_text,
+    iter_rows_from_file,
     pick_text,
 )
 
@@ -110,40 +111,46 @@ def main() -> int:
                 if not csv_limiter.acquire(max_wait_seconds=BULK_MAX_SLOT_WAIT_SECONDS):
                     break
                 console_uids = [row["console_uid"] for row in chunk]
-                csv_text = fetch_batch_csv(
+                csv_download = fetch_batch_csv_file(
                     http, base_url=base_url, token=token, console_uids=console_uids
                 )
-                if csv_text is None:
+                if csv_download is None:
                     continue
-                for csv_row in load_rows_from_text(csv_text):
-                    for target, aliases in PRICE_FIELDS.items():
-                        raw = pick_text(csv_row, aliases)
-                        if not raw:
-                            continue
-                        # Re-derive the pre-sanity-check cents value the old
-                        # code would have produced, to see which field(s)
-                        # actually exceed the new ceiling.
-                        cleaned = raw.replace(",", "").strip()
-                        try:
-                            cents = (
-                                round(float(cleaned.replace("$", "")) * 100)
-                                if cleaned.startswith("$") or "." in cleaned
-                                else int(float(cleaned))
-                            )
-                        except ValueError:
-                            continue
-                        if cents > MAX_PLAUSIBLE_PRICE_CENTS:
-                            hits += 1
-                            print(
-                                f"  [{target}] raw={raw!r} (~${cents / 100:,.2f}) "
-                                f"product={pick_text(csv_row, TEXT_FIELDS['product_name'])!r} "
-                                f"console={pick_text(csv_row, TEXT_FIELDS['console_name'])!r} "
-                                f"id={pick_text(csv_row, TEXT_FIELDS['pricecharting_id'])!r} "
-                                f"upc={pick_text(csv_row, TEXT_FIELDS['upc'])!r} "
-                                f"url={pick_text(csv_row, TEXT_FIELDS['product_url'])!r}",
-                                flush=True,
-                            )
+                try:
+                    rows_iter = iter_rows_from_file(
+                        csv_download.path, encoding=csv_download.encoding
+                    )
+                    for csv_row in rows_iter:
+                        for target, aliases in PRICE_FIELDS.items():
+                            raw = pick_text(csv_row, aliases)
+                            if not raw:
+                                continue
+                            # Re-derive the pre-sanity-check cents value the old
+                            # code would have produced, to see which field(s)
+                            # actually exceed the new ceiling.
+                            cleaned = raw.replace(",", "").strip()
+                            try:
+                                cents = (
+                                    round(float(cleaned.replace("$", "")) * 100)
+                                    if cleaned.startswith("$") or "." in cleaned
+                                    else int(float(cleaned))
+                                )
+                            except ValueError:
+                                continue
+                            if cents > MAX_PLAUSIBLE_PRICE_CENTS:
+                                hits += 1
+                                print(
+                                    f"  [{target}] raw={raw!r} (~${cents / 100:,.2f}) "
+                                    f"product={pick_text(csv_row, TEXT_FIELDS['product_name'])!r} "
+                                    f"console={pick_text(csv_row, TEXT_FIELDS['console_name'])!r} "
+                                    f"id={pick_text(csv_row, TEXT_FIELDS['pricecharting_id'])!r} "
+                                    f"upc={pick_text(csv_row, TEXT_FIELDS['upc'])!r} "
+                                    f"url={pick_text(csv_row, TEXT_FIELDS['product_url'])!r}",
+                                    flush=True,
+                                )
 
+                finally:
+                    cleanup_csv_downloads([csv_download])
     print(f"\n{hits} field(s) found exceeding the ${MAX_PLAUSIBLE_PRICE_CENTS / 100:,.0f} ceiling.")
     if hits == 0:
         print(
