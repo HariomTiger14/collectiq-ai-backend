@@ -182,6 +182,7 @@ def main(argv=None) -> int:
             )
 
         size_mb = download.path.stat().st_size / (1024 * 1024)
+        rss_after_download = _rss_mb()
         print(f"downloaded            : {size_mb:.1f} MB in {fetch_seconds:.1f}s")
         print(f"peak RSS (download)   : {download_sampler.peak:.0f} MB")
 
@@ -228,6 +229,7 @@ def main(argv=None) -> int:
             parse_seconds = (time.perf_counter() - ingest_started) - write_seconds
         finally:
             cleanup_csv_downloads([download])
+        rss_after_ingest = _rss_mb()
 
     stats = getattr(catalog_client, "catalog_write_stats", None) or {}
     history = getattr(catalog_client, "price_history_stats", None) or {}
@@ -249,6 +251,14 @@ def main(argv=None) -> int:
     print(f"http status           : 200  (429s={rate_counter.value} "
           f"403s={blocked_counter.value})")
     print(f"temp file removed     : {not download.path.exists()}")
+    # Settled RSS between phases separates a transient spike from retained
+    # structures: parsing that reaches 120 MB and falls back to 75 is a very
+    # different diagnosis from one that reaches 120 MB and holds it.
+    print(f"RSS settled (baseline) : {baseline:.0f} MB")
+    print(f"RSS settled (post-dl)  : {rss_after_download:.0f} MB")
+    print(f"RSS settled (post-ingest): {rss_after_ingest:.0f} MB")
+    growth = rss_after_ingest - baseline
+    print(f"retained above baseline: {growth:+.0f} MB")
     print(f"OVERALL PEAK RSS      : {overall:.0f} MB   (of 256 MB)")
     if overall < 150:
         verdict = "EXCELLENT -- safe to escalate to the next batch size"
