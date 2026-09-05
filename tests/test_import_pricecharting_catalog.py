@@ -24,6 +24,27 @@ from scripts.import_pricecharting_catalog import (
 )
 
 
+def _no_sleep_limiter():
+    """A limiter whose waits are instant.
+
+    Under pytest the shared limiter cannot reach the database, so it degrades
+    to LOCAL pacing and sleeps the real 600-second CSV interval between the
+    two category downloads these tests perform. Correct in production;
+    absurd in a test, and it was costing 600s of every suite run."""
+    from scripts._shared_rate_limiter import (
+        CLASS_ESSENTIAL_CATALOG,
+        PRICECHARTING_CSV,
+        SharedRateLimiter,
+    )
+
+    return SharedRateLimiter(
+        PRICECHARTING_CSV,
+        slot_class=CLASS_ESSENTIAL_CATALOG,
+        fallback_interval_seconds=600.0,
+        sleep=lambda _seconds: None,
+    )
+
+
 class ImportPriceChartingCatalogTest(unittest.TestCase):
     def test_parse_price_cents_keeps_pricecharting_pennies(self) -> None:
         self.assertEqual(parse_price_cents("3325"), 3325)
@@ -208,7 +229,9 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
         ), patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
             client_class.return_value.__enter__.return_value = transport
 
-            sources = download_env_sources(timeout_seconds=1)
+            sources = download_env_sources(
+                timeout_seconds=1, csv_limiter=_no_sleep_limiter()
+            )
 
         self.assertEqual([source.name for source in sources], ["video_games.csv", "pokemon.csv"])
         self.assertEqual(sources[0].rows[0]["product-name"], "Mario Kart 8 Deluxe")
@@ -234,7 +257,11 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
         ), patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
             client_class.return_value.__enter__.return_value = transport
 
-            sources = download_env_sources(timeout_seconds=1, source_filter="video_games")
+            sources = download_env_sources(
+                timeout_seconds=1,
+                source_filter="video_games",
+                csv_limiter=_no_sleep_limiter(),
+            )
 
         self.assertEqual([source.name for source in sources], ["video_games.csv"])
         self.assertEqual(sources[0].rows[0]["product-name"], "Mario Kart 8 Deluxe")
@@ -252,7 +279,9 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
             clear=False,
         ):
             with self.assertRaises(SystemExit):
-                download_env_sources(timeout_seconds=1)
+                download_env_sources(
+                    timeout_seconds=1, csv_limiter=_no_sleep_limiter()
+                )
 
     def test_to_catalog_row_skips_rows_without_identity(self) -> None:
         self.assertIsNone(

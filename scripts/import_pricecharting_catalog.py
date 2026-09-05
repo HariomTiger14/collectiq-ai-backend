@@ -281,6 +281,7 @@ def download_env_sources(
     *,
     timeout_seconds: float,
     source_filter: str | None = None,
+    csv_limiter: "SharedRateLimiter | None" = None,
 ) -> list[CatalogSource]:
     # Imported lazily: backfill_pricecharting_sets imports this module at
     # module level, so a top-level import here would be circular.
@@ -299,11 +300,16 @@ def download_env_sources(
     # they share it with the crons. Downloading all five categories back to
     # back -- which is what the documented --from-env command used to do --
     # breaches that limit five times over in a few seconds.
-    csv_limiter = SharedRateLimiter(
-        PRICECHARTING_CSV,
-        slot_class=CLASS_ESSENTIAL_CATALOG,
-        fallback_interval_seconds=CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
-    )
+    # Injectable so a test can supply one that does not really sleep. When
+    # the limiter cannot reach the database it falls back to LOCAL pacing and
+    # sleeps the full interval for real -- correct in production, but it
+    # turned this function's test into a 600-second one.
+    if csv_limiter is None:
+        csv_limiter = SharedRateLimiter(
+            PRICECHARTING_CSV,
+            slot_class=CLASS_ESSENTIAL_CATALOG,
+            fallback_interval_seconds=CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
+        )
 
     with httpx.Client(
         timeout=timeout_seconds, follow_redirects=True, headers=REQUEST_HEADERS
