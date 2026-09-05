@@ -16,6 +16,7 @@ the published one-call-per-10-minutes limit even if run back to back.
 
 import argparse
 import os
+from datetime import datetime, timezone
 import threading
 import time
 from pathlib import Path
@@ -35,7 +36,7 @@ from scripts.backfill_pricecharting_sets import (
     fetch_batch_csv_file,
     write_catalog_rows_with_retry,
 )
-from scripts.refresh_sportscardspro_rotation import TIER3_MAX_FAILURES
+from scripts.refresh_sportscardspro_rotation import SOURCE_FILE_TAG, TIER3_MAX_FAILURES
 from scripts.import_pricecharting_catalog import (
     SupabaseCatalogClient,
     chunked_iter,
@@ -195,7 +196,17 @@ def main(argv=None) -> int:
         print(f"downloaded            : {size_mb:.1f} MB in {fetch_seconds:.1f}s")
         print(f"peak RSS (download)   : {download_sampler.peak:.0f} MB")
 
-        stamp = "benchmark"
+        # Must be a REAL provider-download timestamp, and must use the
+        # rotation's own source tag. It becomes the new history version's
+        # valid_from AND the value used to close the previous current row,
+        # so a placeholder like 1970-01-01 makes valid_to < valid_from and
+        # every close-current fails with 23514. It is also the price
+        # observation's observed_at, which is half its idempotency key --
+        # a constant one writes junk rows that look like 1970 prices.
+        # Using the rotation's tag means this run is a genuine refresh of
+        # those sets rather than a parallel set of throwaway rows.
+        stamp = SOURCE_FILE_TAG
+        source_downloaded_at = datetime.now(timezone.utc).isoformat()
         catalog_client = None if args.dry_run else SupabaseCatalogClient(
             supabase_url=supabase_url, service_role_key=key,
             timeout_seconds=args.timeout_seconds,
@@ -209,7 +220,7 @@ def main(argv=None) -> int:
                 for raw in iter_rows_from_file(
                     download.path, encoding=download.encoding
                 ):
-                    row = to_catalog_row(raw, stamp, "1970-01-01T00:00:00+00:00")
+                    row = to_catalog_row(raw, stamp, source_downloaded_at)
                     if row is not None:
                         yield row
 
@@ -249,9 +260,12 @@ def main(argv=None) -> int:
     print(f"peak RSS (db write)   : {write_peak:.0f} MB  ({write_seconds:.1f}s writing)")
     print(f"catalog rows written  : {stats.get('written', 0):,}")
     print(f"rows skipped unchanged: {stats.get('skippedUnchanged', 0):,}")
-    print(f"scd2 versions created : {history.get('inserted', 0):,}")
-    print(f"scd2 duplicates skipped: {history.get('duplicateSkipped', 0):,}")
-    print(f"scd2 write failures   : {history.get('failed', 0):,}")
+    # These count price OBSERVATIONS (pricecharting_price_history), not SCD2
+    # catalog-history versions -- mislabelling them hid a failure that the
+    # observation counters happily reported as successes.
+    print(f"price observations ins: {history.get('inserted', 0):,}")
+    print(f"price obs dup-skipped : {history.get('duplicateSkipped', 0):,}")
+    print(f"price obs failures    : {history.get('failed', 0):,}")
     print(f"write failures        : {errors}")
     print("sets stamped          : 0 (deliberate -- stamping would mutate the "
           "rotation; its cost is one PATCH body)")
