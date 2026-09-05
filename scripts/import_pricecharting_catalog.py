@@ -13,7 +13,11 @@ from typing import Any, Iterable, Iterator
 
 import httpx
 
-from scripts._shared_rate_limiter import PRICECHARTING_CSV, SharedRateLimiter
+from scripts._shared_rate_limiter import (
+    CLASS_ESSENTIAL_CATALOG,
+    PRICECHARTING_CSV,
+    SharedRateLimiter,
+)
 
 
 PRICE_FIELDS = {
@@ -296,6 +300,7 @@ def download_env_sources(
     # breaches that limit five times over in a few seconds.
     csv_limiter = SharedRateLimiter(
         PRICECHARTING_CSV,
+        slot_class=CLASS_ESSENTIAL_CATALOG,
         fallback_interval_seconds=CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
     )
 
@@ -343,6 +348,22 @@ def iter_rows_from_text(csv_text: str) -> "Iterator[dict[str, str]]":
     only constraint, which is the one we cannot engineer around."""
     for row in csv.DictReader(io.StringIO(csv_text)):
         yield dict(row)
+
+
+def iter_rows_from_file(
+    path: "Path", *, encoding: str = "utf-8"
+) -> "Iterator[dict[str, str]]":
+    """Row-at-a-time parse straight off disk.
+
+    iter_rows_from_text() still holds the whole CSV as a str, and copies it
+    again into a StringIO. For a 300-set download-custom batch that is ~28 MB
+    twice over, on top of the bytes httpx already buffered -- measured at a
+    229 MB peak against a 256 MB container. Reading from the file keeps the
+    body out of the heap entirely, so peak memory tracks the ingest chunk
+    size rather than the size of the download."""
+    with open(path, "r", encoding=encoding, errors="replace", newline="") as handle:
+        for row in csv.DictReader(handle):
+            yield dict(row)
 
 
 def chunked_iter(rows: "Iterable[Any]", size: int) -> "Iterator[list[Any]]":

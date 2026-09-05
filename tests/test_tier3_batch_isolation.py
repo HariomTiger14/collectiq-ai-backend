@@ -11,7 +11,9 @@ endpoint. It sat at queue position 3 and, because failures were never
 stamped, was retried first on every run forever.
 """
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import httpx
@@ -21,7 +23,7 @@ from scripts.refresh_sportscardspro_rotation import (
     _isolate_failed_batch,
     _ThrottleAbort,
 )
-from scripts.backfill_pricecharting_sets import _Counter
+from scripts.backfill_pricecharting_sets import CsvDownload, _Counter
 
 
 def _rows(*uids):
@@ -32,6 +34,7 @@ def _isolate(rows, dead_uids, *, status=503, budget=32):
     """Run isolation against a fake endpoint that 503s any request whose
     console_uid list contains a dead uid -- the real failure semantics."""
     calls = []
+    written: list[Path] = []
 
     def fake_fetch(http, *, base_url, token, console_uids, rate_limit_counter,
                    blocked_counter, status_sink=None):
@@ -40,12 +43,19 @@ def _isolate(rows, dead_uids, *, status=503, budget=32):
             if status_sink is not None:
                 status_sink.append(status)
             return None
-        return "csv:" + ",".join(console_uids)
+        # The real fetch hands back a file on disk, so the fake must too --
+        # otherwise the caller's cleanup path is never exercised.
+        handle, name = tempfile.mkstemp(suffix=".csv")
+        path = Path(name)
+        with open(handle, "w", encoding="utf-8") as out:
+            out.write("csv:" + ",".join(console_uids))
+        written.append(path)
+        return CsvDownload(path, "utf-8")
 
     with mock.patch(
-        "scripts.refresh_sportscardspro_rotation.fetch_batch_csv", fake_fetch
+        "scripts.refresh_sportscardspro_rotation.fetch_batch_csv_file", fake_fetch
     ):
-        texts, dead = _isolate_failed_batch(
+        downloads, dead = _isolate_failed_batch(
             mock.MagicMock(spec=httpx.Client),
             base_url="https://example.test",
             token="t",
@@ -55,22 +65,26 @@ def _isolate(rows, dead_uids, *, status=503, budget=32):
             blocked_counter=_Counter(),
             budget=[budget],
         )
-    return texts, dead, calls
+    return downloads, dead, calls, written
 
 
 class Tier3BatchIsolationTest(unittest.TestCase):
     def test_single_dead_set_is_pinpointed_and_the_rest_salvaged(self):
         rows = _rows("A", "B", "C", "D", "E", "F", "G", "H")
-        texts, dead, _ = _isolate(rows, {"E"})
+        downloads, dead, _, _written = _isolate(rows, {"E"})
 
         self.assertEqual([r["console_uid"] for r in dead], ["E"])
-        recovered = {u for t in texts for u in t.removeprefix("csv:").split(",")}
+        recovered = {
+            u
+            for d in downloads
+            for u in d.path.read_text().removeprefix("csv:").split(",")
+        }
         # Every healthy set comes back; previously all 8 were discarded.
         self.assertEqual(recovered, {"A", "B", "C", "D", "F", "G", "H"})
 
     def test_isolation_is_cheaper_than_probing_every_set(self):
         rows = _rows(*"ABCDEFGHIJKLMNOP")  # 16 sets
-        _, dead, calls = _isolate(rows, {"K"})
+        _downloads, dead, calls, _written = _isolate(rows, {"K"})
 
         self.assertEqual([r["console_uid"] for r in dead], ["K"])
         # Halving finds one offender in ~2*log2(n); linear probing would be 16.
@@ -78,17 +92,21 @@ class Tier3BatchIsolationTest(unittest.TestCase):
 
     def test_multiple_dead_sets_all_found(self):
         rows = _rows(*"ABCDEFGH")
-        texts, dead, _ = _isolate(rows, {"B", "G"})
+        downloads, dead, _, _written = _isolate(rows, {"B", "G"})
 
         self.assertEqual(sorted(r["console_uid"] for r in dead), ["B", "G"])
-        recovered = {u for t in texts for u in t.removeprefix("csv:").split(",")}
+        recovered = {
+            u
+            for d in downloads
+            for u in d.path.read_text().removeprefix("csv:").split(",")
+        }
         self.assertEqual(recovered, {"A", "C", "D", "E", "F", "H"})
 
     def test_all_dead_returns_no_csv_and_every_row_dead(self):
         rows = _rows("A", "B")
-        texts, dead, _ = _isolate(rows, {"A", "B"})
+        downloads, dead, _, _written = _isolate(rows, {"A", "B"})
 
-        self.assertEqual(texts, [])
+        self.assertEqual(downloads, [])
         self.assertEqual(sorted(r["console_uid"] for r in dead), ["A", "B"])
 
     def test_throttle_aborts_instead_of_probing_individual_sets(self):
@@ -102,7 +120,9 @@ class Tier3BatchIsolationTest(unittest.TestCase):
 
     def test_budget_bounds_the_worst_case(self):
         rows = _rows(*"ABCDEFGH")
-        _, _, calls = _isolate(rows, {"A", "C", "E", "G"}, budget=3)
+        _downloads, _dead, calls, _written = _isolate(
+            rows, {"A", "C", "E", "G"}, budget=3
+        )
         self.assertLessEqual(len(calls), 3)
 
     def test_max_failures_threshold_is_positive(self):

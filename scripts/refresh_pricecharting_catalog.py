@@ -13,7 +13,11 @@ from typing import Any
 import httpx
 
 from scripts._ops_run_recorder import dump_and_report, run_with_recorder
-from scripts._shared_rate_limiter import PRICECHARTING_CSV, SharedRateLimiter
+from scripts._shared_rate_limiter import (
+    CLASS_ESSENTIAL_CATALOG,
+    PRICECHARTING_CSV,
+    SharedRateLimiter,
+)
 from scripts.backfill_pricecharting_sets import REQUEST_HEADERS
 from scripts.import_pricecharting_catalog import PRICECHARTING_CSV_ENV_VARS
 from scripts.import_pricecharting_catalog import SupabaseCatalogClient
@@ -42,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     # endpoint on the same account and can land inside this run's window.
     csv_limiter = SharedRateLimiter(
         PRICECHARTING_CSV,
+        slot_class=CLASS_ESSENTIAL_CATALOG,
         fallback_interval_seconds=args.sleep_between_sources_seconds,
     )
 

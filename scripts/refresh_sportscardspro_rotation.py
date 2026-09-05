@@ -50,7 +50,12 @@ from typing import Any
 import httpx
 
 from scripts._ops_run_recorder import dump_and_report, run_with_recorder
-from scripts._shared_rate_limiter import PRICECHARTING_CSV, SharedRateLimiter
+from scripts._shared_rate_limiter import (
+    BULK_MAX_SLOT_WAIT_SECONDS,
+    CLASS_TIER3,
+    PRICECHARTING_CSV,
+    SharedRateLimiter,
+)
 from scripts.backfill_pricecharting_sets import (
     REQUEST_HEADERS,
     SOURCE_SITE_BASE_URLS,
@@ -59,15 +64,17 @@ from scripts.backfill_pricecharting_sets import (
     SPORTSCARDSPRO_DEFAULT_MAX_ATTEMPTS,
     _Counter,
     _RateLimitCircuitBreaker,
-    fetch_batch_csv,
-    fetch_batch_csv_with_retry,
+    CsvDownload,
+    cleanup_csv_downloads,
+    fetch_batch_csv_file,
+    fetch_batch_csv_file_with_retry,
     write_catalog_rows,
     write_catalog_rows_with_retry,
 )
 from scripts.import_pricecharting_catalog import (
     SupabaseCatalogClient,
     chunked_iter,
-    iter_rows_from_text,
+    iter_rows_from_file,
     to_catalog_row,
 )
 
@@ -151,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
     base_url = SOURCE_SITE_BASE_URLS["sportscardspro"]
     csv_limiter = SharedRateLimiter(
         PRICECHARTING_CSV,
+        slot_class=CLASS_TIER3,
         fallback_interval_seconds=args.sleep_between_requests_seconds,
     )
     breaker = _RateLimitCircuitBreaker(RATE_LIMIT_BREAKER_THRESHOLD)
@@ -192,12 +200,16 @@ def main(argv: list[str] | None = None) -> int:
             # Account-wide, not per-run: the categories refresh and the sets
             # backfill draw on the same published CSV limit and overlap this
             # job for most of the day.
-            csv_limiter.acquire()
+            if not csv_limiter.acquire(max_wait_seconds=BULK_MAX_SLOT_WAIT_SECONDS):
+                # tier-3 is the residual consumer: it yields to the daily
+                # refreshes and resumes next run. The rotation queue is
+                # ordered, so nothing is lost by stopping here.
+                break
             console_uids = [row["console_uid"] for row in chunk]
             before_429s = rate_limit_counter.value
             before_403s = blocked_counter.value
             status_sink: list[int] = []
-            csv_text = fetch_batch_csv_with_retry(
+            csv_download = fetch_batch_csv_file_with_retry(
                 http,
                 base_url=base_url,
                 token=token,
@@ -209,154 +221,162 @@ def main(argv: list[str] | None = None) -> int:
                 status_sink=status_sink,
             )
 
-            csv_texts: list[str] = []
-            live_chunk = chunk
-            if csv_text is not None:
-                csv_texts = [csv_text]
-                breaker.record_success()
-            else:
-                # Trip on EITHER signal. Previously only 429 counted, so a
-                # run taking pure 403s never tripped and would spend all
-                # 120 throttled requests on an endpoint already refusing
-                # us -- exactly the behaviour most likely to harden a
-                # temporary block.
-                throttled = (
-                    rate_limit_counter.value > before_429s
-                    or blocked_counter.value > before_403s
-                )
-                status = status_sink[-1] if status_sink else 0
-                if throttled or not status:
-                    # Endpoint-wide refusal, or a transport error that never
-                    # produced a status. Either way the batch says nothing
-                    # about any individual set, so there is nothing to isolate.
-                    failed_batches += 1
-                    failed_fetches += 1
-                    if throttled:
+            csv_downloads: list[CsvDownload] = []
+            # The temp files must go back whatever happens -- every branch below
+            # can continue out of this iteration, and a leaked 28 MB file per
+            # batch would fill the container's disk within one run.
+            try:
+                live_chunk = chunk
+                if csv_download is not None:
+                    csv_downloads = [csv_download]
+                    breaker.record_success()
+                else:
+                    # Trip on EITHER signal. Previously only 429 counted, so a
+                    # run taking pure 403s never tripped and would spend all
+                    # 120 throttled requests on an endpoint already refusing
+                    # us -- exactly the behaviour most likely to harden a
+                    # temporary block.
+                    throttled = (
+                        rate_limit_counter.value > before_429s
+                        or blocked_counter.value > before_403s
+                    )
+                    status = status_sink[-1] if status_sink else 0
+                    if throttled or not status:
+                        # Endpoint-wide refusal, or a transport error that never
+                        # produced a status. Either way the batch says nothing
+                        # about any individual set, so there is nothing to isolate.
+                        failed_batches += 1
+                        failed_fetches += 1
+                        if throttled:
+                            breaker.record_rate_limited()
+                        continue
+
+                    # The endpoint answered and refused THIS combination of
+                    # console_uids -- historically one set removed upstream
+                    # taking its whole batch down with it (see the 20260901
+                    # migration). Salvage the healthy sets instead of discarding
+                    # the batch and re-fetching all of them next run.
+                    isolation_budget = [args.max_isolation_requests]
+                    try:
+                        csv_downloads, dead_rows = _isolate_failed_batch(
+                            http,
+                            base_url=base_url,
+                            token=token,
+                            rows=chunk,
+                            sleep_seconds=args.sleep_between_requests_seconds,
+                            rate_limit_counter=rate_limit_counter,
+                            blocked_counter=blocked_counter,
+                            budget=isolation_budget,
+                        )
+                    except _ThrottleAbort as exc:
+                        print(f"  Isolation abandoned: {exc}", flush=True)
+                        failed_batches += 1
+                        failed_fetches += 1
                         breaker.record_rate_limited()
-                    continue
-
-                # The endpoint answered and refused THIS combination of
-                # console_uids -- historically one set removed upstream
-                # taking its whole batch down with it (see the 20260901
-                # migration). Salvage the healthy sets instead of discarding
-                # the batch and re-fetching all of them next run.
-                isolation_budget = [args.max_isolation_requests]
-                try:
-                    csv_texts, dead_rows = _isolate_failed_batch(
-                        http,
-                        base_url=base_url,
-                        token=token,
-                        rows=chunk,
-                        sleep_seconds=args.sleep_between_requests_seconds,
-                        rate_limit_counter=rate_limit_counter,
-                        blocked_counter=blocked_counter,
-                        budget=isolation_budget,
-                    )
-                except _ThrottleAbort as exc:
-                    print(f"  Isolation abandoned: {exc}", flush=True)
-                    failed_batches += 1
-                    failed_fetches += 1
-                    breaker.record_rate_limited()
-                    continue
-                finally:
-                    isolation_requests += (
-                        args.max_isolation_requests - isolation_budget[0]
-                    )
-
-                if dead_rows:
-                    dead_ids = [row["registry_id"] for row in dead_rows]
-                    dead_sets += len(dead_ids)
-                    if not args.dry_run:
-                        registry.record_tier3_failures(
-                            dead_ids,
-                            error=f"download-custom refused this set (HTTP {status})",
+                        continue
+                    finally:
+                        isolation_requests += (
+                            args.max_isolation_requests - isolation_budget[0]
                         )
-                    dead_id_set = {row["registry_id"] for row in dead_rows}
-                    live_chunk = [
-                        row for row in chunk if row["registry_id"] not in dead_id_set
-                    ]
 
-                if not csv_texts:
-                    # Every set in the batch was refused individually.
-                    failed_batches += 1
-                    failed_fetches += 1
-                    continue
-                salvaged_sets += len(live_chunk)
-                breaker.record_success()
+                    if dead_rows:
+                        dead_ids = [row["registry_id"] for row in dead_rows]
+                        dead_sets += len(dead_ids)
+                        if not args.dry_run:
+                            registry.record_tier3_failures(
+                                dead_ids,
+                                error=f"download-custom refused this set (HTTP {status})",
+                            )
+                        dead_id_set = {row["registry_id"] for row in dead_rows}
+                        live_chunk = [
+                            row for row in chunk if row["registry_id"] not in dead_id_set
+                        ]
 
-            # Stamped per batch, not once per run. It becomes the history
-            # row's valid_from and the value used to close the previous
-            # current row, so a run-wide stamp goes stale as the run gets
-            # longer: a multi-hour catch-up would try to close a row that
-            # tier-1 (hourly, same table) wrote AFTER this run started,
-            # producing valid_to < valid_from and a 23514 violation against
-            # pricecharting_catalog_history_valid_window_check. Measured
-            # 2026-09-01: 30 such failures in a 5.5-hour run.
-            source_downloaded_at = datetime.now(timezone.utc).isoformat()
-            # Parse and write in chunks rather than materialising the batch.
-            # A 100-set batch is ~63,600 rows; holding those as dicts is what
-            # forced batch sizes down to single digits -- a 20-set batch
-            # (~12,700 rows) already OOM-killed a 512Mi instance. Peak memory
-            # here is one chunk, so batch size is bounded by the fetch limit
-            # (one CSV call per 10 minutes) rather than by RAM.
-            #
-            # Splitting a batch across writes is safe: the history gate
-            # compares against the CURRENT history row, so if the same
-            # pricecharting_id appears in two chunks the second sees the
-            # version the first just wrote and skips it instead of creating a
-            # duplicate. A failed chunk fails the batch and the set is never
-            # stamped, so the retry re-fetches and the already-written chunks
-            # become content-hash no-ops.
-            def _iter_catalog_rows():
-                for text in csv_texts:
-                    for raw in iter_rows_from_text(text):
-                        row = to_catalog_row(raw, SOURCE_FILE_TAG, source_downloaded_at)
-                        if row is not None:
-                            yield row
+                    if not csv_downloads:
+                        # Every set in the batch was refused individually.
+                        failed_batches += 1
+                        failed_fetches += 1
+                        continue
+                    salvaged_sets += len(live_chunk)
+                    breaker.record_success()
 
-            wrote, retried = True, 0
-            if args.dry_run:
-                total_catalog_rows += sum(1 for _ in _iter_catalog_rows())
-            else:
-                for chunk in chunked_iter(_iter_catalog_rows(), args.ingest_chunk_rows):
-                    total_catalog_rows += len(chunk)
-                    if copy_writer is not None:
-                        # One transaction per chunk: it either lands or it
-                        # does not, so there is no partial state to reason
-                        # about on retry.
-                        chunk_wrote, chunk_retried = copy_writer.write(chunk), 0
-                    else:
-                        assert catalog_client is not None
-                        # Retrying a write costs no sportscardspro request;
-                        # giving up costs a full re-fetch of bytes we hold.
-                        chunk_wrote, chunk_retried = write_catalog_rows_with_retry(
-                            catalog_client,
-                            chunk,
-                            batch_size=args.catalog_batch_size,
-                            attempts=args.write_attempts,
-                            backoff_seconds=args.write_retry_seconds,
-                        )
-                    retried += chunk_retried
-                    if not chunk_wrote:
-                        wrote = False
-                        break
+                # Stamped per batch, not once per run. It becomes the history
+                # row's valid_from and the value used to close the previous
+                # current row, so a run-wide stamp goes stale as the run gets
+                # longer: a multi-hour catch-up would try to close a row that
+                # tier-1 (hourly, same table) wrote AFTER this run started,
+                # producing valid_to < valid_from and a 23514 violation against
+                # pricecharting_catalog_history_valid_window_check. Measured
+                # 2026-09-01: 30 such failures in a 5.5-hour run.
+                source_downloaded_at = datetime.now(timezone.utc).isoformat()
+                # Parse and write in chunks rather than materialising the batch.
+                # A 100-set batch is ~63,600 rows; holding those as dicts is what
+                # forced batch sizes down to single digits -- a 20-set batch
+                # (~12,700 rows) already OOM-killed a 512Mi instance. Peak memory
+                # here is one chunk, so batch size is bounded by the fetch limit
+                # (one CSV call per 10 minutes) rather than by RAM.
+                #
+                # Splitting a batch across writes is safe: the history gate
+                # compares against the CURRENT history row, so if the same
+                # pricecharting_id appears in two chunks the second sees the
+                # version the first just wrote and skips it instead of creating a
+                # duplicate. A failed chunk fails the batch and the set is never
+                # stamped, so the retry re-fetches and the already-written chunks
+                # become content-hash no-ops.
+                def _iter_catalog_rows():
+                    for download in csv_downloads:
+                        for raw in iter_rows_from_file(
+                            download.path, encoding=download.encoding
+                        ):
+                            row = to_catalog_row(raw, SOURCE_FILE_TAG, source_downloaded_at)
+                            if row is not None:
+                                yield row
 
-                write_retries += retried
-                if not wrote:
-                    failed_batches += 1
-                    failed_writes += 1
-                    continue
-            # Stamp each batch as soon as its write lands, not in one
-            # PATCH at the end of the run: a run is ~55 minutes long, and
-            # end-of-run stamping means a killed run (deploy, timeout,
-            # OOM) loses every stamp -- the next run would re-spend all
-            # 220 throttled requests re-fetching sets whose data already
-            # landed. A failed batch is simply never stamped, keeping its
-            # sets at the front of the rotation.
-            batch_ids = [row["registry_id"] for row in live_chunk]
-            if not args.dry_run:
-                registry.mark_tier3_refreshed(batch_ids)
-            refreshed_ids.extend(batch_ids)
+                wrote, retried = True, 0
+                if args.dry_run:
+                    total_catalog_rows += sum(1 for _ in _iter_catalog_rows())
+                else:
+                    for chunk in chunked_iter(_iter_catalog_rows(), args.ingest_chunk_rows):
+                        total_catalog_rows += len(chunk)
+                        if copy_writer is not None:
+                            # One transaction per chunk: it either lands or it
+                            # does not, so there is no partial state to reason
+                            # about on retry.
+                            chunk_wrote, chunk_retried = copy_writer.write(chunk), 0
+                        else:
+                            assert catalog_client is not None
+                            # Retrying a write costs no sportscardspro request;
+                            # giving up costs a full re-fetch of bytes we hold.
+                            chunk_wrote, chunk_retried = write_catalog_rows_with_retry(
+                                catalog_client,
+                                chunk,
+                                batch_size=args.catalog_batch_size,
+                                attempts=args.write_attempts,
+                                backoff_seconds=args.write_retry_seconds,
+                            )
+                        retried += chunk_retried
+                        if not chunk_wrote:
+                            wrote = False
+                            break
+
+                    write_retries += retried
+                    if not wrote:
+                        failed_batches += 1
+                        failed_writes += 1
+                        continue
+                # Stamp each batch as soon as its write lands, not in one
+                # PATCH at the end of the run: a run is ~55 minutes long, and
+                # end-of-run stamping means a killed run (deploy, timeout,
+                # OOM) loses every stamp -- the next run would re-spend all
+                # 220 throttled requests re-fetching sets whose data already
+                # landed. A failed batch is simply never stamped, keeping its
+                # sets at the front of the rotation.
+                batch_ids = [row["registry_id"] for row in live_chunk]
+                if not args.dry_run:
+                    registry.mark_tier3_refreshed(batch_ids)
+                refreshed_ids.extend(batch_ids)
+            finally:
+                cleanup_csv_downloads(csv_downloads)
 
     writer_with_stats = copy_writer or catalog_client
     catalog_write_stats = (
@@ -428,7 +448,7 @@ def _isolate_failed_batch(
     blocked_counter: _Counter,
     budget: list[int],
     limiter: Any = None,
-) -> tuple[list[str], list[dict[str, Any]]]:
+) -> tuple[list[CsvDownload], list[dict[str, Any]]]:
     """Split a failed batch to salvage its healthy sets and pinpoint the
     set(s) the endpoint cannot serve.
 
@@ -438,18 +458,22 @@ def _isolate_failed_batch(
     Halving costs ~2*log2(n) requests to find one offender instead of n,
     and hands back CSV for everything else.
 
-    Returns (csv_texts, dead_rows). ``budget`` is a one-element list used as
+    Returns (csv_downloads, dead_rows) -- the caller owns those files and
+    must clean them up. ``budget`` is a one-element list used as
     a shared mutable countdown so the recursion cannot exceed its allowance.
     """
     if not rows or budget[0] <= 0:
         return [], []
     budget[0] -= 1
     if limiter is not None:
-        limiter.acquire()
+        if not limiter.acquire(max_wait_seconds=BULK_MAX_SLOT_WAIT_SECONDS):
+            # Same "not attempted" signal as the budget guard above: these
+            # rows stay pending rather than being recorded as failures.
+            return [], []
     elif sleep_seconds > 0:
         time.sleep(sleep_seconds)
     status_sink: list[int] = []
-    csv_text = fetch_batch_csv(
+    csv_download = fetch_batch_csv_file(
         http,
         base_url=base_url,
         token=token,
@@ -458,8 +482,8 @@ def _isolate_failed_batch(
         blocked_counter=blocked_counter,
         status_sink=status_sink,
     )
-    if csv_text is not None:
-        return [csv_text], []
+    if csv_download is not None:
+        return [csv_download], []
 
     status = status_sink[-1] if status_sink else 0
     if status in (429, 403):
@@ -485,17 +509,23 @@ def _isolate_failed_batch(
         budget=budget,
         limiter=limiter,
     )
-    right_csv, right_dead = _isolate_failed_batch(
-        http,
-        base_url=base_url,
-        token=token,
-        rows=rows[mid:],
-        sleep_seconds=sleep_seconds,
-        rate_limit_counter=rate_limit_counter,
-        blocked_counter=blocked_counter,
-        budget=budget,
-        limiter=limiter,
-    )
+    try:
+        right_csv, right_dead = _isolate_failed_batch(
+            http,
+            base_url=base_url,
+            token=token,
+            rows=rows[mid:],
+            sleep_seconds=sleep_seconds,
+            rate_limit_counter=rate_limit_counter,
+            blocked_counter=blocked_counter,
+            budget=budget,
+            limiter=limiter,
+        )
+    except _ThrottleAbort:
+        # The left half already has files on disk and nobody upstream will
+        # ever see them now, so they have to be removed here.
+        cleanup_csv_downloads(left_csv)
+        raise
     return left_csv + right_csv, left_dead + right_dead
 
 

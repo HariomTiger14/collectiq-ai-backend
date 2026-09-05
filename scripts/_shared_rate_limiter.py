@@ -11,6 +11,19 @@ UPDATE on a single row, so two jobs asking at the same instant cannot both be
 granted. Callers sleep and re-ask rather than being queued server-side, so a
 caller that dies mid-wait holds nothing.
 
+Serialising was not enough on its own. The RPC is a race, not a queue:
+whoever polls first after the interval expires wins. Two jobs that must
+finish daily were competing against ~120 bulk runs and winning about 2% of
+races, which left the 23-call categories refresh completing 4.5 calls a day.
+So each caller now declares a CLASS, and the transaction decides which class
+may take the next slot (see 20260905_provider_slot_classes.sql).
+
+An essential job announces itself by ASKING -- there is no reservation to
+take out and none to clean up. Its liveness timestamp is updated even when
+the ask is refused, so a job waiting out the interval still holds bulk off
+rather than losing the slot it is waiting for. If it dies, the timestamp
+goes stale on its own and bulk resumes.
+
 Failure policy is deliberately the opposite of the ops recorder's. That module
 must never break a job, so it swallows errors and carries on. Here, carrying
 on would mean calling the provider without a slot -- the exact breach this
@@ -31,9 +44,28 @@ import httpx
 PRICECHARTING_CSV = "pricecharting:csv"
 KICKSDB_API = "kicksdb:api"
 
+# Allocation classes, registered in provider_slot_classes by 20260905. The
+# class a job declares decides its priority; see that migration for what
+# each one is entitled to.
+CLASS_ESSENTIAL_CATEGORIES = "essential_categories"
+CLASS_ESSENTIAL_CATALOG = "essential_catalog"
+CLASS_BACKFILL = "backfill"
+CLASS_TIER3 = "tier3"
+
 # A single wait is capped so a wildly wrong interval can't hang a run for
-# hours in one sleep; the loop simply re-asks.
+# hours in one sleep; the loop simply re-asks. The server returns the true
+# remaining wait each time, so the chunks converge exactly on the boundary
+# rather than overshooting it -- 610s becomes 60x10 then 10, and the caller
+# is asking at the moment the slot opens. No tight polling is needed for
+# that: priority is decided in the transaction, not by who wakes first.
 _MAX_SINGLE_SLEEP_SECONDS = 60.0
+
+# How long a BULK caller will wait for a slot before ending its run instead.
+# Render crons bill wall-clock, so a container parked behind the 3h40m
+# categories refresh is paying to do nothing. Both bulk jobs resume from a
+# persistent queue, so stopping early costs nothing but a little latency.
+# Must comfortably exceed the interval or normal waits would abort.
+BULK_MAX_SLOT_WAIT_SECONDS = 1800.0
 
 
 class SharedRateLimiter:
@@ -42,6 +74,7 @@ class SharedRateLimiter:
         limit_key: str,
         *,
         fallback_interval_seconds: float,
+        slot_class: str | None = None,
         supabase_url: str | None = None,
         service_role_key: str | None = None,
         timeout_seconds: float = 15.0,
@@ -49,6 +82,7 @@ class SharedRateLimiter:
         monotonic: Any = time.monotonic,
     ) -> None:
         self.limit_key = limit_key
+        self.slot_class = slot_class
         self.fallback_interval_seconds = fallback_interval_seconds
         self.supabase_url = (supabase_url or os.getenv("SUPABASE_URL", "")).strip().rstrip("/")
         self.service_role_key = (
@@ -59,15 +93,27 @@ class SharedRateLimiter:
         self._monotonic = monotonic
         self._last_local_acquire: float | None = None
         self.degraded_to_local = False
+        self.quota_exhausted = False
 
-    def acquire(self) -> None:
-        """Block until this caller may make one request."""
+    def acquire(self, *, max_wait_seconds: float | None = None) -> bool:
+        """Block until this caller may make one request.
+
+        Returns True when a slot was granted. Returns False when the caller
+        should SKIP its work rather than wait: the class is out of daily
+        budget, or waiting would exceed max_wait_seconds.
+
+        max_wait_seconds matters because these are Render cron containers
+        billed by wall-clock. A bulk job parked behind a 3h40m essential run
+        is burning money to do nothing; it is cheaper to end the run and let
+        the next scheduled one pick up where the queue left off.
+        """
         if not self.supabase_url or not self.service_role_key:
             self._acquire_locally()
-            return
+            return True
+        waited = 0.0
         while True:
             try:
-                wait = self._ask()
+                granted, reason, retry_after = self._ask()
             except Exception as exc:  # noqa: BLE001 -- see module docstring
                 if not self.degraded_to_local:
                     print(
@@ -78,17 +124,43 @@ class SharedRateLimiter:
                     )
                     self.degraded_to_local = True
                 self._acquire_locally()
-                return
-            if wait <= 0:
+                return True
+            if granted:
                 self._last_local_acquire = self._monotonic()
-                return
-            self._sleep(min(wait, _MAX_SINGLE_SLEEP_SECONDS))
+                return True
+            if reason == "QUOTA_EXHAUSTED":
+                if not self.quota_exhausted:
+                    print(
+                        f"  {self.slot_class} has used its daily {self.limit_key} "
+                        f"budget; skipping the rest of this run's calls.",
+                        flush=True,
+                    )
+                    self.quota_exhausted = True
+                return False
+            if max_wait_seconds is not None and waited + retry_after > max_wait_seconds:
+                print(
+                    f"  {self.slot_class} would wait {retry_after:.0f}s more for a "
+                    f"{self.limit_key} slot ({reason}); ending this run instead of "
+                    f"holding a container open.",
+                    flush=True,
+                )
+                return False
+            nap = min(retry_after, _MAX_SINGLE_SLEEP_SECONDS)
+            waited += nap
+            self._sleep(nap)
 
-    def _ask(self) -> float:
+    def _ask(self) -> tuple[bool, str, float]:
+        """Returns (granted, reason, retry_after_seconds).
+
+        The server distinguishes "the interval has not elapsed" from "another
+        class has priority right now" from "you are out of budget for the
+        day", because the right response differs: wait a known amount, wait
+        and re-ask, or stop.
+        """
         with httpx.Client(timeout=self.timeout_seconds) as client:
             response = client.post(
-                f"{self.supabase_url}/rest/v1/rpc/acquire_rate_limit_slot",
-                json={"p_key": self.limit_key},
+                f"{self.supabase_url}/rest/v1/rpc/acquire_provider_slot",
+                json={"p_key": self.limit_key, "p_class": self.slot_class},
                 headers={
                     "apikey": self.service_role_key,
                     "Authorization": f"Bearer {self.service_role_key}",
@@ -96,7 +168,12 @@ class SharedRateLimiter:
                 },
             )
             response.raise_for_status()
-            return float(response.json())
+            payload = response.json()
+        return (
+            bool(payload["granted"]),
+            str(payload.get("reason", "")),
+            float(payload.get("retry_after_seconds") or 0.0),
+        )
 
     def _acquire_locally(self) -> None:
         last = self._last_local_acquire
