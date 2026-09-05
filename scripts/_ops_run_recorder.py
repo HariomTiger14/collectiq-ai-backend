@@ -34,6 +34,14 @@ import httpx
 
 _STACK_CAP = 4000
 _summary: dict[str, Any] | None = None
+# Set by run_with_recorder so a non-fatal DB failure deep in the write path
+# can attach itself to the run that is currently in flight.
+_active: "_Recorder | None" = None
+
+# Postgres cancels a statement that exceeds statement_timeout with this
+# SQLSTATE. PostgREST forwards it as an HTTP 500 whose JSON body carries the
+# code, so it can be detected structurally rather than by matching prose.
+SQLSTATE_STATEMENT_TIMEOUT = "57014"
 
 
 def report_summary(summary: dict[str, Any]) -> None:
@@ -43,7 +51,9 @@ def report_summary(summary: dict[str, Any]) -> None:
 
 
 def run_with_recorder(job_name: str, main: Callable[[], int]) -> int:
+    global _active
     recorder = _Recorder(job_name)
+    _active = recorder
     recorder.start()
     try:
         exit_code = main()
@@ -57,6 +67,109 @@ def run_with_recorder(job_name: str, main: Callable[[], int]) -> int:
         raise
     recorder.finish_succeeded(exit_code)
     return exit_code
+
+
+def sqlstate_of(body: str) -> str | None:
+    """SQLSTATE from a PostgREST error body, read from the JSON `code` field.
+
+    Structural rather than textual: PostgREST returns
+    {"code":"57014","message":"canceling statement due to statement timeout"},
+    so the code is authoritative and survives message wording changes. The
+    prose fallback exists only for responses that are not JSON at all."""
+    if not body:
+        return None
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        code = payload.get("code")
+        if isinstance(code, str) and code.strip():
+            return code.strip()
+    if "canceling statement due to statement timeout" in body:
+        return SQLSTATE_STATEMENT_TIMEOUT
+    return None
+
+
+def build_db_failure_event(
+    *,
+    job_name: str,
+    run_id: str | None,
+    operation: str,
+    row_count: int,
+    sqlstate: str,
+    status_code: int,
+    body: str,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The ops_error_events payload for one failed database write.
+
+    Deliberately carries no catalogue rows: the diagnostic value is in WHICH
+    operation failed, HOW MANY rows it was writing, and WHEN -- not in the
+    contents. The message is scrubbed because PostgREST echoes the failing
+    row in `details`, which for these tables includes product names."""
+    fingerprint = hashlib.md5(
+        f"db|{job_name}|{operation}|{sqlstate}".encode()
+    ).hexdigest()
+    return {
+        "source": "cron",
+        "job_name": job_name,
+        "error_class": f"PostgresError{sqlstate}",
+        "message": scrub_secrets(str(body))[:2000],
+        "fingerprint": fingerprint,
+        "context": {
+            "runId": run_id,
+            "operation": operation,
+            "rowCount": row_count,
+            "sqlstate": sqlstate,
+            "httpStatus": status_code,
+            "renderService": os.getenv("RENDER_SERVICE_NAME"),
+            **(context or {}),
+        },
+    }
+
+
+def record_db_timeout(
+    *,
+    operation: str,
+    row_count: int,
+    status_code: int,
+    body: str,
+    context: dict[str, Any] | None = None,
+) -> bool:
+    """Record ONE ops_error_events row for a statement-timeout write failure.
+
+    Called at the narrowest point -- inside the helper that owns the failing
+    request -- so the exception can propagate through PartialCatalogWriteError
+    and write_catalog_rows without any layer recording it again.
+
+    Only 57014 is recorded. Every caught error becoming an event would turn
+    the board into noise; this is the specific failure being diagnosed.
+    Returns True when an event was written."""
+    sqlstate = sqlstate_of(body)
+    if sqlstate != SQLSTATE_STATEMENT_TIMEOUT:
+        return False
+    recorder = _active
+    if recorder is None or not recorder._configured:
+        return False
+    try:
+        recorder._request(
+            "POST", "/rest/v1/ops_error_events",
+            build_db_failure_event(
+                job_name=recorder.job_name,
+                run_id=recorder.run_id,
+                operation=operation,
+                row_count=row_count,
+                sqlstate=sqlstate,
+                status_code=status_code,
+                body=body,
+                context=context,
+            ),
+            headers={"Prefer": "return=minimal"},
+        )
+        return True
+    except Exception:  # noqa: BLE001 -- observability must never break a job
+        return False
 
 
 # Credentials reach tracebacks through URLs: httpx puts the full request URL in

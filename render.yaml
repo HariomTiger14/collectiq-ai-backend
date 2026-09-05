@@ -375,7 +375,7 @@ services:
     branch: main
     schedule: "45 4 * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m scripts.refresh_completed_pricecharting_categories --batch-size 300 --catalog-batch-size 200 --sleep-between-requests-seconds 600
+    startCommand: python -m scripts.refresh_completed_pricecharting_categories --batch-size 300 --catalog-batch-size 40 --sleep-between-requests-seconds 600
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8

@@ -13,6 +13,7 @@ from typing import Any, Iterable, Iterator
 
 import httpx
 
+from scripts._ops_run_recorder import record_db_timeout
 from scripts._shared_rate_limiter import (
     CLASS_ESSENTIAL_CATALOG,
     PRICECHARTING_CSV,
@@ -944,6 +945,13 @@ class SupabaseCatalogClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            record_db_timeout(
+                operation="history_close",
+                row_count=len(pricecharting_ids),
+                status_code=response.status_code,
+                body=response.text,
+                context={"table": "pricecharting_catalog_history"},
+            )
             raise SystemExit(
                 "Supabase catalog history close-current failed "
                 f"with HTTP {response.status_code}: {response.text}"
@@ -964,6 +972,13 @@ class SupabaseCatalogClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            record_db_timeout(
+                operation="history_insert",
+                row_count=len(rows),
+                status_code=response.status_code,
+                body=response.text,
+                context={"table": "pricecharting_catalog_history"},
+            )
             raise SystemExit(
                 "Supabase catalog history insert failed "
                 f"at rows {batch_offset + 1}-{batch_offset + len(rows)} "
@@ -995,6 +1010,13 @@ class SupabaseCatalogClient:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             self.price_history_stats["failed"] += len(rows)
+            record_db_timeout(
+                operation="price_observation_insert",
+                row_count=len(rows),
+                status_code=response.status_code,
+                body=response.text,
+                context={"table": "pricecharting_price_history"},
+            )
             raise SystemExit(
                 "Supabase price-history insert failed "
                 f"with HTTP {response.status_code}: {response.text}"
@@ -1039,6 +1061,17 @@ class SupabaseCatalogClient:
                 try:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as exc:
+                    # Recorded HERE, at the request that actually failed, so
+                    # the event carries the real row count and operation --
+                    # and so no outer layer records it again as it becomes a
+                    # PartialCatalogWriteError and then a False return.
+                    record_db_timeout(
+                        operation=f"{label}_upsert",
+                        row_count=len(batch),
+                        status_code=response.status_code,
+                        body=response.text,
+                        context={"table": table, "writeBatchSize": batch_size},
+                    )
                     raise SystemExit(
                         f"Supabase {label} import failed "
                         f"at rows {index + 1}-{index + len(batch)} "
