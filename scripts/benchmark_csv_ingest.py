@@ -29,6 +29,7 @@ from scripts._shared_rate_limiter import (
 )
 from scripts.backfill_pricecharting_sets import (
     CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
+    _Counter,
     REQUEST_HEADERS,
     cleanup_csv_downloads,
     fetch_batch_csv_file,
@@ -42,6 +43,21 @@ from scripts.import_pricecharting_catalog import (
 )
 
 CSV_BASE_URL = "https://www.pricecharting.com"
+
+# Refresh-age ordering says nothing about set SIZE, and sizes vary by two
+# orders of magnitude -- a 300-set sample drawn that way could easily be a
+# friendly one and report a peak the real rotation never sees. These are
+# console_uids whose row counts were measured directly from download-custom
+# responses on 2026-09-04, seeded into every sample so the benchmark always
+# carries some genuinely heavy sets:
+#
+#   G47162  2021 Panini Mosaic (baseball)      10,589 rows
+#   G66750  2023 Topps Chrome Update            6,289 rows
+#   G66421  2022 Topps Simplicidad UEFA           640 rows
+#   G63100  2021 Topps Chrome F1 Autographs       318 rows
+#
+# Not a row-count feature, just four known-heavy ids.
+KNOWN_LARGE_UIDS = ["G47162", "G66750", "G66421", "G63100"]
 
 
 def _rss_mb() -> float:
@@ -120,8 +136,12 @@ def main(argv=None) -> int:
         headers=headers,
         timeout=60,
     ).json()
-    uids = [row["console_uid"] for row in registry]
-    print(f"sets requested        : {len(uids)}")
+    sampled = [row["console_uid"] for row in registry]
+    seeds = [u for u in KNOWN_LARGE_UIDS if u not in sampled]
+    # Seeds replace the tail rather than extending it, so --sets is exact.
+    uids = (seeds + sampled)[: args.sets]
+    print(f"sets requested        : {len(uids)}  "
+          f"({len(seeds)} known-large seeded, {len(uids) - len(seeds)} by refresh age)")
 
     baseline = _rss_mb()
     print(f"baseline RSS          : {baseline:.0f} MB")
@@ -131,9 +151,14 @@ def main(argv=None) -> int:
         slot_class=CLASS_TIER3,
         fallback_interval_seconds=CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
     )
+    # acquire() blocks until the shared 610s gate allows a call, so running
+    # these back to back is safe -- do NOT space them by hand.
+    print("waiting for a CSV slot (shared limiter enforces the 610s gate)...", flush=True)
     if not limiter.acquire():
         raise SystemExit("no CSV slot available (class out of daily budget)")
 
+    status_sink: list[int] = []
+    rate_counter, blocked_counter = _Counter(), _Counter()
     started = time.perf_counter()
     with httpx.Client(
         timeout=args.timeout_seconds, follow_redirects=True, headers=REQUEST_HEADERS
@@ -141,11 +166,20 @@ def main(argv=None) -> int:
         with Sampler() as download_sampler:
             fetch_started = time.perf_counter()
             download = fetch_batch_csv_file(
-                http, base_url=CSV_BASE_URL, token=token, console_uids=uids
+                http,
+                base_url=CSV_BASE_URL,
+                token=token,
+                console_uids=uids,
+                status_sink=status_sink,
+                rate_limit_counter=rate_counter,
+                blocked_counter=blocked_counter,
             )
             fetch_seconds = time.perf_counter() - fetch_started
         if download is None:
-            raise SystemExit("download failed -- see the message above")
+            raise SystemExit(
+                f"download failed -- http status {status_sink or 'transport error'}, "
+                f"429s={rate_counter.value} 403s={blocked_counter.value}"
+            )
 
         size_mb = download.path.stat().st_size / (1024 * 1024)
         print(f"downloaded            : {size_mb:.1f} MB in {fetch_seconds:.1f}s")
@@ -196,6 +230,7 @@ def main(argv=None) -> int:
             cleanup_csv_downloads([download])
 
     stats = getattr(catalog_client, "catalog_write_stats", None) or {}
+    history = getattr(catalog_client, "price_history_stats", None) or {}
     total_seconds = time.perf_counter() - started
     overall = max(download_sampler.peak, parse_peak, write_peak)
     print(f"csv rows parsed       : {rows:,}")
@@ -203,11 +238,27 @@ def main(argv=None) -> int:
     print(f"peak RSS (db write)   : {write_peak:.0f} MB  ({write_seconds:.1f}s writing)")
     print(f"catalog rows written  : {stats.get('written', 0):,}")
     print(f"rows skipped unchanged: {stats.get('skippedUnchanged', 0):,}")
+    print(f"scd2 versions created : {history.get('inserted', 0):,}")
+    print(f"scd2 duplicates skipped: {history.get('duplicateSkipped', 0):,}")
+    print(f"scd2 write failures   : {history.get('failed', 0):,}")
     print(f"write failures        : {errors}")
+    print("sets stamped          : 0 (deliberate -- stamping would mutate the "
+          "rotation; its cost is one PATCH body)")
     print(f"http duration         : {fetch_seconds:.1f}s")
     print(f"end-to-end duration   : {total_seconds:.1f}s")
-    print(f"OVERALL PEAK RSS      : {overall:.0f} MB   (target < 170 MB of 256)")
+    print(f"http status           : 200  (429s={rate_counter.value} "
+          f"403s={blocked_counter.value})")
     print(f"temp file removed     : {not download.path.exists()}")
+    print(f"OVERALL PEAK RSS      : {overall:.0f} MB   (of 256 MB)")
+    if overall < 150:
+        verdict = "EXCELLENT -- safe to escalate to the next batch size"
+    elif overall < 170:
+        verdict = "ACCEPTABLE -- usable, but do not escalate further"
+    elif overall < 190:
+        verdict = "TOO CLOSE for a 256 MB container -- step back a size"
+    else:
+        verdict = "REJECT this configuration"
+    print(f"VERDICT               : {verdict}")
     return 0
 
 
