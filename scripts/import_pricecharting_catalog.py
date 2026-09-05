@@ -933,6 +933,7 @@ class SupabaseCatalogClient:
         pricecharting_ids: list[str],
         valid_to: str,
     ) -> None:
+        request_started_at = time.perf_counter()
         response = client.patch(
             f"{self.supabase_url}/rest/v1/pricecharting_catalog_history",
             params={
@@ -946,6 +947,7 @@ class SupabaseCatalogClient:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             record_db_failure(
+                duration_seconds=time.perf_counter() - request_started_at,
                 operation="history_close",
                 row_count=len(pricecharting_ids),
                 status_code=response.status_code,
@@ -964,6 +966,7 @@ class SupabaseCatalogClient:
         *,
         batch_offset: int,
     ) -> int:
+        request_started_at = time.perf_counter()
         response = client.post(
             f"{self.supabase_url}/rest/v1/pricecharting_catalog_history",
             headers={**self._headers(), "Prefer": "return=minimal"},
@@ -973,6 +976,7 @@ class SupabaseCatalogClient:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             record_db_failure(
+                duration_seconds=time.perf_counter() - request_started_at,
                 operation="history_insert",
                 row_count=len(rows),
                 status_code=response.status_code,
@@ -997,6 +1001,7 @@ class SupabaseCatalogClient:
         # representation contains only the genuinely inserted rows, which
         # is what makes inserted-vs-duplicate observable.
         self.price_history_stats["attempted"] += len(rows)
+        request_started_at = time.perf_counter()
         response = client.post(
             f"{self.supabase_url}/rest/v1/pricecharting_price_history",
             params={"on_conflict": "pricecharting_id,observed_at"},
@@ -1011,6 +1016,7 @@ class SupabaseCatalogClient:
         except httpx.HTTPStatusError as exc:
             self.price_history_stats["failed"] += len(rows)
             record_db_failure(
+                duration_seconds=time.perf_counter() - request_started_at,
                 operation="price_observation_insert",
                 row_count=len(rows),
                 status_code=response.status_code,
@@ -1052,6 +1058,7 @@ class SupabaseCatalogClient:
         with httpx.Client(timeout=self.timeout_seconds) as client:
             for index in range(0, len(rows), batch_size):
                 batch = rows[index : index + batch_size]
+                request_started_at = time.perf_counter()
                 response = client.post(
                     f"{self.supabase_url}/rest/v1/{table}",
                     params={"on_conflict": on_conflict},
@@ -1066,6 +1073,7 @@ class SupabaseCatalogClient:
                     # and so no outer layer records it again as it becomes a
                     # PartialCatalogWriteError and then a False return.
                     record_db_failure(
+                        duration_seconds=time.perf_counter() - request_started_at,
                         operation=f"{label}_upsert",
                         row_count=len(batch),
                         status_code=response.status_code,

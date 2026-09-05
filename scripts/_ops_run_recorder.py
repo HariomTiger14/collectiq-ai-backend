@@ -146,6 +146,7 @@ def record_db_failure(
     row_count: int,
     status_code: int,
     body: str,
+    duration_seconds: float | None = None,
     context: dict[str, Any] | None = None,
 ) -> bool:
     """Record ONE ops_error_events row for a diagnosable write failure.
@@ -173,7 +174,19 @@ def record_db_failure(
                 sqlstate=sqlstate,
                 status_code=status_code,
                 body=body,
-                context={"failureKind": RECORDED_SQLSTATES[sqlstate], **(context or {})},
+                context={
+                    "failureKind": RECORDED_SQLSTATES[sqlstate],
+                    # How long the request actually took. A 39-row write that
+                    # sits for almost exactly the 8s statement_timeout is
+                    # contention; one that fails fast is not. Co-occurrence
+                    # with another job cannot tell those apart.
+                    "durationSeconds": (
+                        round(duration_seconds, 2)
+                        if duration_seconds is not None
+                        else None
+                    ),
+                    **(context or {}),
+                },
             ),
             headers={"Prefer": "return=minimal"},
         )

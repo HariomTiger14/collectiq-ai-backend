@@ -219,6 +219,57 @@ class WritePathIntegrationTest(unittest.TestCase):
         self.assertEqual(self.fake.posts[0][1]["context"]["rowCount"], 3)
 
 
+class DurationCaptureTest(unittest.TestCase):
+    """How long the failed request took separates contention from cost.
+
+    A 39-row write that sits for almost exactly the 8s statement_timeout was
+    waiting on something; one that fails fast was not. Co-occurrence with
+    another job in the same hour cannot distinguish those."""
+
+    def setUp(self):
+        self.fake = _FakeRecorder()
+        patcher = mock.patch.object(recorder_module, "_active", self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_event_carries_how_long_the_request_took(self):
+        record_db_failure(
+            operation="catalog_upsert", row_count=39, status_code=500,
+            body=TIMEOUT_BODY, duration_seconds=7.984,
+        )
+        self.assertEqual(self.fake.posts[0][1]["context"]["durationSeconds"], 7.98)
+
+    def test_duration_is_optional_and_absent_rather_than_wrong(self):
+        record_db_failure(
+            operation="catalog_upsert", row_count=39, status_code=500,
+            body=TIMEOUT_BODY,
+        )
+        self.assertIsNone(self.fake.posts[0][1]["context"]["durationSeconds"])
+
+    def test_the_real_write_path_reports_a_duration(self):
+        client = SupabaseCatalogClient(
+            supabase_url="https://db.test", service_role_key="k", timeout_seconds=5
+        )
+        with httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(500, text=TIMEOUT_BODY)
+            )
+        ) as http:
+            with self.assertRaises(SystemExit):
+                self.client_insert(client, http)
+        duration = self.fake.posts[0][1]["context"]["durationSeconds"]
+        self.assertIsNotNone(duration)
+        self.assertGreaterEqual(duration, 0.0)
+
+    @staticmethod
+    def client_insert(client, http):
+        return client._insert_history_rows(
+            http,
+            [{"pricecharting_id": "1", "change_hash": "c1", "currency": "USD"}],
+            batch_offset=0,
+        )
+
+
 class LayerDeduplicationTest(unittest.TestCase):
     """One failed request must produce one event, not one per layer.
 
