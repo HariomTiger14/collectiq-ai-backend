@@ -27,7 +27,7 @@ logger = logging.getLogger("collectiq.pricing.pricecharting")
 def attribution_url_for(
     *, pricing_provider: str | None, matched_product_id: str | None
 ) -> str | None:
-    """Real link-out for the "Pricing data by PriceCharting" attribution.
+    """Real link-out for the "Powered by PriceCharting" attribution.
 
     matchedProductId is PriceCharting's own numeric product id, already
     computed above in providerDiagnostics but never previously surfaced to a

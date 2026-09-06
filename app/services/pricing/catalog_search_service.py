@@ -2043,6 +2043,22 @@ def _source_display_name(row: dict[str, Any]) -> str:
     return _PROVIDER_DISPLAY_NAMES.get(provider, "PriceCharting")
 
 
+def _attribution_for(source: str) -> str:
+    """Attribution line for a pricing source.
+
+    PriceCharting gets "Powered by PriceCharting" verbatim: their Terms
+    put consumer apps outside what a Legendary subscription covers
+    ("cannot be used in any software, application, or system that is
+    accessible to third parties ... without express written permission"),
+    and the written permission PackLox holds is conditional on that exact
+    wording plus a linkback. The generic "Pricing data by X" phrasing
+    stays for every other provider, none of which specify wording.
+    """
+    if source == "PriceCharting":
+        return "Powered by PriceCharting"
+    return f"Pricing data by {source}"
+
+
 def _row_to_result(row: dict[str, Any], query: str) -> CatalogSearchResult:
     pricing = _pricing_from_row(row)
     source = _source_display_name(row)
@@ -2056,7 +2072,7 @@ def _row_to_result(row: dict[str, Any], query: str) -> CatalogSearchResult:
         productUrl=_clean(row.get("product_url")),
         sourceFile=_clean(row.get("source_file")),
         confidence=_match_confidence(row, query),
-        attribution=f"Pricing data by {source}",
+        attribution=_attribution_for(source),
         lastUpdated=_latest_timestamp(row),
         imageUrl=None,
         pricing=pricing,
