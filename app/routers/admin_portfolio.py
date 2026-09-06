@@ -3,7 +3,10 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from app.routers.admin_auth import require_admin_import_token
+from app.routers.admin_auth import (
+    require_admin_import_token,
+    require_admin_permission,
+)
 from app.services.admin_audit_service import AdminAuditService
 from app.services.admin_portfolio_service import AdminPortfolioService
 
@@ -85,7 +88,7 @@ def get_admin_portfolio_item(
 def update_admin_portfolio_item(
     item_id: str,
     request: PortfolioItemUpdateRequest,
-    _admin: dict[str, Any] = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_permission("users:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminPortfolioService().update_item(

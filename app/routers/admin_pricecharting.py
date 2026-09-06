@@ -4,7 +4,10 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.core.config import settings
-from app.routers.admin_auth import require_admin_import_token
+from app.routers.admin_auth import (
+    require_admin_import_token,
+    require_admin_permission,
+)
 from app.services.admin_import_job_service import AdminImportJobService
 from scripts.import_pricecharting_catalog import PRICECHARTING_CSV_ENV_VARS
 from scripts.import_pricecharting_catalog import (
@@ -33,7 +36,7 @@ def import_pricecharting_catalog(
         le=600,
         description="Download/import timeout in seconds.",
     ),
-    _admin: None = Depends(require_admin_import_token),
+    _admin: None = Depends(require_admin_permission("imports:run")),
 ) -> dict[str, Any]:
     source_filter = _normalized_source_filter(source)
     jobs = AdminImportJobService()

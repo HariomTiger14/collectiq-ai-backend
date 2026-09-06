@@ -1,6 +1,9 @@
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 
-from app.routers.admin_auth import require_admin_job_token
+from app.routers.admin_auth import (
+    require_admin_job_token,
+    require_admin_permission,
+)
 from app.services.data_requests.data_request_service import (
     DataRequestError,
     DataRequestNotFoundError,
@@ -113,7 +116,7 @@ async def list_my_data_requests(
 async def list_admin_data_requests(
     status_filter: str | None = Query(None, alias="status"),
     limit: int = Query(50, ge=1, le=200),
-    _admin: None = Depends(require_admin_job_token),
+    _admin: None = Depends(require_admin_permission("admin:read")),
 ) -> dict:
     try:
         return _service.list_requests(status=status_filter, limit=limit)
@@ -149,7 +152,7 @@ async def purge_due_data_requests(
 async def process_admin_data_request(
     request_id: str,
     dry_run: bool = Query(True, alias="dryRun"),
-    _admin: None = Depends(require_admin_job_token),
+    _admin: None = Depends(require_admin_permission("users:write")),
 ) -> dict:
     try:
         return _service.process_request(request_id, dry_run=dry_run)

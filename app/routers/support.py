@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel
 
-from app.routers.admin_auth import require_admin_job_token
+from app.routers.admin_auth import require_admin_permission
 from app.services.support.support_ticket_service import (
     MAX_ATTACHMENT_BYTES,
     SupportTicketError,
@@ -147,7 +147,7 @@ async def upload_my_attachment(
 async def list_admin_tickets(
     status_filter: str | None = Query(None, alias="status"),
     limit: int = Query(50, ge=1, le=200),
-    _admin: None = Depends(require_admin_job_token),
+    _admin: None = Depends(require_admin_permission("admin:read")),
 ) -> dict:
     return _handle(lambda: _service.list_tickets(status=status_filter, limit=limit))
 
@@ -155,7 +155,7 @@ async def list_admin_tickets(
 @router.get("/admin/support/tickets/{ticket_id}")
 async def get_admin_ticket_thread(
     ticket_id: str,
-    _admin: None = Depends(require_admin_job_token),
+    _admin: None = Depends(require_admin_permission("admin:read")),
 ) -> dict:
     return _handle(lambda: _service.get_ticket_thread(ticket_id=ticket_id, user_id=None))
 
@@ -164,7 +164,7 @@ async def get_admin_ticket_thread(
 async def reply_to_ticket_as_admin(
     ticket_id: str,
     payload: ReplyRequest,
-    _admin: None = Depends(require_admin_job_token),
+    _admin: None = Depends(require_admin_permission("users:write")),
 ) -> dict:
     return _handle(lambda: _service.reply_as_admin(ticket_id=ticket_id, body=payload.body))
 
@@ -173,7 +173,7 @@ async def reply_to_ticket_as_admin(
 async def set_admin_ticket_status(
     ticket_id: str,
     payload: SetStatusRequest,
-    _admin: None = Depends(require_admin_job_token),
+    _admin: None = Depends(require_admin_permission("users:write")),
 ) -> dict:
     return _handle(lambda: _service.set_ticket_status(ticket_id=ticket_id, status=payload.status))
 
@@ -182,7 +182,7 @@ async def set_admin_ticket_status(
 async def upload_admin_attachment(
     message_id: str,
     file: UploadFile = File(...),
-    _admin: None = Depends(require_admin_job_token),
+    _admin: None = Depends(require_admin_permission("users:write")),
 ) -> dict:
     raw_bytes = await file.read()
     if len(raw_bytes) > MAX_ATTACHMENT_BYTES:

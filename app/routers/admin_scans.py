@@ -3,7 +3,10 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from app.routers.admin_auth import require_admin_import_token
+from app.routers.admin_auth import (
+    require_admin_import_token,
+    require_admin_permission,
+)
 from app.services.admin_audit_service import AdminAuditService
 from app.services.admin_scan_failure_service import (
     AdminScanFailureService,
@@ -100,7 +103,7 @@ def scan_failures(
 @router.post("/failures/{scan_id}/reviewed")
 def mark_scan_failure_reviewed(
     scan_id: str,
-    _admin: None = Depends(require_admin_import_token),
+    _admin: None = Depends(require_admin_permission("scans:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminScanFailureService().mark_reviewed(scan_id)
@@ -142,7 +145,7 @@ def mark_scan_failure_reviewed(
 def resolve_scan_failure(
     scan_id: str,
     request: ScanFailureResolveRequest,
-    _admin: None = Depends(require_admin_import_token),
+    _admin: None = Depends(require_admin_permission("scans:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminScanFailureService().resolve_failure(
@@ -188,7 +191,7 @@ def resolve_scan_failure(
 @router.post("/failures/{scan_id}/retry")
 def retry_scan_failure_analysis(
     scan_id: str,
-    _admin: None = Depends(require_admin_import_token),
+    _admin: None = Depends(require_admin_permission("scans:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminScanFailureService().retry_analysis(scan_id)
@@ -228,7 +231,7 @@ def retry_scan_failure_analysis(
 @router.post("/failure-actions/reviewed")
 def bulk_mark_scan_failures_reviewed(
     request: BulkScanFailureRequest,
-    _admin: dict[str, Any] = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_permission("scans:write")),
 ) -> dict[str, Any]:
     payload = AdminScanFailureService().bulk_mark_reviewed(request.scanIds)
     _record_audit(
@@ -246,7 +249,7 @@ def bulk_mark_scan_failures_reviewed(
 @router.post("/failure-actions/resolved")
 def bulk_resolve_scan_failures(
     request: BulkScanFailureRequest,
-    _admin: dict[str, Any] = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_permission("scans:write")),
 ) -> dict[str, Any]:
     payload = AdminScanFailureService().bulk_resolve_failures(
         request.scanIds,
