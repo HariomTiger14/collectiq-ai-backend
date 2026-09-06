@@ -55,7 +55,7 @@ class CatalogSearchResult(BaseModel):
     productUrl: str | None = None
     sourceFile: str | None = None
     confidence: float | None = None
-    attribution: str = "Pricing data by PriceCharting"
+    attribution: str = "Powered by PriceCharting"
     lastUpdated: str | None = None
     imageUrl: str | None = None
     # Link-only, never rendered inline: the same publisher-sourced image

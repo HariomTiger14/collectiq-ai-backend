@@ -33,7 +33,7 @@ def _result(*, id: str, confidence: float) -> CatalogSearchResult:
         productUrl=None,
         sourceFile=None,
         confidence=confidence,
-        attribution="Pricing data by PriceCharting",
+        attribution="Powered by PriceCharting",
         lastUpdated=None,
         imageUrl=None,
         pricing=CatalogSearchPricing(
@@ -141,7 +141,7 @@ class FindBestMatchTest(unittest.TestCase):
             productUrl=None,
             sourceFile=None,
             confidence=0.96,
-            attribution="Pricing data by PriceCharting",
+            attribution="Powered by PriceCharting",
             lastUpdated=None,
             imageUrl=None,
             pricing=CatalogSearchPricing(

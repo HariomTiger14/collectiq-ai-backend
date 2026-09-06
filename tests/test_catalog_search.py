@@ -13,6 +13,7 @@ from app.services.pricing.catalog_search_service import (
     resolve_category_group_filters,
     CatalogItemNotFoundError,
     CatalogSearchService,
+    _attribution_for,
     _funko_lookup_title,
     _lego_set_number,
     _magic_card_name,
@@ -54,6 +55,54 @@ def _patched_marketplace_credentials():
 
 
 class CatalogSearchServiceTest(unittest.TestCase):
+    def test_pricecharting_attribution_wording_is_contractual(self) -> None:
+        # "Powered by PriceCharting" is not a copy choice. PriceCharting's
+        # Terms put consumer apps outside what a Legendary subscription
+        # covers -- Price Data "cannot be used in any software,
+        # application, or system that is accessible to third parties ...
+        # without express written permission" -- and the permission
+        # PackLox holds is conditional on that exact wording plus a
+        # linkback. Changing this string breaks the grant the whole app
+        # depends on, so it is pinned here rather than left to review.
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_pricecharting_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "pricecharting_id": "pc-1",
+                            "product_name": "Charizard #4",
+                            "console_name": "Pokemon Base Set",
+                            "product_url": "https://www.pricecharting.com/game/pokemon-base-set/charizard-4",
+                            "loose_price": 30000,
+                        },
+                    ],
+                )
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        result = service.search("charizard", limit=5).results[0]
+
+        self.assertEqual(result.attribution, "Powered by PriceCharting")
+        # The linkback is the other half of the same condition.
+        self.assertEqual(
+            result.productUrl,
+            "https://www.pricecharting.com/game/pokemon-base-set/charizard-4",
+        )
+
+    def test_non_pricecharting_sources_keep_generic_attribution(self) -> None:
+        # Only PriceCharting specifies wording; nobody else should be
+        # relabelled "Powered by".
+        self.assertEqual(_attribution_for("KicksDB"), "Pricing data by KicksDB")
+        self.assertEqual(_attribution_for("eBay"), "Pricing data by eBay")
+        self.assertEqual(_attribution_for("PriceCharting"), "Powered by PriceCharting")
+
     def test_search_returns_ranked_pricecharting_results(self) -> None:
         requests: list[httpx.Request] = []
 
