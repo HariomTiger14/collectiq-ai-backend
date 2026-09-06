@@ -23,6 +23,7 @@ import json
 import os
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -32,6 +33,23 @@ DEFAULT_SOURCE_URL = (
     "master/funko_pop.json"
 )
 DEFAULT_BATCH_SIZE = 500
+
+# Hosts we hold, or reasonably believe we hold, the right to display from.
+#
+# The kennymkchan dataset is MIT licensed, but MIT covers the *metadata* --
+# every one of its 23,940 imageName values (measured 2026-09-06: 23,940 of
+# 23,940, no exceptions) points at images.hobbydb.com, whose photographs
+# the MIT grant does not reach and whose terms have never been reviewed.
+# That host is therefore NOT on this list, so a plain re-run of this
+# importer now fails loudly instead of silently repopulating the table.
+#
+# The wider lesson this guard encodes: an open-source licence on a dataset
+# says nothing about the images it links to. Three PackLox sources have
+# now been cleared on that mistaken basis (kennymkchan/hobbyDB,
+# Lorcana-API/Disney, TCGdex/Pokemon Company). Image hosts arrive as row
+# DATA, not as code, so a code review cannot catch them -- only an
+# import-time assertion like this one can.
+ALLOWED_IMAGE_HOSTS: frozenset[str] = frozenset()
 
 
 def normalize_title(title: str) -> str:
@@ -47,6 +65,33 @@ def content_hash_for(row: dict[str, Any]) -> str:
         ]
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def assert_image_hosts_allowed(source_rows: list[dict[str, Any]]) -> None:
+    """Refuse to import image URLs from hosts we have no display right to.
+
+    Fails the whole run rather than skipping offending rows: a partial
+    import would leave the table in a state nobody reasoned about, and the
+    point here is to force a rights decision, not to route around one.
+    """
+    seen: dict[str, int] = {}
+    for source_row in source_rows:
+        image_url = str(source_row.get("imageName") or "").strip()
+        if not image_url:
+            continue
+        host = urlparse(image_url).netloc.lower()
+        if host and host not in ALLOWED_IMAGE_HOSTS:
+            seen[host] = seen.get(host, 0) + 1
+    if not seen:
+        return
+    detail = ", ".join(f"{host} ({count} rows)" for host, count in sorted(seen.items()))
+    raise SystemExit(
+        "Refusing to import: image URLs point at host(s) not in "
+        f"ALLOWED_IMAGE_HOSTS -- {detail}.\n"
+        "An MIT/CC licence on the dataset does not cover the images it "
+        "links to. Secure a display right for the host, then add it to "
+        "ALLOWED_IMAGE_HOSTS; do not widen the list to make this pass."
+    )
 
 
 def fetch_source_rows(source_url: str, timeout_seconds: float) -> list[dict[str, Any]]:
@@ -144,6 +189,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Fetching {args.source_url} ...", flush=True)
     source_rows = fetch_source_rows(args.source_url, args.timeout_seconds)
     print(f"Fetched {len(source_rows)} source rows.", flush=True)
+
+    # Rights gate before anything is transformed or written. Runs on
+    # --dry-run too: the point is to surface the host, not the payload.
+    assert_image_hosts_allowed(source_rows)
 
     catalog_rows = [row for row in (to_catalog_row(r) for r in source_rows) if row is not None]
     skipped = len(source_rows) - len(catalog_rows)
