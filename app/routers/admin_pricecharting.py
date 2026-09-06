@@ -36,7 +36,7 @@ def import_pricecharting_catalog(
         le=600,
         description="Download/import timeout in seconds.",
     ),
-    _admin: None = Depends(require_admin_permission("imports:run")),
+    _admin: dict[str, Any] = Depends(require_admin_permission("imports:run")),
 ) -> dict[str, Any]:
     source_filter = _normalized_source_filter(source)
     jobs = AdminImportJobService()
@@ -154,7 +154,7 @@ def import_pricecharting_catalog(
 @router.get("/import-jobs")
 def list_pricecharting_import_jobs(
     limit: int = Query(25, ge=1, le=100),
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     return AdminImportJobService().list_jobs(limit=limit)
 

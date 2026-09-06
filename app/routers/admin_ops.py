@@ -25,7 +25,7 @@ BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
 @router.get("/readiness")
 def ops_readiness(
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     # A fast subset of /admin/ops/summary — just the config-readiness
     # checklist, which is pure in-memory settings inspection (sub-ms).
@@ -45,7 +45,7 @@ def ops_readiness(
 
 @router.get("/pipeline-health")
 def ops_pipeline_health(
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     # The Scheduled-jobs board: per-job status merging the run ledger
     # (ops_cron_runs), data-freshness probes (admin_pipeline_health RPC),
@@ -65,7 +65,7 @@ def ops_pipeline_health(
 def ops_runs(
     job: str | None = Query(default=None, max_length=80),
     limit: int = Query(default=50, ge=1, le=200),
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     try:
         return AdminOpsObservabilityService().runs(job=job, limit=limit)
@@ -80,7 +80,7 @@ def ops_runs(
 def ops_errors(
     fingerprint: str | None = Query(default=None, max_length=64),
     limit: int = Query(default=50, ge=1, le=100),
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     # Without a fingerprint: grouped error feed (one row per distinct
     # route/job + error class). With one: the individual occurrences,
@@ -96,7 +96,7 @@ def ops_errors(
 
 @router.get("/summary")
 def ops_summary(
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     generated_at = datetime.now(timezone.utc).isoformat()
     health_report = HealthCheckService().run()

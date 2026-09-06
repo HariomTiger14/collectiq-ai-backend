@@ -19,7 +19,7 @@ def list_admin_audit_events(
     since: str | None = Query(default=None, min_length=1),
     until: str | None = Query(default=None, min_length=1),
     limit: int = Query(50, ge=1, le=200),
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     try:
         return AdminAuditService().list_events(

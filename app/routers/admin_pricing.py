@@ -41,7 +41,7 @@ class BulkPricingActionRequest(BaseModel):
 
 @router.get("/health")
 def pricing_health(
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     try:
         return PricingHealthService().health()
@@ -58,7 +58,7 @@ def pricing_health(
 
 @router.get("/health/quick")
 def pricing_health_quick(
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     """Providers + currency only, no catalog RPC -- see
     PricingHealthService.quick_health for why this exists separately from
@@ -71,7 +71,7 @@ def pricing_health_quick(
 def reprice_all_portfolio_items(
     dry_run: bool = Query(False, alias="dryRun"),
     limit: int = Query(1000, ge=1, le=10000),
-    _admin: None = Depends(require_admin_job_token),
+    _admin: dict[str, Any] = Depends(require_admin_job_token),
 ) -> dict[str, Any]:
     """Scheduled batch re-pricing: re-value every portfolio item and persist
     refreshed values. Unavailable results are a no-op (never zero out a value).
@@ -79,6 +79,7 @@ def reprice_all_portfolio_items(
     summary = BatchRepricingService().reprice_all(limit=limit, dry_run=dry_run)
     payload = summary.to_dict()
     _record_audit(
+        admin=_admin,
         action="pricing.reprice_all",
         status="success",
         metadata={
@@ -98,11 +99,12 @@ def pricing_review_queue(
         pattern="^(all|needs_review|low_confidence|missing_price|stale_price)$",
     ),
     limit: int = Query(50, ge=1, le=200),
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     try:
         payload = AdminPricingReviewQueueService().list_queue(reason=reason, limit=limit)
         _record_audit(
+            admin=_admin,
             action="pricing_review_queue.viewed",
             status="success",
             metadata={"filter": reason, "count": payload.get("count", 0)},
@@ -110,6 +112,7 @@ def pricing_review_queue(
         return payload
     except ReviewQueueRepositoryError as error:
         _record_audit(
+            admin=_admin,
             action="pricing_review_queue.viewed",
             status="failure",
             metadata={"filter": reason, "error": str(error)},
@@ -125,11 +128,12 @@ def pricing_review_queue(
 @router.post("/review-queue/{item_id}/reviewed")
 def mark_pricing_reviewed(
     item_id: str,
-    _admin: None = Depends(require_admin_permission("pricing:write")),
+    _admin: dict[str, Any] = Depends(require_admin_permission("pricing:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminPricingReviewQueueService().mark_reviewed(item_id)
         _record_audit(
+            admin=_admin,
             action="pricing_review_queue.mark_reviewed",
             status="success",
             target_id=item_id,
@@ -137,6 +141,7 @@ def mark_pricing_reviewed(
         return payload
     except ReviewQueueItemNotFoundError as error:
         _record_audit(
+            admin=_admin,
             action="pricing_review_queue.mark_reviewed",
             status="failure",
             target_id=item_id,
@@ -150,6 +155,7 @@ def mark_pricing_reviewed(
 
     except ReviewQueueRepositoryError as error:
         _record_audit(
+            admin=_admin,
             action="pricing_review_queue.mark_reviewed",
             status="failure",
             target_id=item_id,
@@ -167,7 +173,7 @@ def mark_pricing_reviewed(
 def override_review_queue_price(
     item_id: str,
     request: PricingOverrideRequest,
-    _admin: None = Depends(require_admin_permission("pricing:write")),
+    _admin: dict[str, Any] = Depends(require_admin_permission("pricing:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminPricingReviewQueueService().override_price(
@@ -177,6 +183,7 @@ def override_review_queue_price(
             note=request.note,
         )
         _record_audit(
+            admin=_admin,
             action="pricing_review_queue.override_price",
             status="success",
             target_id=item_id,
@@ -189,6 +196,7 @@ def override_review_queue_price(
         return payload
     except ReviewQueueItemNotFoundError as error:
         _record_audit(
+            admin=_admin,
             action="pricing_review_queue.override_price",
             status="failure",
             target_id=item_id,
@@ -201,6 +209,7 @@ def override_review_queue_price(
         ) from error
     except ReviewQueueRepositoryError as error:
         _record_audit(
+            admin=_admin,
             action="pricing_review_queue.override_price",
             status="failure",
             target_id=item_id,
@@ -218,7 +227,7 @@ def override_review_queue_price(
 def assign_pricing_review_item(
     item_id: str,
     request: PricingAssignmentRequest,
-    _admin: None = Depends(require_admin_permission("pricing:write")),
+    _admin: dict[str, Any] = Depends(require_admin_permission("pricing:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminPricingReviewQueueService().assign_item(
@@ -227,6 +236,7 @@ def assign_pricing_review_item(
             status=request.status,
         )
         _record_audit(
+            admin=_admin,
             action="pricing_review_queue.assign",
             status="success",
             target_id=item_id,
@@ -238,6 +248,7 @@ def assign_pricing_review_item(
         return payload
     except ReviewQueueItemNotFoundError as error:
         _record_audit(
+            admin=_admin,
             action="pricing_review_queue.assign",
             status="failure",
             target_id=item_id,
@@ -250,6 +261,7 @@ def assign_pricing_review_item(
         ) from error
     except ReviewQueueRepositoryError as error:
         _record_audit(
+            admin=_admin,
             action="pricing_review_queue.assign",
             status="failure",
             target_id=item_id,
@@ -266,11 +278,12 @@ def assign_pricing_review_item(
 @router.post("/review-queue/{item_id}/retry")
 def retry_review_queue_pricing(
     item_id: str,
-    _admin: None = Depends(require_admin_permission("pricing:write")),
+    _admin: dict[str, Any] = Depends(require_admin_permission("pricing:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminPricingReviewQueueService().retry_pricing(item_id)
         _record_audit(
+            admin=_admin,
             action="pricing_review_queue.retry_pricing",
             status="success",
             target_id=item_id,
@@ -282,6 +295,7 @@ def retry_review_queue_pricing(
         return payload
     except ReviewQueueItemNotFoundError as error:
         _record_audit(
+            admin=_admin,
             action="pricing_review_queue.retry_pricing",
             status="failure",
             target_id=item_id,
@@ -295,6 +309,7 @@ def retry_review_queue_pricing(
 
     except ReviewQueueItemNotPriceableError as error:
         _record_audit(
+            admin=_admin,
             action="pricing_review_queue.retry_pricing",
             status="failure",
             target_id=item_id,
@@ -307,6 +322,7 @@ def retry_review_queue_pricing(
         ) from error
     except ReviewQueueRepositoryError as error:
         _record_audit(
+            admin=_admin,
             action="pricing_review_queue.retry_pricing",
             status="failure",
             target_id=item_id,
@@ -327,6 +343,7 @@ def bulk_mark_pricing_reviewed(
 ) -> dict[str, Any]:
     payload = AdminPricingReviewQueueService().bulk_mark_reviewed(request.itemIds)
     _record_audit(
+        admin=_admin,
         action="pricing_review_queue.bulk_mark_reviewed",
         status="success" if payload.get("success") else "failure",
         metadata={
@@ -345,6 +362,7 @@ def bulk_retry_review_queue_pricing(
 ) -> dict[str, Any]:
     payload = AdminPricingReviewQueueService().bulk_retry_pricing(request.itemIds)
     _record_audit(
+        admin=_admin,
         action="pricing_review_queue.bulk_retry_pricing",
         status="success" if payload.get("success") else "failure",
         metadata={
@@ -375,6 +393,7 @@ def _review_queue_error(
 
 def _record_audit(
     *,
+    admin: dict[str, Any] | None = None,
     action: str,
     status: str,
     target_id: str | None = None,
@@ -382,6 +401,12 @@ def _record_audit(
 ) -> None:
     try:
         AdminAuditService().record(
+            # Reuses admin_users.py's convention verbatim so the audit log has one
+            # actor format. Correct for BOTH identities without branching: a
+            # Supabase session carries an email, and _static_admin() returns
+            # id="admin_token" with an empty email -- so a runbook or cron action
+            # still records admin_token, accurately rather than by default.
+            actor=str((admin or {}).get("email") or (admin or {}).get("id") or "admin_token"),
             action=action,
             status=status,
             target_type="portfolio_item" if target_id else None,
