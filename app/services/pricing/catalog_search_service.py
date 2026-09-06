@@ -1152,21 +1152,28 @@ class CatalogSearchService:
         group_name = _POKEMON_SET_TCGPLAYER_GROUPS.get(set_name.lower())
 
         variant_token = _pokemon_variant_token(result.title)
+        # TCGdex: plain rows AND stage-1 safe same-face variants (reverse
+        # holo / reverse / holo / jumbo -- see SAFE_VARIANT_TAGS), no
+        # sibling check needed (the base scan depicts the right card face
+        # for all of them). Other bracket tags stay placeholder-only.
+        #
+        # Ordered ahead of the TCGplayer variant-exact probe (2026-09-06).
+        # The two are disjoint by construction: the exact probe returns
+        # None unless the token is shadowless/named-error, and this guard
+        # excludes exactly those tokens -- so no row's image changes. The
+        # win is skipping a wasted tcgplayer_pokemon_catalog round trip on
+        # safe-variant rows in the five classic sets.
+        if variant_token is None or is_safe_variant_tag(variant_token):
+            tcgdex_image_url = self._fetch_tcgdex_pokemon_image(set_name, card_number)
+            if tcgdex_image_url:
+                return result.model_copy(update={"imageUrl": tcgdex_image_url})
+
         if group_name is not None:
             exact_image_url = self._fetch_tcgplayer_exact_variant_image(
                 group_name, card_number, variant_token
             )
             if exact_image_url:
                 return result.model_copy(update={"imageUrl": exact_image_url})
-
-        # TCGdex: plain rows AND stage-1 safe same-face variants (reverse
-        # holo / reverse / holo / jumbo -- see SAFE_VARIANT_TAGS), no
-        # sibling check needed (the base scan depicts the right card face
-        # for all of them). Other bracket tags stay placeholder-only.
-        if variant_token is None or is_safe_variant_tag(variant_token):
-            tcgdex_image_url = self._fetch_tcgdex_pokemon_image(set_name, card_number)
-            if tcgdex_image_url:
-                return result.model_copy(update={"imageUrl": tcgdex_image_url})
 
         # TCGplayer generic fallback keeps the original sibling-suppression
         # semantics. Candidate fetched FIRST, sibling check only before
@@ -1227,14 +1234,14 @@ class CatalogSearchService:
         # (our detail page -- card search results stay link-only).
         return f"{image_base}/high.webp"
 
-    @staticmethod
-    def _tcgplayer_full_size(image_url: str) -> str:
-        # The TCGCSV import stored TCGplayer's 200px thumbnail URLs; the
-        # same CDN serves the identical photo at _in_1000x1000 (verified
-        # live: 714x1000, HTTP 200 -- vs 403 for other guessed suffixes).
-        # Substitute only the known thumbnail suffix; anything else passes
-        # through untouched.
-        return image_url.replace("_200w.jpg", "_in_1000x1000.jpg")
+    # NOTE (2026-09-06): _tcgplayer_full_size removed. It rewrote the
+    # TCGCSV-stored "_200w.jpg" thumbnail suffix to "_in_1000x1000.jpg"
+    # (714x1000). PackLox has no contractual relationship with TCGplayer
+    # -- these URLs reach their CDN via the free tcgcsv.com mirror -- so
+    # the stored 200px thumbnail is now passed through unchanged, matching
+    # what admin_catalog_service already did. Only "_200w.jpg" and
+    # "_in_1000x1000.jpg" are valid suffixes on that CDN (others 403), so
+    # there is no intermediate size to fall back to.
 
     def _fetch_tcgplayer_rows(self, group_name: str, card_number: str) -> list[dict[str, Any]]:
         params = {
@@ -1256,7 +1263,7 @@ class CatalogSearchService:
             for row in self._fetch_tcgplayer_rows(f"{group_name} (Shadowless)", card_number):
                 image_url = row.get("image_url")
                 if image_url:
-                    return self._tcgplayer_full_size(str(image_url))
+                    return str(image_url)
             return None
         # Named error/misprint products (e.g. "Charizard (Black Dot
         # Error)"): only ever an exact match when every word of the
@@ -1272,7 +1279,7 @@ class CatalogSearchService:
                 continue
             product_words = _normalize_variant_words(str(row.get("product_name") or ""))
             if variant_words.issubset(product_words) and row.get("image_url"):
-                return self._tcgplayer_full_size(str(row["image_url"]))
+                return str(row["image_url"])
         return None
 
     def _fetch_tcgplayer_generic_image(self, group_name: str, card_number: str) -> str | None:
@@ -1286,7 +1293,7 @@ class CatalogSearchService:
             # data — either way, no single image we're confident in.
             return None
         image_url = rows[0].get("image_url")
-        return self._tcgplayer_full_size(str(image_url)) if image_url else None
+        return str(image_url) if image_url else None
 
     def _has_sibling_pokemon_rows(
         self, set_name: str, card_number: str, *, exclude_id: str
