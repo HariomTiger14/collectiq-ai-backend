@@ -246,6 +246,13 @@ def _compact_valuation_snapshot(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": row.get("id"),
         "valueAud": row.get("value_aud"),
+        # value_aud is historically misnamed and holds whatever currency was
+        # active at write time. Without this the admin chart could not tell
+        # AUD points from USD ones and subtracted across them, reporting a
+        # ~34% crash on an item whose value had not moved. The column is NOT
+        # NULL DEFAULT 'AUD' (mobile migration 202608220001, legacy rows
+        # backfilled), so the fallback is belt-and-braces.
+        "currency": (row.get("currency") or "AUD"),
         "displayString": row.get("display_string"),
         "valuationStatus": row.get("valuation_status"),
         "valuationStrategy": row.get("valuation_strategy"),

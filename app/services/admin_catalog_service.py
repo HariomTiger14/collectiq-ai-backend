@@ -1308,6 +1308,13 @@ def _compact_catalog_row(row: dict[str, Any], *, source: str) -> dict[str, Any]:
         "source": "PriceCharting",
         "lastUpdated": row.get("updated_at"),
         "imageUrl": None,
+        # The note the admin edit form writes was never read back, so the box
+        # rendered empty every time -- a saved note was invisible, and the
+        # next edit silently replaced it. PriceCharting only: kicksdb_catalog
+        # has no admin_note column, and its branch above deliberately omits
+        # the key rather than emitting a null the portal would have to
+        # special-case.
+        "adminNote": row.get("admin_note"),
         "pricing": {"marketValue": market_value, "currency": (row.get("currency") or "USD").upper()},
     }
 

@@ -1036,6 +1036,10 @@ def _compact_valuation_snapshot(
         "portfolioItemId": row.get("portfolio_item_id"),
         "itemTitle": item_title or "Deleted or unknown item",
         "valueAud": row.get("value_aud"),
+        # See _compact_valuation_snapshot in admin_portfolio_service.py: the
+        # column is misnamed, and a history row without its currency cannot
+        # be compared safely against another.
+        "currency": (row.get("currency") or "AUD"),
         "displayString": row.get("display_string"),
         "valuationStatus": row.get("valuation_status"),
         "valuationStrategy": row.get("valuation_strategy"),
