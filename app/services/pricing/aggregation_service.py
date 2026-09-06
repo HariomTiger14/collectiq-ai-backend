@@ -16,6 +16,23 @@ from app.services.pricing.pricing_intelligence_engine import PricingConfidenceEn
 
 logger = logging.getLogger("collectiq.pricing")
 
+# Providers quote their own native currency and the backend converts nothing,
+# so this is only the shape a currency takes when a provider omitted it -- not
+# an assumption that every provider is USD. eBay, for one, is genuinely AUD
+# (EBAY_MARKETPLACE_ID defaults to EBAY_AU) and keeps saying so.
+_DEFAULT_CURRENCY = "USD"
+
+
+def _normalize_currency(value: str | None) -> str:
+    """Strip first, then fall back.
+
+    `(value or "USD").strip().upper()` reads as equivalent and is not: a
+    whitespace-only string is truthy, so the fallback never fires and the
+    expression returns "" -- an unlabelled amount. Stripping first makes
+    "   " behave like "" and like None.
+    """
+    return (value or "").strip().upper() or _DEFAULT_CURRENCY
+
 
 class PricingAggregationService:
     provider_name = "aggregate"
@@ -107,6 +124,16 @@ class PricingAggregationService:
             for result in provider_results
             for sale in result.comparableSales
         )
+        # Checked here, before the confidence engine, because outlier removal
+        # and the median that follows compare raw soldPrice values with no
+        # notion of currency. Pooling providers is the point of this class, so
+        # the moment two of them quote different currencies -- eBay is AUD,
+        # PriceCharting and KicksDB are USD -- an aggregate price is arithmetic
+        # on unlike units. Converting here is deliberately out of scope: the
+        # backend stores provider-native amounts and converts nothing, so the
+        # honest answer is no price rather than a confidently wrong one.
+        self._reject_mixed_currency_comps(comps)
+
         provider_count = self._provider_count(provider_results, comps)
         intelligence = self._confidence_engine.analyze(
             recognition=recognition,
@@ -160,7 +187,12 @@ class PricingAggregationService:
             estimatedMarketValue=estimated_value,
             lowEstimate=low_estimate,
             highEstimate=high_estimate,
-            currency=provider_results[0].currency or "AUD",
+            # Defensive only: PricingResult.currency is a required field and
+            # every provider sets it, so this fallback is not reachable today.
+            # It defaults to USD rather than AUD so that if a provider ever
+            # does omit it, the guess matches the provider-native currency the
+            # rest of the system assumes.
+            currency=_normalize_currency(provider_results[0].currency),
             pricingSource=", ".join(sources) if sources else "Mock pricing fallback",
             pricingConfidence=confidence,
             lastUpdated=utc_timestamp(),
@@ -228,6 +260,28 @@ class PricingAggregationService:
             f"{label}:{counts[label]}" for label in sorted(counts)
         )
 
+    def _reject_mixed_currency_comps(self, comps: list[MarketComparableSale]) -> None:
+        """Refuse to aggregate comparable sales quoted in different currencies.
+
+        Raises EmptyMarketDataError, which both analyze routes already handle
+        as a no-market-match placeholder -- the same outcome as a provider
+        returning nothing usable, which is exactly what this is.
+        """
+        currencies = {sale.currency for sale in comps}
+        if len(currencies) <= 1:
+            return
+        detail = ", ".join(sorted(currencies))
+        logger.warning(
+            "Refusing to aggregate mixed-currency comparable sales currencies=%s "
+            "compCount=%s",
+            detail,
+            len(comps),
+        )
+        raise EmptyMarketDataError(
+            "Mixed comparable sale currencies cannot be aggregated safely "
+            f"({detail}). No converted price is available for this item."
+        )
+
     def _normalize_sales(self, sales) -> list[MarketComparableSale]:
         normalized: list[MarketComparableSale] = []
         for sale in sales:
@@ -239,7 +293,7 @@ class PricingAggregationService:
                     source=(sale.source or "Unknown source").strip(),
                     title=(sale.title or "Comparable sale").strip(),
                     soldPrice=price,
-                    currency=(sale.currency or "AUD").strip().upper(),
+                    currency=_normalize_currency(sale.currency),
                     soldDate=(sale.soldDate or utc_timestamp()).strip(),
                     condition=(sale.condition or "Unknown").strip(),
                     url=sale.url,
