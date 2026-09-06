@@ -10,10 +10,16 @@ SUPPORTED_DISPLAY_CURRENCIES = {"AUD", "CAD", "GBP", "USD"}
 
 
 def normalize_display_currency(value: str | None) -> str:
-    currency = (value or settings.default_display_currency or "AUD").strip().upper()
+    # Both fallbacks route through the configured default: an unrecognised
+    # code used to silently become AUD, which is how a USD provider price
+    # ended up labelled in a currency nothing had chosen.
+    default = (settings.default_display_currency or "USD").strip().upper()
+    if default not in SUPPORTED_DISPLAY_CURRENCIES:
+        default = "USD"
+    currency = (value or default).strip().upper()
     if currency in SUPPORTED_DISPLAY_CURRENCIES:
         return currency
-    return "AUD"
+    return default
 
 
 def convert_pricing_result(

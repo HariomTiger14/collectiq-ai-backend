@@ -265,7 +265,9 @@ class BatchRepricingService:
         value = float(pricing.estimatedMarketValue)
         low = _to_float(pricing.lowEstimate)
         high = _to_float(pricing.highEstimate)
-        currency = (pricing.currency or "AUD").strip().upper() or "AUD"
+        currency = (
+            pricing.currency or settings.default_display_currency
+        ).strip().upper() or settings.default_display_currency.strip().upper()
         source = _source_name(pricing) or "market"
 
         raw = dict(row.get("raw_json") or {})
@@ -563,11 +565,14 @@ def _source_name(pricing: Any) -> str | None:
 
 
 def _display_currency_from_row(row: dict[str, Any]) -> str:
+    # Falls back to the configured default rather than a second hardcoded
+    # "AUD" -- two independent defaults is how a value ends up labelled in a
+    # currency nothing actually chose.
     raw = row.get("raw_json") or {}
     return (
         _clean(raw.get("currency"))
         or _clean((raw.get("pricing") or {}).get("currency"))
-        or "AUD"
+        or settings.default_display_currency.strip().upper()
     )
 
 

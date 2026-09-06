@@ -15,7 +15,6 @@ from app.services.pricing.catalog_search_service import CatalogSearchError
 from app.services.pricing.portfolio_catalog_matching_service import (
     PortfolioCatalogMatchingError,
     PortfolioItemReader,
-    _display_currency_from_item,
     backfill_catalog_history_for_item,
     build_match_query,
     find_best_match,
@@ -191,20 +190,6 @@ class FindBestMatchTest(unittest.TestCase):
 
         assert match is not None
         self.assertEqual(match["id"], "x")
-
-
-class DisplayCurrencyFromItemTest(unittest.TestCase):
-    def test_uses_raw_json_currency(self) -> None:
-        item = {"raw_json": {"currency": "USD"}}
-        self.assertEqual(_display_currency_from_item(item), "USD")
-
-    def test_falls_back_to_nested_pricing_currency(self) -> None:
-        item = {"raw_json": {"pricing": {"currency": "GBP"}}}
-        self.assertEqual(_display_currency_from_item(item), "GBP")
-
-    def test_defaults_to_aud(self) -> None:
-        self.assertEqual(_display_currency_from_item({}), "AUD")
-        self.assertEqual(_display_currency_from_item({"raw_json": {}}), "AUD")
 
 
 def _history_point(*, valid_from: str, market_value: float | None, currency: str = "USD") -> CatalogHistoryPoint:

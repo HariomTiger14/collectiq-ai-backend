@@ -221,8 +221,6 @@ def backfill_catalog_history_for_item(
     earliest_existing = reader.fetch_earliest_snapshot_at(
         item_id=item["id"], user_id=item["user_id"]
     )
-    display_currency = _display_currency_from_item(item)
-
     rows: list[dict[str, Any]] = []
     for point in detail.history:
         if earliest_existing is not None and point.validFrom >= earliest_existing:
@@ -263,15 +261,6 @@ def backfill_catalog_history_for_item(
         )
 
     return reader.insert_snapshots(rows)
-
-
-def _display_currency_from_item(item: dict[str, Any]) -> str:
-    raw = item.get("raw_json") or {}
-    currency = str(raw.get("currency") or "").strip()
-    if currency:
-        return currency
-    pricing_currency = str((raw.get("pricing") or {}).get("currency") or "").strip()
-    return pricing_currency or "AUD"
 
 
 def _utc_now_iso() -> str:
