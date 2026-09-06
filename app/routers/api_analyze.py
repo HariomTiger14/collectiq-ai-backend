@@ -40,7 +40,6 @@ from app.services.pricing.base_pricing_provider import (
 )
 from app.services.pricing.cache_policy import pricing_cache_policy
 from app.services.pricing.currency_conversion import (
-    convert_pricing_result,
     normalize_display_currency,
 )
 from app.services.pricing.pricecharting_pricing_provider import attribution_url_for
@@ -987,7 +986,8 @@ def _price_recognition(
             source=provider_name,
             reason=str(exc),
         )
-    result = convert_pricing_result(result, target_currency=display_currency)
+    # Stored and returned in the provider's own currency -- see
+    # RepriceService.reprice for why converting before persisting was wrong.
     try:
         _shared_pricing_cache.set(
             recognition,

@@ -70,7 +70,11 @@ class RepriceEndpointTest(unittest.TestCase):
         self.assertEqual(pricing["reasonCode"], "PROVIDER_NOT_CONFIGURED")
         self.assertIn("provider missing", pricing["displayMessage"])
 
-    def test_reprice_converts_provider_usd_to_display_currency(self) -> None:
+    def test_reprice_keeps_the_providers_own_currency(self) -> None:
+        # The response is persisted as-is by the app, so converting here left
+        # every stored value written at the hardcoded settings rate while the
+        # app converts back for display at the live daily rate -- a 9.5% gap
+        # for USD->AUD on 2026-09-04. Display converts once instead.
         payload = _payload()
         payload["displayCurrency"] = "AUD"
         with patch(
@@ -89,17 +93,11 @@ class RepriceEndpointTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         pricing = response.json()["pricing"]
         self.assertEqual(pricing["status"], "available")
-        self.assertEqual(pricing["estimatedMarketValue"], 150)
-        self.assertEqual(pricing["lowEstimate"], 120)
-        self.assertEqual(pricing["highEstimate"], 180)
-        self.assertEqual(pricing["currency"], "AUD")
-        self.assertEqual(pricing["displayString"], "AUD $150.00")
-        self.assertEqual(pricing["originalMarketPayload"]["price"], 100)
-        self.assertEqual(pricing["originalMarketPayload"]["currency"], "USD")
-        self.assertEqual(pricing["originalMarketPayload"]["displayCurrency"], "AUD")
-        self.assertEqual(pricing["originalMarketPayload"]["exchangeRateUsed"], 1.5)
-        self.assertEqual(pricing["comparableSales"][0]["soldPrice"], 120)
-        self.assertEqual(pricing["comparableSales"][0]["currency"], "AUD")
+        self.assertEqual(pricing["estimatedMarketValue"], 100)
+        self.assertEqual(pricing["lowEstimate"], 80)
+        self.assertEqual(pricing["highEstimate"], 120)
+        self.assertEqual(pricing["currency"], "USD")
+        self.assertEqual(pricing["comparableSales"][0]["currency"], "USD")
 
     def test_reprice_rejects_missing_title(self) -> None:
         payload = _payload()

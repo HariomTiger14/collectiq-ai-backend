@@ -42,7 +42,6 @@ from app.services.pricing.catalog_search_service import (
     CatalogSearchError,
     CatalogSearchService,
 )
-from app.services.pricing.currency_conversion import _exchange_rate
 from app.services.pricing.reprice_service import (
     RepriceService,
     RepriceValidationError,
@@ -201,24 +200,28 @@ class BatchRepricingService:
         pricing = result.pricing
         available = pricing.marketValue is not None and pricing.marketValue > 0
 
-        # The catalog stores native provider currency (e.g. USD); the live-API
-        # path always converts to the item's own display currency before
-        # persisting (RepriceService -> convert_pricing_result()) -- this must
-        # match, or a catalog-matched item's value gets stored as if its raw
-        # USD amount were AUD (understating it by the FX rate, ~35% for USD).
-        display_currency = _display_currency_from_row(row)
-        rate = _exchange_rate(pricing.currency, display_currency)
-        value = _to_float(pricing.marketValue * rate) if available else None
-        low = _to_float(pricing.lowEstimate * rate) if pricing.lowEstimate else None
-        high = _to_float(pricing.highEstimate * rate) if pricing.highEstimate else None
+        # Persist the provider's own currency and amount, untouched.
+        #
+        # This used to convert to the item's display currency to match the
+        # live-API path, which did the same. Both converted with a hardcoded
+        # settings rate (FX_USD_TO_AUD, 1.52) while the app converts back for
+        # display using the live daily rate (1.3882 on 2026-09-04) -- so a
+        # USD 1.00 card was stored as AUD 1.52 and shown back as USD 1.09,
+        # overstating it by 9.5%, and its AUD figure was stale by the same
+        # margin. Storing what the provider actually said leaves exactly one
+        # conversion, at display time, against a real dated rate.
+        currency = (pricing.currency or "USD").strip().upper()
+        value = _to_float(pricing.marketValue) if available else None
+        low = _to_float(pricing.lowEstimate) if pricing.lowEstimate else None
+        high = _to_float(pricing.highEstimate) if pricing.highEstimate else None
 
         return RepricePricingResponse(
             status="available" if available else "unavailable",
             estimatedMarketValue=value,
             lowEstimate=low,
             highEstimate=high,
-            currency=display_currency,
-            displayString=_display_string(value, display_currency) if available else None,
+            currency=currency,
+            displayString=_display_string(value, currency) if available else None,
             confidenceScore=result.confidence,
             pricingConfidence=round(result.confidence * 100),
             valuationStrategy="catalog_lookup",

@@ -439,31 +439,26 @@ def test_catalog_matched_item_prices_from_catalog_not_live_api():
     assert body["raw_json"]["pricing"]["estimatedMarketValue"] == 250.0
 
 
-def test_catalog_matched_item_converts_catalog_currency_to_item_display_currency():
-    # Real bug hit in review: the catalog stores native provider currency
-    # (USD), but the live-API path always converts to the item's own display
-    # currency before persisting -- the catalog path skipped that entirely,
-    # so a USD catalog value would get stored as if it were already AUD
-    # (understating it by the FX rate). Uses the real _exchange_rate() for
-    # the expected value rather than a hardcoded number, so this doesn't
-    # drift if the configured FX rate ever changes.
-    from app.services.pricing.currency_conversion import _exchange_rate
-
+def test_catalog_matched_item_stores_the_providers_own_currency():
+    # This used to convert the catalog's native USD into the item's display
+    # currency before persisting, matching what the live-API path did. Both
+    # converted with the hardcoded settings rate (FX_USD_TO_AUD) while the app
+    # converts back for display against the live daily rate, so every stored
+    # value carried the gap between the two -- 9.5% on 2026-09-04. Store what
+    # the provider said and let display convert once, against a dated rate.
     catalog = _FakeCatalogSearch(market_value=100.0, low=80.0, high=120.0, currency="USD")
-    item = _item(pricecharting_id="12345")  # raw_json has no currency -> AUD display
+    item = _item(pricecharting_id="12345")  # raw_json has no currency
     service, patched, _snap = _service(
         items_pages=[[item]], reprice=_ExplodingReprice(), catalog_search=catalog
     )
 
     service.reprice_all()
 
-    rate = _exchange_rate("USD", "AUD")
-    assert rate != 1.0, "test is meaningless if USD/AUD happen to be configured 1:1"
     body = patched[0]["body"]
-    assert body["raw_json"]["pricing"]["estimatedMarketValue"] == 100.0 * rate
-    assert body["estimated_value_low"] == 80.0 * rate
-    assert body["estimated_value_high"] == 120.0 * rate
-    assert body["raw_json"]["pricing"]["currency"] == "AUD"
+    assert body["raw_json"]["pricing"]["estimatedMarketValue"] == 100.0
+    assert body["estimated_value_low"] == 80.0
+    assert body["estimated_value_high"] == 120.0
+    assert body["raw_json"]["pricing"]["currency"] == "USD"
 
 
 def test_catalog_matched_item_uses_catalog_lookup_valuation_strategy():

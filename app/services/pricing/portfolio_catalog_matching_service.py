@@ -11,7 +11,6 @@ from app.services.pricing.catalog_search_service import (
     CatalogSearchError,
     CatalogSearchService,
 )
-from app.services.pricing.currency_conversion import _exchange_rate
 
 
 class PortfolioCatalogMatchingError(Exception):
@@ -231,17 +230,22 @@ def backfill_catalog_history_for_item(
         value = point.pricing.marketValue
         if value is None or value <= 0:
             continue
-        rate = _exchange_rate(point.pricing.currency, display_currency)
+        # Backfilled history keeps the catalog's own currency. Converting it
+        # here applied today's hardcoded settings rate to a price from months
+        # ago, so a chart's shape carried an FX artefact that never happened;
+        # the app converts each point using the rate in effect on that
+        # point's own date instead.
+        currency = (point.pricing.currency or "USD").strip().upper()
         low = point.pricing.lowEstimate if point.pricing.lowEstimate else value
         high = point.pricing.highEstimate if point.pricing.highEstimate else value
         rows.append(
             {
                 "user_id": item["user_id"],
                 "portfolio_item_id": item["id"],
-                "value_aud": value * rate,
-                "low_estimate_aud": low * rate,
-                "high_estimate_aud": high * rate,
-                "currency": display_currency,
+                "value_aud": value,
+                "low_estimate_aud": low,
+                "high_estimate_aud": high,
+                "currency": currency,
                 "display_string": None,
                 "valuation_status": "market_estimated",
                 "reason_code": "catalog_history_backfill",
