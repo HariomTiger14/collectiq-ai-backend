@@ -238,50 +238,70 @@ class RouteDenialTest(unittest.TestCase):
 
 
 class RouteAllowTest(unittest.TestCase):
-    """A role holding the permission must get past the gate.
+    """A role holding the permission must get through to a real success.
 
-    Each case stubs the service the handler reaches, so the assertion is about
-    the permission check opening -- not about the feature behind it.
+    These deliberately do NOT assert "not 403". That weaker form passes on a
+    422, so it proves the gate opened while saying nothing about whether the
+    request was even shaped correctly -- it hid a real mistake in this file:
+    /admin/push/broadcast takes query parameters, and the first version of
+    this test sent a JSON body. Each case now sends the payload the handler
+    actually declares, asserts 200, and asserts the service was called with
+    the arguments the route promised to pass through.
     """
 
     def setUp(self) -> None:
         self.client = TestClient(app)
 
-    def _assert_passes_gate(self, response) -> None:
-        self.assertNotIn(
-            response.status_code, (401, 403), f"gate closed unexpectedly: {response.text}"
-        )
+    # -- pricing:write -----------------------------------------------------
 
     def test_admin_may_mark_a_review_queue_item_reviewed(self) -> None:
         with as_role("admin"), patch(
             "app.routers.admin_pricing.AdminPricingReviewQueueService"
         ) as service, patch("app.routers.admin_pricing.AdminAuditService"):
-            service.return_value.mark_reviewed.return_value = {"success": True}
+            service.return_value.mark_reviewed.return_value = {
+                "success": True,
+                "itemId": "item-1",
+            }
             response = self.client.post(
-                "/admin/pricing/review-queue/item-1/reviewed", headers=AUTH, json={}
+                "/admin/pricing/review-queue/item-1/reviewed", headers=AUTH
             )
-        self._assert_passes_gate(response)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["success"])
+        service.return_value.mark_reviewed.assert_called_once_with("item-1")
+
+    # -- scans:write -------------------------------------------------------
 
     def test_owner_may_mark_a_scan_failure_reviewed(self) -> None:
         with as_role("owner"), patch(
             "app.routers.admin_scans.AdminScanFailureService"
         ) as service, patch("app.routers.admin_scans.AdminAuditService"):
-            service.return_value.mark_reviewed.return_value = {"success": True}
+            service.return_value.mark_reviewed.return_value = {
+                "success": True,
+                "scanId": "scan-1",
+            }
             response = self.client.post(
-                "/admin/scans/failures/scan-1/reviewed", headers=AUTH, json={}
+                "/admin/scans/failures/scan-1/reviewed", headers=AUTH
             )
-        self._assert_passes_gate(response)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["success"])
+        service.return_value.mark_reviewed.assert_called_once_with("scan-1")
 
     def test_support_may_mark_a_scan_failure_reviewed(self) -> None:
-        """support holds scans:write, so this must NOT be a denial."""
+        """support holds scans:write, so this is an allow case, not a denial."""
         with as_role("support"), patch(
             "app.routers.admin_scans.AdminScanFailureService"
         ) as service, patch("app.routers.admin_scans.AdminAuditService"):
             service.return_value.mark_reviewed.return_value = {"success": True}
             response = self.client.post(
-                "/admin/scans/failures/scan-1/reviewed", headers=AUTH, json={}
+                "/admin/scans/failures/scan-1/reviewed", headers=AUTH
             )
-        self._assert_passes_gate(response)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        service.return_value.mark_reviewed.assert_called_once_with("scan-1")
+
+    # -- catalog:write -----------------------------------------------------
 
     def test_pricing_reviewer_may_edit_catalog_metadata(self) -> None:
         """pricing_reviewer holds catalog:write."""
@@ -292,60 +312,200 @@ class RouteAllowTest(unittest.TestCase):
             response = self.client.patch(
                 "/admin/catalog/catalog-1",
                 headers=AUTH,
-                json={"note": "corrected title", "title": "Charizard"},
+                json={"title": "Charizard", "note": "corrected title"},
             )
-        self._assert_passes_gate(response)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["success"])
+        # exclude_unset: only the two fields sent should reach the service.
+        service.return_value.update_item.assert_called_once_with(
+            "catalog-1", {"title": "Charizard", "note": "corrected title"}
+        )
+
+    # -- imports:run -------------------------------------------------------
+
+    def test_pricing_reviewer_may_run_a_pricecharting_import(self) -> None:
+        with as_role("pricing_reviewer"), patch(
+            "app.routers.admin_pricecharting.AdminImportJobService"
+        ) as jobs, patch(
+            "app.routers.admin_pricecharting.download_env_sources"
+        ) as download:
+            jobs.return_value.create_job.return_value = {"id": "job-1"}
+            download.return_value = []
+            response = self.client.post(
+                "/admin/pricecharting/import?dryRun=true&source=pokemon",
+                headers=AUTH,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        jobs.return_value.create_job.assert_called_once_with(
+            source="pokemon", dry_run=True
+        )
+
+    # -- users:write -------------------------------------------------------
+
+    def test_admin_may_edit_a_portfolio_item(self) -> None:
+        with as_role("admin"), patch(
+            "app.routers.admin_portfolio.AdminPortfolioService"
+        ) as service, patch("app.routers.admin_portfolio.AdminAuditService"):
+            service.return_value.update_item.return_value = {"success": True}
+            response = self.client.patch(
+                "/admin/portfolio/items/item-1",
+                headers=AUTH,
+                json={"condition": "Near Mint"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["success"])
+        service.return_value.update_item.assert_called_once_with(
+            "item-1", {"condition": "Near Mint"}, actor="admin@packlox.com"
+        )
+
+    def test_admin_may_process_a_data_request(self) -> None:
+        with as_role("admin"), patch("app.routers.data_requests._service") as service:
+            service.process_request.return_value = {"success": True, "type": "export"}
+            response = self.client.post(
+                "/admin/data-requests/request-1/process?dryRun=false", headers=AUTH
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["success"])
+        service.process_request.assert_called_once_with("request-1", dry_run=False)
+
+    def test_support_may_reply_to_a_ticket(self) -> None:
+        with as_role("support"), patch("app.routers.support._service") as service:
+            service.reply_as_admin.return_value = {"success": True, "messageId": "m-1"}
+            response = self.client.post(
+                "/admin/support/tickets/ticket-1/reply",
+                headers=AUTH,
+                json={"body": "Looking into it now."},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["success"])
+        service.reply_as_admin.assert_called_once_with(
+            ticket_id="ticket-1", body="Looking into it now."
+        )
+
+    def test_support_may_set_a_ticket_status(self) -> None:
+        with as_role("support"), patch("app.routers.support._service") as service:
+            service.set_ticket_status.return_value = {"success": True}
+            response = self.client.post(
+                "/admin/support/tickets/ticket-1/status",
+                headers=AUTH,
+                json={"status": "resolved"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        service.set_ticket_status.assert_called_once_with(
+            ticket_id="ticket-1", status="resolved"
+        )
+
+    def test_admin_may_upload_a_support_attachment(self) -> None:
+        """The one multipart route -- proves the file field is accepted."""
+        with as_role("admin"), patch("app.routers.support._service") as service:
+            service.add_attachment.return_value = {"success": True}
+            response = self.client.post(
+                "/admin/support/messages/message-1/attachments",
+                headers=AUTH,
+                files={"file": ("evidence.csv", b"a,b\n1,2\n", "text/csv")},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["success"])
+        service.add_attachment.assert_called_once()
+
+    # -- push:write --------------------------------------------------------
 
     def test_admin_may_send_a_push_broadcast(self) -> None:
+        """Query parameters, not a JSON body -- the mistake this rewrite caught."""
         with as_role("admin"), patch(
             "app.routers.push.PriceAlertPushService"
         ) as service:
-            service.return_value.dispatch_broadcast.return_value = {"success": True}
-            response = self.client.post(
-                "/admin/push/broadcast",
-                headers=AUTH,
-                json={"title": "t", "body": "b", "segment": "all"},
+            service.return_value.dispatch_broadcast.return_value = _SummaryStub(
+                {"segment": "all", "attemptedDeliveries": 0}
             )
-        self._assert_passes_gate(response)
+            response = self.client.post(
+                "/admin/push/broadcast"
+                "?segment=all&title=Heads%20up&body=New%20prices&dryRun=true",
+                headers=AUTH,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["segment"], "all")
+        service.return_value.dispatch_broadcast.assert_called_once_with(
+            segment="all", title="Heads up", body="New prices", dry_run=True
+        )
+
+    def test_admin_may_disable_a_push_device(self) -> None:
+        with as_role("admin"), patch(
+            "app.routers.push.PriceAlertPushService"
+        ) as service:
+            service.return_value.disable_device_registration.return_value = {
+                "success": True,
+                "disabled": True,
+            }
+            response = self.client.post(
+                "/admin/push/devices/device-1/disable", headers=AUTH
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["disabled"])
+        service.return_value.disable_device_registration.assert_called_once_with(
+            "device-1"
+        )
+
+    # -- admin:read --------------------------------------------------------
 
     def test_viewer_may_read_the_push_delivery_history(self) -> None:
         """admin:read routes must be reachable without a job token."""
         with as_role("viewer"), patch(
             "app.routers.push.PriceAlertPushService"
         ) as service:
-            service.return_value.delivery_history.return_value = {"success": True}
-            response = self.client.get("/admin/push/history", headers=AUTH)
-        self._assert_passes_gate(response)
+            service.return_value.delivery_history.return_value = {
+                "success": True,
+                "deliveries": [],
+            }
+            response = self.client.get("/admin/push/history?limit=10", headers=AUTH)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["success"])
+        service.return_value.delivery_history.assert_called_once_with(limit=10)
+
+    def test_viewer_may_read_the_push_audience_counts(self) -> None:
+        with as_role("viewer"), patch(
+            "app.routers.push.PriceAlertPushService"
+        ) as service:
+            service.return_value.audience_counts.return_value = {
+                "success": True,
+                "all": 0,
+            }
+            response = self.client.get("/admin/push/audience", headers=AUTH)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        service.return_value.audience_counts.assert_called_once_with()
 
     def test_viewer_may_read_the_support_queue(self) -> None:
         with as_role("viewer"), patch("app.routers.support._service") as service:
             service.list_tickets.return_value = {"success": True, "tickets": []}
-            response = self.client.get("/admin/support/tickets", headers=AUTH)
-        self._assert_passes_gate(response)
+            response = self.client.get(
+                "/admin/support/tickets?status=open&limit=25", headers=AUTH
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["success"])
+        service.list_tickets.assert_called_once_with(status="open", limit=25)
 
     def test_viewer_may_read_the_data_request_queue(self) -> None:
         with as_role("viewer"), patch("app.routers.data_requests._service") as service:
             service.list_requests.return_value = {"success": True, "requests": []}
-            response = self.client.get("/admin/data-requests", headers=AUTH)
-        self._assert_passes_gate(response)
-
-    def test_admin_may_process_a_data_request(self) -> None:
-        with as_role("admin"), patch("app.routers.data_requests._service") as service:
-            service.process_request.return_value = {"success": True}
-            response = self.client.post(
-                "/admin/data-requests/request-1/process", headers=AUTH, json={}
+            response = self.client.get(
+                "/admin/data-requests?status=open&limit=25", headers=AUTH
             )
-        self._assert_passes_gate(response)
 
-    def test_support_may_reply_to_a_ticket(self) -> None:
-        with as_role("support"), patch("app.routers.support._service") as service:
-            service.reply_as_admin.return_value = {"success": True}
-            response = self.client.post(
-                "/admin/support/tickets/ticket-1/reply",
-                headers=AUTH,
-                json={"body": "looking into it"},
-            )
-        self._assert_passes_gate(response)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["success"])
+        service.list_requests.assert_called_once_with(status="open", limit=25)
 
 
 class ScheduledJobRouteTest(unittest.TestCase):
