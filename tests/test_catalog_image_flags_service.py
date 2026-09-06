@@ -3,6 +3,7 @@ import unittest
 
 import httpx
 
+from app.services.pricing.catalog_search_service import CatalogSearchService
 from app.services.catalog_image_flags_service import (
     KNOWN_CATEGORIES,
     CatalogImageFlagsError,
@@ -13,6 +14,26 @@ from app.services.catalog_image_flags_service import (
 
 
 class CatalogImageFlagsServiceTest(unittest.TestCase):
+    def test_known_categories_match_the_search_service_read_path(self) -> None:
+        # Two hardcoded lists decide whether a kill switch works:
+        # KNOWN_CATEGORIES gates what the admin portal can list and PATCH,
+        # and CatalogSearchService's `all_categories` gates what the read
+        # path actually honours. A category in only one of them is either
+        # an invisible switch (read path honours it, portal can't show it
+        # -- how 'kicksdb' originally shipped) or a dead one (portal
+        # toggles it, read path ignores it). Both fail silently, and both
+        # fail at the exact moment someone needs the switch.
+        service = CatalogSearchService(
+            supabase_url="",
+            service_role_key="",
+        )
+        read_path = service._fetch_enabled_image_categories()
+        self.assertEqual(
+            set(KNOWN_CATEGORIES),
+            read_path,
+            "KNOWN_CATEGORIES and CatalogSearchService.all_categories have drifted",
+        )
+
     def test_list_flags_not_configured_returns_all_known_categories_enabled(self) -> None:
         repository = SupabaseCatalogImageFlagsRepository(
             supabase_url="",
