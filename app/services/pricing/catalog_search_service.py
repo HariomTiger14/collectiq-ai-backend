@@ -438,24 +438,12 @@ class CatalogSearchService:
             if "coins" in enabled:
                 result = self._enrich_with_coin_images(result)
             history_points = [_history_row_to_point(row) for row in history_rows]
-            if target_currency:
-                result = result.model_copy(
-                    update={
-                        "pricing": _convert_catalog_pricing(
-                            result.pricing, target_currency=target_currency
-                        )
-                    }
-                )
-                history_points = [
-                    point.model_copy(
-                        update={
-                            "pricing": _convert_catalog_pricing(
-                                point.pricing, target_currency=target_currency
-                            )
-                        }
-                    )
-                    for point in history_points
-                ]
+            # Catalog prices stay in the provider's own USD. This used to
+            # convert them with the hardcoded settings rate, which is stale
+            # (1.52 configured against a live 1.3882) and applied today's
+            # rate to historical points as well. The app converts at display
+            # time against real dated rates. `currency` still selects which
+            # marketplace's listings to match.
             marketplace_listings = self._fetch_marketplace_listings(
                 catalog_id=normalized_id,
                 product_name=str(row.get("product_name") or ""),
@@ -526,23 +514,6 @@ class CatalogSearchService:
                         }
                     )
                     for listing in kicksdb_listings
-                ]
-                kicksdb_result = kicksdb_result.model_copy(
-                    update={
-                        "pricing": _convert_catalog_pricing(
-                            kicksdb_result.pricing, target_currency=target_currency
-                        )
-                    }
-                )
-                kicksdb_history_points = [
-                    point.model_copy(
-                        update={
-                            "pricing": _convert_catalog_pricing(
-                                point.pricing, target_currency=target_currency
-                            )
-                        }
-                    )
-                    for point in kicksdb_history_points
                 ]
             return CatalogDetailResponse(
                 result=kicksdb_result,

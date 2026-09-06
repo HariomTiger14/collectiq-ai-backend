@@ -992,14 +992,13 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertEqual(len(history_requests), 1)
         self.assertIn("limit=10", str(history_requests[0].url))
 
-    def test_detail_converts_pricing_and_history_when_currency_requested(self) -> None:
-        # PriceCharting data is always USD-sourced -- requesting a non-USD
-        # display currency must convert both the headline pricing AND every
-        # history point consistently, using the same static FX rate
-        # (settings.fx_usd_to_aud, default 1.52) currency_conversion.py
-        # already uses for scan pricing. Without this, the chart and the
-        # headline price would show different currencies on the same
-        # screen.
+    def test_detail_keeps_pricing_in_usd_even_when_a_currency_is_requested(self) -> None:
+        # PriceCharting data is always USD-sourced, and that is what the
+        # response carries. Converting here used the hardcoded settings rate
+        # (1.52 against a live 1.3882) and applied today's rate to historical
+        # points, putting FX moves into a chart that never happened. The app
+        # converts at display time against real dated rates; `currency` still
+        # selects which marketplace's listings to match.
         def handler(request: httpx.Request) -> httpx.Response:
             if "pricecharting_catalog_history" in str(request.url):
                 return httpx.Response(
@@ -1048,11 +1047,10 @@ class CatalogSearchServiceTest(unittest.TestCase):
 
         response = service.detail("999", history_limit=10, currency="AUD")
 
-        self.assertEqual(response.result.pricing.currency, "AUD")
-        self.assertEqual(response.result.pricing.originalCurrency, "USD")
-        self.assertEqual(response.result.pricing.marketValue, round(161 * 1.52, 2))
-        self.assertEqual(response.history[0].pricing.currency, "AUD")
-        self.assertEqual(response.history[0].pricing.highEstimate, round(800 * 1.52, 2))
+        self.assertEqual(response.result.pricing.currency, "USD")
+        self.assertEqual(response.result.pricing.marketValue, 161)
+        self.assertEqual(response.history[0].pricing.currency, "USD")
+        self.assertEqual(response.history[0].pricing.highEstimate, 800)
 
     def test_detail_does_not_convert_when_no_currency_requested(self) -> None:
         # Backward compatibility: omitting the currency param (existing
