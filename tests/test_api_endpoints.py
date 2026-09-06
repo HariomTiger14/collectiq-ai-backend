@@ -228,7 +228,9 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertEqual(pricing["highEstimate"], 0)
         self.assertEqual(payload["estimated_value_low"], pricing["lowEstimate"])
         self.assertEqual(payload["estimated_value_high"], pricing["highEstimate"])
-        self.assertEqual(pricing["currency"], "AUD")
+        # USD: no market price, so this carries the AI's own estimate, and the
+        # recognition prompt asks the model for US dollars.
+        self.assertEqual(pricing["currency"], "USD")
         self.assertTrue(pricing["pricingSource"])
         self.assertGreaterEqual(pricing["pricingConfidence"], 0)
         self.assertLessEqual(pricing["pricingConfidence"], 100)
@@ -417,7 +419,9 @@ class ApiEndpointsTest(unittest.TestCase):
         self.assertEqual(payload["itemName"], "1999 Pokemon Charizard Holo")
         self.assertEqual(payload["category"], "Pokemon Card")
         self.assertEqual(payload["estimated_value"], payload["estimatedValue"])
-        self.assertEqual(payload["currency"], "AUD")
+        # USD, matching the recognition prompt's requested currency -- these
+        # two are a pair; see _valuation_placeholder.
+        self.assertEqual(payload["currency"], "USD")
         self.assertIsInstance(payload["tags"], list)
         self.assertIsInstance(payload["attributes"], dict)
         self.assertIsInstance(payload["images"], list)

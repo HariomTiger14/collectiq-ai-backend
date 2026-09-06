@@ -370,7 +370,13 @@ class OpenAIRecognitionProvider(AIRecognitionProvider):
             "the exact title, platform, publisher, region/edition, and whether "
             "the image shows a case, cartridge/disc, cover art, or sealed item. "
             "For LEGO, identify the set name and visible set number. Use conservative "
-            "Australian-dollar estimates. Prefer uncertainty over overclaiming. "
+            # US dollars, matching the currency this value is labelled with when
+            # it is returned (_valuation_placeholder in api_analyze.py) and the
+            # provider-native USD every other value in the system is stored in.
+            # These two must change together: the model's number is labelled,
+            # never converted, so a mismatch understates or overstates every
+            # AI-estimated item by the AUD/USD rate.
+            "US-dollar estimates. Prefer uncertainty over overclaiming. "
             "If a retail cover, box, card face, comic cover, or packaging front "
             "shows readable product title text, use that visible title as the "
             "main title even when condition, barcode, region, edition, or contents "
