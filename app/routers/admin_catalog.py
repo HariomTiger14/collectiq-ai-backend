@@ -5,7 +5,10 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from app.routers.admin_auth import require_admin_import_token
+from app.routers.admin_auth import (
+    require_admin_import_token,
+    require_admin_permission,
+)
 from app.services.admin_audit_service import AdminAuditService
 from app.services.admin_catalog_service import AdminCatalogError, AdminCatalogService
 from app.services.admin_pipeline_status_service import (
@@ -78,7 +81,7 @@ class CatalogUpdateRequest(BaseModel):
 def update_catalog_item(
     catalog_id: str,
     request: CatalogUpdateRequest,
-    _admin: None = Depends(require_admin_import_token),
+    _admin: None = Depends(require_admin_permission("catalog:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminCatalogService().update_item(

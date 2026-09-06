@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from app.routers.admin_auth import (
     require_admin_import_token,
     require_admin_job_token,
+    require_admin_permission,
 )
 from app.services.admin_audit_service import AdminAuditService
 from app.services.pricing.batch_repricing_service import BatchRepricingService
@@ -124,7 +125,7 @@ def pricing_review_queue(
 @router.post("/review-queue/{item_id}/reviewed")
 def mark_pricing_reviewed(
     item_id: str,
-    _admin: None = Depends(require_admin_import_token),
+    _admin: None = Depends(require_admin_permission("pricing:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminPricingReviewQueueService().mark_reviewed(item_id)
@@ -166,7 +167,7 @@ def mark_pricing_reviewed(
 def override_review_queue_price(
     item_id: str,
     request: PricingOverrideRequest,
-    _admin: None = Depends(require_admin_import_token),
+    _admin: None = Depends(require_admin_permission("pricing:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminPricingReviewQueueService().override_price(
@@ -217,7 +218,7 @@ def override_review_queue_price(
 def assign_pricing_review_item(
     item_id: str,
     request: PricingAssignmentRequest,
-    _admin: None = Depends(require_admin_import_token),
+    _admin: None = Depends(require_admin_permission("pricing:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminPricingReviewQueueService().assign_item(
@@ -265,7 +266,7 @@ def assign_pricing_review_item(
 @router.post("/review-queue/{item_id}/retry")
 def retry_review_queue_pricing(
     item_id: str,
-    _admin: None = Depends(require_admin_import_token),
+    _admin: None = Depends(require_admin_permission("pricing:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminPricingReviewQueueService().retry_pricing(item_id)
@@ -322,7 +323,7 @@ def retry_review_queue_pricing(
 @router.post("/review-queue-actions/reviewed")
 def bulk_mark_pricing_reviewed(
     request: BulkPricingActionRequest,
-    _admin: dict[str, Any] = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_permission("pricing:write")),
 ) -> dict[str, Any]:
     payload = AdminPricingReviewQueueService().bulk_mark_reviewed(request.itemIds)
     _record_audit(
@@ -340,7 +341,7 @@ def bulk_mark_pricing_reviewed(
 @router.post("/review-queue-actions/retry")
 def bulk_retry_review_queue_pricing(
     request: BulkPricingActionRequest,
-    _admin: dict[str, Any] = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_permission("pricing:write")),
 ) -> dict[str, Any]:
     payload = AdminPricingReviewQueueService().bulk_retry_pricing(request.itemIds)
     _record_audit(

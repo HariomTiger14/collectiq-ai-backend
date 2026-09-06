@@ -1,7 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from app.services.ops.observability import recorded_admin_job
 
-from app.routers.admin_auth import require_admin_job_token
+from app.routers.admin_auth import (
+    require_admin_job_token,
+    require_admin_permission,
+)
 from app.services.alerts.price_alert_evaluation_service import (
     PriceAlertEvaluationService,
 )
@@ -75,7 +78,7 @@ async def send_test_push_notification(
     dry_run: bool = Query(False, alias="dryRun"),
     limit: int = Query(10, ge=1, le=100),
     user_id: str | None = Query(None, alias="userId"),
-    _admin: None = Depends(require_admin_job_token),
+    _admin: None = Depends(require_admin_permission("push:write")),
 ) -> dict:
     try:
         summary = PriceAlertPushService().dispatch_test_notification(
@@ -102,7 +105,7 @@ async def send_test_price_alert_push_notification(
     dry_run: bool = Query(False, alias="dryRun"),
     limit: int = Query(10, ge=1, le=100),
     user_id: str | None = Query(None, alias="userId"),
-    _admin: None = Depends(require_admin_job_token),
+    _admin: None = Depends(require_admin_permission("push:write")),
 ) -> dict:
     try:
         summary = PriceAlertPushService().dispatch_test_price_alert_notification(
@@ -127,7 +130,7 @@ async def send_test_price_alert_push_notification(
 @router.get("/history")
 async def list_push_delivery_history(
     limit: int = Query(25, ge=1, le=100),
-    _admin: None = Depends(require_admin_job_token),
+    _admin: None = Depends(require_admin_permission("admin:read")),
 ) -> dict:
     try:
         return PriceAlertPushService().delivery_history(limit=limit)
@@ -144,7 +147,7 @@ async def list_push_delivery_history(
 
 @router.get("/audience")
 async def get_push_audience_counts(
-    _admin: None = Depends(require_admin_job_token),
+    _admin: None = Depends(require_admin_permission("admin:read")),
 ) -> dict:
     try:
         return PriceAlertPushService().audience_counts()
@@ -165,7 +168,7 @@ async def send_broadcast_push_notification(
     title: str = Query(..., min_length=1, max_length=120),
     body: str = Query(..., min_length=1, max_length=500),
     dry_run: bool = Query(True, alias="dryRun"),
-    _admin: None = Depends(require_admin_job_token),
+    _admin: None = Depends(require_admin_permission("push:write")),
 ) -> dict:
     try:
         summary = PriceAlertPushService().dispatch_broadcast(
@@ -193,7 +196,7 @@ async def send_push_to_user(
     body: str = Query(..., min_length=1, max_length=500),
     device_id: str | None = Query(None, alias="deviceId"),
     dry_run: bool = Query(True, alias="dryRun"),
-    _admin: None = Depends(require_admin_job_token),
+    _admin: None = Depends(require_admin_permission("push:write")),
 ) -> dict:
     try:
         summary = PriceAlertPushService().dispatch_to_user(
@@ -218,7 +221,7 @@ async def send_push_to_user(
 @router.post("/devices/{device_id}/disable")
 async def disable_push_device_registration(
     device_id: str,
-    _admin: None = Depends(require_admin_job_token),
+    _admin: None = Depends(require_admin_permission("push:write")),
 ) -> dict:
     try:
         return PriceAlertPushService().disable_device_registration(device_id)

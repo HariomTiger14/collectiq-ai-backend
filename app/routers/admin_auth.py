@@ -13,6 +13,12 @@ FULL_ADMIN_PERMISSIONS = {
     "catalog:write",
     "imports:run",
     "pricing:write",
+    # Sending a push reaches real devices and cannot be recalled, so it is its
+    # own permission rather than folding into users:write. Only the roles that
+    # hold every permission get it: viewer is read-only, support handles
+    # per-user tickets and account actions, and pricing_reviewer works on
+    # catalog/pricing -- none of them has a reason to broadcast.
+    "push:write",
     "reports:export",
     "scans:write",
     "users:write",
