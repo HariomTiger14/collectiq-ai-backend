@@ -104,7 +104,7 @@ def pricing_review_queue(
     try:
         payload = AdminPricingReviewQueueService().list_queue(reason=reason, limit=limit)
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="pricing_review_queue.viewed",
             status="success",
             metadata={"filter": reason, "count": payload.get("count", 0)},
@@ -112,7 +112,7 @@ def pricing_review_queue(
         return payload
     except ReviewQueueRepositoryError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="pricing_review_queue.viewed",
             status="failure",
             metadata={"filter": reason, "error": str(error)},
@@ -133,7 +133,7 @@ def mark_pricing_reviewed(
     try:
         payload = AdminPricingReviewQueueService().mark_reviewed(item_id)
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="pricing_review_queue.mark_reviewed",
             status="success",
             target_id=item_id,
@@ -141,7 +141,7 @@ def mark_pricing_reviewed(
         return payload
     except ReviewQueueItemNotFoundError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="pricing_review_queue.mark_reviewed",
             status="failure",
             target_id=item_id,
@@ -155,7 +155,7 @@ def mark_pricing_reviewed(
 
     except ReviewQueueRepositoryError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="pricing_review_queue.mark_reviewed",
             status="failure",
             target_id=item_id,
@@ -183,7 +183,7 @@ def override_review_queue_price(
             note=request.note,
         )
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="pricing_review_queue.override_price",
             status="success",
             target_id=item_id,
@@ -196,7 +196,7 @@ def override_review_queue_price(
         return payload
     except ReviewQueueItemNotFoundError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="pricing_review_queue.override_price",
             status="failure",
             target_id=item_id,
@@ -209,7 +209,7 @@ def override_review_queue_price(
         ) from error
     except ReviewQueueRepositoryError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="pricing_review_queue.override_price",
             status="failure",
             target_id=item_id,
@@ -236,7 +236,7 @@ def assign_pricing_review_item(
             status=request.status,
         )
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="pricing_review_queue.assign",
             status="success",
             target_id=item_id,
@@ -248,7 +248,7 @@ def assign_pricing_review_item(
         return payload
     except ReviewQueueItemNotFoundError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="pricing_review_queue.assign",
             status="failure",
             target_id=item_id,
@@ -261,7 +261,7 @@ def assign_pricing_review_item(
         ) from error
     except ReviewQueueRepositoryError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="pricing_review_queue.assign",
             status="failure",
             target_id=item_id,
@@ -283,7 +283,7 @@ def retry_review_queue_pricing(
     try:
         payload = AdminPricingReviewQueueService().retry_pricing(item_id)
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="pricing_review_queue.retry_pricing",
             status="success",
             target_id=item_id,
@@ -295,7 +295,7 @@ def retry_review_queue_pricing(
         return payload
     except ReviewQueueItemNotFoundError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="pricing_review_queue.retry_pricing",
             status="failure",
             target_id=item_id,
@@ -309,7 +309,7 @@ def retry_review_queue_pricing(
 
     except ReviewQueueItemNotPriceableError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="pricing_review_queue.retry_pricing",
             status="failure",
             target_id=item_id,
@@ -322,7 +322,7 @@ def retry_review_queue_pricing(
         ) from error
     except ReviewQueueRepositoryError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="pricing_review_queue.retry_pricing",
             status="failure",
             target_id=item_id,

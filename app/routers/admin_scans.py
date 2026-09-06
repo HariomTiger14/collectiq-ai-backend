@@ -37,7 +37,7 @@ def scan_failure_detail(
     try:
         payload = AdminScanFailureService().get_failure_detail(scan_id)
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="scan_failure_queue.detail_viewed",
             status="success",
             target_id=scan_id,
@@ -45,7 +45,7 @@ def scan_failure_detail(
         return payload
     except ScanFailureNotFoundError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="scan_failure_queue.detail_viewed",
             status="failure",
             target_id=scan_id,
@@ -58,7 +58,7 @@ def scan_failure_detail(
         ) from error
     except ScanFailureQueueError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="scan_failure_queue.detail_viewed",
             status="failure",
             target_id=scan_id,
@@ -84,7 +84,7 @@ def scan_failures(
     try:
         payload = AdminScanFailureService().list_failures(reason=reason, limit=limit)
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="scan_failure_queue.viewed",
             status="success",
             metadata={"filter": reason, "count": payload.get("count", 0)},
@@ -92,7 +92,7 @@ def scan_failures(
         return payload
     except ScanFailureQueueError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="scan_failure_queue.viewed",
             status="failure",
             metadata={"filter": reason, "error": str(error)},
@@ -113,7 +113,7 @@ def mark_scan_failure_reviewed(
     try:
         payload = AdminScanFailureService().mark_reviewed(scan_id)
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="scan_failure_queue.mark_reviewed",
             status="success",
             target_id=scan_id,
@@ -121,7 +121,7 @@ def mark_scan_failure_reviewed(
         return payload
     except ScanFailureNotFoundError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="scan_failure_queue.mark_reviewed",
             status="failure",
             target_id=scan_id,
@@ -135,7 +135,7 @@ def mark_scan_failure_reviewed(
 
     except ScanFailureQueueError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="scan_failure_queue.mark_reviewed",
             status="failure",
             target_id=scan_id,
@@ -162,7 +162,7 @@ def resolve_scan_failure(
             note=request.note,
         )
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="scan_failure_queue.resolve",
             status="success",
             target_id=scan_id,
@@ -171,7 +171,7 @@ def resolve_scan_failure(
         return payload
     except ScanFailureNotFoundError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="scan_failure_queue.resolve",
             status="failure",
             target_id=scan_id,
@@ -185,7 +185,7 @@ def resolve_scan_failure(
 
     except ScanFailureQueueError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="scan_failure_queue.resolve",
             status="failure",
             target_id=scan_id,
@@ -207,7 +207,7 @@ def retry_scan_failure_analysis(
     try:
         payload = AdminScanFailureService().retry_analysis(scan_id)
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="scan_failure_queue.retry_analysis",
             status="success",
             target_id=scan_id,
@@ -215,7 +215,7 @@ def retry_scan_failure_analysis(
         return payload
     except ScanFailureNotFoundError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="scan_failure_queue.retry_analysis",
             status="failure",
             target_id=scan_id,
@@ -228,7 +228,7 @@ def retry_scan_failure_analysis(
         ) from error
     except ScanFailureQueueError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="scan_failure_queue.retry_analysis",
             status="failure",
             target_id=scan_id,

@@ -63,7 +63,7 @@ def get_admin_portfolio_item(
     try:
         payload = AdminPortfolioService().get_item(item_id)
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="admin_portfolio.item_viewed",
             status="success",
             target_id=item_id,
@@ -71,7 +71,7 @@ def get_admin_portfolio_item(
         return payload
     except KeyError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="admin_portfolio.item_viewed",
             status="failure",
             target_id=item_id,
@@ -100,7 +100,7 @@ def update_admin_portfolio_item(
             actor=str(_admin.get("email") or _admin.get("id") or "admin"),
         )
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="admin_portfolio.item_updated",
             status="success",
             target_id=item_id,
@@ -109,7 +109,7 @@ def update_admin_portfolio_item(
         return payload
     except KeyError as error:
         _record_audit(
-        admin=_admin,
+            admin=_admin,
             action="admin_portfolio.item_updated",
             status="failure",
             target_id=item_id,
