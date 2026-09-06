@@ -1042,7 +1042,12 @@ def _valuation_placeholder(
         estimatedMarketValue=0,
         lowEstimate=0,
         highEstimate=0,
-        currency="AUD",
+        # USD, because this is the path where the AI's own estimate becomes the
+        # displayed value (display_value falls back to aiEstimatedValue when
+        # there is no market price), and the recognition prompt asks the model
+        # for US-dollar estimates. Nothing converts this number -- it is only
+        # labelled -- so the label has to match what the model was asked for.
+        currency="USD",
         pricingSource=source,
         pricingConfidence=0,
         lastUpdated=utc_timestamp(),

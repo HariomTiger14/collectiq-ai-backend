@@ -193,7 +193,10 @@ def _pricing_placeholder(status: str, source: str, reason: str) -> PricingResult
         estimatedMarketValue=0,
         lowEstimate=0,
         highEstimate=0,
-        currency="AUD",
+        # USD for the same reason as api_analyze._valuation_placeholder: this
+        # route shares the recognition prompt, so it carries the same
+        # US-dollar AI estimate and must not label it as anything else.
+        currency="USD",
         pricingSource=source,
         pricingConfidence=0,
         lastUpdated=utc_timestamp(),
