@@ -4,6 +4,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app.main import app
+from tests.admin_auth_helpers import console_admin
 from app.services.catalog_image_flags_service import (
     CatalogImageFlagsError,
     UnknownCatalogImageCategoryError,
@@ -104,12 +105,11 @@ class AdminCatalogImageFlagsUpdateTest(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "unauthorized")
 
     def test_update_success_returns_flag_and_records_audit(self) -> None:
-        with patch("app.routers.admin_auth.settings") as settings, patch(
+        with console_admin() as settings, patch(
             "app.routers.admin_catalog_image_flags.CatalogImageFlagsService"
         ) as service_cls, patch(
             "app.routers.admin_catalog_image_flags.AdminAuditService"
         ) as audit_cls:
-            settings.admin_import_token = "secret-token"
             service_cls.return_value.set_flag.return_value = {
                 "success": True,
                 "flag": {
@@ -143,12 +143,11 @@ class AdminCatalogImageFlagsUpdateTest(unittest.TestCase):
         self.assertEqual(audit_kwargs["metadata"], {"enabled": False})
 
     def test_update_unknown_category_returns_404_and_records_failure_audit(self) -> None:
-        with patch("app.routers.admin_auth.settings") as settings, patch(
+        with console_admin() as settings, patch(
             "app.routers.admin_catalog_image_flags.CatalogImageFlagsService"
         ) as service_cls, patch(
             "app.routers.admin_catalog_image_flags.AdminAuditService"
         ) as audit_cls:
-            settings.admin_import_token = "secret-token"
             service_cls.return_value.set_flag.side_effect = (
                 UnknownCatalogImageCategoryError("'not-real' is not a known category.")
             )
@@ -169,12 +168,11 @@ class AdminCatalogImageFlagsUpdateTest(unittest.TestCase):
         self.assertEqual(audit_kwargs["target_id"], "not-real")
 
     def test_update_service_error_returns_503(self) -> None:
-        with patch("app.routers.admin_auth.settings") as settings, patch(
+        with console_admin() as settings, patch(
             "app.routers.admin_catalog_image_flags.CatalogImageFlagsService"
         ) as service_cls, patch(
             "app.routers.admin_catalog_image_flags.AdminAuditService"
         ):
-            settings.admin_import_token = "secret-token"
             service_cls.return_value.set_flag.side_effect = CatalogImageFlagsError(
                 "boom"
             )

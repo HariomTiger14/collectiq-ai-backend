@@ -4,6 +4,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app.main import app
+from tests.admin_auth_helpers import console_admin
 from app.services.admin_audit_service import clear_in_memory_audit_events
 
 
@@ -57,10 +58,9 @@ class AdminReportsAndActionsTest(unittest.TestCase):
         self.assertIn("collector@example.com", response.text)
 
     def test_user_support_action_records_audit(self) -> None:
-        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+        with console_admin() as auth_settings, patch(
             "app.routers.admin_users.AdminUserService",
         ) as service:
-            auth_settings.admin_import_token = "secret-token"
             service.return_value.force_logout.return_value = {
                 "success": True,
                 "userId": "user-1",
@@ -82,10 +82,9 @@ class AdminReportsAndActionsTest(unittest.TestCase):
         self.assertEqual(audit_response.json()["events"][0]["targetId"], "user-1")
 
     def test_admin_role_update_records_audit(self) -> None:
-        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+        with console_admin() as auth_settings, patch(
             "app.routers.admin_users.AdminUserService",
         ) as service:
-            auth_settings.admin_import_token = "secret-token"
             service.return_value.update_admin_role.return_value = {
                 "success": True,
                 "userId": "user-1",

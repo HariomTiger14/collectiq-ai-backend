@@ -4,6 +4,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app.main import app
+from tests.admin_auth_helpers import console_admin, static_job_token
 from app.services.pricing.promote_scan_derived_catalog import PromotionResult
 
 
@@ -11,9 +12,18 @@ class AdminCatalogPromotionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(app)
 
-    def test_requires_configured_admin_token(self) -> None:
+    def test_requires_configured_job_token(self) -> None:
+        """This is a scheduled job, so it reports the JOB token as missing.
+
+        It used to authenticate with the human import token, which is what
+        kept ADMIN_IMPORT_TOKEN load-bearing for automation.
+        """
         with patch("app.routers.admin_auth.settings") as settings:
+            settings.admin_job_token = ""
             settings.admin_import_token = ""
+            settings.supabase_url = ""
+            settings.supabase_anon_key = ""
+            settings.supabase_service_role_key = ""
 
             response = self.client.post(
                 "/admin/catalog/promote-scan-derived?dryRun=true"
@@ -21,12 +31,13 @@ class AdminCatalogPromotionTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(
-            response.json()["error"]["code"], "admin_import_not_configured"
+            response.json()["error"]["code"], "admin_job_not_configured"
         )
 
     def test_rejects_invalid_admin_token(self) -> None:
         with patch("app.routers.admin_auth.settings") as settings:
-            settings.admin_import_token = "secret-token"
+            settings.admin_job_token = "secret-token"
+            settings.admin_import_token = "a-different-import-token"
 
             response = self.client.post(
                 "/admin/catalog/promote-scan-derived?dryRun=true",
@@ -37,7 +48,7 @@ class AdminCatalogPromotionTest(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "unauthorized")
 
     def test_dry_run_returns_promotion_summary(self) -> None:
-        with patch("app.routers.admin_auth.settings") as settings, patch(
+        with static_job_token() as settings, patch(
             "app.routers.admin_catalog_promotion.promote_scan_derived_rows",
             return_value=PromotionResult(
                 candidateCount=5,
@@ -46,7 +57,6 @@ class AdminCatalogPromotionTest(unittest.TestCase):
                 skippedMissingTitle=1,
             ),
         ) as promote:
-            settings.admin_import_token = "secret-token"
 
             response = self.client.post(
                 "/admin/catalog/promote-scan-derived?dryRun=true&minHitCount=2",

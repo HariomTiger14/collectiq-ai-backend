@@ -4,6 +4,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app.main import app
+from tests.admin_auth_helpers import console_admin
 from app.services.admin_audit_service import clear_in_memory_audit_events
 from app.services.admin_import_job_service import AdminImportJobService
 from app.services.admin_scan_failure_service import clear_in_memory_scans, seed_in_memory_scan
@@ -20,10 +21,9 @@ class AdminCatalogImportScanDetailTest(unittest.TestCase):
         clear_in_memory_scans()
 
     def test_catalog_update_endpoint_records_audit(self) -> None:
-        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+        with console_admin() as auth_settings, patch(
             "app.routers.admin_catalog.AdminCatalogService",
         ) as service:
-            auth_settings.admin_import_token = "secret-token"
             service.return_value.update_item.return_value = {
                 "success": True,
                 "itemId": "999",

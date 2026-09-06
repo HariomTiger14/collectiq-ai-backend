@@ -6,6 +6,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app.main import app
+from tests.admin_auth_helpers import console_admin
 from app.schemas.portfolio import PortfolioCreateRequest
 from app.schemas.pricing import RepricePricingResponse, RepriceResponse
 from app.services.portfolio_service import portfolio_service
@@ -154,8 +155,7 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
             )
         )
 
-        with patch("app.routers.admin_auth.settings") as settings:
-            settings.admin_import_token = "secret-token"
+        with console_admin() as settings:
             response = self.client.post(
                 "/admin/pricing/review-queue/needs-review/reviewed",
                 headers={"Authorization": "Bearer secret-token"},
@@ -180,8 +180,7 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
             )
         )
 
-        with patch("app.routers.admin_auth.settings") as settings:
-            settings.admin_import_token = "secret-token"
+        with console_admin() as settings:
             response = self.client.post(
                 "/admin/pricing/review-queue/override-me/override",
                 headers={"Authorization": "Bearer secret-token"},
@@ -216,10 +215,9 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
             )
         )
 
-        with patch("app.routers.admin_auth.settings") as settings, patch(
+        with console_admin() as settings, patch(
             "app.services.pricing.admin_review_queue_service.RepriceService",
         ) as service:
-            settings.admin_import_token = "secret-token"
             service.return_value.reprice.return_value = _reprice_response()
             response = self.client.post(
                 "/admin/pricing/review-queue/retry-me/retry",
@@ -247,8 +245,7 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
             )
         )
 
-        with patch("app.routers.admin_auth.settings") as settings:
-            settings.admin_import_token = "secret-token"
+        with console_admin() as settings:
             response = self.client.patch(
                 "/admin/pricing/review-queue/assign-me/assignment",
                 headers={"Authorization": "Bearer secret-token"},

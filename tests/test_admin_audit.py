@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from unittest.mock import patch
 
 from app.main import app
+from tests.admin_auth_helpers import console_admin
 from app.schemas.portfolio import PortfolioCreateRequest
 from app.services.admin_audit_service import (
     AdminAuditService,
@@ -120,8 +121,7 @@ class AdminAuditTest(unittest.TestCase):
             )
         )
 
-        with patch("app.routers.admin_auth.settings") as settings:
-            settings.admin_import_token = "secret-token"
+        with console_admin() as settings:
             response = self.client.post(
                 "/admin/pricing/review-queue/needs-review/reviewed",
                 headers={"Authorization": "Bearer secret-token"},
