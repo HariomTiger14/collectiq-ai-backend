@@ -32,12 +32,16 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from app.core.config import settings
+from app.services.ops.scrubbing import scrub_secrets
 
 _STACK_CAP = 4000
 
 
 def record_unhandled_error(*, route: str, error: BaseException) -> None:
-    stack = "".join(traceback.format_exception(error))[-_STACK_CAP:]
+    # Scrubbed: a traceback can carry a provider URL with its token in the
+    # query string. The cron path has redacted since #179; this one did not,
+    # so API 500s were the unredacted half of the same ledger.
+    stack = scrub_secrets("".join(traceback.format_exception(error)))[-_STACK_CAP:]
     error_class = type(error).__name__
     fingerprint = hashlib.md5(f"api|{route}|{error_class}".encode()).hexdigest()
     _post(
@@ -46,12 +50,68 @@ def record_unhandled_error(*, route: str, error: BaseException) -> None:
             "source": "api",
             "job_name": route,
             "error_class": error_class,
-            "message": str(error)[:2000],
+            "message": scrub_secrets(str(error))[:2000],
             "stack": stack,
             "fingerprint": fingerprint,
         },
         prefer="return=minimal",
     )
+
+
+def record_handled_server_error(
+    *,
+    route: str,
+    status_code: int,
+    detail: Any,
+) -> None:
+    """Record a deliberate 5xx response in the ops error feed.
+
+    Handled failures were the invisible half of observability: a service that
+    caught its own error and returned 503 told the admin something broke and
+    told the ops feed nothing, so the console showed a failure that left no
+    trace anywhere. Every investigation started by querying the database by
+    hand.
+
+    Keyed on STATUS rather than a list of exception classes. 5xx means the
+    server failed; 4xx means the caller asked for something it could not
+    have. A class allowlist would need editing every time a service is added
+    and would silently miss the ones nobody remembered -- exactly how this
+    gap appeared. It also excludes auth failures, not-founds, validation
+    errors and duplicate-action conflicts without naming them.
+
+    Best-effort, like every write in this module: it can never change the
+    response the client already receives.
+    """
+    if status_code < 500:
+        return
+    code, message = _detail_parts(detail)
+    error_class = f"HTTP{status_code}:{code}" if code else f"HTTP{status_code}"
+    fingerprint = hashlib.md5(f"api|{route}|{error_class}".encode()).hexdigest()
+    _post(
+        "/rest/v1/ops_error_events",
+        {
+            "source": "api",
+            "job_name": route,
+            "error_class": error_class,
+            "message": scrub_secrets(message)[:2000],
+            # No traceback: the exception was handled, so there is no failure
+            # path to show, and the detail is already the useful part.
+            "stack": None,
+            "fingerprint": fingerprint,
+        },
+        prefer="return=minimal",
+    )
+
+
+def _detail_parts(detail: Any) -> tuple[str, str]:
+    """The (code, message) pair out of this codebase's error envelope.
+
+    Most endpoints raise {code, message, retryable}; a few raise a plain
+    string. Both shapes have to group sensibly in the feed.
+    """
+    if isinstance(detail, dict):
+        return str(detail.get("code") or ""), str(detail.get("message") or detail)
+    return "", str(detail)
 
 
 def recorded_admin_job(job_name: str) -> Callable:
