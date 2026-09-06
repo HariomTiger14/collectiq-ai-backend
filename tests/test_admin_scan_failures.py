@@ -5,6 +5,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app.main import app
+from tests.admin_auth_helpers import console_admin
 from app.services.admin_audit_service import clear_in_memory_audit_events
 from app.services.admin_scan_failure_service import (
     AdminScanFailureService,
@@ -76,8 +77,7 @@ class AdminScanFailureTest(unittest.TestCase):
             }
         )
 
-        with patch("app.routers.admin_auth.settings") as settings:
-            settings.admin_import_token = "secret-token"
+        with console_admin() as settings:
             response = self.client.post(
                 "/admin/scans/failures/scan-review/reviewed",
                 headers={"Authorization": "Bearer secret-token"},
@@ -104,8 +104,7 @@ class AdminScanFailureTest(unittest.TestCase):
             }
         )
 
-        with patch("app.routers.admin_auth.settings") as settings:
-            settings.admin_import_token = "secret-token"
+        with console_admin() as settings:
             response = self.client.post(
                 "/admin/scans/failures/scan-resolve/resolved",
                 headers={"Authorization": "Bearer secret-token"},
@@ -156,8 +155,7 @@ class AdminScanFailureTest(unittest.TestCase):
             }
         )
 
-        with patch("app.routers.admin_auth.settings") as settings:
-            settings.admin_import_token = "secret-token"
+        with console_admin() as settings:
             response = self.client.post(
                 "/admin/scans/failures/scan-no-image/retry",
                 headers={"Authorization": "Bearer secret-token"},

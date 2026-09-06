@@ -3,7 +3,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from app.services.ops.observability import recorded_admin_job
 
-from app.routers.admin_auth import require_admin_import_token
+from app.routers.admin_auth import require_admin_job_token
 from app.services.admin_import_job_service import AdminImportJobService
 from app.services.pricing.promote_scan_derived_catalog import (
     ScanDerivedPromotionError,
@@ -32,7 +32,12 @@ def promote_scan_derived_catalog_rows(
     ),
     limit: int = Query(500, ge=1, le=2000),
     timeout_seconds: int = Query(30, alias="timeoutSeconds", ge=5, le=120),
-    _admin: dict[str, Any] = Depends(require_admin_import_token),
+    # A scheduled job, and already operated as one -- the cron calls this
+    # route on a timer. It authenticated with the human import token only by
+    # historical accident, which is what kept ADMIN_IMPORT_TOKEN load-bearing
+    # for automation. ⚠️ The cron's Render env var must be switched from
+    # ADMIN_IMPORT_TOKEN to ADMIN_JOB_TOKEN before it is unsuspended.
+    _admin: dict[str, Any] = Depends(require_admin_job_token),
 ) -> dict[str, Any]:
     jobs = AdminImportJobService()
     job = jobs.create_job(source="scan_derived", dry_run=dry_run)

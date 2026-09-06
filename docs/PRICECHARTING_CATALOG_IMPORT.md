@@ -71,6 +71,24 @@ Configure this private Render environment variable:
 
 - `ADMIN_IMPORT_TOKEN`
 
+> **What this token can do (narrowed 2026-09-07).** `ADMIN_IMPORT_TOKEN` is an
+> **import and read** operational credential, not a full admin token. It holds
+> `admin:read`, `audit:read` and `imports:run` — enough to run the imports
+> below and to read the admin console's read-only surfaces, and nothing else.
+>
+> It **cannot** edit pricing, users, portfolio items, catalog metadata, scan
+> failures, or send push notifications. Those require a real Supabase admin
+> session — someone signed into `admin.packlox.com` — so that consequential
+> actions are attributable to a person and recorded in the audit log against
+> their identity.
+>
+> It previously held every permission, which made a single shared env-var
+> secret owner-equivalent. That is what changed; the token value itself was
+> not rotated.
+>
+> **Scheduled jobs use `ADMIN_JOB_TOKEN`, not this token.** The two are
+> separate values in Render and must stay separate.
+
 Then trigger a compact dry-run response without using Render Shell:
 
 ```bash

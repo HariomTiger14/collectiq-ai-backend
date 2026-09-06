@@ -5,6 +5,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app.main import app
+from tests.admin_auth_helpers import console_admin
 from app.services.admin_audit_service import clear_in_memory_audit_events
 from app.services.admin_user_service import (
     AdminUserService,
@@ -383,10 +384,9 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(event["metadata"]["userId"], "user-1")
 
     def test_subscription_override_endpoint_records_audit(self) -> None:
-        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+        with console_admin() as auth_settings, patch(
             "app.routers.admin_users.AdminUserService",
         ) as service:
-            auth_settings.admin_import_token = "secret-token"
             service.return_value.override_subscription.return_value = {
                 "success": True,
                 "userId": "user-1",
@@ -411,8 +411,7 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(event["metadata"]["plan"], "pro")
 
     def test_subscription_override_rejects_invalid_plan(self) -> None:
-        with patch("app.routers.admin_auth.settings") as auth_settings:
-            auth_settings.admin_import_token = "secret-token"
+        with console_admin() as auth_settings:
             response = self.client.post(
                 "/admin/users/user-1/subscription",
                 json={"plan": "diamond"},
@@ -422,10 +421,9 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
 
     def test_scan_usage_reset_endpoint_records_audit(self) -> None:
-        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+        with console_admin() as auth_settings, patch(
             "app.routers.admin_users.AdminUserService",
         ) as service:
-            auth_settings.admin_import_token = "secret-token"
             service.return_value.reset_scan_usage.return_value = {
                 "success": True,
                 "scanUsage": {"used": 0, "limit": 30, "periodStart": "2026-07-01"},
@@ -472,10 +470,9 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(event["metadata"]["query"], "collector@example.com")
 
     def test_collector_profile_update_endpoint_records_audit(self) -> None:
-        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+        with console_admin() as auth_settings, patch(
             "app.routers.admin_users.AdminUserService",
         ) as service:
-            auth_settings.admin_import_token = "secret-token"
             service.return_value.update_collector_profile.return_value = {
                 "success": True,
                 "userId": "user-1",
@@ -500,10 +497,9 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(event["metadata"]["displayName"], "New Name")
 
     def test_wishlist_entry_update_endpoint_records_audit(self) -> None:
-        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+        with console_admin() as auth_settings, patch(
             "app.routers.admin_users.AdminUserService",
         ) as service:
-            auth_settings.admin_import_token = "secret-token"
             service.return_value.update_wishlist_entry.return_value = {
                 "success": True,
                 "userId": "user-1",
@@ -529,8 +525,7 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(event["metadata"]["status"], "owned")
 
     def test_wishlist_entry_update_rejects_invalid_status(self) -> None:
-        with patch("app.routers.admin_auth.settings") as auth_settings:
-            auth_settings.admin_import_token = "secret-token"
+        with console_admin() as auth_settings:
             response = self.client.patch(
                 "/admin/users/user-1/wishlist/item-1",
                 json={"status": "sold"},
@@ -540,10 +535,9 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
 
     def test_wishlist_entry_delete_endpoint_records_audit(self) -> None:
-        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+        with console_admin() as auth_settings, patch(
             "app.routers.admin_users.AdminUserService",
         ) as service:
-            auth_settings.admin_import_token = "secret-token"
             service.return_value.delete_wishlist_entry.return_value = {
                 "success": True,
                 "userId": "user-1",
@@ -567,10 +561,9 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(len(audit_response.json()["events"]), 1)
 
     def test_price_alert_update_endpoint_records_audit(self) -> None:
-        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+        with console_admin() as auth_settings, patch(
             "app.routers.admin_users.AdminUserService",
         ) as service:
-            auth_settings.admin_import_token = "secret-token"
             service.return_value.update_price_alert.return_value = {
                 "success": True,
                 "userId": "user-1",
@@ -604,10 +597,9 @@ class AdminUsersTest(unittest.TestCase):
         self.assertEqual(event["metadata"]["enabled"], False)
 
     def test_price_alert_delete_endpoint_records_audit(self) -> None:
-        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+        with console_admin() as auth_settings, patch(
             "app.routers.admin_users.AdminUserService",
         ) as service:
-            auth_settings.admin_import_token = "secret-token"
             service.return_value.delete_price_alert.return_value = {
                 "success": True,
                 "userId": "user-1",
@@ -763,8 +755,7 @@ class AdminTeamTest(unittest.TestCase):
         # not just staff -- so role="user" must pass request validation
         # (it fails downstream at 503 in this test only because Supabase
         # isn't configured, not because of the role).
-        with patch("app.routers.admin_auth.settings") as auth_settings:
-            auth_settings.admin_import_token = "secret-token"
+        with console_admin() as auth_settings:
             response = self.client.post(
                 "/admin/users/team",
                 json={"email": "new.hire@packlox.com", "role": "user"},
@@ -774,8 +765,7 @@ class AdminTeamTest(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
 
     def test_team_invite_request_rejects_an_unknown_role(self) -> None:
-        with patch("app.routers.admin_auth.settings") as auth_settings:
-            auth_settings.admin_import_token = "secret-token"
+        with console_admin() as auth_settings:
             response = self.client.post(
                 "/admin/users/team",
                 json={"email": "new.hire@packlox.com", "role": "owner"},

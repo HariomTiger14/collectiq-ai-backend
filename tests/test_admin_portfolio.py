@@ -5,6 +5,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from app.main import app
+from tests.admin_auth_helpers import console_admin
 from app.schemas.portfolio import PortfolioCreateRequest
 from app.services.admin_portfolio_service import AdminPortfolioService
 from app.services.pricing.admin_review_queue_service import (
@@ -106,8 +107,7 @@ class AdminPortfolioTest(unittest.TestCase):
             )
         )
 
-        with patch("app.routers.admin_auth.settings") as settings:
-            settings.admin_import_token = "secret-token"
+        with console_admin() as settings:
             response = self.client.patch(
                 "/admin/portfolio/items/item-update",
                 headers={"Authorization": "Bearer secret-token"},
@@ -150,8 +150,7 @@ class AdminPortfolioTest(unittest.TestCase):
             )
         )
 
-        with patch("app.routers.admin_auth.settings") as settings:
-            settings.admin_import_token = "secret-token"
+        with console_admin() as settings:
             response = self.client.patch(
                 "/admin/portfolio/items/item-locked-fields",
                 headers={"Authorization": "Bearer secret-token"},

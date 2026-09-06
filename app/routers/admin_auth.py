@@ -24,6 +24,24 @@ FULL_ADMIN_PERMISSIONS = {
     "users:write",
 }
 
+# What the static ADMIN_IMPORT_TOKEN may do. It used to hold
+# FULL_ADMIN_PERMISSIONS, which made it owner-equivalent: a single shared
+# secret that could price, edit users, resolve scans and send push to every
+# device, bypassing the role model entirely. It is a shared operational
+# credential that lives in env vars and runbooks, not a person, so it now
+# holds only what the documented operational tasks actually need -- reading
+# the console surface and running catalog imports.
+#
+# ADMIN_JOB_TOKEN is deliberately NOT narrowed here (see
+# require_admin_job_token): cron routes authenticate with it directly and do
+# not go through a permission check, and reducing it would be a separate
+# decision with its own blast radius.
+STATIC_IMPORT_TOKEN_PERMISSIONS = {
+    "admin:read",
+    "audit:read",
+    "imports:run",
+}
+
 ROLE_PERMISSIONS = {
     "viewer": {"admin:read", "audit:read"},
     "support": {"admin:read", "audit:read", "reports:export", "scans:write", "users:write"},
@@ -47,6 +65,7 @@ def require_admin_import_token(
 ) -> dict[str, Any]:
     return _require_admin_token(
         expected_token=settings.admin_import_token,
+        static_permissions=STATIC_IMPORT_TOKEN_PERMISSIONS,
         not_configured_code="admin_import_not_configured",
         not_configured_message="ADMIN_IMPORT_TOKEN is not configured.",
         x_admin_token=x_admin_token,
@@ -58,8 +77,12 @@ def require_admin_job_token(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    # Unchanged: a scheduled job authenticates with this token and the routes
+    # it reaches check the token itself, not a permission. Narrowing it would
+    # change what every cron can do, which is a separate decision.
     return _require_admin_token(
         expected_token=settings.admin_job_token,
+        static_permissions=FULL_ADMIN_PERMISSIONS,
         not_configured_code="admin_job_not_configured",
         not_configured_message="ADMIN_JOB_TOKEN is not configured.",
         x_admin_token=x_admin_token,
@@ -99,6 +122,7 @@ def require_admin_permission(permission: str) -> Callable[..., dict[str, Any]]:
 def _require_admin_token(
     *,
     expected_token: str,
+    static_permissions: set[str],
     not_configured_code: str,
     not_configured_message: str,
     x_admin_token: str | None,
@@ -107,7 +131,7 @@ def _require_admin_token(
     supplied_token = (x_admin_token or _bearer_token(authorization) or "").strip()
     expected = expected_token.strip()
     if expected and supplied_token == expected:
-        return _static_admin()
+        return _static_admin(static_permissions)
 
     supabase_admin = _supabase_admin_token(supplied_token)
     if supabase_admin:
@@ -251,14 +275,22 @@ def _permissions_for_role(role: str) -> set[str]:
     return set(ROLE_PERMISSIONS.get(normalized, ROLE_PERMISSIONS["viewer"]))
 
 
-def _static_admin() -> dict[str, Any]:
+def _static_admin(permissions: set[str]) -> dict[str, Any]:
+    """The identity a static token resolves to.
+
+    Callers pass the permission set, so the import token and the job token no
+    longer share one owner-equivalent identity. `role` stays "admin" because
+    it is a machine identity rather than a console role -- what it may
+    actually do is decided by `permissions`, not by this label.
+    """
+    granted = sorted(permissions)
     return {
         "id": "admin_token",
         "email": "",
         "role": "admin",
         "isAdmin": True,
-        "permissions": sorted(FULL_ADMIN_PERMISSIONS),
-        "canWrite": True,
+        "permissions": granted,
+        "canWrite": bool(set(granted) - {"admin:read", "audit:read"}),
         "authMode": "admin_token",
     }
 
