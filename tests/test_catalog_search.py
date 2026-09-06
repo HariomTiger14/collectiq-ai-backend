@@ -513,6 +513,88 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertEqual(response.results[0].source, "KicksDB")
         self.assertEqual(response.results[0].attribution, "Pricing data by KicksDB")
 
+    def test_search_suppresses_kicksdb_images_when_flag_disabled(self) -> None:
+        # The sneaker switch is the only image flag that suppresses an
+        # already-present URL rather than skipping an enrichment call, and
+        # the case that needs it most -- an all-KicksDB result set, where
+        # every row already has an image -- is exactly the case that skips
+        # the enrichment block. Pin both.
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "kicksdb_id": "kdb-1",
+                            "title": "Air Jordan 1 Retro High OG",
+                            "brand": "Jordan",
+                            "category": "Sneakers",
+                            "image_url": "https://images.stockx.com/air-jordan-1.jpg?w=140",
+                            "currency": "USD",
+                            "avg_price_cents": 31000,
+                            "updated_at": "2026-08-10T00:00:00Z",
+                        },
+                    ],
+                )
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[{"category": "kicksdb", "enabled": False}])
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        response = service.search("air jordan 1", limit=10)
+
+        self.assertEqual(response.count, 1)
+        result = response.results[0]
+        self.assertEqual(result.source, "KicksDB")
+        self.assertIsNone(result.imageUrl)
+        self.assertIsNone(result.externalImageUrl)
+        self.assertEqual(result.images, [])
+        # Pricing and identity must survive -- this is an image switch.
+        self.assertEqual(result.title, "Air Jordan 1 Retro High OG")
+        self.assertEqual(result.pricing.marketValue, 310.0)
+
+    def test_search_keeps_kicksdb_images_when_flag_enabled(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "search_kicksdb_catalog" in url:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "kicksdb_id": "kdb-1",
+                            "title": "Air Jordan 1 Retro High OG",
+                            "brand": "Jordan",
+                            "category": "Sneakers",
+                            "image_url": "https://images.stockx.com/air-jordan-1.jpg?w=140",
+                            "currency": "USD",
+                            "avg_price_cents": 31000,
+                            "updated_at": "2026-08-10T00:00:00Z",
+                        },
+                    ],
+                )
+            if "catalog_image_source_flags" in url:
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[])
+
+        service = CatalogSearchService(
+            supabase_url="https://example.supabase.co",
+            service_role_key="service-role",
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+        result = service.search("air jordan 1", limit=10).results[0]
+
+        self.assertEqual(
+            result.imageUrl, "https://images.stockx.com/air-jordan-1.jpg?w=140"
+        )
+        self.assertIsNotNone(result.externalImageUrl)
+
     def test_search_merges_real_kicksdb_catalog_results_with_images(self) -> None:
         # kicksdb_catalog is a separate table from pricecharting_catalog
         # (confirmed 100% image_url coverage live, 11,415/11,415 rows) —

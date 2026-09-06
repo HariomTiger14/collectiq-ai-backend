@@ -342,8 +342,11 @@ class CatalogSearchService:
         # catalog-images bucket (scripts/rehost_yugioh_images.py) --
         # YGOPRODeck forbids hotlinking outright, so inline display
         # waited for self-hosted pixels. Killable via 'yugioh'.
+        # Fetched once, up front, rather than inside the block below:
+        # sneaker suppression needs the flags even when every row already
+        # has an image, which is precisely when that block is skipped.
+        enabled_image_categories = self._fetch_enabled_image_categories()
         if any(not result.imageUrl for result in results):
-            enabled_image_categories = self._fetch_enabled_image_categories()
             # Pokemon thumbnails BEFORE the link-only pass: rows that get
             # an inline TCGdex low.webp short-circuit
             # _resolve_external_image_url (imageUrl set -> early return),
@@ -387,6 +390,18 @@ class CatalogSearchService:
             # why that stays cheap at this table's scale.
             if "videogames" in enabled_image_categories:
                 results = self._enrich_pricecharting_video_game_images(results)
+        # Sneaker suppression is checked unconditionally, outside the
+        # `if any(not result.imageUrl ...)` block above: a result set made
+        # entirely of KicksDB rows never enters that block (every row
+        # already has an imageUrl), which is exactly the case that needs
+        # the switch. Runs last so nothing can re-attach afterwards.
+        if "kicksdb" not in enabled_image_categories:
+            results = [
+                _suppress_kicksdb_images(result)
+                if result.source == "KicksDB"
+                else result
+                for result in results
+            ]
         return CatalogSearchResponse(
             query=normalized_query,
             count=len(results),
@@ -498,6 +513,13 @@ class CatalogSearchService:
                         else gallery_images
                     }
                 )
+            # Applied after the gallery/primary block so it clears every
+            # surface that block can populate. Flags are fetched here, not
+            # reused from the PriceCharting branch above -- that branch
+            # returns before this point, so its `enabled` never executes
+            # on the KicksDB path.
+            if "kicksdb" not in self._fetch_enabled_image_categories():
+                kicksdb_result = _suppress_kicksdb_images(kicksdb_result)
             kicksdb_listings = _kicksdb_marketplace_listings(kicksdb_row)
             if target_currency:
                 kicksdb_listings = [
@@ -821,6 +843,14 @@ class CatalogSearchService:
             "onepiece",
             "videogames",
             "coins",
+            # Sneakers differ from every other entry here: KicksDB rows
+            # arrive with image_url already populated, so there is no
+            # enrichment call to skip. Disabling this category instead
+            # SUPPRESSES the already-present URL -- see
+            # _suppress_kicksdb_images. Those URLs resolve to StockX's
+            # CDN, whose hotlink protection is a Cloudflare toggle on
+            # their side, so this needs to be flippable without a deploy.
+            "kicksdb",
         }
         try:
             payload = self._request(
@@ -2091,6 +2121,27 @@ def _pricing_from_row(row: dict[str, Any]) -> CatalogSearchPricing:
         cibPrice=cib,
         newPrice=new,
         gradedPrice=graded,
+    )
+
+
+def _suppress_kicksdb_images(result: CatalogSearchResult) -> CatalogSearchResult:
+    """Strip sneaker imagery when the 'kicksdb' image flag is disabled.
+
+    Applied AFTER row construction rather than inside
+    _kicksdb_row_to_result: that mapper is a pure module-level function
+    used by both search() and detail(), and threading service state
+    through it would spread the flag across the call graph. Suppressing
+    at the end also guarantees nothing downstream can re-attach an image.
+
+    Every other category's flag skips an enrichment call. This one has no
+    call to skip -- the URL is already on the row -- so it clears the
+    three surfaces the KicksDB path can populate: the inline thumbnail,
+    the "View image" link, and the detail gallery.
+    """
+    if not (result.imageUrl or result.externalImageUrl or result.images):
+        return result
+    return result.model_copy(
+        update={"imageUrl": None, "externalImageUrl": None, "images": []}
     )
 
 

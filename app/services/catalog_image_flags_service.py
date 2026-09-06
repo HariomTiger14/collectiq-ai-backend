@@ -7,6 +7,11 @@ import httpx
 
 from app.core.config import settings
 
+# Must stay in step with the `all_categories` set in
+# CatalogSearchService._fetch_enabled_image_categories -- that one decides
+# what the read path honours, this one decides what the admin portal can
+# list and toggle. A category present in only one of the two is either an
+# unusable switch or an invisible one.
 KNOWN_CATEGORIES: tuple[str, ...] = (
     "funko",
     "pokemon",
@@ -17,6 +22,7 @@ KNOWN_CATEGORIES: tuple[str, ...] = (
     "onepiece",
     "videogames",
     "coins",
+    "kicksdb",
 )
 
 
