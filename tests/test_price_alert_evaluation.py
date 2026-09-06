@@ -161,3 +161,72 @@ def test_notified_alert_stays_when_still_met():
     assert summary.triggered == 0
     assert summary.rearmed == 0
     assert patched == []
+
+
+def test_message_names_the_collectors_own_currency():
+    # The threshold text was hardcoded "AUD {n}". With item prices stored in
+    # the provider's USD, a threshold set as AUD 80 is compared as USD 52 --
+    # quoting either number under the wrong currency is a false statement.
+    service, patched = _service(
+        alerts=[
+            _alert(
+                rule_type="priceRisesAboveAmount",
+                target_amount=52,
+                display_amount=80,
+                display_currency="AUD",
+            )
+        ],
+        items=[_item(60)],
+    )
+    service.evaluate_and_flag()
+
+    message = patched[0]["body"]["message"]
+    assert "AUD 80" in message
+    assert "52" not in message
+
+
+def test_message_falls_back_to_aud_for_alerts_created_before_currency_intent():
+    # Rows with no display_* columns predate the split and were all AUD.
+    service, patched = _service(
+        alerts=[_alert(rule_type="priceRisesAboveAmount", target_amount=100)],
+        items=[_item(150)],
+    )
+    service.evaluate_and_flag()
+
+    assert "AUD 100" in patched[0]["body"]["message"]
+
+
+def test_drop_below_still_triggers_on_the_comparison_value():
+    service, patched = _service(
+        alerts=[
+            _alert(
+                rule_type="priceDropsBelowAmount",
+                target_amount=52,
+                display_amount=80,
+                display_currency="AUD",
+            )
+        ],
+        items=[_item(40)],
+    )
+    summary = service.evaluate_and_flag()
+
+    assert summary.triggered == 1
+    assert "dropped below AUD 80" in patched[0]["body"]["message"]
+
+
+def test_message_reads_intent_from_raw_json_when_columns_are_absent():
+    # The app persists intent in raw_json so an alert can save without the
+    # display_* migration applied. The evaluator must find it there too.
+    service, patched = _service(
+        alerts=[
+            _alert(
+                rule_type="priceRisesAboveAmount",
+                target_amount=52,
+                raw_json={"rule": {"amount": 80, "displayCurrency": "AUD"}},
+            )
+        ],
+        items=[_item(60)],
+    )
+    service.evaluate_and_flag()
+
+    assert "AUD 80" in patched[0]["body"]["message"]

@@ -224,14 +224,26 @@ class PriceAlertEvaluationService:
         title = alert.get("item_title") or raw.get("title") or "Item"
         rule_type = alert.get("rule_type")
 
-        if rule_type == "priceRisesAboveAmount":
+        if rule_type in ("priceRisesAboveAmount", "priceDropsBelowAmount"):
+            # Compare like with like. target_amount is the threshold in the
+            # currency the item price is stored in (USD for anything priced
+            # after native storage landed); the collector's own figure and
+            # currency live in display_amount/display_currency and are what
+            # the message quotes back to them.
             amount = _to_float(alert.get("target_amount"))
-            if current is not None and amount is not None and current >= amount:
-                return f"{title} rose above {_aud(amount)}."
-        elif rule_type == "priceDropsBelowAmount":
-            amount = _to_float(alert.get("target_amount"))
-            if current is not None and amount is not None and current <= amount:
-                return f"{title} dropped below {_aud(amount)}."
+            if current is not None and amount is not None:
+                crossed = (
+                    current >= amount
+                    if rule_type == "priceRisesAboveAmount"
+                    else current <= amount
+                )
+                if crossed:
+                    verb = (
+                        "rose above"
+                        if rule_type == "priceRisesAboveAmount"
+                        else "dropped below"
+                    )
+                    return f"{title} {verb} {_threshold_text(alert, amount)}."
         elif rule_type == "percentageIncrease":
             baseline = _to_float(alert.get("baseline_value")) or current
             pct = _to_float(alert.get("percentage")) or 0.0
@@ -290,8 +302,30 @@ def _parse_iso(value: Any) -> datetime | None:
     return parsed
 
 
-def _aud(value: float) -> str:
-    return f"AUD {int(round(value)):,}"
+def _threshold_text(alert: dict[str, Any], fallback_amount: float) -> str:
+    """The threshold as the collector set it, named in their own currency.
+
+    This used to be hardcoded as "AUD {n}", which stated a currency the
+    number might not be in. Prefers the collector's own figure; falls back to
+    the comparison value for alerts created before the two were recorded
+    separately, which were all AUD.
+    """
+    # The app writes intent into raw_json (no migration needed for an alert
+    # to save); the display_* columns are the same values promoted for admin
+    # and reporting. Read either.
+    rule = (alert.get("raw_json") or {}).get("rule") or {}
+    display_amount = _to_float(
+        alert.get("display_amount") if alert.get("display_amount") is not None
+        else rule.get("amount")
+    )
+    display_currency = str(
+        alert.get("display_currency") or rule.get("displayCurrency") or ""
+    ).strip().upper()
+    if display_amount is not None and display_currency:
+        return f"{display_currency} {int(round(display_amount)):,}"
+    if display_amount is not None:
+        return f"AUD {int(round(display_amount)):,}"
+    return f"AUD {int(round(fallback_amount)):,}"
 
 
 def _percent(value: float) -> str:
