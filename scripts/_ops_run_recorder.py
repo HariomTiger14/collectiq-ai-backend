@@ -204,24 +204,12 @@ def record_db_failure(
 #
 # which stored a live API token in the ledger -- readable by anything with
 # database access, and copied again into ops_error_events. Redacting here
-# rather than per-script is deliberate: _redact_token() in
-# backfill_pricecharting_sets.py covers only print() calls in that one file and
-# needs the token passed in, so every other job leaked by default.
-#
-# Matches on the PARAMETER NAME rather than on known secret values, so it also
-# covers credentials this module never sees.
-_SECRET_QUERY_PARAMS = re.compile(
-    r"([?&](?:t|key|token|api[-_]?key|apikey|access[-_]?token|password|secret)=)"
-    r"""[^&\s"'>]+""",
-    re.IGNORECASE,
-)
-
-
-def scrub_secrets(text: str) -> str:
-    """Redact credential-bearing query parameters from arbitrary text."""
-    if not text:
-        return text
-    return _SECRET_QUERY_PARAMS.sub(r"\1[REDACTED]", text)
+# Redaction moved to app/services/ops/scrubbing.py so the API path shares it --
+# it used to live here, which meant unhandled API errors reached the ops feed
+# unredacted. Re-exported so this module's public surface is unchanged and
+# scripts importing scrub_secrets from here keep working. The shared module is
+# dependency-free precisely so importing it cannot break a cron.
+from app.services.ops.scrubbing import scrub_secrets  # noqa: E402
 
 
 class _Recorder:

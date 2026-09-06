@@ -3,7 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core.config import UPLOAD_DIR, settings
-from app.services.ops.observability import record_unhandled_error
+from app.services.ops.observability import (
+    record_handled_server_error,
+    record_unhandled_error,
+)
 from app.routers import (
     admin_audit,
     admin_catalog,
@@ -41,6 +44,50 @@ app = FastAPI(
     version=settings.version,
     description="Local backend for CollectIQ AI scanner workflows.",
 )
+
+# ORDER HERE IS LOAD-BEARING, AND COUNTER-INTUITIVE. add_middleware() inserts
+# at position 0, so the LAST registered middleware is the OUTERMOST. This
+# catch-all is registered BEFORE CORSMiddleware precisely so that CORS ends up
+# wrapping it -- which is what puts Access-Control-Allow-Origin on the 500 it
+# returns.
+#
+# It exists because a handler registered with @app.exception_handler(Exception)
+# is served by Starlette's ServerErrorMiddleware, which sits outside every user
+# middleware including CORS. That response carried no CORS headers, so an
+# unhandled backend error reached the admin console as a bare "Failed to
+# fetch": a correct error envelope the browser was never permitted to read.
+# Measured rather than reasoned about -- tests/test_error_visibility.py fails
+# if this registration moves below add_middleware(CORSMiddleware).
+@app.middleware("http")
+async def unhandled_exception_middleware(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as error:  # noqa: BLE001 - deliberate catch-all
+        route = (
+            getattr(getattr(request, "scope", {}).get("route"), "path", None)
+            or request.url.path
+        )
+        # Best-effort in the strict sense: if the recorder itself raises, that
+        # exception would escape this middleware and be served by
+        # ServerErrorMiddleware -- outside CORS -- reinstating the very bug
+        # this middleware exists to fix. Observability must never take down
+        # the thing it observes, and here it must not take down its own fix.
+        try:
+            record_unhandled_error(route=route, error=error)
+        except Exception:  # noqa: BLE001 - observability is never load-bearing
+            pass
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": {
+                    "code": "internal_error",
+                    "message": "Internal server error.",
+                    "retryable": True,
+                },
+            },
+        )
+
 
 _allow_origins = list(settings.cors_allowed_origins)
 app.add_middleware(
@@ -91,27 +138,28 @@ async def http_exception_handler(
     request: Request,
     exc: HTTPException,
 ) -> JSONResponse:
+    # A deliberate 5xx is still a server-side failure and belongs in the ops
+    # feed; 4xx is the caller being told no, which is not a defect and would
+    # bury the feed in auth and not-found noise. Best-effort -- recording can
+    # never change the response.
+    if exc.status_code >= 500:
+        route = (
+            getattr(getattr(request, "scope", {}).get("route"), "path", None)
+            or request.url.path
+        )
+        try:
+            record_handled_server_error(
+                route=route, status_code=exc.status_code, detail=exc.detail
+            )
+        except Exception:  # noqa: BLE001 - observability is never load-bearing
+            pass
     return JSONResponse(
         status_code=exc.status_code,
         content={"success": False, "error": exc.detail},
     )
 
 
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(
-    request: Request,
-    exc: Exception,
-) -> JSONResponse:
-    # Every unhandled exception becomes an ops_error_events row so the
-    # admin portal's error feed sees it (grouped by route + error class);
-    # HTTPExceptions never reach here -- deliberate 4xx/5xx responses are
-    # not defects. The route TEMPLATE (/admin/users/{user_id}), not the
-    # concrete path, keys the fingerprint so one buggy route groups as
-    # one issue. Recording is best-effort and can never mask the error:
-    # the client still gets the same 500 it always did.
-    route = getattr(getattr(request, "scope", {}).get("route"), "path", None) or request.url.path
-    record_unhandled_error(route=route, error=exc)
-    return JSONResponse(
-        status_code=500,
-        content={"success": False, "error": {"code": "internal_error", "message": "Internal server error."}},
-    )
+# The catch-all lives in unhandled_exception_middleware near the top of this
+# file, NOT here: an @app.exception_handler(Exception) response is produced
+# by Starlette's ServerErrorMiddleware, which sits outside CORS, so the
+# browser can never read it.
