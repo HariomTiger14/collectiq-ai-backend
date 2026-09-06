@@ -18,7 +18,6 @@ from app.services.pricing.base_pricing_provider import (
     PricingResult,
 )
 from app.services.pricing.currency_conversion import (
-    convert_pricing_result,
     normalize_display_currency,
 )
 from app.services.pricing.pricecharting_pricing_provider import attribution_url_for
@@ -92,7 +91,11 @@ class RepriceService:
                 reason_code="LOOKUP_FAILED",
                 currency=display_currency,
             )
-        pricing = convert_pricing_result(pricing, target_currency=display_currency)
+        # Persist and return the provider's own currency. Converting here used
+        # a hardcoded settings rate while the app converts for display against
+        # the live daily rate, so every stored value carried the gap between
+        # the two (9.5% for USD->AUD on 2026-09-04). One conversion, at
+        # display time, against a real dated rate.
         self._set_cached_pricing(recognition, pricing, display_currency)
 
         return RepriceResponse(

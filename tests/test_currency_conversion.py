@@ -2,7 +2,10 @@ import unittest
 from unittest.mock import patch
 
 from app.services.pricing.base_pricing_provider import PricingResult
-from app.services.pricing.currency_conversion import convert_pricing_result
+from app.services.pricing.currency_conversion import (
+    convert_pricing_result,
+    normalize_display_currency,
+)
 
 
 class CurrencyConversionTest(unittest.TestCase):
@@ -57,3 +60,19 @@ class CurrencyConversionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NormalizeDisplayCurrencyTest(unittest.TestCase):
+    def test_defaults_to_the_configured_currency(self) -> None:
+        # Providers quote USD, and the backend no longer converts before
+        # persisting, so an unspecified currency must not become AUD -- that
+        # silent default is what labelled USD provider prices as AUD.
+        self.assertEqual(normalize_display_currency(None), "USD")
+        self.assertEqual(normalize_display_currency(""), "USD")
+
+    def test_an_unsupported_code_falls_back_to_the_default_not_aud(self) -> None:
+        self.assertEqual(normalize_display_currency("JPY"), "USD")
+
+    def test_keeps_a_supported_code(self) -> None:
+        self.assertEqual(normalize_display_currency("aud"), "AUD")
+        self.assertEqual(normalize_display_currency(" gbp "), "GBP")

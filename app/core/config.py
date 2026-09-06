@@ -202,7 +202,13 @@ class Settings:
     pricing_provider_min_interval_ms: int = int(
         os.getenv("PRICING_PROVIDER_MIN_INTERVAL_MS", "250")
     )
-    default_display_currency: str = os.getenv("DEFAULT_DISPLAY_CURRENCY", "AUD")
+    # USD, because that is what the pricing providers quote in: PriceCharting
+    # and SportsCardsPro are USD-only. The backend no longer converts before
+    # persisting (see RepriceService.reprice), so this is the currency a value
+    # is stored and labelled in when nothing else specifies one -- it should
+    # match the providers, not a market. What a collector reads in is their
+    # own profile setting, applied by the app at display time.
+    default_display_currency: str = os.getenv("DEFAULT_DISPLAY_CURRENCY", "USD")
     fx_usd_to_aud: float = float(os.getenv("FX_USD_TO_AUD", "1.52"))
     fx_usd_to_cad: float = float(os.getenv("FX_USD_TO_CAD", "1.37"))
     fx_usd_to_gbp: float = float(os.getenv("FX_USD_TO_GBP", "0.78"))

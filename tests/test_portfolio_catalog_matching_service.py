@@ -15,7 +15,6 @@ from app.services.pricing.catalog_search_service import CatalogSearchError
 from app.services.pricing.portfolio_catalog_matching_service import (
     PortfolioCatalogMatchingError,
     PortfolioItemReader,
-    _display_currency_from_item,
     backfill_catalog_history_for_item,
     build_match_query,
     find_best_match,
@@ -193,20 +192,6 @@ class FindBestMatchTest(unittest.TestCase):
         self.assertEqual(match["id"], "x")
 
 
-class DisplayCurrencyFromItemTest(unittest.TestCase):
-    def test_uses_raw_json_currency(self) -> None:
-        item = {"raw_json": {"currency": "USD"}}
-        self.assertEqual(_display_currency_from_item(item), "USD")
-
-    def test_falls_back_to_nested_pricing_currency(self) -> None:
-        item = {"raw_json": {"pricing": {"currency": "GBP"}}}
-        self.assertEqual(_display_currency_from_item(item), "GBP")
-
-    def test_defaults_to_aud(self) -> None:
-        self.assertEqual(_display_currency_from_item({}), "AUD")
-        self.assertEqual(_display_currency_from_item({"raw_json": {}}), "AUD")
-
-
 def _history_point(*, valid_from: str, market_value: float | None, currency: str = "USD") -> CatalogHistoryPoint:
     return CatalogHistoryPoint(
         validFrom=valid_from,
@@ -281,9 +266,12 @@ class BackfillCatalogHistoryForItemTest(unittest.TestCase):
         self.assertEqual(inserted, 0)
         self.assertEqual(reader.inserted_rows, [])
 
-    def test_converts_currency_to_the_items_display_currency(self) -> None:
-        from app.services.pricing.currency_conversion import _exchange_rate
-
+    def test_keeps_the_catalogs_own_currency(self) -> None:
+        # Backfilled points are historical. Converting them applied today's
+        # hardcoded settings rate to a months-old price, putting an FX move
+        # into a chart that never happened -- and that rate is itself stale
+        # (1.52 configured against a live 1.3882). The app converts each
+        # point at the rate in effect on its own date instead.
         history = [_history_point(valid_from="2026-01-01T00:00:00Z", market_value=100.0, currency="USD")]
         catalog = _StubDetailCatalog(history=history)
         reader = _RecordingHistoryReader(earliest_existing=None)
@@ -293,9 +281,8 @@ class BackfillCatalogHistoryForItemTest(unittest.TestCase):
             catalog, reader, item=item, catalog_id="12345", match_source="PriceCharting", match_confidence=0.96
         )
 
-        rate = _exchange_rate("USD", "AUD")
-        self.assertEqual(reader.inserted_rows[0]["value_aud"], 100.0 * rate)
-        self.assertEqual(reader.inserted_rows[0]["currency"], "AUD")
+        self.assertEqual(reader.inserted_rows[0]["value_aud"], 100.0)
+        self.assertEqual(reader.inserted_rows[0]["currency"], "USD")
 
     def test_returns_zero_when_catalog_detail_lookup_fails(self) -> None:
         catalog = _ExplodingDetailCatalog()
