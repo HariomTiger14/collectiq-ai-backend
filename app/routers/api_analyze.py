@@ -890,6 +890,10 @@ def _price_recognition(
     trace_id: str,
     display_currency: str,
 ):
+    # display_currency does not convert the result. A priced lookup returns
+    # the provider's own currency; this keys the shared pricing cache and
+    # labels zero-valued placeholders. See docs/BACKEND_SIT_DEPLOYMENT.md,
+    # "Currency Boundary".
     provider_name = settings.pricing_provider.strip().lower()
     lookup_query = _pricing_lookup_query(recognition)
     logger.info(

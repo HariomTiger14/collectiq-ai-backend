@@ -428,6 +428,64 @@ Existing app-compatible fields such as `brand`, `estimatedValue`, and nested `pr
 - Never commit `.env` files with real secrets.
 - Production remains disabled by app configuration.
 
+## Currency Boundary
+
+One rule, and where each half of it lives:
+
+| Layer | Currency |
+|---|---|
+| Provider (PriceCharting, SportsCardsPro, KicksDB) | USD — these providers quote USD only |
+| Backend persisted values | the provider's own, unconverted |
+| Backend catalog responses | USD, whatever `currency` a caller passes |
+| Mobile app display | the collector's selected currency, converted once against a live dated rate |
+
+Nothing between the provider and the screen converts. Values were previously
+converted before persisting, using a hardcoded `FX_USD_TO_AUD` constant, while
+the app converted back at the live rate — a 9.5% gap on 2026-09-04.
+
+**What `displayCurrency` still does** on `/api/analyze`, `/api/pricing/quote`
+and `/api/pricing/reprice`. It no longer converts a priced result: a
+successful lookup returns the provider's own amount and currency whatever is
+requested (`tests/test_reprice_endpoint.py::test_reprice_keeps_the_providers_own_currency`).
+It remains used for two things:
+
+1. **Unavailable placeholders.** When a lookup finds no market match, the
+   response carries `estimatedMarketValue: 0` and echoes the requested
+   currency. There is no provider currency to report and no amount to
+   mislabel.
+2. **The shared pricing cache key.** Entries are still keyed per display
+   currency. Harmless but now redundant — the cached payload is identical
+   across currencies, so this only duplicates entries. Worth collapsing.
+
+On `/api/pricing/catalog/{id}` the parameter selects which marketplace's eBay
+listings to match, and nothing else.
+
+### Pending migrations
+
+Apply in the Supabase SQL editor; there is no `exec_sql` RPC on this project.
+
+- `database/migrations/20260906_price_alert_currency_intent.sql` — **not yet
+  applied.** Adds `display_amount`, `display_currency`,
+  `normalized_amount_usd`, `exchange_rate_used`, `exchange_rate_date` to
+  `price_alerts`. **Optional for the app**: the app writes the same intent
+  into `raw_json` and the evaluator reads either, so alerts save and fire
+  without it. Apply it when admin/reporting needs a threshold's real currency
+  without unpacking JSON; the file carries a backfill query for existing rows.
+
+### Known currency follow-ups
+
+- **eBay marketplace listings** on the catalog detail page still convert
+  server-side with the static `FX_USD_TO_*` constants. Deliberately not folded
+  into the catalog fix: a listing's price belongs to a specific marketplace,
+  so whether to show it natively with a clear label or convert it in the app
+  is a product decision, not a bug fix. These constants now have no other
+  consumer.
+- **Legacy rows.** `portfolio_valuation_snapshots` holds 74 rows written in
+  AUD at the old static rate. They carry their own currency and convert
+  correctly on display, so they are safe; a reprice run rewrites them
+  natively. Nothing recorded the rate they were written at, so they cannot be
+  reversed exactly.
+
 ## Final SIT Deployment Checklist
 
 ### Render Setup

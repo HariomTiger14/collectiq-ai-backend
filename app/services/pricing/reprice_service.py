@@ -40,6 +40,11 @@ class RepriceService:
 
     def reprice(self, request: RepriceRequest) -> RepriceResponse:
         recognition = _recognition_from_request(request)
+        # displayCurrency no longer converts anything. A priced result comes
+        # back in the provider's own currency whatever is requested; this is
+        # used only to key the shared cache and to label the zero-valued
+        # placeholders below. See docs/BACKEND_SIT_DEPLOYMENT.md, "Currency
+        # Boundary".
         display_currency = normalize_display_currency(
             request.displayCurrency or request.previousCurrency
         )
