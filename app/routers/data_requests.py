@@ -1,3 +1,5 @@
+from typing import Any
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 
 from app.routers.admin_auth import (
@@ -116,7 +118,7 @@ async def list_my_data_requests(
 async def list_admin_data_requests(
     status_filter: str | None = Query(None, alias="status"),
     limit: int = Query(50, ge=1, le=200),
-    _admin: None = Depends(require_admin_permission("admin:read")),
+    _admin: dict[str, Any] = Depends(require_admin_permission("admin:read")),
 ) -> dict:
     try:
         return _service.list_requests(status=status_filter, limit=limit)
@@ -131,7 +133,7 @@ async def list_admin_data_requests(
 async def purge_due_data_requests(
     limit: int = Query(50, ge=1, le=500),
     dry_run: bool = Query(True, alias="dryRun"),
-    _admin: None = Depends(require_admin_job_token),
+    _admin: dict[str, Any] = Depends(require_admin_job_token),
 ) -> dict:
     """Cron entry point: carry out deletions whose grace period has elapsed.
 
@@ -152,7 +154,7 @@ async def purge_due_data_requests(
 async def process_admin_data_request(
     request_id: str,
     dry_run: bool = Query(True, alias="dryRun"),
-    _admin: None = Depends(require_admin_permission("users:write")),
+    _admin: dict[str, Any] = Depends(require_admin_permission("users:write")),
 ) -> dict:
     try:
         return _service.process_request(request_id, dry_run=dry_run)

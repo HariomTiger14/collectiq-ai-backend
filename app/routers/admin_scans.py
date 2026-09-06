@@ -32,11 +32,12 @@ class BulkScanFailureRequest(BaseModel):
 @router.get("/failures/{scan_id}")
 def scan_failure_detail(
     scan_id: str,
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     try:
         payload = AdminScanFailureService().get_failure_detail(scan_id)
         _record_audit(
+        admin=_admin,
             action="scan_failure_queue.detail_viewed",
             status="success",
             target_id=scan_id,
@@ -44,6 +45,7 @@ def scan_failure_detail(
         return payload
     except ScanFailureNotFoundError as error:
         _record_audit(
+        admin=_admin,
             action="scan_failure_queue.detail_viewed",
             status="failure",
             target_id=scan_id,
@@ -56,6 +58,7 @@ def scan_failure_detail(
         ) from error
     except ScanFailureQueueError as error:
         _record_audit(
+        admin=_admin,
             action="scan_failure_queue.detail_viewed",
             status="failure",
             target_id=scan_id,
@@ -76,11 +79,12 @@ def scan_failures(
         pattern="^(all|provider_error|low_confidence|image_quality|unpriced|needs_review)$",
     ),
     limit: int = Query(50, ge=1, le=200),
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     try:
         payload = AdminScanFailureService().list_failures(reason=reason, limit=limit)
         _record_audit(
+        admin=_admin,
             action="scan_failure_queue.viewed",
             status="success",
             metadata={"filter": reason, "count": payload.get("count", 0)},
@@ -88,6 +92,7 @@ def scan_failures(
         return payload
     except ScanFailureQueueError as error:
         _record_audit(
+        admin=_admin,
             action="scan_failure_queue.viewed",
             status="failure",
             metadata={"filter": reason, "error": str(error)},
@@ -103,11 +108,12 @@ def scan_failures(
 @router.post("/failures/{scan_id}/reviewed")
 def mark_scan_failure_reviewed(
     scan_id: str,
-    _admin: None = Depends(require_admin_permission("scans:write")),
+    _admin: dict[str, Any] = Depends(require_admin_permission("scans:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminScanFailureService().mark_reviewed(scan_id)
         _record_audit(
+        admin=_admin,
             action="scan_failure_queue.mark_reviewed",
             status="success",
             target_id=scan_id,
@@ -115,6 +121,7 @@ def mark_scan_failure_reviewed(
         return payload
     except ScanFailureNotFoundError as error:
         _record_audit(
+        admin=_admin,
             action="scan_failure_queue.mark_reviewed",
             status="failure",
             target_id=scan_id,
@@ -128,6 +135,7 @@ def mark_scan_failure_reviewed(
 
     except ScanFailureQueueError as error:
         _record_audit(
+        admin=_admin,
             action="scan_failure_queue.mark_reviewed",
             status="failure",
             target_id=scan_id,
@@ -145,7 +153,7 @@ def mark_scan_failure_reviewed(
 def resolve_scan_failure(
     scan_id: str,
     request: ScanFailureResolveRequest,
-    _admin: None = Depends(require_admin_permission("scans:write")),
+    _admin: dict[str, Any] = Depends(require_admin_permission("scans:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminScanFailureService().resolve_failure(
@@ -154,6 +162,7 @@ def resolve_scan_failure(
             note=request.note,
         )
         _record_audit(
+        admin=_admin,
             action="scan_failure_queue.resolve",
             status="success",
             target_id=scan_id,
@@ -162,6 +171,7 @@ def resolve_scan_failure(
         return payload
     except ScanFailureNotFoundError as error:
         _record_audit(
+        admin=_admin,
             action="scan_failure_queue.resolve",
             status="failure",
             target_id=scan_id,
@@ -175,6 +185,7 @@ def resolve_scan_failure(
 
     except ScanFailureQueueError as error:
         _record_audit(
+        admin=_admin,
             action="scan_failure_queue.resolve",
             status="failure",
             target_id=scan_id,
@@ -191,11 +202,12 @@ def resolve_scan_failure(
 @router.post("/failures/{scan_id}/retry")
 def retry_scan_failure_analysis(
     scan_id: str,
-    _admin: None = Depends(require_admin_permission("scans:write")),
+    _admin: dict[str, Any] = Depends(require_admin_permission("scans:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminScanFailureService().retry_analysis(scan_id)
         _record_audit(
+        admin=_admin,
             action="scan_failure_queue.retry_analysis",
             status="success",
             target_id=scan_id,
@@ -203,6 +215,7 @@ def retry_scan_failure_analysis(
         return payload
     except ScanFailureNotFoundError as error:
         _record_audit(
+        admin=_admin,
             action="scan_failure_queue.retry_analysis",
             status="failure",
             target_id=scan_id,
@@ -215,6 +228,7 @@ def retry_scan_failure_analysis(
         ) from error
     except ScanFailureQueueError as error:
         _record_audit(
+        admin=_admin,
             action="scan_failure_queue.retry_analysis",
             status="failure",
             target_id=scan_id,
@@ -235,6 +249,7 @@ def bulk_mark_scan_failures_reviewed(
 ) -> dict[str, Any]:
     payload = AdminScanFailureService().bulk_mark_reviewed(request.scanIds)
     _record_audit(
+        admin=_admin,
         action="scan_failure_queue.bulk_mark_reviewed",
         status="success" if payload.get("success") else "failure",
         metadata={
@@ -257,6 +272,7 @@ def bulk_resolve_scan_failures(
         note=request.note,
     )
     _record_audit(
+        admin=_admin,
         action="scan_failure_queue.bulk_resolve",
         status="success" if payload.get("success") else "failure",
         metadata={
@@ -285,6 +301,7 @@ def _scan_queue_error(
 
 def _record_audit(
     *,
+    admin: dict[str, Any] | None = None,
     action: str,
     status: str,
     target_id: str | None = None,
@@ -292,6 +309,12 @@ def _record_audit(
 ) -> None:
     try:
         AdminAuditService().record(
+            # Reuses admin_users.py's convention verbatim so the audit log has one
+            # actor format. Correct for BOTH identities without branching: a
+            # Supabase session carries an email, and _static_admin() returns
+            # id="admin_token" with an empty email -- so a runbook or cron action
+            # still records admin_token, accurately rather than by default.
+            actor=str((admin or {}).get("email") or (admin or {}).get("id") or "admin_token"),
             action=action,
             status=status,
             target_type="scan_analysis" if target_id else None,

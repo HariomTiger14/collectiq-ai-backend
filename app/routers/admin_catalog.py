@@ -22,7 +22,7 @@ router = APIRouter(prefix="/admin/catalog", tags=["Admin Catalog"])
 
 @router.get("/pipelines")
 def get_catalog_pipeline_status(
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     try:
         return AdminPipelineStatusService().get_summary()
@@ -48,7 +48,7 @@ def list_catalog_items(
     maxPrice: float | None = Query(default=None, ge=0),
     q: str | None = Query(default=None, max_length=120),
     sort: str | None = Query(default=None, pattern="^(price_asc|price_desc)$"),
-    _admin: None = Depends(require_admin_import_token),
+    _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     try:
         return AdminCatalogService().list_items(
@@ -81,7 +81,7 @@ class CatalogUpdateRequest(BaseModel):
 def update_catalog_item(
     catalog_id: str,
     request: CatalogUpdateRequest,
-    _admin: None = Depends(require_admin_permission("catalog:write")),
+    _admin: dict[str, Any] = Depends(require_admin_permission("catalog:write")),
 ) -> dict[str, Any]:
     try:
         payload = AdminCatalogService().update_item(
@@ -93,6 +93,7 @@ def update_catalog_item(
             "success",
             catalog_id,
             {"fields": sorted(request.model_dump(exclude_unset=True).keys())},
+            admin=_admin,
         )
         return payload
     except AdminCatalogError as error:
@@ -101,6 +102,7 @@ def update_catalog_item(
             "failure",
             catalog_id,
             {"error": str(error)},
+            admin=_admin,
         )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -117,9 +119,16 @@ def _record_audit(
     event_status: str,
     target_id: str,
     metadata: dict[str, Any],
+    admin: dict[str, Any] | None = None,
 ) -> None:
+    # Reuses admin_users.py's convention verbatim so the audit log has one
+    # actor format. Correct for both identities without branching: a Supabase
+    # session carries an email, while _static_admin() has id="admin_token" and
+    # no email, so a runbook or cron action still records admin_token -- but
+    # accurately, rather than because the argument was omitted.
     try:
         AdminAuditService().record(
+            actor=str((admin or {}).get("email") or (admin or {}).get("id") or "admin_token"),
             action=action,
             status=event_status,
             target_type="catalog_item",

@@ -44,6 +44,7 @@ def list_admin_portfolio_items(
         category=category, min_price=minPrice, max_price=maxPrice,
     )
     _record_audit(
+        admin=_admin,
         action="admin_portfolio.items_viewed",
         status="success",
         metadata={
@@ -62,6 +63,7 @@ def get_admin_portfolio_item(
     try:
         payload = AdminPortfolioService().get_item(item_id)
         _record_audit(
+        admin=_admin,
             action="admin_portfolio.item_viewed",
             status="success",
             target_id=item_id,
@@ -69,6 +71,7 @@ def get_admin_portfolio_item(
         return payload
     except KeyError as error:
         _record_audit(
+        admin=_admin,
             action="admin_portfolio.item_viewed",
             status="failure",
             target_id=item_id,
@@ -97,6 +100,7 @@ def update_admin_portfolio_item(
             actor=str(_admin.get("email") or _admin.get("id") or "admin"),
         )
         _record_audit(
+        admin=_admin,
             action="admin_portfolio.item_updated",
             status="success",
             target_id=item_id,
@@ -105,6 +109,7 @@ def update_admin_portfolio_item(
         return payload
     except KeyError as error:
         _record_audit(
+        admin=_admin,
             action="admin_portfolio.item_updated",
             status="failure",
             target_id=item_id,
@@ -122,6 +127,7 @@ def update_admin_portfolio_item(
 
 def _record_audit(
     *,
+    admin: dict[str, Any] | None = None,
     action: str,
     status: str,
     target_id: str | None = None,
@@ -129,6 +135,12 @@ def _record_audit(
 ) -> None:
     try:
         AdminAuditService().record(
+            # Reuses admin_users.py's convention verbatim so the audit log has one
+            # actor format. Correct for BOTH identities without branching: a
+            # Supabase session carries an email, and _static_admin() returns
+            # id="admin_token" with an empty email -- so a runbook or cron action
+            # still records admin_token, accurately rather than by default.
+            actor=str((admin or {}).get("email") or (admin or {}).get("id") or "admin_token"),
             action=action,
             status=status,
             target_type="portfolio_item" if target_id else None,

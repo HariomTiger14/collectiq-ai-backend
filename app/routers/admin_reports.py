@@ -26,7 +26,7 @@ def reports_overview(
     _admin: dict[str, Any] = Depends(require_admin_import_token),
 ) -> dict[str, Any]:
     payload = AdminReportsService().overview(days=days, since=since, until=until)
-    _record_audit("admin_reports.overview_viewed", "success", {"summary": payload.get("summary", {})})
+    _record_audit("admin_reports.overview_viewed", "success", {"summary": payload.get("summary", {})}, admin=_admin)
     return payload
 
 
@@ -60,7 +60,7 @@ def reports_export(
             limit=limit,
         )
     except Exception as error:
-        _record_audit("admin_reports.exported", "failure", {"dataset": dataset, "error": str(error)})
+        _record_audit("admin_reports.exported", "failure", {"dataset": dataset, "error": str(error)}, admin=_admin)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
@@ -69,7 +69,7 @@ def reports_export(
                 "retryable": True,
             },
         ) from error
-    _record_audit("admin_reports.exported", "success", {"dataset": dataset, "count": len(rows)})
+    _record_audit("admin_reports.exported", "success", {"dataset": dataset, "count": len(rows)}, admin=_admin)
     return StreamingResponse(
         iter([_csv_text(rows)]),
         media_type="text/csv",
@@ -131,8 +131,23 @@ def _csv_value(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def _record_audit(action: str, event_status: str, metadata: dict[str, Any]) -> None:
+def _record_audit(
+    action: str,
+    event_status: str,
+    metadata: dict[str, Any],
+    admin: dict[str, Any] | None = None,
+) -> None:
+    # Reuses admin_users.py's convention verbatim so the audit log has one
+    # actor format. Correct for both identities without branching: a Supabase
+    # session carries an email, while _static_admin() has id="admin_token" and
+    # no email, so a runbook or cron action still records admin_token -- but
+    # accurately, rather than because the argument was omitted.
     try:
-        AdminAuditService().record(action=action, status=event_status, metadata=metadata)
+        AdminAuditService().record(
+            action=action,
+            status=event_status,
+            metadata=metadata,
+            actor=str((admin or {}).get("email") or (admin or {}).get("id") or "admin_token"),
+        )
     except Exception:
         return

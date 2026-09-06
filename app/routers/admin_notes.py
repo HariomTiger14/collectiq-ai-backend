@@ -55,6 +55,7 @@ def create_admin_note(
             request.targetType,
             request.targetId,
             {"noteId": payload.get("note", {}).get("id")},
+            admin=admin,
         )
         return payload
     except AdminNotesError as error:
@@ -64,6 +65,7 @@ def create_admin_note(
             request.targetType,
             request.targetId,
             {"error": str(error)},
+            admin=admin,
         )
         raise _notes_error(str(error)) from error
 
@@ -85,9 +87,16 @@ def _record_audit(
     target_type: str,
     target_id: str,
     metadata: dict[str, Any],
+    admin: dict[str, Any] | None = None,
 ) -> None:
+    # Reuses admin_users.py's convention verbatim so the audit log has one
+    # actor format. Correct for both identities without branching: a Supabase
+    # session carries an email, while _static_admin() has id="admin_token" and
+    # no email, so a runbook or cron action still records admin_token -- but
+    # accurately, rather than because the argument was omitted.
     try:
         AdminAuditService().record(
+            actor=str((admin or {}).get("email") or (admin or {}).get("id") or "admin_token"),
             action=action,
             status=event_status,
             target_type=target_type,
