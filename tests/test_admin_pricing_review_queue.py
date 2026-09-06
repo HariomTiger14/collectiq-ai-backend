@@ -347,24 +347,24 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
             get_rows=[
                 {
                     "id": "supabase-review",
-                    "data": {
+                    "raw_json": {
                         "title": "Review Me",
                         "category": "Card",
                         "needsReview": True,
+                        "pricing": {"estimatedMarketValue": 20, "pricingConfidence": 85},
                     },
-                    "pricing": {"estimatedMarketValue": 20, "pricingConfidence": 85},
                 }
             ],
             patch_rows=[
                 {
                     "id": "supabase-review",
-                    "data": {
+                    "raw_json": {
                         "title": "Review Me",
                         "category": "Card",
                         "needsReview": False,
                         "reviewStatus": "reviewed",
+                        "pricing": {"estimatedMarketValue": 20, "pricingConfidence": 85},
                     },
-                    "pricing": {"estimatedMarketValue": 20, "pricingConfidence": 85},
                     "review_status": "reviewed",
                 }
             ],
@@ -383,8 +383,17 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
         patch_request = client.requests[-1]
         self.assertEqual(patch_request["method"], "PATCH")
         self.assertEqual(patch_request["params"]["id"], "eq.supabase-review")
-        self.assertFalse(patch_request["json"]["needs_review"])
-        self.assertEqual(patch_request["json"]["review_status"], "reviewed")
+        # raw_json is the real JSON column. needs_review/review_status never
+        # existed on portfolio_items, so asserting them here was pinning a
+        # schema the database does not have -- which is what kept the broken
+        # writer green for as long as it was.
+        self.assertFalse(patch_request["json"]["raw_json"]["needsReview"])
+        self.assertEqual(patch_request["json"]["raw_json"]["reviewStatus"], "reviewed")
+        for phantom in ("data", "pricing", "needs_review", "reviewed_at", "review_status"):
+            self.assertNotIn(phantom, patch_request["json"])
+        # Marking reviewed is not a pricing action; it must not touch value.
+        self.assertNotIn("estimated_value_low", patch_request["json"])
+        self.assertNotIn("estimated_value_high", patch_request["json"])
         self.assertEqual(patch_request["headers"]["Prefer"], "return=representation")
 
     def test_supabase_override_price_patches_persistent_item(self) -> None:
@@ -392,18 +401,18 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
             get_rows=[
                 {
                     "id": "supabase-override",
-                    "data": {
+                    "raw_json": {
                         "title": "Override Me",
                         "category": "Card",
                         "needsReview": True,
+                        "pricing": {"estimatedMarketValue": 0, "pricingConfidence": 0},
                     },
-                    "pricing": {"estimatedMarketValue": 0, "pricingConfidence": 0},
                 }
             ],
             patch_rows=[
                 {
                     "id": "supabase-override",
-                    "data": {
+                    "raw_json": {
                         "title": "Override Me",
                         "category": "Card",
                         "needsReview": False,
@@ -437,34 +446,39 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
         patch_request = client.requests[-1]
         self.assertEqual(patch_request["method"], "PATCH")
         self.assertEqual(patch_request["params"]["id"], "eq.supabase-override")
-        self.assertFalse(patch_request["json"]["needs_review"])
-        self.assertEqual(patch_request["json"]["review_status"], "admin_override")
-        self.assertEqual(patch_request["json"]["data"]["estimatedValue"], 88.0)
-        self.assertEqual(patch_request["json"]["data"]["valuationStatus"], "market_estimated")
+        self.assertFalse(patch_request["json"]["raw_json"]["needsReview"])
+        self.assertEqual(patch_request["json"]["raw_json"]["reviewStatus"], "admin_override")
+        self.assertEqual(patch_request["json"]["raw_json"]["estimatedValue"], 88.0)
+        self.assertEqual(patch_request["json"]["raw_json"]["valuationStatus"], "market_estimated")
+        # The value columns ARE still written by a pricing action -- it asks
+        # for them explicitly, because the app's sync healing reads them off
+        # the row when raw_json has lost its displayable valuation.
         self.assertEqual(patch_request["json"]["estimated_value_high"], 88.0)
         self.assertIsNone(patch_request["json"]["estimated_value_low"])
-        self.assertEqual(patch_request["json"]["pricing"]["estimatedMarketValue"], 88.0)
-        self.assertEqual(patch_request["json"]["pricing"]["currency"], "USD")
+        self.assertEqual(
+            patch_request["json"]["raw_json"]["pricing"]["estimatedMarketValue"], 88.0
+        )
+        self.assertEqual(patch_request["json"]["raw_json"]["pricing"]["currency"], "USD")
 
     def test_supabase_retry_pricing_patches_app_visible_value_fields(self) -> None:
         client = _FakeSupabaseClient(
             get_rows=[
                 {
                     "id": "supabase-retry",
-                    "data": {
+                    "raw_json": {
                         "title": "Retry Me",
                         "category": "Trading Card",
                         "condition": "Near Mint",
                         "estimatedValue": 10.0,
                         "valuationStatus": "ai_estimated",
+                        "pricing": {"estimatedMarketValue": 10.0, "pricingConfidence": 20},
                     },
-                    "pricing": {"estimatedMarketValue": 10.0, "pricingConfidence": 20},
                 }
             ],
             patch_rows=[
                 {
                     "id": "supabase-retry",
-                    "data": {
+                    "raw_json": {
                         "title": "Retry Me",
                         "category": "Trading Card",
                         "estimatedValue": 125.0,
@@ -502,36 +516,40 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
         patch_request = client.requests[-1]
         self.assertEqual(patch_request["method"], "PATCH")
         self.assertEqual(patch_request["params"]["id"], "eq.supabase-retry")
-        self.assertEqual(patch_request["json"]["data"]["estimatedValue"], 125.0)
-        self.assertEqual(patch_request["json"]["data"]["valuationStatus"], "market_estimated")
+        self.assertEqual(patch_request["json"]["raw_json"]["estimatedValue"], 125.0)
+        self.assertEqual(
+            patch_request["json"]["raw_json"]["valuationStatus"], "market_estimated"
+        )
         self.assertEqual(patch_request["json"]["estimated_value_low"], 110.0)
         self.assertEqual(patch_request["json"]["estimated_value_high"], 140.0)
-        self.assertEqual(patch_request["json"]["pricing"]["estimatedMarketValue"], 125.0)
+        self.assertEqual(
+            patch_request["json"]["raw_json"]["pricing"]["estimatedMarketValue"], 125.0
+        )
 
     def test_supabase_assign_pricing_review_item_patches_persistent_item(self) -> None:
         client = _FakeSupabaseClient(
             get_rows=[
                 {
                     "id": "supabase-assign",
-                    "data": {
+                    "raw_json": {
                         "title": "Assign Me",
                         "category": "Trading Card",
                         "needsReview": True,
+                        "pricing": {"estimatedMarketValue": 0, "pricingConfidence": 0},
                     },
-                    "pricing": {"estimatedMarketValue": 0, "pricingConfidence": 0},
                 }
             ],
             patch_rows=[
                 {
                     "id": "supabase-assign",
-                    "data": {
+                    "raw_json": {
                         "title": "Assign Me",
                         "category": "Trading Card",
                         "needsReview": True,
                         "pricingAssignee": "ops@packlox.com",
                         "pricingAssignmentStatus": "in_review",
+                        "pricing": {"estimatedMarketValue": 0, "pricingConfidence": 0},
                     },
-                    "pricing": {"estimatedMarketValue": 0, "pricingConfidence": 0},
                 }
             ],
         )
@@ -553,8 +571,14 @@ class AdminPricingReviewQueueTest(unittest.TestCase):
         patch_request = client.requests[-1]
         self.assertEqual(patch_request["method"], "PATCH")
         self.assertEqual(patch_request["params"]["id"], "eq.supabase-assign")
-        self.assertEqual(patch_request["json"]["data"]["pricingAssignee"], "ops@packlox.com")
-        self.assertEqual(patch_request["json"]["data"]["pricingAssignmentStatus"], "in_review")
+        self.assertEqual(
+            patch_request["json"]["raw_json"]["pricingAssignee"], "ops@packlox.com"
+        )
+        self.assertEqual(
+            patch_request["json"]["raw_json"]["pricingAssignmentStatus"], "in_review"
+        )
+        # Assignment is workflow metadata, not a price -- no value columns.
+        self.assertNotIn("estimated_value_low", patch_request["json"])
 
 
 class _FakeSupabaseClient:

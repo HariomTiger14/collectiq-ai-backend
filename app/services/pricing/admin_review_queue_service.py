@@ -109,7 +109,11 @@ class AdminPricingReviewQueueService:
             "reviewStatus": "pricing_retried",
         }
         if self._repository.is_configured:
-            self._repository.update_item_data(item_id, update_data)
+            self._repository.update_item_data(
+                item_id,
+                update_data,
+                row_columns=_valuation_row_columns(pricing, display_value),
+            )
         else:
             portfolio_service.update_item_data(item_id, update_data)
         return {
@@ -156,7 +160,13 @@ class AdminPricingReviewQueueService:
             "adminReviewNote": note.strip() if isinstance(note, str) and note.strip() else None,
         }
         if self._repository.is_configured:
-            self._repository.update_item_data(item_id, update_data)
+            self._repository.update_item_data(
+                item_id,
+                update_data,
+                row_columns=_valuation_row_columns(
+                    pricing, pricing["estimatedMarketValue"]
+                ),
+            )
         else:
             portfolio_service.update_item_data(item_id, update_data)
         return {
@@ -401,22 +411,43 @@ class SupabasePricingReviewQueueRepository:
                 break
         return rows
 
-    def update_item_data(self, item_id: str, data: dict[str, Any]) -> PortfolioItem | None:
-        current = self.get_item(item_id)
-        if current is None:
+    def update_item_data(
+        self,
+        item_id: str,
+        data: dict[str, Any],
+        *,
+        row_columns: dict[str, Any] | None = None,
+    ) -> PortfolioItem | None:
+        # Reads the raw row rather than get_item()'s reconstruction. The
+        # reconstruction is lossy by design -- it surfaces a handful of fields
+        # for the admin UI, not the app's full client model -- so merging into
+        # it and writing the result back would silently drop everything it
+        # doesn't reproduce (images, sync bookkeeping, valuation detail).
+        # raw_json is the record; merge into raw_json itself.
+        rows = self._request(
+            "GET",
+            f"/rest/v1/{self._table_name}",
+            params={"id": f"eq.{item_id}", "select": "*", "limit": "1"},
+        )
+        if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
             return None
-        merged_data = {**current.data, **data}
+        row = rows[0]
+        current_raw = row.get("raw_json") if isinstance(row.get("raw_json"), dict) else {}
+        merged_raw = {**current_raw, **data}
         payload = self._request(
             "PATCH",
             f"/rest/v1/{self._table_name}",
             params={"id": f"eq.{item_id}", "select": "*"},
-            json_payload=_row_update_from_data(merged_data),
+            json_payload=_portfolio_row_update(
+                merged_raw, changes=data, row_columns=row_columns
+            ),
             extra_headers={"Prefer": "return=representation"},
         )
         if isinstance(payload, list) and payload:
-            row = payload[0]
-            return _portfolio_item_from_row(row) if isinstance(row, dict) else current
-        return PortfolioItem(id=item_id, data=merged_data)
+            updated = payload[0]
+            if isinstance(updated, dict):
+                return _portfolio_item_from_row(updated)
+        return PortfolioItem(id=item_id, data=merged_raw)
 
     def _request(
         self,
@@ -588,6 +619,13 @@ def _portfolio_item_from_row(row: dict[str, Any]) -> PortfolioItem | None:
         estimated_value = row.get("estimated_value") or row.get("estimated_value_low")
     merged = {
         **({"estimatedValue": estimated_value} if estimated_value is not None else {}),
+        # raw_json is the actual record. Without it, fields that live only in
+        # the blob -- condition, adminNotes, and the review flags -- were
+        # invisible here, because every one of them was being read from a
+        # top-level column that does not exist. An admin edit would save and
+        # then appear not to have saved. Real columns still win where the two
+        # overlap, since those are what other readers index on.
+        **raw,
         **data,
         **{
             key: value
@@ -619,21 +657,64 @@ def _portfolio_item_from_row(row: dict[str, Any]) -> PortfolioItem | None:
     return PortfolioItem(id=item_id, data=merged)
 
 
-def _row_update_from_data(data: dict[str, Any]) -> dict[str, Any]:
-    pricing = data.get("pricing") if isinstance(data.get("pricing"), dict) else {}
-    value = _price_value({}, pricing) or _estimated_value(data)
-    low_value = _estimate_value(pricing, "lowEstimate")
-    high_value = _estimate_value(pricing, "highEstimate") or value
+def _valuation_row_columns(
+    pricing: dict[str, Any],
+    value: Any,
+) -> dict[str, Any]:
+    """The value columns a pricing action must persist alongside raw_json.
+
+    The app's own sync healing promotes a row to `market_estimated` using
+    these columns when raw_json has lost its displayable valuation, so a
+    price that lands only in the blob is invisible to the device that
+    already holds the item. Only the paths that actually computed a price
+    call this.
+    """
     return {
-        "data": data,
-        "pricing": pricing or None,
-        "estimated_value_low": low_value,
-        "estimated_value_high": high_value,
-        "needs_review": bool(data.get("needsReview") or data.get("requiresReview")),
-        "reviewed_at": data.get("reviewedAt"),
-        "review_status": data.get("reviewStatus"),
+        "estimated_value_low": _estimate_value(pricing, "lowEstimate"),
+        "estimated_value_high": _estimate_value(pricing, "highEstimate") or value,
+    }
+
+
+def _portfolio_row_update(
+    merged_raw: dict[str, Any],
+    *,
+    changes: dict[str, Any],
+    row_columns: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The row payload for an admin edit of a portfolio item.
+
+    Replaces a writer that sent five columns `portfolio_items` does not have
+    -- `data`, `pricing`, `needs_review`, `reviewed_at`, `review_status` --
+    so every admin edit failed at PostgREST. The JSON column is `raw_json`.
+
+    It also used to recompute `estimated_value_low`/`estimated_value_high`
+    from the merged blob on every call, including metadata-only edits. With
+    no usable pricing block that resolves to 0, so an admin editing a note
+    could have zeroed the item's value. The phantom columns were the only
+    thing preventing it. Valuation is written by the pricing paths that
+    actually compute it (repricing, the review-queue override) and is
+    deliberately untouched here.
+
+    `category` is mirrored to its real top-level column when it changes,
+    because the table carries both and readers disagree about which wins.
+
+    `row_columns` is the deliberate exception: the pricing paths (override
+    and retry) must persist `estimated_value_low`/`_high`, because the app's
+    own sync healing reads those columns off the row when raw_json has lost
+    its displayable valuation. They ask for that explicitly, so a metadata
+    edit cannot do it by accident -- which is exactly the failure mode this
+    function was rewritten to remove.
+    """
+    update: dict[str, Any] = {
+        "raw_json": merged_raw,
         "updated_at": _utc_now(),
     }
+    category = changes.get("category")
+    if isinstance(category, str) and category.strip():
+        update["category"] = category.strip()
+    if row_columns:
+        update.update(row_columns)
+    return update
 
 
 def _confidence(data: dict[str, Any], pricing: dict[str, Any]) -> int | None:
