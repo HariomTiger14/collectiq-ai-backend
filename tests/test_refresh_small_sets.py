@@ -270,5 +270,61 @@ class Tier1EligibilityIntegrationTest(unittest.TestCase):
                     self.assertEqual(offenders, [], f"non-tier1 column written: {offenders}")
 
 
+
+
+class TransientApiFailuresDoNotPenaliseSetsTest(unittest.TestCase):
+    """A throttle or outage must cost the run, not the set.
+
+    Before this distinction every failed request became an api_404 miss, so
+    three minutes of vendor 429s could have set aside a batch of perfectly
+    good sets for 30 days apiece.
+    """
+
+    def _run_with_status(self, status, *, miss_count=0):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status, json={"status": "error"})
+
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        return refresh_small_sets(
+            http,
+            [{
+                "registry_id": "1", "source_site": "pricecharting",
+                "set_name": "1962 Bazooka", "tier1_miss_count": miss_count,
+            }],
+            token="tok", sleep_seconds=0, source_downloaded_at="2026-09-08T00:00:00Z",
+        )
+
+    def test_a_429_writes_no_eligibility_update(self) -> None:
+        result = self._run_with_status(429)
+        self.assertEqual(result.eligibility_updates, {})
+
+    def test_a_503_writes_no_eligibility_update(self) -> None:
+        result = self._run_with_status(503)
+        self.assertEqual(result.eligibility_updates, {})
+
+    def test_every_transient_status_leaves_the_counter_alone(self) -> None:
+        for status in (429, 500, 502, 503, 504):
+            with self.subTest(status=status):
+                result = self._run_with_status(status, miss_count=MISS_THRESHOLD - 1)
+                self.assertEqual(
+                    result.eligibility_updates, {},
+                    f"HTTP {status} pushed a set toward exclusion",
+                )
+
+    def test_a_set_one_miss_from_exclusion_survives_an_outage(self) -> None:
+        result = self._run_with_status(503, miss_count=MISS_THRESHOLD - 1)
+        self.assertEqual(result.eligibility_updates, {})
+        self.assertEqual(result.checked_ids, ["1"])
+
+    def test_a_real_404_still_counts(self) -> None:
+        """The carve-out must not disarm the case it was carved out of."""
+        result = self._run_with_status(404)
+        self.assertEqual(result.eligibility_updates["1"], {"tier1_miss_count": 1})
+
+    def test_a_404_at_the_threshold_still_excludes(self) -> None:
+        result = self._run_with_status(404, miss_count=MISS_THRESHOLD - 1)
+        self.assertIs(result.eligibility_updates["1"]["tier1_refresh_eligible"], False)
+
+
 if __name__ == "__main__":
     unittest.main()

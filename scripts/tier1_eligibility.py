@@ -18,6 +18,12 @@ answer: a set over the cap stays over it, and a name that resolves to another
 set keeps resolving there. Mark ineligible immediately; waiting for three
 identical results spends three days of API calls to learn nothing.
 
+Not evidence at all -- REASON_TRANSIENT. A 429, a 5xx or a dropped
+connection is a fact about the request, not about the set, and produces no
+registry write whatsoever. Counting those would let a single rate-limit
+episode or a short vendor outage push good sets out of tier-1 for 30 days
+apiece.
+
 Transient-capable -- API_404 and API_EMPTY. A vendor blip, a deploy, a
 momentary index gap all look like this, and marking on the first one would
 quietly exclude good sets for a month. These require MISS_THRESHOLD
@@ -56,6 +62,16 @@ REASON_404 = "api_404"
 REASON_EMPTY = "api_empty"
 REASON_CAPPED = "api_capped_100"
 REASON_WRONG_FAMILY = "api_ambiguous_or_wrong_family"
+
+# Not a verdict about the SET at all -- the request never got a usable answer.
+# A 429, a 5xx or a dropped connection says the vendor or the network was
+# unwell, not that this set is unsearchable, so it must never count toward
+# exclusion. Folding these in with 404 would let one rate-limit episode or a
+# short outage push good sets out of tier-1 for 30 days each.
+REASON_TRANSIENT = "transient_fetch_error"
+
+# Statuses that mean "ask again later", never "this set is no good".
+TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 OK = "ok"
 
@@ -101,7 +117,12 @@ def classify_search_result(
     are transient-capable.
     """
     if products is None:
-        return REASON_404
+        # ONLY a genuine 404 is evidence about the set. Anything else -- a
+        # throttle, a vendor 5xx, or a transport failure that never produced
+        # a status at all -- is evidence about the request.
+        if http_status == 404:
+            return REASON_404
+        return REASON_TRANSIENT
     if len(products) == 0:
         return REASON_EMPTY
     if len(products) >= API_SEARCH_RESULT_CAP:
@@ -153,6 +174,10 @@ def plan_registry_update(
             "tier1_ineligible_at": moment.isoformat(),
             "tier1_recheck_after": (moment + timedelta(days=RECHECK_DAYS)).isoformat(),
         }
+
+    if reason == REASON_TRANSIENT:
+        # Skipped for this run only: no counter, no exclusion, no write.
+        return None
 
     if reason in TRANSIENT_REASONS:
         misses = current_miss_count + 1

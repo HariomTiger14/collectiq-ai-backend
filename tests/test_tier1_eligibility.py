@@ -26,8 +26,10 @@ from scripts.tier1_eligibility import (
     REASON_404,
     REASON_CAPPED,
     REASON_EMPTY,
+    REASON_TRANSIENT,
     REASON_WRONG_FAMILY,
     RECHECK_DAYS,
+    TRANSIENT_HTTP_STATUSES,
     classify_search_result,
     plan_registry_update,
 )
@@ -40,10 +42,39 @@ def _products(n, console="Baseball Cards 1962 Bazooka"):
 
 
 class ClassificationTest(unittest.TestCase):
-    def test_a_failed_call_is_a_404_class_miss(self) -> None:
+    def test_only_a_genuine_404_counts_against_the_set(self) -> None:
         self.assertEqual(
             classify_search_result(None, set_name="1962 Bazooka", http_status=404), REASON_404
         )
+
+    def test_a_throttle_or_outage_is_not_evidence_about_the_set(self) -> None:
+        """429/5xx say the vendor was unwell, not that this set is unsearchable.
+
+        Folding these in with 404 would let one rate-limit episode or a short
+        outage push good sets out of tier-1 for 30 days each.
+        """
+        for status in sorted(TRANSIENT_HTTP_STATUSES):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    classify_search_result(None, set_name="1962 Bazooka", http_status=status),
+                    REASON_TRANSIENT,
+                )
+
+    def test_a_transport_failure_with_no_status_is_transient(self) -> None:
+        """A dropped connection never produces a status at all."""
+        self.assertEqual(
+            classify_search_result(None, set_name="1962 Bazooka", http_status=None),
+            REASON_TRANSIENT,
+        )
+
+    def test_an_unexpected_status_defaults_to_transient(self) -> None:
+        """Fail SAFE here: the wrong default excludes healthy sets."""
+        for status in (400, 401, 418, 599):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    classify_search_result(None, set_name="x", http_status=status),
+                    REASON_TRANSIENT,
+                )
 
     def test_an_empty_result_is_its_own_reason(self) -> None:
         self.assertEqual(classify_search_result([], set_name="1962 Bazooka"), REASON_EMPTY)
@@ -195,6 +226,39 @@ class MigrationMatchesTheCodeTest(unittest.TestCase):
         for column in written:
             with self.subTest(column=column):
                 self.assertIn(column, sql, f"{column} is written but never added by the migration")
+
+
+
+
+class TransientFailuresNeverPenaliseASetTest(unittest.TestCase):
+    """The distinction that matters most: request health vs set health."""
+
+    def test_no_registry_update_is_produced_at_all(self) -> None:
+        for misses in (0, 1, MISS_THRESHOLD - 1, MISS_THRESHOLD):
+            with self.subTest(misses=misses):
+                self.assertIsNone(
+                    plan_registry_update(REASON_TRANSIENT, current_miss_count=misses, now=NOW)
+                )
+
+    def test_the_miss_counter_does_not_move(self) -> None:
+        """A set one miss from exclusion must not be pushed over by a 503."""
+        update = plan_registry_update(
+            REASON_TRANSIENT, current_miss_count=MISS_THRESHOLD - 1, now=NOW
+        )
+        self.assertIsNone(update, "a transient failure advanced the exclusion counter")
+
+    def test_a_404_still_does_count(self) -> None:
+        """The fix must not disarm the case it was carved out of."""
+        self.assertEqual(
+            plan_registry_update(REASON_404, current_miss_count=0, now=NOW),
+            {"tier1_miss_count": 1},
+        )
+
+    def test_transient_is_not_in_either_acting_reason_set(self) -> None:
+        from scripts.tier1_eligibility import DETERMINISTIC_REASONS, TRANSIENT_REASONS
+
+        self.assertNotIn(REASON_TRANSIENT, DETERMINISTIC_REASONS)
+        self.assertNotIn(REASON_TRANSIENT, TRANSIENT_REASONS)
 
 
 if __name__ == "__main__":
