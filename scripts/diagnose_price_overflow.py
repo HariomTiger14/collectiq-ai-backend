@@ -25,6 +25,7 @@ from scripts._shared_rate_limiter import (
     PRICECHARTING_CSV,
     SharedRateLimiter,
 )
+from scripts.csv_source_policy import csv_base_url
 from scripts.backfill_pricecharting_sets import (
     SOURCE_SITE_BASE_URLS,
     chunked,
@@ -102,7 +103,8 @@ def main() -> int:
         timeout=args.timeout_seconds, follow_redirects=True, headers=REQUEST_HEADERS
     ) as http:
         for source_site, rows in group_by_site(failed_rows).items():
-            base_url = SOURCE_SITE_BASE_URLS[source_site]
+            # CSV path -> pricecharting.com (see csv_source_policy).
+            base_url = csv_base_url(source_site)
             for chunk in chunked(rows, args.batch_size):
                 # Paced like every other CSV caller. This is a manual
                 # diagnostic, but it hits the same endpoint on the same

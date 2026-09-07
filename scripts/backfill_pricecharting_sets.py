@@ -112,6 +112,11 @@ from scripts._shared_rate_limiter import (
     SharedRateLimiter,
 )
 from scripts._ops_run_recorder import dump_and_report, run_with_recorder
+from scripts.csv_source_policy import (
+    CsvFamilyMismatch,
+    csv_base_url,
+    validate_csv_families,
+)
 from scripts.import_pricecharting_catalog import (
     TEXT_FIELDS,
     PartialCatalogWriteError,
@@ -531,7 +536,10 @@ def _run_backfill(
         failed_rows.extend(resolve_failed_sportscardspro)
 
         for source_site, rows in group_by_site(resolved).items():
-            base_url = SOURCE_SITE_BASE_URLS[source_site]
+            # CSV downloads all go to pricecharting.com -- sportscardspro.com
+            # is Cloudflare-blocked from every host we have. See
+            # csv_source_policy for the vendor confirmation and probe.
+            base_url = csv_base_url(source_site)
             is_sportscardspro = source_site == "sportscardspro"
             # CSV pacing is deliberately NOT the page-resolve pacing. Set
             # pages are ordinary HTML fetches; download-custom is a CSV call
@@ -579,6 +587,32 @@ def _run_backfill(
                 )
                 phase_seconds["csv_fetch"] += time.perf_counter() - csv_fetch_started_at
                 if csv_download is None:
+                    failed_rows.extend(chunk)
+                    continue
+
+                # Prove this CSV is the CSV we asked for before writing any
+                # of it. download-custom does not validate its filter -- a
+                # wrong parameter returns 200/text-csv with 123,166 valid rows
+                # of the WRONG catalog (measured 2026-09-07). One extra parse
+                # pass buys an abort before the first row lands.
+                observed_families: set[str] = set()
+                for raw in iter_rows_from_file(
+                    csv_download.path, encoding=csv_download.encoding
+                ):
+                    console_name = raw.get("console-name") or raw.get("console_name")
+                    if console_name:
+                        observed_families.add(console_name)
+                try:
+                    validate_csv_families(
+                        observed_families,
+                        expected_set_names=[
+                            str(row.get("set_name") or "") for row in chunk
+                        ],
+                        requested_uid_count=len(chunk),
+                    )
+                except CsvFamilyMismatch as exc:
+                    print(f"  REFUSING BATCH: {exc}", flush=True)
+                    cleanup_csv_downloads([csv_download])
                     failed_rows.extend(chunk)
                     continue
 
