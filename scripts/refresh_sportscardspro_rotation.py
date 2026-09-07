@@ -50,6 +50,12 @@ from typing import Any
 import httpx
 
 from scripts._ops_run_recorder import dump_and_report, run_with_recorder
+from scripts.csv_source_policy import (
+    TRANSIENT_CSV_STATUSES,
+    CsvFamilyMismatch,
+    csv_base_url,
+    validate_csv_families,
+)
 from scripts._shared_rate_limiter import (
     BULK_MAX_SLOT_WAIT_SECONDS,
     CLASS_TIER3,
@@ -155,7 +161,11 @@ def main(argv: list[str] | None = None) -> int:
         print(dump_and_report({"success": True, "setsConsidered": 0}, indent=2), flush=True)
         return 0
 
-    base_url = SOURCE_SITE_BASE_URLS["sportscardspro"]
+    # sportscardspro.com is Cloudflare-blocked from Render AND from a
+    # laptop (verified 2026-09-07). The vendor confirmed download-custom
+    # is identical on pricecharting.com, and a live probe confirmed a
+    # sports console_uid resolves there. See csv_source_policy.
+    base_url = csv_base_url("sportscardspro")
     csv_limiter = SharedRateLimiter(
         PRICECHARTING_CSV,
         slot_class=CLASS_TIER3,
@@ -169,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
     blocked_counter = _Counter()
     total_catalog_rows = 0
     failed_batches = 0
+    transient_failures = 0
+    family_mismatches = 0
     # failed_batches lumped fetch failures and write failures into one
     # number, so the ledger could not say whether a run's ~13% loss was
     # sportscardspro throttling us or Postgres timing out on a 12M-row
@@ -241,6 +253,25 @@ def main(argv: list[str] | None = None) -> int:
                         or blocked_counter.value > before_403s
                     )
                     status = status_sink[-1] if status_sink else 0
+                    # A transient upstream failure says nothing about any
+                    # individual console_uid. Isolating it would spend the
+                    # budget one set at a time and -- because each isolated
+                    # fetch fails too -- record a tier-3 failure against every
+                    # HEALTHY set in the batch. Three of those park a set out
+                    # of the rotation permanently, so a passing 503 could
+                    # silently shrink the queue. Fail the batch and let the
+                    # next run re-fetch it, exactly as for a throttle.
+                    if status in TRANSIENT_CSV_STATUSES:
+                        print(
+                            f"  Transient upstream failure (HTTP {status}) on "
+                            f"{len(chunk)} sets -- failing the batch without "
+                            "isolating; sets stay at the head of the rotation.",
+                            flush=True,
+                        )
+                        failed_batches += 1
+                        failed_fetches += 1
+                        transient_failures += 1
+                        continue
                     if throttled or not status:
                         # Endpoint-wide refusal, or a transport error that never
                         # produced a status. Either way the batch says nothing
@@ -323,6 +354,38 @@ def main(argv: list[str] | None = None) -> int:
                 # duplicate. A failed chunk fails the batch and the set is never
                 # stamped, so the retry re-fetches and the already-written chunks
                 # become content-hash no-ops.
+                # A CSV must prove it is the CSV we asked for before any of
+                # it is written. download-custom does not validate its filter:
+                # a wrong parameter returns 200/text-csv with 123,166 valid
+                # rows of the WRONG catalog (measured 2026-09-07), which every
+                # downstream check would have accepted. This costs one extra
+                # parse pass over the batch and buys the guarantee that a
+                # mismatch aborts before the first row lands and before the
+                # sets are stamped refreshed.
+                observed_families: set[str] = set()
+                for download in csv_downloads:
+                    for raw in iter_rows_from_file(
+                        download.path, encoding=download.encoding
+                    ):
+                        console_name = raw.get("console-name") or raw.get("console_name")
+                        if console_name:
+                            observed_families.add(console_name)
+                try:
+                    validate_csv_families(
+                        observed_families,
+                        expected_set_names=[
+                            str(row.get("set_name") or "") for row in live_chunk
+                        ],
+                        requested_uid_count=len(live_chunk),
+                    )
+                except CsvFamilyMismatch as exc:
+                    # Not stamped, not written: the sets stay at the head of
+                    # the rotation and the next run re-fetches them.
+                    print(f"  REFUSING BATCH: {exc}", flush=True)
+                    family_mismatches += 1
+                    failed_batches += 1
+                    continue
+
                 def _iter_catalog_rows():
                     for download in csv_downloads:
                         for raw in iter_rows_from_file(
@@ -396,6 +459,8 @@ def main(argv: list[str] | None = None) -> int:
                 "failedBatches": failed_batches,
                 "failedFetches": failed_fetches,
                 "failedWrites": failed_writes,
+                "transientFetchFailures": transient_failures,
+                "familyMismatches": family_mismatches,
                 "writeRetries": write_retries,
                 "rateLimited429s": rate_limit_counter.value,
                 "blocked403s": blocked_counter.value,

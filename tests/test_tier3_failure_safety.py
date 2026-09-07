@@ -16,9 +16,26 @@ from unittest import mock
 from scripts.backfill_pricecharting_sets import CsvDownload
 from scripts.refresh_sportscardspro_rotation import main, parse_args
 
-CSV = "id,console-name,product-name,loose-price\n" + "".join(
-    f"{i},Baseball Cards Set,Card {i},$1.00\n" for i in range(1, 51)
-)
+def _csv_for(console_uids):
+    """A CSV shaped like the vendor's real response for these uids.
+
+    console-name mirrors the requested set, because that is what
+    download-custom actually returns -- registry set_name "1887 N172 Old
+    Judge" comes back as "Baseball Cards 1887 N172 Old Judge" (verified
+    against the live endpoint 2026-09-07). The rotation now validates that
+    correspondence before writing, so a fixture returning one generic
+    console-name for every set would be rejected exactly like a
+    wrong-catalog response -- correctly, since that is what it looks like.
+    """
+    header = "id,console-name,product-name,loose-price\n"
+    body = ""
+    for uid in console_uids:
+        index = uid.lstrip("G")
+        body += "".join(
+            f"{index}{row},Baseball Cards Set {index},Card {row},$1.00\n"
+            for row in range(1, 26)
+        )
+    return header + body
 
 
 class _Registry:
@@ -51,11 +68,11 @@ class Tier3FailureSafetyTest(unittest.TestCase):
         registry = _Registry(_rows(4))
         made: list[Path] = []
 
-        def fake_fetch(*a, **kw):
+        def fake_fetch(*a, console_uids, **kw):
             handle, name = tempfile.mkstemp(prefix="pricecharting-batch-", suffix=".csv")
             path = Path(name)
             with open(handle, "w", encoding="utf-8") as out:
-                out.write(CSV)
+                out.write(_csv_for(console_uids))
             made.append(path)
             return CsvDownload(path, "utf-8")
 
