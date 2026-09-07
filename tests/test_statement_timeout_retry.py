@@ -213,5 +213,108 @@ class NonTimeoutErrorsAreUnchangedTest(unittest.TestCase):
         self.assertEqual(service.timeout_retry_stats["timeouts"], 0)
 
 
+class CountersReachTheRunSummaryTest(unittest.TestCase):
+    """Recovered rows are only useful if the ledger can show them.
+
+    Without these fields a run that recovered 300 rows and a run that never
+    hit a timeout produce identical summaries -- and the next decision
+    (raise the 8s cap? drop the HOT-blocking indexes?) is made from the
+    ledger. The counters existed on the client before this and reached no
+    summary, which is the same shape of gap as a refusal that only printed
+    to stdout (18j).
+    """
+
+    FIELDS = (
+        "statementTimeouts",
+        "statementTimeoutRetries",
+        "statementTimeoutRowsRecovered",
+        "statementTimeoutRowsAbandoned",
+    )
+
+    # Every scheduled job that writes the catalog through SupabaseCatalogClient.
+    SCHEDULED_WRITERS = (
+        "refresh_small_sets.py",
+        "refresh_completed_pricecharting_categories.py",
+        "refresh_pricecharting_catalog.py",
+        "refresh_tracked_catalog_items.py",
+        "backfill_pricecharting_sets.py",
+        "refresh_sportscardspro_rotation.py",
+    )
+
+    def test_every_scheduled_catalog_writer_reports_the_counters(self) -> None:
+        import pathlib
+
+        for name in self.SCHEDULED_WRITERS:
+            with self.subTest(script=name):
+                source = (pathlib.Path("scripts") / name).read_text()
+                self.assertIn(
+                    "timeout_retry_summary(",
+                    source,
+                    f"{name} writes through SupabaseCatalogClient but its run "
+                    "summary does not expose the statement-timeout counters",
+                )
+
+    def test_the_helper_emits_exactly_the_agreed_fields(self) -> None:
+        from scripts.import_pricecharting_catalog import timeout_retry_summary
+
+        service = _service()
+        summary = timeout_retry_summary(service)
+        for field in self.FIELDS:
+            self.assertIn(field, summary)
+        self.assertEqual(summary["writePath"], "rest")
+
+    def test_the_counters_carry_real_values_after_a_recovery(self) -> None:
+        from scripts.import_pricecharting_catalog import timeout_retry_summary
+
+        fake, ctx = _client_with([_Timeout()])
+        service = _service()
+        with ctx, patch("scripts.import_pricecharting_catalog.time.sleep"):
+            service._upsert(
+                table="pricecharting_catalog", rows=_rows(10), batch_size=10,
+                on_conflict="pricecharting_id", label="catalog",
+            )
+        summary = timeout_retry_summary(service)
+        self.assertEqual(summary["statementTimeouts"], 1)
+        self.assertGreaterEqual(summary["statementTimeoutRetries"], 1)
+        self.assertEqual(summary["statementTimeoutRowsRecovered"], 10)
+        self.assertEqual(summary["statementTimeoutRowsAbandoned"], 0)
+
+    def test_the_copy_path_is_labelled_rather_than_reporting_bare_zeros(self) -> None:
+        """Zeros mean different things, and the difference matters.
+
+        The tier-3 COPY writer talks to Postgres directly and never meets the
+        PostgREST role's 8s statement_timeout, so its zeros mean "not
+        applicable". Reported bare they would read as a clean REST run and
+        overstate how well the retry is working.
+        """
+        from scripts.import_pricecharting_catalog import timeout_retry_summary
+
+        class _CopyWriter:  # no timeout_retry_stats, like CopyCatalogWriter
+            pass
+
+        summary = timeout_retry_summary(_CopyWriter())
+        self.assertEqual(summary["writePath"], "copy")
+        for field in self.FIELDS:
+            self.assertEqual(summary[field], 0)
+
+    def test_the_real_copy_writer_is_still_labelled_copy(self) -> None:
+        """Pins it against the actual class, not a stand-in."""
+        from scripts.import_pricecharting_catalog import timeout_retry_summary
+        from scripts.tier3_copy_writer import CopyCatalogWriter
+
+        writer = CopyCatalogWriter.__new__(CopyCatalogWriter)
+        self.assertEqual(timeout_retry_summary(writer)["writePath"], "copy")
+
+
+    def test_a_dry_run_is_labelled_none_not_copy(self) -> None:
+        """A dry run writes nothing; calling that "copy" would be a lie."""
+        from scripts.import_pricecharting_catalog import timeout_retry_summary
+
+        summary = timeout_retry_summary(None)
+        self.assertEqual(summary["writePath"], "none")
+        for field in self.FIELDS:
+            self.assertEqual(summary[field], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

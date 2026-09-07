@@ -120,6 +120,7 @@ from scripts.csv_source_policy import (
     validate_csv_families,
 )
 from scripts.import_pricecharting_catalog import (
+    timeout_retry_summary,
     TEXT_FIELDS,
     PartialCatalogWriteError,
     SupabaseCatalogClient,
@@ -287,6 +288,7 @@ def _build_result_summary(
     catalog_write_events: list[dict[str, Any]],
     family_mismatches: int = 0,
     family_mismatch_details: list[dict[str, Any]] | None = None,
+    timeout_retry_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assembles the final JSON printed to stdout -- pulled out of main() so
     the counters/timings it reports can be unit tested without wiring up a
@@ -304,6 +306,7 @@ def _build_result_summary(
         # line only, indistinguishable in the ledger from any other
         # failed rows (18j).
         "familyMismatchDetails": family_mismatch_details or [],
+        **(timeout_retry_fields or {}),
         "catalogRowsWritten": catalog_rows_written,
         "catalogRowsParsed": catalog_rows_parsed,
         "sportscardsproApiAttempted": api_search_counts["attempted"],
@@ -721,6 +724,7 @@ def _run_backfill(
                 catalog_write_events=catalog_write_events,
                 family_mismatches=family_mismatches,
                 family_mismatch_details=family_mismatch_details,
+                timeout_retry_fields=timeout_retry_summary(catalog_client),
             ),
             indent=2,
         ),

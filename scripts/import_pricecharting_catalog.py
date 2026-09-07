@@ -625,6 +625,26 @@ def parse_price_cents(value: str) -> int | None:
     return cents
 
 
+# Why this hardens the REST writer rather than moving everything to COPY.
+#
+# scripts/tier3_copy_writer.py already exists and remains the preferred
+# tier-3 path: it writes through a direct DATABASE_URL connection, so it
+# never meets the PostgREST role's 8s statement_timeout at all, and one
+# COPY plus a server-side merge replaces ~375 independent statements.
+#
+# Expanding it to the other scheduled jobs is a genuine migration, not a
+# switch: a different connection (psycopg + DATABASE_URL, which Render's
+# cron path does not currently carry), a different write mechanism, and
+# different failure semantics -- one transaction that lands or does not,
+# rather than sub-batches that partially succeed. Every caller's error
+# handling is written against the latter.
+#
+# The bleeding is live and measured (300 rows lost in one run), so this
+# stops it where the rows are actually being lost, safely and reversibly.
+# Whether a broader COPY migration is worth it is a decision better made
+# from the statement-timeout counters this change starts recording than
+# from the guess we would be making today.
+
 # Statement-timeout recovery. Three attempts because the timeouts are
 # transient contention against a fixed 8s cap, not a capacity wall: the same
 # rows usually write on the next try. Bounded tightly on purpose -- retrying
@@ -647,6 +667,52 @@ class _StatementTimeoutExhausted(Exception):
     def __init__(self, rows_abandoned: int) -> None:
         super().__init__(f"{rows_abandoned} rows abandoned after timeout retries")
         self.rows_abandoned = rows_abandoned
+
+
+def timeout_retry_summary(writer: Any) -> dict[str, Any]:
+    """The statement-timeout counters, shaped for a run summary.
+
+    Every scheduled catalog writer reports these so the retry can be judged
+    from the ops ledger rather than inferred. Without them a run that
+    recovered 300 rows and one that never hit a timeout look identical, and
+    the next decision -- whether raising the 8s cap or dropping the
+    HOT-blocking indexes is actually needed -- depends on telling those
+    apart.
+
+    `writePath` is included because zeros mean different things. The tier-3
+    COPY writer talks to Postgres directly over DATABASE_URL and never meets
+    the PostgREST role's 8s statement_timeout, so its zeros mean "not
+    applicable", not "no timeouts occurred". Reporting bare zeros for it
+    would read as a clean REST run and quietly overstate how well the retry
+    is doing.
+    """
+    if writer is None:
+        # No writer at all -- a dry run. Distinct from "copy": nothing was
+        # written, so the zeros describe an absence of writes rather than a
+        # write path that cannot time out.
+        return {
+            "writePath": "none",
+            "statementTimeouts": 0,
+            "statementTimeoutRetries": 0,
+            "statementTimeoutRowsRecovered": 0,
+            "statementTimeoutRowsAbandoned": 0,
+        }
+    stats = getattr(writer, "timeout_retry_stats", None)
+    if stats is None:
+        return {
+            "writePath": "copy",
+            "statementTimeouts": 0,
+            "statementTimeoutRetries": 0,
+            "statementTimeoutRowsRecovered": 0,
+            "statementTimeoutRowsAbandoned": 0,
+        }
+    return {
+        "writePath": "rest",
+        "statementTimeouts": stats["timeouts"],
+        "statementTimeoutRetries": stats["retries"],
+        "statementTimeoutRowsRecovered": stats["rowsRecovered"],
+        "statementTimeoutRowsAbandoned": stats["rowsAbandoned"],
+    }
 
 
 class PartialCatalogWriteError(Exception):

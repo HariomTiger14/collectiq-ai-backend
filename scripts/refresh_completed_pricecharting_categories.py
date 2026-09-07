@@ -52,6 +52,7 @@ from scripts.backfill_pricecharting_sets import (
     write_catalog_rows,
 )
 from scripts.import_pricecharting_catalog import (
+    timeout_retry_summary,
     SupabaseCatalogClient,
     chunked_iter,
     iter_rows_from_file,
@@ -228,6 +229,7 @@ def main(argv: list[str] | None = None) -> int:
                 "dryRun": args.dry_run,
                 "setsConsidered": len(rows),
                 "setsRefreshed": succeeded_sets,
+                **timeout_retry_summary(catalog_client),
                 "failedBatches": failed_batches,
                 "familyMismatches": family_mismatches,
                 # Detail, not just a count: a refusal used to be a stdout

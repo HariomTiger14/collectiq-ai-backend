@@ -80,6 +80,7 @@ from scripts.backfill_pricecharting_sets import (
     write_catalog_rows_with_retry,
 )
 from scripts.import_pricecharting_catalog import (
+    timeout_retry_summary,
     SupabaseCatalogClient,
     chunked_iter,
     iter_rows_from_file,
@@ -458,6 +459,7 @@ def main(argv: list[str] | None = None) -> int:
                 "dryRun": args.dry_run,
                 "setsConsidered": len(rows),
                 "setsRefreshed": len(refreshed_ids),
+                **timeout_retry_summary(writer_with_stats),
                 "failedBatches": failed_batches,
                 "failedFetches": failed_fetches,
                 "failedWrites": failed_writes,

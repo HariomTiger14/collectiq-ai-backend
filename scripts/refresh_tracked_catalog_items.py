@@ -38,6 +38,7 @@ from scripts.backfill_pricecharting_sets import (
     write_catalog_rows,
 )
 from scripts.import_pricecharting_catalog import (
+    timeout_retry_summary,
     SupabaseCatalogClient,
     to_catalog_row,
     to_catalog_row_from_api_product,
@@ -132,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
                 "success": True,
                 "dryRun": args.dry_run,
                 "tracked": len(tracked_ids),
+                **timeout_retry_summary(catalog_client),
                 "candidates": len(candidates),
                 "refreshed": len(catalog_rows) if written else 0,
                 "failed": failed + (0 if written else len(catalog_rows)),
