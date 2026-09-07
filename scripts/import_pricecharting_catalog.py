@@ -625,6 +625,96 @@ def parse_price_cents(value: str) -> int | None:
     return cents
 
 
+# Why this hardens the REST writer rather than moving everything to COPY.
+#
+# scripts/tier3_copy_writer.py already exists and remains the preferred
+# tier-3 path: it writes through a direct DATABASE_URL connection, so it
+# never meets the PostgREST role's 8s statement_timeout at all, and one
+# COPY plus a server-side merge replaces ~375 independent statements.
+#
+# Expanding it to the other scheduled jobs is a genuine migration, not a
+# switch: a different connection (psycopg + DATABASE_URL, which Render's
+# cron path does not currently carry), a different write mechanism, and
+# different failure semantics -- one transaction that lands or does not,
+# rather than sub-batches that partially succeed. Every caller's error
+# handling is written against the latter.
+#
+# The bleeding is live and measured (300 rows lost in one run), so this
+# stops it where the rows are actually being lost, safely and reversibly.
+# Whether a broader COPY migration is worth it is a decision better made
+# from the statement-timeout counters this change starts recording than
+# from the guess we would be making today.
+
+# Statement-timeout recovery. Three attempts because the timeouts are
+# transient contention against a fixed 8s cap, not a capacity wall: the same
+# rows usually write on the next try. Bounded tightly on purpose -- retrying
+# a contended write many times adds to the contention it is waiting on.
+MAX_TIMEOUT_ATTEMPTS = 3
+TIMEOUT_RETRY_BACKOFF_SECONDS = 1.5
+
+
+class _StatementTimeoutExhausted(Exception):
+    """A sub-batch still timed out after every retry.
+
+    Raised by the inner frames and caught by the outermost one, so the
+    ledger records ONE event carrying the row count the caller actually
+    asked to write. Recording at the leaf instead would report the size
+    of the last halved fragment -- a 39-row batch would appear in
+    ops_error_events as a 9-row failure, quietly corrupting the very
+    metric the 57014 diagnosis was built on (batch size vs duration).
+    """
+
+    def __init__(self, rows_abandoned: int) -> None:
+        super().__init__(f"{rows_abandoned} rows abandoned after timeout retries")
+        self.rows_abandoned = rows_abandoned
+
+
+def timeout_retry_summary(writer: Any) -> dict[str, Any]:
+    """The statement-timeout counters, shaped for a run summary.
+
+    Every scheduled catalog writer reports these so the retry can be judged
+    from the ops ledger rather than inferred. Without them a run that
+    recovered 300 rows and one that never hit a timeout look identical, and
+    the next decision -- whether raising the 8s cap or dropping the
+    HOT-blocking indexes is actually needed -- depends on telling those
+    apart.
+
+    `writePath` is included because zeros mean different things. The tier-3
+    COPY writer talks to Postgres directly over DATABASE_URL and never meets
+    the PostgREST role's 8s statement_timeout, so its zeros mean "not
+    applicable", not "no timeouts occurred". Reporting bare zeros for it
+    would read as a clean REST run and quietly overstate how well the retry
+    is doing.
+    """
+    if writer is None:
+        # No writer at all -- a dry run. Distinct from "copy": nothing was
+        # written, so the zeros describe an absence of writes rather than a
+        # write path that cannot time out.
+        return {
+            "writePath": "none",
+            "statementTimeouts": 0,
+            "statementTimeoutRetries": 0,
+            "statementTimeoutRowsRecovered": 0,
+            "statementTimeoutRowsAbandoned": 0,
+        }
+    stats = getattr(writer, "timeout_retry_stats", None)
+    if stats is None:
+        return {
+            "writePath": "copy",
+            "statementTimeouts": 0,
+            "statementTimeoutRetries": 0,
+            "statementTimeoutRowsRecovered": 0,
+            "statementTimeoutRowsAbandoned": 0,
+        }
+    return {
+        "writePath": "rest",
+        "statementTimeouts": stats["timeouts"],
+        "statementTimeoutRetries": stats["retries"],
+        "statementTimeoutRowsRecovered": stats["rowsRecovered"],
+        "statementTimeoutRowsAbandoned": stats["rowsAbandoned"],
+    }
+
+
 class PartialCatalogWriteError(Exception):
     """Raised by upsert_rows()/sync_scd2_history_rows() when at least one
     sub-batch failed but every sub-batch was still attempted (unlike a bare
@@ -685,6 +775,14 @@ class SupabaseCatalogClient:
         # like every row was rewritten every cycle. Accumulating here lets
         # any caller record the real split without changing upsert_rows()'
         # int return type, which ~15 import scripts depend on.
+        # Statement-timeout recovery, reported per run so the cost and
+        # the benefit of retrying are both visible rather than inferred.
+        self.timeout_retry_stats: dict[str, int] = {
+            "timeouts": 0,
+            "retries": 0,
+            "rowsRecovered": 0,
+            "rowsAbandoned": 0,
+        }
         self.catalog_write_stats: dict[str, int] = {
             "written": 0,
             "skippedUnchanged": 0,
@@ -1064,36 +1162,148 @@ class SupabaseCatalogClient:
         with httpx.Client(timeout=self.timeout_seconds) as client:
             for index in range(0, len(rows), batch_size):
                 batch = rows[index : index + batch_size]
-                request_started_at = time.perf_counter()
-                response = client.post(
-                    f"{self.supabase_url}/rest/v1/{table}",
-                    params={"on_conflict": on_conflict},
+                total += self._post_batch(
+                    client,
+                    table=table,
+                    batch=batch,
+                    on_conflict=on_conflict,
+                    label=label,
                     headers=headers,
-                    json=batch,
+                    batch_size=batch_size,
+                    first_row_number=index + 1,
                 )
+                print(f"Imported {total} / {len(rows)} {label} rows...", flush=True)
+        return total
+
+    def _post_batch(
+        self,
+        client: "httpx.Client",
+        *,
+        table: str,
+        batch: list[dict[str, Any]],
+        on_conflict: str,
+        label: str,
+        headers: dict[str, str],
+        batch_size: int,
+        first_row_number: int,
+        attempt: int = 1,
+    ) -> int:
+        """POST one batch, recovering from Postgres statement timeouts.
+
+        A 57014 used to abandon the whole sub-batch: measured 2026-09-07,
+        one `small-sets-refresh` run wrote 1,445 rows and lost 300 to three
+        timeouts -- 17% of what it attempted, silently, every run.
+
+        Two recovery levers, because the evidence supports both and neither
+        alone is enough:
+
+        * TIME. The timeouts are a fixed 8s cap (the PostgREST role's
+          statement_timeout) hit by a latency tail, not by volume -- batches
+          of 5, 6, 8 and 13 rows have timed out at 8.2s while batches of
+          1,000 succeed. So the same rows usually write fine a moment later,
+          and simply trying again is the lever that actually recovers rows.
+        * SIZE. Halving is still worth doing because a smaller statement is
+          a smaller target for whatever it was queued behind, and it costs
+          nothing when the first lever is what works. It is NOT the primary
+          fix, and this deliberately does not shrink the caller's batch_size
+          for subsequent batches: that would be a permanent throughput cut
+          in response to a transient condition.
+
+        Gives up after MAX_TIMEOUT_ATTEMPTS and records the failure then, so
+        one slow moment produces one ledger event rather than a cascade.
+        """
+        request_started_at = time.perf_counter()
+        response = client.post(
+            f"{self.supabase_url}/rest/v1/{table}",
+            params={"on_conflict": on_conflict},
+            headers=headers,
+            json=batch,
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            timed_out = "57014" in (response.text or "")
+            can_retry = timed_out and attempt < MAX_TIMEOUT_ATTEMPTS
+            if timed_out and attempt == 1:
+                self.timeout_retry_stats["timeouts"] += 1
+            if can_retry:
+                self.timeout_retry_stats["retries"] += 1
+                # Backoff before AND halving: the pause is what usually
+                # works, the split is insurance.
+                time.sleep(TIMEOUT_RETRY_BACKOFF_SECONDS * attempt)
+                if len(batch) > 1:
+                    middle = len(batch) // 2
+                    halves = (batch[:middle], batch[middle:])
+                else:
+                    halves = (batch,)
+                written = 0
                 try:
-                    response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    # Recorded HERE, at the request that actually failed, so
-                    # the event carries the real row count and operation --
-                    # and so no outer layer records it again as it becomes a
-                    # PartialCatalogWriteError and then a False return.
+                    for offset, half in enumerate(halves):
+                        written += self._post_batch(
+                            client,
+                            table=table,
+                            batch=half,
+                            on_conflict=on_conflict,
+                            label=label,
+                            headers=headers,
+                            batch_size=batch_size,
+                            first_row_number=(
+                                first_row_number + (len(halves[0]) if offset else 0)
+                            ),
+                            attempt=attempt + 1,
+                        )
+                except _StatementTimeoutExhausted:
+                    if attempt > 1:
+                        raise
                     record_db_failure(
                         duration_seconds=time.perf_counter() - request_started_at,
                         operation=f"{label}_upsert",
                         row_count=len(batch),
                         status_code=response.status_code,
                         body=response.text,
-                        context={"table": table, "writeBatchSize": batch_size},
+                        context={
+                            "table": table,
+                            "writeBatchSize": batch_size,
+                            "attempts": MAX_TIMEOUT_ATTEMPTS,
+                            "statementTimeout": True,
+                            "rowsRecoveredBeforeGivingUp": written,
+                        },
                     )
                     raise SystemExit(
-                        f"Supabase {label} import failed "
-                        f"at rows {index + 1}-{index + len(batch)} "
-                        f"with HTTP {response.status_code}: {response.text}"
+                        f"Supabase {label} import failed at rows "
+                        f"{first_row_number}-{first_row_number + len(batch) - 1} "
+                        f"after {MAX_TIMEOUT_ATTEMPTS} statement-timeout attempts"
                     ) from exc
-                total += len(batch)
-                print(f"Imported {total} / {len(rows)} {label} rows...", flush=True)
-        return total
+                self.timeout_retry_stats["rowsRecovered"] += written
+                return written
+            if timed_out:
+                # Do not record here: the outermost frame does, with the
+                # caller's real batch size. See _StatementTimeoutExhausted.
+                self.timeout_retry_stats["rowsAbandoned"] += len(batch)
+                raise _StatementTimeoutExhausted(len(batch)) from exc
+            # Recorded HERE, at the request that actually failed, so the
+            # event carries the real row count and operation -- and so no
+            # outer layer records it again as it becomes a
+            # PartialCatalogWriteError and then a False return.
+            record_db_failure(
+                duration_seconds=time.perf_counter() - request_started_at,
+                operation=f"{label}_upsert",
+                row_count=len(batch),
+                status_code=response.status_code,
+                body=response.text,
+                context={
+                    "table": table,
+                    "writeBatchSize": batch_size,
+                    "attempt": attempt,
+                    "statementTimeout": timed_out,
+                },
+            )
+            raise SystemExit(
+                f"Supabase {label} import failed "
+                f"at rows {first_row_number}-{first_row_number + len(batch) - 1} "
+                f"with HTTP {response.status_code}: {response.text}"
+            ) from exc
+        return len(batch)
 
     def _headers(self) -> dict[str, str]:
         return {

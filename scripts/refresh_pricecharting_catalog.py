@@ -21,6 +21,7 @@ from scripts._shared_rate_limiter import (
 from scripts.backfill_pricecharting_sets import REQUEST_HEADERS
 from scripts.import_pricecharting_catalog import PRICECHARTING_CSV_ENV_VARS
 from scripts.import_pricecharting_catalog import SupabaseCatalogClient
+from scripts.import_pricecharting_catalog import timeout_retry_summary
 from scripts.import_pricecharting_catalog import to_catalog_row
 
 
@@ -89,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
                 "success": not failures,
                 "dryRun": args.dry_run,
                 "sources": summaries,
+                **timeout_retry_summary(client),
                 "failedSources": failures,
                 "inputRows": sum(summary["inputRows"] for summary in summaries),
                 "validRows": sum(summary["validRows"] for summary in summaries),

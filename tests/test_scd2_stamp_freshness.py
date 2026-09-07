@@ -18,19 +18,36 @@ from unittest import mock
 
 from scripts.backfill_pricecharting_sets import CsvDownload
 
-CSV = "id,console-name,product-name,loose-price\n" + "".join(
-    f"{i},Comic Books Set,Item {i},$1.00\n" for i in range(1, 6)
-)
+def _csv_for(console_uids):
+    """A CSV shaped like the vendor's real response for these uids.
+
+    console-name mirrors the requested set, because that is what
+    download-custom returns: registry set_name "1887 N172 Old Judge" comes
+    back as "Baseball Cards 1887 N172 Old Judge" (verified live 2026-09-07).
+    This job now validates that correspondence before writing, so a fixture
+    returning one generic console-name for every set is rejected exactly
+    like a wrong-catalog response -- correctly, since that is what it looks
+    like from the inside.
+    """
+    header = "id,console-name,product-name,loose-price\n"
+    body = ""
+    for uid in console_uids:
+        index = uid.lstrip("G")
+        body += "".join(
+            f"{index}{row},Comic Books Set {index},Item {row},$1.00\n"
+            for row in range(1, 6)
+        )
+    return header + body
 
 
-def _download(*_a, **_kw):
+def _download(*_a, console_uids=(), **_kw):
     import tempfile
     from pathlib import Path
 
     handle, name = tempfile.mkstemp(suffix=".csv")
     path = Path(name)
     with open(handle, "w", encoding="utf-8") as out:
-        out.write(CSV)
+        out.write(_csv_for(console_uids))
     return CsvDownload(path, "utf-8")
 
 
@@ -76,6 +93,8 @@ class CategoriesStampTest(unittest.TestCase):
                                             "PRICECHARTING_API_TOKEN": "t"}):
             reader.return_value.fetch_refreshable_rows.return_value = rows
             limiter.return_value.acquire.return_value = True
+            # Serialised into the run summary too (timeout counters).
+            catalog.return_value.timeout_retry_stats = {"timeouts": 0, "retries": 0, "rowsRecovered": 0, "rowsAbandoned": 0}
             catalog.return_value.catalog_write_stats = {
                 "written": 0, "skippedUnchanged": 0, "failed": 0
             }

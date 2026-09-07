@@ -115,9 +115,12 @@ from scripts._ops_run_recorder import dump_and_report, run_with_recorder
 from scripts.csv_source_policy import (
     CsvFamilyMismatch,
     csv_base_url,
+    families_in_rows,
+    mismatch_detail,
     validate_csv_families,
 )
 from scripts.import_pricecharting_catalog import (
+    timeout_retry_summary,
     TEXT_FIELDS,
     PartialCatalogWriteError,
     SupabaseCatalogClient,
@@ -283,6 +286,9 @@ def _build_result_summary(
     phase_seconds: dict[str, float],
     catalog_write_phase_seconds: dict[str, float],
     catalog_write_events: list[dict[str, Any]],
+    family_mismatches: int = 0,
+    family_mismatch_details: list[dict[str, Any]] | None = None,
+    timeout_retry_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assembles the final JSON printed to stdout -- pulled out of main() so
     the counters/timings it reports can be unit tested without wiring up a
@@ -295,6 +301,12 @@ def _build_result_summary(
         "succeededViaApiSearch": api_search_succeeded,
         "deferredToLaterRun": deferred_count,
         "failed": failed_count,
+        "familyMismatches": family_mismatches,
+        # Detail, not just a count -- a refusal was previously a stdout
+        # line only, indistinguishable in the ledger from any other
+        # failed rows (18j).
+        "familyMismatchDetails": family_mismatch_details or [],
+        **(timeout_retry_fields or {}),
         "catalogRowsWritten": catalog_rows_written,
         "catalogRowsParsed": catalog_rows_parsed,
         "sportscardsproApiAttempted": api_search_counts["attempted"],
@@ -426,6 +438,8 @@ def _run_backfill(
     source_downloaded_at = datetime.now(timezone.utc).isoformat()
     succeeded_ids: list[str] = []
     failed_rows: list[dict[str, Any]] = []
+    family_mismatches = 0
+    family_mismatch_details: list[dict[str, Any]] = []
     total_catalog_rows = 0
     api_search_succeeded = 0
     api_search_counts = _new_api_search_counts()
@@ -595,23 +609,26 @@ def _run_backfill(
                 # wrong parameter returns 200/text-csv with 123,166 valid rows
                 # of the WRONG catalog (measured 2026-09-07). One extra parse
                 # pass buys an abort before the first row lands.
-                observed_families: set[str] = set()
-                for raw in iter_rows_from_file(
-                    csv_download.path, encoding=csv_download.encoding
-                ):
-                    console_name = raw.get("console-name") or raw.get("console_name")
-                    if console_name:
-                        observed_families.add(console_name)
                 try:
                     validate_csv_families(
-                        observed_families,
+                        families_in_rows(
+                            iter_rows_from_file(
+                                csv_download.path, encoding=csv_download.encoding
+                            )
+                        ),
                         expected_set_names=[
                             str(row.get("set_name") or "") for row in chunk
                         ],
                         requested_uid_count=len(chunk),
                     )
                 except CsvFamilyMismatch as exc:
+                    # Counted and detailed in the summary, not only printed:
+                    # from the ledger a refusal used to be indistinguishable
+                    # from any other failed rows (18j).
                     print(f"  REFUSING BATCH: {exc}", flush=True)
+                    family_mismatches += 1
+                    if len(family_mismatch_details) < 3:
+                        family_mismatch_details.append(mismatch_detail(exc))
                     cleanup_csv_downloads([csv_download])
                     failed_rows.extend(chunk)
                     continue
@@ -705,6 +722,9 @@ def _run_backfill(
                     {} if catalog_client is None else catalog_client.phase_seconds
                 ),
                 catalog_write_events=catalog_write_events,
+                family_mismatches=family_mismatches,
+                family_mismatch_details=family_mismatch_details,
+                timeout_retry_fields=timeout_retry_summary(catalog_client),
             ),
             indent=2,
         ),

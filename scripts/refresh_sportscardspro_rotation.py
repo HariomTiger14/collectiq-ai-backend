@@ -54,6 +54,8 @@ from scripts.csv_source_policy import (
     TRANSIENT_CSV_STATUSES,
     CsvFamilyMismatch,
     csv_base_url,
+    families_in_rows,
+    mismatch_detail,
     validate_csv_families,
 )
 from scripts._shared_rate_limiter import (
@@ -78,6 +80,7 @@ from scripts.backfill_pricecharting_sets import (
     write_catalog_rows_with_retry,
 )
 from scripts.import_pricecharting_catalog import (
+    timeout_retry_summary,
     SupabaseCatalogClient,
     chunked_iter,
     iter_rows_from_file,
@@ -181,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     failed_batches = 0
     transient_failures = 0
     family_mismatches = 0
+    family_mismatch_details: list[dict] = []
     # failed_batches lumped fetch failures and write failures into one
     # number, so the ledger could not say whether a run's ~13% loss was
     # sportscardspro throttling us or Postgres timing out on a 12M-row
@@ -364,12 +368,9 @@ def main(argv: list[str] | None = None) -> int:
                 # sets are stamped refreshed.
                 observed_families: set[str] = set()
                 for download in csv_downloads:
-                    for raw in iter_rows_from_file(
-                        download.path, encoding=download.encoding
-                    ):
-                        console_name = raw.get("console-name") or raw.get("console_name")
-                        if console_name:
-                            observed_families.add(console_name)
+                    observed_families |= families_in_rows(
+                        iter_rows_from_file(download.path, encoding=download.encoding)
+                    )
                 try:
                     validate_csv_families(
                         observed_families,
@@ -383,6 +384,8 @@ def main(argv: list[str] | None = None) -> int:
                     # the rotation and the next run re-fetches them.
                     print(f"  REFUSING BATCH: {exc}", flush=True)
                     family_mismatches += 1
+                    if len(family_mismatch_details) < 3:
+                        family_mismatch_details.append(mismatch_detail(exc))
                     failed_batches += 1
                     continue
 
@@ -456,11 +459,13 @@ def main(argv: list[str] | None = None) -> int:
                 "dryRun": args.dry_run,
                 "setsConsidered": len(rows),
                 "setsRefreshed": len(refreshed_ids),
+                **timeout_retry_summary(writer_with_stats),
                 "failedBatches": failed_batches,
                 "failedFetches": failed_fetches,
                 "failedWrites": failed_writes,
                 "transientFetchFailures": transient_failures,
                 "familyMismatches": family_mismatches,
+                "familyMismatchDetails": family_mismatch_details,
                 "writeRetries": write_retries,
                 "rateLimited429s": rate_limit_counter.value,
                 "blocked403s": blocked_counter.value,

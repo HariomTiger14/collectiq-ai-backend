@@ -94,6 +94,8 @@ class Tier3FailureSafetyTest(unittest.TestCase):
                                             "PRICECHARTING_API_TOKEN": "t"}):
             limiter.return_value.acquire.return_value = True
             # The run summary serialises these, so they have to be real.
+            # Serialised into the run summary too (timeout counters).
+            catalog.return_value.timeout_retry_stats = {"timeouts": 0, "retries": 0, "rowsRecovered": 0, "rowsAbandoned": 0}
             catalog.return_value.catalog_write_stats = {
                 "written": 0, "skippedUnchanged": 0, "failed": 0
             }

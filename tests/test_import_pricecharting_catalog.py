@@ -6,6 +6,7 @@ from unittest.mock import patch
 import httpx
 
 from scripts.import_pricecharting_catalog import (
+    MAX_TIMEOUT_ATTEMPTS,
     PartialCatalogWriteError,
     SupabaseCatalogClient,
     catalog_history_change_hash,
@@ -438,7 +439,14 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
             _catalog_row("2", "Second"),
             _catalog_row("3", "Third"),
         ]
-        transport = _FakeSupabaseTransport(current_rows=[], fail_on_post_call_index=1)
+        # Persistently failing: one statement timeout is now retried and
+        # recovered, so proving the loop CONTINUES past a dead sub-batch
+        # needs one that stays dead through every attempt.
+        transport = _FakeSupabaseTransport(
+            current_rows=[],
+            fail_on_post_call_index=1,
+            fail_repeat=MAX_TIMEOUT_ATTEMPTS,
+        )
         with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
             client_class.return_value.__enter__.return_value = transport
             client = SupabaseCatalogClient(
@@ -641,6 +649,7 @@ class _FakeSupabaseTransport:
         current_rows: list[dict[str, str]],
         fail_on_post_call_index: int | None = None,
         fail_on_price_history_post: bool = False,
+        fail_repeat: int = 1,
     ) -> None:
         self.current_rows = current_rows
         self.closed_ids: list[str] = []
@@ -648,6 +657,10 @@ class _FakeSupabaseTransport:
         self.upserted_rows: list[dict[str, object]] = []
         self.price_history_rows: list[dict[str, object]] = []
         self._fail_on_post_call_index = fail_on_post_call_index
+        # How many CONSECUTIVE posts fail from that index. A statement
+        # timeout is retried now, so a single failure is recovered --
+        # exhausting the retries takes MAX_TIMEOUT_ATTEMPTS of them.
+        self._fail_repeat = fail_repeat
         self._fail_on_price_history_post = fail_on_price_history_post
         self._post_call_count = 0
 
@@ -670,7 +683,12 @@ class _FakeSupabaseTransport:
             return _FakeSupabaseResponse(rows)
         call_index = self._post_call_count
         self._post_call_count += 1
-        if call_index == self._fail_on_post_call_index:
+        if (
+            self._fail_on_post_call_index is not None
+            and self._fail_on_post_call_index
+            <= call_index
+            < self._fail_on_post_call_index + self._fail_repeat
+        ):
             return _FailingSupabaseResponse()
         if url.endswith("/pricecharting_catalog_history"):
             self.inserted_rows.extend(rows)

@@ -34,6 +34,13 @@ from scripts._shared_rate_limiter import (
     PRICECHARTING_CSV,
     SharedRateLimiter,
 )
+from scripts.csv_source_policy import (
+    CsvFamilyMismatch,
+    csv_base_url,
+    families_in_rows,
+    mismatch_detail,
+    validate_csv_families,
+)
 from scripts._ops_run_recorder import dump_and_report, run_with_recorder
 from scripts.backfill_pricecharting_sets import (
     CSV_DOWNLOAD_MIN_INTERVAL_SECONDS,
@@ -45,6 +52,7 @@ from scripts.backfill_pricecharting_sets import (
     write_catalog_rows,
 )
 from scripts.import_pricecharting_catalog import (
+    timeout_retry_summary,
     SupabaseCatalogClient,
     chunked_iter,
     iter_rows_from_file,
@@ -97,9 +105,14 @@ def main(argv: list[str] | None = None) -> int:
         print(dump_and_report({"success": True, "setsConsidered": 0}, indent=2), flush=True)
         return 0
 
-    base_url = SOURCE_SITE_BASE_URLS["pricecharting"]
+    # Already the right host, but routed through the shared policy so
+    # this job cannot drift from it -- it was missed entirely by the
+    # #204 migration precisely because it looked correct.
+    base_url = csv_base_url("pricecharting")
     total_catalog_rows = 0
     failed_batches = 0
+    family_mismatches = 0
+    family_mismatch_details: list[dict] = []
     succeeded_sets = 0
 
     with httpx.Client(
@@ -133,6 +146,30 @@ def main(argv: list[str] | None = None) -> int:
             )
             if csv_download is None:
                 failed_batches += 1
+                continue
+
+            # Prove this CSV is the one we asked for before writing any of
+            # it. download-custom does not validate its filter: a wrong
+            # parameter returns 200/text-csv with 123,166 rows of the WRONG
+            # catalog. This job writes to the shared catalog daily and had no
+            # such guard until now.
+            try:
+                validate_csv_families(
+                    families_in_rows(
+                        iter_rows_from_file(
+                            csv_download.path, encoding=csv_download.encoding
+                        )
+                    ),
+                    expected_set_names=[str(row.get("set_name") or "") for row in chunk],
+                    requested_uid_count=len(chunk),
+                )
+            except CsvFamilyMismatch as exc:
+                print(f"  REFUSING BATCH: {exc}", flush=True)
+                family_mismatches += 1
+                if len(family_mismatch_details) < 3:
+                    family_mismatch_details.append(mismatch_detail(exc))
+                failed_batches += 1
+                cleanup_csv_downloads([csv_download])
                 continue
 
             def _iter_catalog_rows(download=csv_download):
@@ -192,7 +229,13 @@ def main(argv: list[str] | None = None) -> int:
                 "dryRun": args.dry_run,
                 "setsConsidered": len(rows),
                 "setsRefreshed": succeeded_sets,
+                **timeout_retry_summary(catalog_client),
                 "failedBatches": failed_batches,
+                "familyMismatches": family_mismatches,
+                # Detail, not just a count: a refusal used to be a stdout
+                # line only, so from the ledger it looked like
+                # unexplained failed rows (18j).
+                "familyMismatchDetails": family_mismatch_details,
                 "catalogRowsParsed": total_catalog_rows,
                 # Real split from the client accumulator; rowsWritten used
                 # to echo rowsParsed, hiding how much of each run was a

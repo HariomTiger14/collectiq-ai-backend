@@ -36,6 +36,7 @@ from scripts.backfill_pricecharting_sets import (
     write_catalog_rows,
 )
 from scripts.import_pricecharting_catalog import (
+    timeout_retry_summary,
     SupabaseCatalogClient,
     dedupe_catalog_rows,
     to_catalog_row,
@@ -123,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
                 "success": True,
                 "dryRun": args.dry_run,
                 "candidates": len(candidates),
+                **timeout_retry_summary(catalog_client),
                 "refreshedSets": len(refreshed_ids) if written else 0,
                 "skippedNotEligible": skipped,
                 # Was len(catalog_rows) -- every parsed row, not the rows

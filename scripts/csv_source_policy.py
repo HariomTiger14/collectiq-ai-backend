@@ -144,6 +144,39 @@ def _matches_requested(observed: str, expected_normalized: list[str]) -> bool:
     return False
 
 
+def families_in_rows(raw_rows) -> set[str]:
+    """Collect the console-name families present in parsed CSV rows.
+
+    The vendor's header is `console-name`; some paths normalise it to
+    `console_name`. Accepting both here means one place knows that, rather
+    than each caller half-remembering it -- which is how a filter comes to
+    look at a key that is never present and quietly validate nothing.
+    """
+    families: set[str] = set()
+    for raw in raw_rows:
+        name = raw.get("console-name") or raw.get("console_name")
+        if name:
+            families.add(name)
+    return families
+
+
+def mismatch_detail(exc: "CsvFamilyMismatch", *, limit: int = 5) -> dict:
+    """The bit of a refusal worth keeping in a run summary.
+
+    A refusal used to exist only as a stdout line, so from the ops ledger it
+    looked like unexplained failed rows and diagnosing it meant going to
+    Render's logs (§7 item 18j). Bounded on purpose: a wrong catalog can
+    carry hundreds of families and the summary is not a log.
+    """
+    return {
+        "requestedUidCount": exc.requested_uid_count,
+        "expectedSetNames": exc.expected[:limit],
+        "observedFamilies": exc.observed[:limit],
+        "observedFamilyCount": len(exc.observed),
+        "reason": str(exc)[:300],
+    }
+
+
 def validate_csv_families(
     observed_console_names: set[str] | list[str],
     *,
