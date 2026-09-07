@@ -184,6 +184,40 @@ class FamilyValidationTest(unittest.TestCase):
         self.assertIn("match no requested set", str(caught.exception))
         self.assertIn("Nintendo 64", str(caught.exception).lower().title())
 
+    def test_a_trailing_number_does_not_match_a_longer_one(self) -> None:
+        """The substring accident: "Set 1" must not match "…Set 10".
+
+        Bare containment accepted this, and real set names differ exactly
+        this way ("2023 Panini Prizm 1" vs "… 10"), so it was a live route
+        to writing one set's prices under another set's identity.
+        """
+        with self.assertRaises(CsvFamilyMismatch):
+            validate_csv_families(
+                {"Baseball Cards Set 10"},
+                expected_set_names=["Set 1"],
+                requested_uid_count=1,
+            )
+
+    def test_the_word_boundary_case_still_passes(self) -> None:
+        validate_csv_families(
+            {"Baseball Cards Set 10"},
+            expected_set_names=["Set 10"],
+            requested_uid_count=1,
+        )
+        validate_csv_families(
+            {"Baseball Cards Set 1"}, expected_set_names=["Set 1"], requested_uid_count=1
+        )
+
+    def test_a_bare_prefix_overlap_is_not_a_match(self) -> None:
+        """"Old Judge" is not "Old Judgement" -- and neither contains the
+        other on a word boundary."""
+        with self.assertRaises(CsvFamilyMismatch):
+            validate_csv_families(
+                {"Baseball Cards 1887 N172 Old Judgement"},
+                expected_set_names=["1887 N172 Old Judge"],
+                requested_uid_count=1,
+            )
+
     def test_one_bad_family_among_good_ones_fails_the_whole_batch(self) -> None:
         with self.assertRaises(CsvFamilyMismatch):
             validate_csv_families(
@@ -298,8 +332,6 @@ class ScriptsStillParseTest(unittest.TestCase):
                 ast.parse((SCRIPTS / name).read_text())
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class WrongCatalogIsRefusedEndToEndTest(unittest.TestCase):
@@ -404,3 +436,7 @@ class WrongCatalogIsRefusedEndToEndTest(unittest.TestCase):
         registry, writes = self._run(good)
         self.assertTrue(writes, "a valid batch should have been written")
         self.assertEqual(sorted(registry.refreshed), ["r0", "r1"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -125,12 +125,23 @@ def _matches_requested(observed: str, expected_normalized: list[str]) -> bool:
 
     The vendor returns a category-qualified name -- set_name "1887 N172 Old
     Judge" comes back as console-name "Baseball Cards 1887 N172 Old Judge"
-    -- so containment either way is the honest comparison, not equality.
+    -- so equality alone is too strict. But bare containment is too loose:
+    "Set 1" would match "Baseball Cards Set 10", and set names really do
+    differ only by a trailing number ("2023 Panini Prizm 1" vs "... 10"),
+    so that is a live way to accept the wrong set's data as the right set's.
+
+    The prefix a category adds is always whole words, so requiring the match
+    to fall on a word boundary keeps the real case working and closes the
+    accident: "…cards set 10" does not end with " set 1".
     """
-    return any(
-        expected and (expected in observed or observed in expected)
-        for expected in expected_normalized
-    )
+    for expected in expected_normalized:
+        if not expected:
+            continue
+        if observed == expected:
+            return True
+        if observed.endswith(" " + expected) or expected.endswith(" " + observed):
+            return True
+    return False
 
 
 def validate_csv_families(
