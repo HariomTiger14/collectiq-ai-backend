@@ -1056,7 +1056,13 @@ def _search_products(
     query: str,
     breaker: "_RateLimitCircuitBreaker | None" = None,
     rate_limit_counter: "_Counter | None" = None,
+    status_sink: list[int] | None = None,
 ) -> list[dict[str, Any]] | None:
+    """status_sink, when given, receives the HTTP status of a FAILED response.
+
+    Tier-1 eligibility needs to tell a genuine 404 apart from a transport
+    error, and this function otherwise collapses every failure into None.
+    """
     if not query:
         return None
     try:
@@ -1068,6 +1074,8 @@ def _search_products(
         payload = response.json()
     except httpx.HTTPStatusError as exc:
         print(f"  API search failed for {query!r}: {_redact_token(str(exc), token)}", flush=True)
+        if status_sink is not None:
+            status_sink.append(exc.response.status_code)
         if exc.response.status_code == 429:
             if breaker is not None:
                 breaker.record_rate_limited()

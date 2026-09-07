@@ -23,11 +23,16 @@ import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 
 from scripts._ops_run_recorder import dump_and_report, run_with_recorder
+from scripts.tier1_eligibility import (
+    OK as TIER1_OK,
+    classify_search_result,
+    plan_registry_update,
+)
 from scripts.backfill_pricecharting_sets import (
     API_SEARCH_RESULT_CAP,
     REQUEST_HEADERS,
@@ -90,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     with httpx.Client(
         timeout=args.timeout_seconds, follow_redirects=True, headers=REQUEST_HEADERS
     ) as http:
-        catalog_rows, refreshed_ids, checked_ids, skipped = refresh_small_sets(
+        result = refresh_small_sets(
             http,
             candidates,
             token=token,
@@ -99,9 +104,11 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     written = True
-    if not args.dry_run and catalog_rows:
+    if not args.dry_run and result.catalog_rows:
         assert catalog_client is not None
-        written = write_catalog_rows(catalog_client, catalog_rows, batch_size=args.catalog_batch_size)
+        written = write_catalog_rows(
+            catalog_client, result.catalog_rows, batch_size=args.catalog_batch_size
+        )
 
     # Every attempted candidate gets its check timestamp bumped regardless of
     # outcome (refreshed, too large, empty, or a transient error) -- this is
@@ -110,8 +117,15 @@ def main(argv: list[str] | None = None) -> int:
     # that set waits the full window before its next attempt too, an
     # acceptable tradeoff for a browsing-freshness nice-to-have, not
     # something tracking a user's own data.
-    if not args.dry_run and checked_ids:
-        reader.mark_tier1_checked(checked_ids)
+    if not args.dry_run and result.checked_ids:
+        reader.mark_tier1_checked(result.checked_ids)
+
+    # Eligibility is recorded separately from the check timestamp: the stamp
+    # says "we looked", this says "and text search cannot serve this set".
+    if not args.dry_run and result.eligibility_updates:
+        reader.apply_tier1_eligibility(result.eligibility_updates)
+
+    excluded_count = reader.count_excluded(stale_before=stale_before)
 
     catalog_write_stats = (
         catalog_client.catalog_write_stats
@@ -125,8 +139,16 @@ def main(argv: list[str] | None = None) -> int:
                 "dryRun": args.dry_run,
                 "candidates": len(candidates),
                 **timeout_retry_summary(catalog_client),
-                "refreshedSets": len(refreshed_ids) if written else 0,
-                "skippedNotEligible": skipped,
+                "refreshedSets": len(result.refreshed_ids) if written else 0,
+                "skippedNotEligible": result.skipped,
+                # How many sets this run set aside, versus how many it
+                # never had to ask about because a previous run did.
+                "tier1MarkedIneligible": sum(
+                    1 for update in result.eligibility_updates.values()
+                    if update.get("tier1_refresh_eligible") is False
+                ),
+                "tier1SkippedIneligible": excluded_count,
+                "tier1IneligibleReasons": result.ineligible_reasons,
                 # Was len(catalog_rows) -- every parsed row, not the rows
                 # actually written. The accumulator reports the real split.
                 "catalogRowsWritten": (
@@ -158,19 +180,46 @@ def refresh_small_sets(
     refreshed_ids: list[str] = []
     checked_ids: list[str] = []
     skipped = 0
+    # registry_id -> tier1_* patch, applied by the caller. Collected rather
+    # than written here so this function stays free of I/O and testable.
+    eligibility_updates: dict[str, dict[str, Any]] = {}
+    reasons: dict[str, int] = {}
     for index, row in enumerate(candidates):
         if index > 0 and sleep_seconds > 0:
             time.sleep(sleep_seconds)
         base_url = SOURCE_SITE_BASE_URLS[row["source_site"]]
+        status_sink: list[int] = []
         products = _search_products(
-            http, base_url=base_url, token=token, query=row.get("set_name") or ""
+            http,
+            base_url=base_url,
+            token=token,
+            query=row.get("set_name") or "",
+            status_sink=status_sink,
         )
         checked_ids.append(row["registry_id"])
+        outcome = classify_search_result(
+            products,
+            set_name=row.get("set_name"),
+            http_status=status_sink[-1] if status_sink else None,
+        )
+        if outcome != TIER1_OK:
+            reasons[outcome] = reasons.get(outcome, 0) + 1
+            update = plan_registry_update(
+                outcome, current_miss_count=int(row.get("tier1_miss_count") or 0)
+            )
+            if update:
+                eligibility_updates[row["registry_id"]] = update
         if products is None or not (0 < len(products) < API_SEARCH_RESULT_CAP):
             # Empty, errored, or hit the cap (ambiguous/truncated) -- not
             # safe to trust as a complete refresh. Leave this set's existing
             # catalog rows untouched; the slow CSV/console_uid backfill path
             # remains the source of truth for it.
+            skipped += 1
+            continue
+        if outcome != TIER1_OK:
+            # Every returned product belongs to some other set: the query
+            # resolves elsewhere, so writing these would file another set's
+            # prices under this one.
             skipped += 1
             continue
         set_catalog_rows = [
@@ -183,6 +232,11 @@ def refresh_small_sets(
             continue
         catalog_rows.extend(set_catalog_rows)
         refreshed_ids.append(row["registry_id"])
+        cleared = plan_registry_update(
+            TIER1_OK, current_miss_count=int(row.get("tier1_miss_count") or 0)
+        )
+        if cleared:
+            eligibility_updates[row["registry_id"]] = cleared
     # Unlike backfill's per-set CSV (scoped to exactly one set), tier 1
     # searches by text -- PriceCharting's fuzzy /api/products?q= match can
     # return an item that actually belongs to a DIFFERENT set (e.g.
@@ -195,7 +249,29 @@ def refresh_small_sets(
     # describe the same real item fetched moments apart, so either is fine
     # to keep.
     catalog_rows = dedupe_catalog_rows(catalog_rows)
-    return catalog_rows, refreshed_ids, checked_ids, skipped
+    return SmallSetRefreshResult(
+        catalog_rows, refreshed_ids, checked_ids, skipped, eligibility_updates, reasons
+    )
+
+
+class SmallSetRefreshResult(NamedTuple):
+    """What one pass over the candidates produced.
+
+    A NamedTuple rather than a bare tuple: this grew from four values to six
+    when tier-1 eligibility was added, and positional unpacking of six things
+    is a miscount waiting to happen.
+    """
+
+    catalog_rows: list[dict[str, Any]]
+    refreshed_ids: list[str]
+    checked_ids: list[str]
+    skipped: int
+    eligibility_updates: dict[str, dict[str, Any]]
+    ineligible_reasons: dict[str, int]
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _stale_cutoff_iso(hours: float, *, now: datetime | None = None) -> str:
@@ -227,9 +303,17 @@ class SmallSetRegistryReader:
             response = client.get(
                 f"{self.supabase_url}/rest/v1/pricecharting_set_registry",
                 params={
-                    "select": "registry_id,source_site,set_name",
+                    "select": "registry_id,source_site,set_name,tier1_miss_count",
                     "last_fetch_status": "eq.success",
                     "or": f"(tier1_refreshed_at.is.null,tier1_refreshed_at.lt.{stale_before})",
+                    # Eligible, OR set aside but past its recheck date. A set
+                    # is never excluded permanently: vendor catalogs change,
+                    # so a set over the 100-item cap today may be searchable
+                    # later, and a bad fuzzy match can be fixed upstream.
+                    "and": (
+                        "(or(tier1_refresh_eligible.is.true,"
+                        f"tier1_recheck_after.lte.{_now_iso()}))"
+                    ),
                     "order": "tier1_refreshed_at.asc.nullsfirst",
                     "limit": str(limit),
                 },
@@ -240,6 +324,65 @@ class SmallSetRegistryReader:
             if not isinstance(payload, list):
                 return []
             return [row for row in payload if isinstance(row, dict)]
+        finally:
+            if should_close:
+                client.close()
+
+    def count_excluded(self, *, stale_before: str) -> int:
+        """How many stale sets this run never had to ask about.
+
+        Reported so the saving is visible: without it, a run that skips 200
+        known-bad sets looks identical to one that had only a few candidates.
+        """
+        client, should_close = self._client_or_new()
+        try:
+            response = client.get(
+                f"{self.supabase_url}/rest/v1/pricecharting_set_registry",
+                params={
+                    "select": "registry_id",
+                    "last_fetch_status": "eq.success",
+                    "tier1_refresh_eligible": "is.false",
+                    "or": f"(tier1_recheck_after.is.null,tier1_recheck_after.gt.{_now_iso()})",
+                    "limit": "1",
+                },
+                headers={**self._headers(), "Prefer": "count=exact"},
+            )
+            response.raise_for_status()
+            content_range = response.headers.get("content-range", "")
+            return int(content_range.split("/")[-1]) if "/" in content_range else 0
+        except Exception:
+            # A reporting nicety must never fail the run.
+            return 0
+        finally:
+            if should_close:
+                client.close()
+
+    def apply_tier1_eligibility(self, updates: dict[str, dict[str, Any]]) -> None:
+        """Write the tier1_* patches produced by the refresh loop.
+
+        Grouped by identical patch so a run of 200 sets marked for the same
+        reason costs a handful of PATCHes rather than 200. Tier-3 columns are
+        never in these payloads -- plan_registry_update only emits tier1_*,
+        and a test asserts it.
+        """
+        if not updates:
+            return
+        grouped: dict[str, list[str]] = {}
+        payloads: dict[str, dict[str, Any]] = {}
+        for registry_id, patch in updates.items():
+            key = json.dumps(patch, sort_keys=True)
+            grouped.setdefault(key, []).append(registry_id)
+            payloads[key] = patch
+        client, should_close = self._client_or_new()
+        try:
+            for key, ids in grouped.items():
+                response = client.patch(
+                    f"{self.supabase_url}/rest/v1/pricecharting_set_registry",
+                    params={"registry_id": f"in.({','.join(ids)})"},
+                    headers={**self._headers(), "Prefer": "return=minimal"},
+                    json=payloads[key],
+                )
+                response.raise_for_status()
         finally:
             if should_close:
                 client.close()
