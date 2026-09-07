@@ -38,12 +38,45 @@ from scripts.csv_source_policy import (
 
 SCRIPTS = pathlib.Path("scripts")
 
-# Every script that performs a /price-guide/download-custom call.
-CSV_CALLERS = (
-    "refresh_sportscardspro_rotation.py",
-    "backfill_pricecharting_sets.py",
-    "diagnose_price_overflow.py",
-)
+# Scripts that call the CSV endpoint but are diagnostic/manual-only: never
+# scheduled, never writing to the shared catalog. Each is exempt from the
+# host+validation policy DELIBERATELY, and saying so here is the point --
+# the previous version of this file carried a hand-written list of the
+# scripts that DID comply, which silently omitted
+# refresh_completed_pricecharting_categories.py: a daily, catalog-writing
+# job that downloaded CSVs with no wrong-catalog guard at all. A list of
+# what to check is only ever as complete as someone's memory; a list of what
+# to skip fails loudly when a new caller appears.
+DIAGNOSTIC_ONLY = {
+    "benchmark_csv_ingest.py",   # one-off ingest benchmark
+    "edge_vs_account.py",        # manual edge/account comparison
+    "render_probe.py",           # manual region probe
+    "csv_source_policy.py",      # the policy itself
+    "_ops_run_recorder.py",      # only mentions the URL in a comment
+    "import_pricecharting_catalog.py",  # parses CSVs; does not fetch them
+}
+
+# Markers that mean "this script actually downloads a CSV".
+_CSV_MARKERS = ("fetch_batch_csv", "download-custom")
+
+
+def _discover_csv_callers() -> list[str]:
+    """Find CSV callers by scanning, not by remembering.
+
+    Anything new that fetches download-custom is picked up automatically and
+    must either comply or be added to DIAGNOSTIC_ONLY on purpose.
+    """
+    found = []
+    for path in sorted(SCRIPTS.glob("*.py")):
+        if path.name in DIAGNOSTIC_ONLY:
+            continue
+        source = path.read_text()
+        if any(marker in source for marker in _CSV_MARKERS):
+            found.append(path.name)
+    return found
+
+
+CSV_CALLERS = tuple(_discover_csv_callers())
 
 
 class HostPolicyTest(unittest.TestCase):
@@ -107,6 +140,53 @@ class NoCsvCallerBypassesThePolicyTest(unittest.TestCase):
                     [],
                     f"{name} resolves a CSV host directly inside a "
                     f"CSV-downloading function at {offenders}; use csv_base_url()",
+                )
+
+    def test_discovery_finds_the_job_the_manual_list_missed(self) -> None:
+        """The concrete miss: a daily catalog writer, absent from the old list.
+
+        refresh_completed_pricecharting_categories.py downloads CSVs and
+        writes to the shared catalog every day at 04:45 UTC. It already used
+        the right host, which is exactly why it went unnoticed -- nothing
+        about it looked wrong. Discovery does not depend on noticing.
+        """
+        self.assertIn("refresh_completed_pricecharting_categories.py", CSV_CALLERS)
+
+    def test_discovery_finds_every_known_caller(self) -> None:
+        for name in (
+            "refresh_sportscardspro_rotation.py",
+            "backfill_pricecharting_sets.py",
+            "diagnose_price_overflow.py",
+            "refresh_completed_pricecharting_categories.py",
+        ):
+            with self.subTest(script=name):
+                self.assertIn(name, CSV_CALLERS)
+
+    def test_exemptions_are_explicit_and_still_exist(self) -> None:
+        """An exemption for a deleted file hides a real caller behind a stale
+        name, so the skip-list has to stay honest too."""
+        for name in DIAGNOSTIC_ONLY:
+            with self.subTest(script=name):
+                self.assertTrue(
+                    (SCRIPTS / name).exists(),
+                    f"{name} is exempted but no longer exists -- remove the exemption",
+                )
+
+    def test_every_discovered_caller_validates_before_writing(self) -> None:
+        """Host routing alone is not the policy; the guard is half of it."""
+        writers = [
+            name
+            for name in CSV_CALLERS
+            if "to_catalog_row" in (SCRIPTS / name).read_text()
+        ]
+        self.assertTrue(writers, "expected at least one CSV-writing script")
+        for name in writers:
+            with self.subTest(script=name):
+                source = (SCRIPTS / name).read_text()
+                self.assertIn(
+                    "validate_csv_families(",
+                    source,
+                    f"{name} writes catalog rows from a CSV without validating it",
                 )
 
     def test_the_api_search_scripts_are_deliberately_untouched(self) -> None:
