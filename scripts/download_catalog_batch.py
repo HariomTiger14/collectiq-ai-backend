@@ -74,6 +74,7 @@ from scripts.csv_source_policy import (
     validate_csv_families,
 )
 from scripts.backfill_pricecharting_sets import REQUEST_HEADERS
+from scripts.catalog_batch_store import BatchStore
 from scripts.import_pricecharting_catalog import iter_rows_from_file
 
 DEFAULT_SOURCE = "sportscardspro"
@@ -84,100 +85,6 @@ DEFAULT_SOURCE = "sportscardspro"
 DEFAULT_BATCH_SIZE = 350
 # Two validated batches waiting is already a signal the ingester is behind.
 DEFAULT_MAX_QUEUE_DEPTH = 2
-
-
-class BatchStore:
-    """PostgREST access to catalog_download_batches and the registry."""
-
-    def __init__(self, *, supabase_url: str, service_role_key: str, timeout_seconds: float):
-        self.base = supabase_url.rstrip("/")
-        self.key = service_role_key
-        self.timeout = timeout_seconds
-        if not self.base or not self.key:
-            raise SystemExit("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.")
-
-    def _headers(self, **extra: str) -> dict[str, str]:
-        return {"apikey": self.key, "Authorization": f"Bearer {self.key}", **extra}
-
-    def _client(self) -> httpx.Client:
-        return httpx.Client(timeout=self.timeout)
-
-    def claim_due_sets(self, *, source: str, limit: int) -> list[dict[str, Any]]:
-        """The rotation's own queue predicate, unchanged.
-
-        Ordering by tier3_refreshed_at NULLS FIRST is what makes the rotation
-        a rotation: never-refreshed sets lead, then oldest.
-        """
-        with self._client() as client:
-            response = client.get(
-                f"{self.base}/rest/v1/pricecharting_set_registry",
-                params={
-                    "select": "registry_id,console_uid,set_name",
-                    "source_site": f"eq.{source}",
-                    "console_uid": "not.is.null",
-                    "last_fetch_status": "eq.success",
-                    "tier3_failure_count": "lt.3",
-                    "order": "tier3_refreshed_at.asc.nullsfirst,registry_id.asc",
-                    "limit": str(limit),
-                },
-                headers=self._headers(),
-            )
-            response.raise_for_status()
-            return [row for row in response.json() if isinstance(row, dict)]
-
-    def batches(self, *, source: str, statuses: list[str]) -> list[dict[str, Any]]:
-        with self._client() as client:
-            response = client.get(
-                f"{self.base}/rest/v1/catalog_download_batches",
-                params={
-                    "select": "*",
-                    "source": f"eq.{source}",
-                    "status": f"in.({','.join(statuses)})",
-                    "order": "created_at.asc",
-                },
-                headers=self._headers(),
-            )
-            response.raise_for_status()
-            return response.json()
-
-    def insert(self, row: dict[str, Any]) -> dict[str, Any]:
-        with self._client() as client:
-            response = client.post(
-                f"{self.base}/rest/v1/catalog_download_batches",
-                headers=self._headers(**{"Content-Type": "application/json",
-                                         "Prefer": "return=representation"}),
-                json=row,
-            )
-            response.raise_for_status()
-            return response.json()[0]
-
-    def update(self, batch_id: str, patch: dict[str, Any]) -> None:
-        patch = {**patch, "updated_at": datetime.now(timezone.utc).isoformat()}
-        with self._client() as client:
-            response = client.patch(
-                f"{self.base}/rest/v1/catalog_download_batches",
-                params={"batch_id": f"eq.{batch_id}"},
-                headers=self._headers(**{"Content-Type": "application/json",
-                                         "Prefer": "return=minimal"}),
-                json=patch,
-            )
-            response.raise_for_status()
-
-    def upload(self, key: str, path: Path) -> None:
-        """Upload the CSV to the private bucket.
-
-        Same service-role storage API the codebase already uses for coin
-        images and data-request exports.
-        """
-        with open(path, "rb") as handle:
-            with httpx.Client(timeout=max(self.timeout, 300)) as client:
-                response = client.post(
-                    f"{self.base}/storage/v1/object/{BUCKET}/{key}",
-                    headers=self._headers(**{"Content-Type": "text/csv",
-                                             "x-upsert": "true"}),
-                    content=handle.read(),
-                )
-                response.raise_for_status()
 
 
 def reap_stale_leases(store: BatchStore, *, source: str, commit: bool) -> int:
