@@ -17,6 +17,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
+
 from scripts.catalog_batches import (
     INGEST_FAILED,
     INGESTED,
@@ -61,9 +63,14 @@ class _Store:
     def batches(self, *, source, statuses):
         return [b for b in self._batches if b["status"] in statuses]
 
-    def claim_validated_batch(self, *, source, claimed_by):
+    def claim_ingestable_batch(self, *, source, claimed_by, max_attempts):
         self.claims += 1
-        return dict(self._batch) if self._batch else None
+        self.claim_max_attempts = max_attempts
+        if not self._batch:
+            return None
+        if int(self._batch.get("attempts") or 0) >= max_attempts:
+            return None
+        return dict(self._batch)
 
     def download_object(self, key, destination):
         Path(destination).write_text(CSV)
@@ -234,15 +241,125 @@ class ClaimIsCompareAndSwapTest(unittest.TestCase):
 
     def test_the_claim_patch_filters_on_the_expected_status(self) -> None:
         source = Path("scripts/catalog_batch_store.py").read_text()
-        claim = source[source.index("def claim_validated_batch"):]
-        self.assertIn('"status": f"eq.{VALIDATED}"', claim)
+        claim = source[source.index("def claim_ingestable_batch"):]
+        # Filters on the status the row was READ with, since a batch may be
+        # claimed from validated or from ingest_failed.
+        self.assertIn("f\"eq.{candidate['status']}\"", claim)
         self.assertIn("return=representation", claim)
 
     def test_a_lost_race_returns_none_rather_than_a_stale_batch(self) -> None:
         source = Path("scripts/catalog_batch_store.py").read_text()
-        claim = source[source.index("def claim_validated_batch"):]
+        claim = source[source.index("def claim_ingestable_batch"):]
         self.assertIn("if claimed:", claim)
         self.assertIn("return None", claim)
+
+
+
+
+class FailedBatchesAreRetriedFromStorageTest(unittest.TestCase):
+    """The whole value of staging the file.
+
+    Found live 2026-09-08: the ingester claimed only `validated`, but a
+    failure sets `ingest_failed`, so a failed batch had to be reset by hand
+    -- twice. Without this the storage design does not actually deliver
+    "download once, retry safely".
+    """
+
+    def test_the_claim_covers_validated_and_ingest_failed(self) -> None:
+        source = Path("scripts/catalog_batch_store.py").read_text()
+        claim = source[source.index("def claim_ingestable_batch"):]
+        self.assertIn("statuses=[VALIDATED, INGEST_FAILED]", claim)
+
+    def test_validation_failed_is_never_retried(self) -> None:
+        """A wrong-catalog file retried is just the wrong catalog, later.
+
+        Asserted against the queried statuses, not the whole method -- the
+        docstring names VALIDATION_FAILED precisely to explain the exclusion.
+        """
+        source = Path("scripts/catalog_batch_store.py").read_text()
+        line = next(l for l in source.splitlines() if "statuses=[" in l and "self.batches" in l)
+        self.assertIn("VALIDATED", line)
+        self.assertIn("INGEST_FAILED", line)
+        self.assertNotIn("VALIDATION_FAILED", line)
+
+    def test_the_cas_filters_on_the_status_the_row_was_read_with(self) -> None:
+        """Two possible source statuses, so the filter cannot be hardcoded."""
+        source = Path("scripts/catalog_batch_store.py").read_text()
+        claim = source[source.index("def claim_ingestable_batch"):]
+        self.assertIn('f"eq.{candidate[\'status\']}"', claim)
+
+    def test_a_batch_over_the_attempt_limit_is_not_claimed(self) -> None:
+        """Exercised against the REAL store, not the fake.
+
+        The first version of this test asserted the fake's own attempt check,
+        so removing the limit from BatchStore changed nothing and the test
+        still passed -- it was testing the test.
+        """
+        from scripts.catalog_batch_store import BatchStore
+
+        patched = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, json=[
+                    {**BATCH, "batch_id": "spent", "attempts": 5},
+                    {**BATCH, "batch_id": "fresh", "attempts": 1},
+                ])
+            patched.append(str(request.url))
+            return httpx.Response(200, json=[{**BATCH, "batch_id": "fresh"}])
+
+        transport = httpx.MockTransport(handler)
+        real = httpx.Client
+        store = BatchStore(supabase_url="https://x.test", service_role_key="k",
+                           timeout_seconds=5)
+        with patch("scripts.catalog_batch_store.httpx.Client",
+                   side_effect=lambda *a, **kw: real(*a, transport=transport,
+                                                     **{k: v for k, v in kw.items()})):
+            claimed = store.claim_ingestable_batch(
+                source="sportscardspro", claimed_by="test", max_attempts=5)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(len(patched), 1, "more than one batch was claimed")
+        self.assertIn("fresh", patched[0],
+                      "claimed the batch that had already used its attempts")
+        self.assertNotIn("spent", patched[0])
+
+    def test_a_batch_under_the_attempt_limit_is_claimed(self) -> None:
+        store = _Store(batch={**BATCH, "attempts": 4})
+        _run(store)
+        self.assertEqual(store.statuses()[-1], INGESTED)
+
+    def test_the_attempt_limit_is_passed_to_the_store(self) -> None:
+        store = _Store()
+        _run(store)
+        self.assertEqual(store.claim_max_attempts, 5)
+
+
+class FailureReportsHowFarItGotTest(unittest.TestCase):
+    """rowsParsed alone hid that a run stopped early.
+
+    Both live failures reported rowsParsed=5000 for a 166,704-row file --
+    technically true, and easy to read as "the file was small".
+    """
+
+    def test_a_failed_ingest_records_rows_parsed_before_failure(self) -> None:
+        store = _Store(batch={**BATCH, "row_count": 166704})
+        _run(store, wrote=False)
+        failed = [p for _, p in store.updates if p.get("status") == INGEST_FAILED][0]
+        self.assertIn("of 166,704", failed["last_error"])
+        self.assertIn("not attempted", failed["last_error"])
+
+    def test_an_incomplete_run_is_flagged_as_incomplete(self) -> None:
+        store = _Store(batch={**BATCH, "row_count": 166704})
+        _run(store, wrote=False)
+        # 25 rows in the fixture CSV vs a claimed 166,704-row file.
+        failed = [p for _, p in store.updates if p.get("status") == INGEST_FAILED][0]
+        self.assertEqual(failed["rows_written"], 20)
+        self.assertIn("catalog write failed after", failed["last_error"])
+
+    def test_a_complete_run_is_not_flagged(self) -> None:
+        store = _Store(batch={**BATCH, "row_count": 25})
+        _run(store)
+        self.assertEqual(store.statuses()[-1], INGESTED)
 
 
 if __name__ == "__main__":

@@ -103,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         store, source=args.source, commit=args.commit)
 
     if not args.commit:
-        waiting = store.batches(source=args.source, statuses=[VALIDATED])
+        waiting = store.batches(source=args.source, statuses=[VALIDATED, INGEST_FAILED])
         summary.update(skippedReason="dry_run", queueDepth=len(waiting))
         print(f"DRY RUN -- {len(waiting)} validated batch(es) waiting. "
               "Pass --commit to ingest one.", flush=True)
@@ -114,11 +114,14 @@ def main(argv: list[str] | None = None) -> int:
         print(dump_and_report(summary, indent=2), flush=True)
         return 0
 
-    batch = store.claim_validated_batch(
-        source=args.source, claimed_by=os.getenv("RENDER_SERVICE_NAME", "local"))
+    batch = store.claim_ingestable_batch(
+        source=args.source,
+        claimed_by=os.getenv("RENDER_SERVICE_NAME", "local"),
+        max_attempts=args.max_attempts,
+    )
     if batch is None:
-        summary["skippedReason"] = "no_validated_batch"
-        print("no validated batch waiting.", flush=True)
+        summary["skippedReason"] = "no_ingestable_batch"
+        print("no validated or retryable batch waiting.", flush=True)
         print(dump_and_report(summary, indent=2), flush=True)
         return 0
 
@@ -178,7 +181,10 @@ def main(argv: list[str] | None = None) -> int:
             "rows_recovered": timeouts["statementTimeoutRowsRecovered"],
             "rows_abandoned": timeouts["statementTimeoutRowsAbandoned"],
         }
-        summary.update(rowsParsed=parsed, writeRetries=retries, ingestMs=ingest_ms,
+        file_rows = int(batch.get("row_count") or 0)
+        summary.update(rowsParsed=parsed, fileRowCount=file_rows,
+                       fileComplete=(file_rows == 0 or parsed >= file_rows),
+                       writeRetries=retries, ingestMs=ingest_ms,
                        rowsWritten=stats["written"], rowsSkipped=stats["skippedUnchanged"],
                        rowsFailed=stats["failed"], **timeouts)
 
@@ -186,11 +192,17 @@ def main(argv: list[str] | None = None) -> int:
             # The object stays in storage, so the retry costs no vendor slot.
             store.update(batch_id, {
                 **common, "status": INGEST_FAILED, "claimed_at": None, "claimed_by": None,
-                "last_error": "catalog write failed", "last_error_class": CLASS_WRITE,
+                "last_error": (
+                    f"catalog write failed after {parsed:,} of {file_rows:,} "
+                    "rows; the rest of the file was not attempted"
+                ),
+                "last_error_class": CLASS_WRITE,
             })
-            summary.update(success=False, status=INGEST_FAILED)
-            print("catalog write failed -- batch left retryable from storage, "
-                  "registry NOT stamped.", flush=True)
+            summary.update(success=False, status=INGEST_FAILED,
+                           rowsParsedBeforeFailure=parsed)
+            print(f"catalog write failed after {parsed:,} of {file_rows:,} rows "
+                  "-- the rest of the file was NOT attempted. Batch left "
+                  "retryable from storage, registry NOT stamped.", flush=True)
             print(dump_and_report(summary, indent=2), flush=True)
             return 0
 
@@ -216,8 +228,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Ingest one validated catalog batch from storage. "
                     "Never fetches from the vendor.")
     parser.add_argument("--source", default=DEFAULT_SOURCE)
+    parser.add_argument(
+        "--max-attempts", type=int, default=5,
+        help="Stop retrying a batch after this many ingest attempts. It stays "
+             "visible as ingest_failed rather than being dropped.")
     parser.add_argument("--ingest-chunk-rows", type=int, default=5000)
-    parser.add_argument("--catalog-batch-size", type=int, default=500)
+    # 1000, not 500: at 500 a 292k-row batch made 590 sub-batches and up to
+    # 3,540 REST calls, and round-trip latency dominated the run (78% of a
+    # 20-minute ingest). 1000 halves that.
+    #
+    # And not 2000, which was tried and broke: PostgREST silently caps a
+    # response at 1,000 rows, so the current-history lookup came back
+    # truncated, 1,000 ids looked like they had no current row, and the
+    # writer hit 23505 inserting a second current row. The write batch and
+    # the lookup batch are the same number here, so the ceiling is
+    # strictly UNDER 1,000 -- a full-cap reply cannot be told apart from a
+    # truncated one. 900 leaves headroom and still cuts sub-batches 586 -> 186.
+    parser.add_argument("--catalog-batch-size", type=int, default=900)
     parser.add_argument("--write-attempts", type=int, default=3)
     parser.add_argument("--write-retry-seconds", type=float, default=5.0)
     parser.add_argument("--timeout-seconds", type=float, default=900)

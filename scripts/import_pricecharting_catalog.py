@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+from functools import lru_cache
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -403,31 +404,32 @@ def to_catalog_row(
     source_file: str,
     source_downloaded_at: str,
 ) -> dict[str, Any] | None:
-    product_id = pick_text(row, TEXT_FIELDS["pricecharting_id"])
-    product_name = pick_text(row, TEXT_FIELDS["product_name"])
+    normalized_row = normalize_row_keys(row)
+    product_id = pick_normalized(normalized_row, TEXT_FIELDS["pricecharting_id"])
+    product_name = pick_normalized(normalized_row, TEXT_FIELDS["product_name"])
     if not product_id or not product_name:
         return None
 
-    console_name = pick_text(row, TEXT_FIELDS["console_name"])
+    console_name = pick_normalized(normalized_row, TEXT_FIELDS["console_name"])
     catalog_row: dict[str, Any] = {
         "pricecharting_id": product_id,
         "product_name": product_name,
         "console_name": console_name,
-        "category": pick_text(row, TEXT_FIELDS["category"]) or console_name,
+        "category": pick_normalized(normalized_row, TEXT_FIELDS["category"]) or console_name,
         "platform_group": compute_platform_group(console_name),
-        "upc": pick_text(row, TEXT_FIELDS["upc"]),
-        "asin": pick_text(row, TEXT_FIELDS["asin"]),
-        "epid": pick_text(row, TEXT_FIELDS["epid"]),
-        "release_date": parse_date(pick_text(row, TEXT_FIELDS["release_date"])),
+        "upc": pick_normalized(normalized_row, TEXT_FIELDS["upc"]),
+        "asin": pick_normalized(normalized_row, TEXT_FIELDS["asin"]),
+        "epid": pick_normalized(normalized_row, TEXT_FIELDS["epid"]),
+        "release_date": parse_date(pick_normalized(normalized_row, TEXT_FIELDS["release_date"])),
         "currency": "USD",
-        "product_url": pick_text(row, TEXT_FIELDS["product_url"]),
+        "product_url": pick_normalized(normalized_row, TEXT_FIELDS["product_url"]),
         "normalized_identity": normalized_identity(product_name, console_name),
         "raw_payload": row,
         "source_file": source_file,
         "source_downloaded_at": source_downloaded_at,
     }
     for target, aliases in PRICE_FIELDS.items():
-        catalog_row[target] = parse_price_cents(pick_text(row, aliases))
+        catalog_row[target] = parse_price_cents(pick_normalized(normalized_row, aliases))
     normalized_row = normalize_catalog_row(catalog_row)
     normalized_row["content_hash"] = catalog_history_change_hash(normalized_row)
     return normalized_row
@@ -564,8 +566,19 @@ def catalog_history_change_hash(catalog_row: dict[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def pick_text(row: dict[str, Any], aliases: list[str]) -> str:
-    normalized = {normalize_key(key): value for key, value in row.items()}
+def normalize_row_keys(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalise a raw CSV row's keys ONCE.
+
+    pick_text used to rebuild this dict on every field lookup, so a 15-column
+    row with 11 lookups ran normalize_key 246 times. Profiled over the real
+    292,687-row batch that was 4.92M regex substitutions and 72% of
+    to_catalog_row's runtime -- 257 seconds of a 20-minute ingest.
+    """
+    return {normalize_key(key): value for key, value in row.items()}
+
+
+def pick_normalized(normalized: dict[str, Any], aliases: list[str]) -> str:
+    """Alias lookup against an already-normalised row."""
     for alias in aliases:
         value = normalized.get(normalize_key(alias))
         if isinstance(value, str) and value.strip():
@@ -575,6 +588,20 @@ def pick_text(row: dict[str, Any], aliases: list[str]) -> str:
     return ""
 
 
+def pick_text(row: dict[str, Any], aliases: list[str]) -> str:
+    """Convenience wrapper for callers holding a raw row.
+
+    Kept so the handful of one-off callers (diagnostics, the API-search path)
+    are unchanged. Hot loops should normalise once and use pick_normalized.
+    """
+    return pick_normalized(normalize_row_keys(row), aliases)
+
+
+# The same ~15 CSV headers and ~30 aliases recur for every row in a 292k-row
+# file, so this turns millions of regex substitutions into dict lookups. The
+# cache is bounded because a malformed file could otherwise present unbounded
+# distinct keys.
+@lru_cache(maxsize=4096)
 def normalize_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
@@ -715,6 +742,43 @@ def timeout_retry_summary(writer: Any) -> dict[str, Any]:
     }
 
 
+# PostgREST caps a response at 1,000 rows and says nothing about it -- no
+# error, no header, no partial-content status. A lookup that asks about more
+# ids than this comes back TRUNCATED and looks like a complete answer.
+#
+# Measured live 2026-09-08: at a 2,000-row write batch,
+# _fetch_current_history_rows asked about 2,000 ids and received 1,000. The
+# missing 1,000 looked like they had no current history row, so the writer
+# inserted a second "current" row beside the existing one and hit 23505 on
+# pricecharting_catalog_history_current_unique_idx. Nothing about the
+# response suggested anything was wrong.
+#
+# Asking for more than this is therefore a programming error, not a runtime
+# condition to handle: the batch size is ours to choose.
+POSTGREST_MAX_LOOKUP_ROWS = 1000
+
+
+def _assert_lookup_fits(ids: list[str], *, what: str) -> None:
+    if len(ids) > POSTGREST_MAX_LOOKUP_ROWS:
+        raise SystemExit(
+            f"{what} lookup asked about {len(ids)} ids, over PostgREST's "
+            f"{POSTGREST_MAX_LOOKUP_ROWS}-row response cap. The reply would be "
+            "silently truncated and the missing ids would be treated as absent. "
+            "Lower the write batch size, or chunk the lookup."
+        )
+
+
+def _assert_lookup_complete(ids: list[str], payload: list, *, what: str) -> None:
+    """Defence in depth: a full-cap response is indistinguishable from a
+    truncated one, so refuse to act on the ambiguous case."""
+    if len(payload) >= POSTGREST_MAX_LOOKUP_ROWS and len(ids) >= POSTGREST_MAX_LOOKUP_ROWS:
+        raise SystemExit(
+            f"{what} lookup returned exactly the {POSTGREST_MAX_LOOKUP_ROWS}-row cap "
+            f"for {len(ids)} requested ids -- cannot tell a complete answer from a "
+            "truncated one, so refusing to write."
+        )
+
+
 class PartialCatalogWriteError(Exception):
     """Raised by upsert_rows()/sync_scd2_history_rows() when at least one
     sub-batch failed but every sub-batch was still attempted (unlike a bare
@@ -792,6 +856,17 @@ class SupabaseCatalogClient:
     def upsert_rows(self, rows: list[dict[str, Any]], *, batch_size: int) -> int:
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
+        # Checked HERE rather than at the lookup: the per-sub-batch handler
+        # catches everything and reports "continuing", which would downgrade
+        # a programming error into silently failed rows.
+        if batch_size >= POSTGREST_MAX_LOOKUP_ROWS:
+            raise ValueError(
+                f"batch_size {batch_size} reaches PostgREST's "
+                f"{POSTGREST_MAX_LOOKUP_ROWS}-row lookup cap; a full-cap reply "
+                "cannot be told apart from a truncated one, so the batch must "
+                "be strictly smaller (see the 23505 on "
+                "pricecharting_catalog_history_current_unique_idx, 2026-09-08)."
+            )
         total = 0
         skipped = 0
         failed_ids: list[str] = []
@@ -866,6 +941,11 @@ class SupabaseCatalogClient:
         ]
         if not ids:
             return {}
+        # Truncation here is waste rather than corruption -- a missing hash
+        # reads as "changed" and the row is rewritten -- but it is the same
+        # silent cap, and a batch size that overflows one lookup overflows
+        # both.
+        _assert_lookup_fits(ids, what="catalog hash")
         response = client.get(
             f"{self.supabase_url}/rest/v1/pricecharting_catalog",
             params={
@@ -884,6 +964,7 @@ class SupabaseCatalogClient:
         rows_payload = response.json()
         if not isinstance(rows_payload, list):
             raise SystemExit("Supabase catalog hash lookup returned invalid data.")
+        _assert_lookup_complete(ids, rows_payload, what="catalog hash")
         return {
             str(row.get("pricecharting_id")): row
             for row in rows_payload
@@ -898,6 +979,17 @@ class SupabaseCatalogClient:
     ) -> int:
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
+        # Checked HERE rather than at the lookup: the per-sub-batch handler
+        # catches everything and reports "continuing", which would downgrade
+        # a programming error into silently failed rows.
+        if batch_size >= POSTGREST_MAX_LOOKUP_ROWS:
+            raise ValueError(
+                f"batch_size {batch_size} reaches PostgREST's "
+                f"{POSTGREST_MAX_LOOKUP_ROWS}-row lookup cap; a full-cap reply "
+                "cannot be told apart from a truncated one, so the batch must "
+                "be strictly smaller (see the 23505 on "
+                "pricecharting_catalog_history_current_unique_idx, 2026-09-08)."
+            )
         inserted = 0
         failed_ids: list[str] = []
         with httpx.Client(timeout=self.timeout_seconds) as client:
@@ -996,6 +1088,7 @@ class SupabaseCatalogClient:
         ]
         if not ids:
             return {}
+        _assert_lookup_fits(ids, what="catalog history")
         response = client.get(
             f"{self.supabase_url}/rest/v1/pricecharting_catalog_history",
             params={
@@ -1024,6 +1117,7 @@ class SupabaseCatalogClient:
         rows_payload = response.json()
         if not isinstance(rows_payload, list):
             raise SystemExit("Supabase catalog history lookup returned invalid data.")
+        _assert_lookup_complete(ids, rows_payload, what="catalog history")
         return {
             str(row.get("pricecharting_id")): row
             for row in rows_payload
@@ -1157,6 +1251,17 @@ class SupabaseCatalogClient:
     ) -> int:
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
+        # Checked HERE rather than at the lookup: the per-sub-batch handler
+        # catches everything and reports "continuing", which would downgrade
+        # a programming error into silently failed rows.
+        if batch_size >= POSTGREST_MAX_LOOKUP_ROWS:
+            raise ValueError(
+                f"batch_size {batch_size} reaches PostgREST's "
+                f"{POSTGREST_MAX_LOOKUP_ROWS}-row lookup cap; a full-cap reply "
+                "cannot be told apart from a truncated one, so the batch must "
+                "be strictly smaller (see the 23505 on "
+                "pricecharting_catalog_history_current_unique_idx, 2026-09-08)."
+            )
         total = 0
         headers = {**self._headers(), "Prefer": "resolution=merge-duplicates,return=minimal"}
         with httpx.Client(timeout=self.timeout_seconds) as client:
