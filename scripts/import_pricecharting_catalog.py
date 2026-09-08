@@ -742,6 +742,43 @@ def timeout_retry_summary(writer: Any) -> dict[str, Any]:
     }
 
 
+# PostgREST caps a response at 1,000 rows and says nothing about it -- no
+# error, no header, no partial-content status. A lookup that asks about more
+# ids than this comes back TRUNCATED and looks like a complete answer.
+#
+# Measured live 2026-09-08: at a 2,000-row write batch,
+# _fetch_current_history_rows asked about 2,000 ids and received 1,000. The
+# missing 1,000 looked like they had no current history row, so the writer
+# inserted a second "current" row beside the existing one and hit 23505 on
+# pricecharting_catalog_history_current_unique_idx. Nothing about the
+# response suggested anything was wrong.
+#
+# Asking for more than this is therefore a programming error, not a runtime
+# condition to handle: the batch size is ours to choose.
+POSTGREST_MAX_LOOKUP_ROWS = 1000
+
+
+def _assert_lookup_fits(ids: list[str], *, what: str) -> None:
+    if len(ids) > POSTGREST_MAX_LOOKUP_ROWS:
+        raise SystemExit(
+            f"{what} lookup asked about {len(ids)} ids, over PostgREST's "
+            f"{POSTGREST_MAX_LOOKUP_ROWS}-row response cap. The reply would be "
+            "silently truncated and the missing ids would be treated as absent. "
+            "Lower the write batch size, or chunk the lookup."
+        )
+
+
+def _assert_lookup_complete(ids: list[str], payload: list, *, what: str) -> None:
+    """Defence in depth: a full-cap response is indistinguishable from a
+    truncated one, so refuse to act on the ambiguous case."""
+    if len(payload) >= POSTGREST_MAX_LOOKUP_ROWS and len(ids) >= POSTGREST_MAX_LOOKUP_ROWS:
+        raise SystemExit(
+            f"{what} lookup returned exactly the {POSTGREST_MAX_LOOKUP_ROWS}-row cap "
+            f"for {len(ids)} requested ids -- cannot tell a complete answer from a "
+            "truncated one, so refusing to write."
+        )
+
+
 class PartialCatalogWriteError(Exception):
     """Raised by upsert_rows()/sync_scd2_history_rows() when at least one
     sub-batch failed but every sub-batch was still attempted (unlike a bare
@@ -819,6 +856,17 @@ class SupabaseCatalogClient:
     def upsert_rows(self, rows: list[dict[str, Any]], *, batch_size: int) -> int:
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
+        # Checked HERE rather than at the lookup: the per-sub-batch handler
+        # catches everything and reports "continuing", which would downgrade
+        # a programming error into silently failed rows.
+        if batch_size >= POSTGREST_MAX_LOOKUP_ROWS:
+            raise ValueError(
+                f"batch_size {batch_size} reaches PostgREST's "
+                f"{POSTGREST_MAX_LOOKUP_ROWS}-row lookup cap; a full-cap reply "
+                "cannot be told apart from a truncated one, so the batch must "
+                "be strictly smaller (see the 23505 on "
+                "pricecharting_catalog_history_current_unique_idx, 2026-09-08)."
+            )
         total = 0
         skipped = 0
         failed_ids: list[str] = []
@@ -893,6 +941,11 @@ class SupabaseCatalogClient:
         ]
         if not ids:
             return {}
+        # Truncation here is waste rather than corruption -- a missing hash
+        # reads as "changed" and the row is rewritten -- but it is the same
+        # silent cap, and a batch size that overflows one lookup overflows
+        # both.
+        _assert_lookup_fits(ids, what="catalog hash")
         response = client.get(
             f"{self.supabase_url}/rest/v1/pricecharting_catalog",
             params={
@@ -911,6 +964,7 @@ class SupabaseCatalogClient:
         rows_payload = response.json()
         if not isinstance(rows_payload, list):
             raise SystemExit("Supabase catalog hash lookup returned invalid data.")
+        _assert_lookup_complete(ids, rows_payload, what="catalog hash")
         return {
             str(row.get("pricecharting_id")): row
             for row in rows_payload
@@ -925,6 +979,17 @@ class SupabaseCatalogClient:
     ) -> int:
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
+        # Checked HERE rather than at the lookup: the per-sub-batch handler
+        # catches everything and reports "continuing", which would downgrade
+        # a programming error into silently failed rows.
+        if batch_size >= POSTGREST_MAX_LOOKUP_ROWS:
+            raise ValueError(
+                f"batch_size {batch_size} reaches PostgREST's "
+                f"{POSTGREST_MAX_LOOKUP_ROWS}-row lookup cap; a full-cap reply "
+                "cannot be told apart from a truncated one, so the batch must "
+                "be strictly smaller (see the 23505 on "
+                "pricecharting_catalog_history_current_unique_idx, 2026-09-08)."
+            )
         inserted = 0
         failed_ids: list[str] = []
         with httpx.Client(timeout=self.timeout_seconds) as client:
@@ -1023,6 +1088,7 @@ class SupabaseCatalogClient:
         ]
         if not ids:
             return {}
+        _assert_lookup_fits(ids, what="catalog history")
         response = client.get(
             f"{self.supabase_url}/rest/v1/pricecharting_catalog_history",
             params={
@@ -1051,6 +1117,7 @@ class SupabaseCatalogClient:
         rows_payload = response.json()
         if not isinstance(rows_payload, list):
             raise SystemExit("Supabase catalog history lookup returned invalid data.")
+        _assert_lookup_complete(ids, rows_payload, what="catalog history")
         return {
             str(row.get("pricecharting_id")): row
             for row in rows_payload
@@ -1184,6 +1251,17 @@ class SupabaseCatalogClient:
     ) -> int:
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero")
+        # Checked HERE rather than at the lookup: the per-sub-batch handler
+        # catches everything and reports "continuing", which would downgrade
+        # a programming error into silently failed rows.
+        if batch_size >= POSTGREST_MAX_LOOKUP_ROWS:
+            raise ValueError(
+                f"batch_size {batch_size} reaches PostgREST's "
+                f"{POSTGREST_MAX_LOOKUP_ROWS}-row lookup cap; a full-cap reply "
+                "cannot be told apart from a truncated one, so the batch must "
+                "be strictly smaller (see the 23505 on "
+                "pricecharting_catalog_history_current_unique_idx, 2026-09-08)."
+            )
         total = 0
         headers = {**self._headers(), "Prefer": "resolution=merge-duplicates,return=minimal"}
         with httpx.Client(timeout=self.timeout_seconds) as client:

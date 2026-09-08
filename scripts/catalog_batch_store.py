@@ -14,7 +14,7 @@ from typing import Any
 
 import httpx
 
-from scripts.catalog_batches import BUCKET, INGESTING, VALIDATED
+from scripts.catalog_batches import BUCKET, INGEST_FAILED, INGESTING, VALIDATED
 
 
 class BatchStore:
@@ -112,22 +112,41 @@ class BatchStore:
 
     # --- ingester-side access ------------------------------------------------
 
-    def claim_validated_batch(self, *, source: str, claimed_by: str) -> dict[str, Any] | None:
-        """Take the oldest validated batch, or None if there is nothing to do.
+    def claim_ingestable_batch(
+        self, *, source: str, claimed_by: str, max_attempts: int
+    ) -> dict[str, Any] | None:
+        """Take the oldest batch that can be ingested, or None.
+
+        Claims VALIDATED batches and also INGEST_FAILED ones, which is the
+        whole point of staging the file: the object is still in storage, so
+        a retry costs no vendor CSV slot. Without this a single failed ingest
+        parks its file forever -- found the hard way on 2026-09-08, when a
+        failed batch had to be reset by hand twice.
+
+        VALIDATION_FAILED is deliberately NOT retryable: that file is a
+        wrong-catalog response, and retrying it would just write the wrong
+        catalog later instead of now.
 
         A compare-and-swap rather than a plain read-then-write: the PATCH
-        filters on status=validated, so if another worker claimed it first
-        this updates zero rows and we simply look again. PostgREST cannot
-        express FOR UPDATE SKIP LOCKED, and a read followed by an
-        unconditional write would let two ingesters process the same batch --
-        which would double-write the catalog and double-stamp the registry.
+        filters on the status the row was read with, so if another worker
+        claimed it first this updates zero rows and we look again. PostgREST
+        cannot express FOR UPDATE SKIP LOCKED, and an unconditional write
+        would let two ingesters process one batch -- double-writing the
+        catalog and double-stamping the registry.
         """
-        for candidate in self.batches(source=source, statuses=[VALIDATED]):
+        candidates = self.batches(source=source, statuses=[VALIDATED, INGEST_FAILED])
+        for candidate in candidates:
+            attempts = int(candidate.get("attempts") or 0)
+            if attempts >= max_attempts:
+                # Left in place rather than hidden: a batch that keeps failing
+                # is a thing to look at, not to quietly drop.
+                continue
             batch_id = candidate["batch_id"]
             with self._client() as client:
                 response = client.patch(
                     f"{self.base}/rest/v1/catalog_download_batches",
-                    params={"batch_id": f"eq.{batch_id}", "status": f"eq.{VALIDATED}"},
+                    params={"batch_id": f"eq.{batch_id}",
+                            "status": f"eq.{candidate['status']}"},
                     headers=self._headers(**{"Content-Type": "application/json",
                                              "Prefer": "return=representation"}),
                     json={
@@ -135,7 +154,7 @@ class BatchStore:
                         "claimed_at": datetime.now(timezone.utc).isoformat(),
                         "claimed_by": claimed_by,
                         "ingest_started_at": datetime.now(timezone.utc).isoformat(),
-                        "attempts": int(candidate.get("attempts") or 0) + 1,
+                        "attempts": attempts + 1,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                     },
                 )
