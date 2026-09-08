@@ -13,3 +13,6 @@ uploads/
 *.log
 .DS_Store
 database/.DS_Store
+
+# one-time backfill progress marker
+.backfill_price_history.checkpoint
