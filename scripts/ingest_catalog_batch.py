@@ -217,7 +217,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     "Never fetches from the vendor.")
     parser.add_argument("--source", default=DEFAULT_SOURCE)
     parser.add_argument("--ingest-chunk-rows", type=int, default=5000)
-    parser.add_argument("--catalog-batch-size", type=int, default=500)
+    # 2000, not 500: at 500 a 292k-row batch made 590 sub-batches and up to
+    # 3,540 REST calls, and round-trip latency dominated the run (measured
+    # 78% of a 20-minute ingest). 2000 cuts that ~4x. #205's retry with
+    # halving covers a timeout, and rows_abandoned has been 0 throughout.
+    parser.add_argument("--catalog-batch-size", type=int, default=2000)
     parser.add_argument("--write-attempts", type=int, default=3)
     parser.add_argument("--write-retry-seconds", type=float, default=5.0)
     parser.add_argument("--timeout-seconds", type=float, default=900)
