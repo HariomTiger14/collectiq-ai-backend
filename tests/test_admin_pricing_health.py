@@ -293,6 +293,112 @@ class PricingHealthServiceTest(unittest.TestCase):
         self.assertEqual(payload["pricecharting"]["sources"], [])
 
 
+class TheHealthBoardDoesNotCallMetadataHistoryPriceFreshnessTest(unittest.TestCase):
+    """SCD2 counts stopped meaning "prices are being refreshed" on 2026-09-09.
+
+    Price-only changes now write a snapshot and no SCD2 version, so
+    historyRows and closedHistoryRows go quiet for a pipeline that is running
+    perfectly. Left unlabelled, that reads as a stall. The fields stay --
+    removing a field breaks anything reading it -- but they are labelled, and
+    a real price signal sits beside them.
+    """
+
+    def _payload(self, handler=None) -> dict:
+        service = PricingHealthService(
+            supabase_url="https://packlox.supabase.co",
+            service_role_key="service-role-key",
+            client=httpx.Client(
+                transport=httpx.MockTransport(handler or _supabase_handler)),
+        )
+        with patch("app.services.pricing.admin_health_service.settings") as settings:
+            settings.pricecharting_api_key = ""
+            settings.ebay_access_token = ""
+            settings.ebay_client_id = ""
+            settings.ebay_client_secret = ""
+            settings.ebay_marketplace_id = "EBAY_AU"
+            settings.ebay_marketplace_insights_api_url = ""
+            settings.ebay_partner_access_granted = False
+            settings.tcgplayer_client_id = ""
+            settings.tcgplayer_client_secret = ""
+            settings.kicksdb_api_key = ""
+            settings.kicksdb_api_base = ""
+            settings.default_display_currency = "AUD"
+            settings.fx_usd_to_aud = 1.52
+            settings.fx_usd_to_cad = 1.37
+            settings.fx_usd_to_gbp = 0.78
+            return service.health()
+
+    def test_the_old_fields_are_still_there(self) -> None:
+        source = self._payload()["pricecharting"]["sources"][0]
+        self.assertIn("historyRows", source)
+        self.assertIn("closedHistoryRows", source)
+
+    def test_they_are_labelled_as_metadata_not_price(self) -> None:
+        source = self._payload()["pricecharting"]["sources"][0]
+        self.assertEqual(source["historyRowsMeasure"], "metadata_versions")
+
+    def test_a_price_freshness_number_sits_beside_them(self) -> None:
+        sources = self._payload()["pricecharting"]["sources"]
+        by_source = {item["source"]: item for item in sources}
+        self.assertEqual(by_source["pokemon.csv"]["priceSnapshotRows"], 4242)
+
+    def test_the_total_is_aggregated_too(self) -> None:
+        pricecharting = self._payload()["pricecharting"]
+        self.assertEqual(
+            pricecharting["totalPriceSnapshotRows"],
+            sum(item["priceSnapshotRows"] for item in pricecharting["sources"]))
+
+    def test_the_rpc_backed_path_carries_the_same_labels(self) -> None:
+        """The RPC path is the one production uses; the REST path is fallback.
+
+        A mutation that stripped the label from only the RPC path passed every
+        other test here, because they all exercise the fallback.
+        """
+        service = PricingHealthService(
+            supabase_url="https://packlox.supabase.co",
+            service_role_key="service-role-key",
+            client=httpx.Client(transport=httpx.MockTransport(_supabase_summary_handler)),
+            stale_after_hours=240,
+        )
+        with patch("app.services.pricing.admin_health_service.settings") as settings:
+            for attribute in ("pricecharting_api_key", "ebay_access_token",
+                              "ebay_client_id", "ebay_client_secret",
+                              "ebay_marketplace_insights_api_url",
+                              "tcgplayer_client_id", "tcgplayer_client_secret",
+                              "kicksdb_api_key", "kicksdb_api_base"):
+                setattr(settings, attribute, "")
+            settings.ebay_marketplace_id = "EBAY_AU"
+            settings.ebay_partner_access_granted = False
+            settings.default_display_currency = "AUD"
+            settings.fx_usd_to_aud = 1.52
+            settings.fx_usd_to_cad = 1.37
+            settings.fx_usd_to_gbp = 0.78
+            payload = service.health()
+        for source in payload["pricecharting"]["sources"]:
+            with self.subTest(source=source["source"]):
+                self.assertEqual(source["historyRowsMeasure"], "metadata_versions")
+                self.assertIn("priceSnapshotRows", source)
+
+    def test_the_price_signal_reads_the_snapshot_table(self) -> None:
+        """Reading it from the SCD2 table is the bug this whole class is about."""
+        requested: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requested.append(request.url.path)
+            return _supabase_handler(request)
+
+        self._payload(handler)
+        self.assertTrue(
+            any(path.endswith("/pricecharting_price_history") for path in requested),
+            "health never asked the snapshot table anything")
+
+
+def _price_snapshot_count(source: str) -> int:
+    """Snapshots written for a source: the number that now means "prices are
+    still being refreshed", where closedHistoryRows used to."""
+    return {"pokemon.csv": 4242}.get(source, 17)
+
+
 def _supabase_handler(request: httpx.Request) -> httpx.Response:
     source = str(request.url.params.get("source_file") or "").replace("eq.", "")
     path = request.url.path
@@ -315,6 +421,19 @@ def _supabase_handler(request: httpx.Request) -> httpx.Response:
             200,
             json=[],
             headers={"content-range": f"0-0/{count}"},
+        )
+    if (
+        path.endswith("/pricecharting_price_history")
+        and request.headers.get("range") == "0-0"
+    ):
+        # The price-freshness probe. Added 2026-09-09: SCD2 history stopped
+        # counting price refreshes, so a handler that 404s here would have
+        # reported the whole board unhealthy -- which is how this fake caught
+        # the change in the first place.
+        return httpx.Response(
+            200,
+            json=[],
+            headers={"content-range": f"0-0/{_price_snapshot_count(source)}"},
         )
     if path.endswith("/pricecharting_catalog"):
         return httpx.Response(

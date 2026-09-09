@@ -544,6 +544,27 @@ def prices_differ(catalog_row: dict[str, Any], current: dict[str, Any]) -> bool:
     )
 
 
+CATALOG_METADATA_SIGNATURE_COLUMNS = tuple(
+    column
+    for column in CATALOG_HISTORY_SIGNATURE_COLUMNS
+    if column not in PRICE_OBSERVATION_COLUMNS and column != "currency"
+)
+
+
+def metadata_differs(catalog_row: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Whether anything OTHER than price differs from the stored SCD2 version.
+
+    This is what now decides whether a full 1,427-byte SCD2 version is written.
+    Prices and currency are excluded deliberately: a price move is recorded as
+    a 188-byte snapshot in pricecharting_price_history instead, which is the
+    table the chart reads (#212).
+    """
+    return any(
+        catalog_row.get(column) != current.get(column)
+        for column in CATALOG_METADATA_SIGNATURE_COLUMNS
+    )
+
+
 def source_timestamp(source_downloaded_at: Any) -> str:
     if isinstance(source_downloaded_at, datetime):
         return source_downloaded_at.astimezone(timezone.utc).isoformat()
@@ -949,7 +970,17 @@ class SupabaseCatalogClient:
         response = client.get(
             f"{self.supabase_url}/rest/v1/pricecharting_catalog",
             params={
-                "select": "pricecharting_id,content_hash",
+                # Prices come along because pricecharting_catalog is now the
+                # ROLLING BASELINE for the snapshot gate. sync_scd2_history_rows
+                # runs BEFORE upsert_rows, so these are the previous run's
+                # prices -- exactly the comparison the frozen SCD2 row can no
+                # longer provide. Fetched in the existing lookup so the gate
+                # costs no extra round trip.
+                "select": (
+                    "pricecharting_id,content_hash,currency,"
+                    "loose_price_cents,cib_price_cents,new_price_cents,"
+                    "graded_price_cents,box_only_price_cents,manual_only_price_cents"
+                ),
                 "pricecharting_id": f"in.({','.join(ids)})",
             },
             headers=self._headers(),
@@ -998,6 +1029,14 @@ class SupabaseCatalogClient:
                 try:
                     comparison_started_at = time.perf_counter()
                     current_by_id = self._fetch_current_history_rows(client, batch)
+                    # The price baseline no longer comes from the SCD2 row.
+                    # Once price-only changes stop writing versions, that row
+                    # freezes at whatever the prices were when metadata last
+                    # moved -- so a price that changed once would compare as
+                    # "changed" against that stale value every single day and
+                    # write a redundant snapshot per item per run, forever.
+                    # pricecharting_catalog still advances every run.
+                    catalog_by_id = self._fetch_current_catalog_hashes(client, batch)
                     self.phase_seconds["scd2_comparison"] += (
                         time.perf_counter() - comparison_started_at
                     )
@@ -1008,20 +1047,23 @@ class SupabaseCatalogClient:
                         product_id = str(row.get("pricecharting_id") or "").strip()
                         if not product_id:
                             continue
-                        history_row = to_catalog_history_row(row)
                         current = current_by_id.get(product_id)
-                        if current and current.get("change_hash") == history_row["change_hash"]:
-                            continue
-                        if current:
-                            changed_ids.append(product_id)
-                        rows_to_insert.append(history_row)
-                        # Step-2 shadow write: a compact price observation
-                        # for price-bearing events only -- a brand-new item
-                        # (first observation) or a version whose prices
-                        # actually differ from the stored current version.
-                        # Metadata-only versions (incl. category
-                        # canonicalization) write NO observation.
-                        if current is None or prices_differ(row, current):
+                        catalog_current = catalog_by_id.get(product_id)
+                        # Two independent decisions, deliberately not chained.
+                        # An earlier version of this short-circuited on
+                        # change_hash equality before classifying, which is
+                        # unsafe now that SCD2 prices freeze: a price that
+                        # moved and came back to the frozen value matches the
+                        # hash, and its genuine change would go unrecorded.
+                        if current is None or metadata_differs(row, current):
+                            history_row = to_catalog_history_row(row)
+                            if current:
+                                changed_ids.append(product_id)
+                            rows_to_insert.append(history_row)
+                        # A price move is a snapshot, never a version. The
+                        # baseline is the catalog row (previous run), not the
+                        # SCD2 row -- see _fetch_current_catalog_hashes.
+                        if catalog_current is None or prices_differ(row, catalog_current):
                             price_observations.append(to_price_observation_row(row))
 
                     insert_started_at = time.perf_counter()
@@ -1092,15 +1134,17 @@ class SupabaseCatalogClient:
         response = client.get(
             f"{self.supabase_url}/rest/v1/pricecharting_catalog_history",
             params={
-                # change_hash gates whether ANY version is written; the
-                # price columns + currency classify whether the change is
-                # price-bearing (-> also a compact price observation) or
-                # metadata-only (-> legacy version only). Fetched together
-                # so classification costs no extra round trip.
+                # The METADATA columns decide whether a version is written
+                # at all. change_hash cannot: it covers prices too, and once
+                # price-only changes stop writing versions the stored row's
+                # prices freeze, so its hash would differ on every price move
+                # and mint exactly the versions this is meant to avoid.
+                # Compared field by field against CATALOG_METADATA_SIGNATURE_
+                # COLUMNS instead, which needs no migration and no rewrite of
+                # the 18M hashes already stored.
                 "select": (
-                    "pricecharting_id,change_hash,currency,"
-                    "loose_price_cents,cib_price_cents,new_price_cents,"
-                    "graded_price_cents,box_only_price_cents,manual_only_price_cents"
+                    "pricecharting_id,change_hash,"
+                    + ",".join(CATALOG_METADATA_SIGNATURE_COLUMNS)
                 ),
                 "is_current": "eq.true",
                 "pricecharting_id": f"in.({','.join(ids)})",

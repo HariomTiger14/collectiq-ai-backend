@@ -97,6 +97,9 @@ class PricingHealthService:
                 "totalClosedHistoryRows": sum(
                     int(source.get("closedHistoryRows") or 0) for source in sources
                 ),
+                "totalPriceSnapshotRows": sum(
+                    int(source.get("priceSnapshotRows") or 0) for source in sources
+                ),
             },
             "providers": provider_statuses,
             "currency": currency_status,
@@ -120,6 +123,8 @@ class PricingHealthService:
                         "currentRows": 0,
                         "historyRows": 0,
                         "closedHistoryRows": 0,
+                        "historyRowsMeasure": "metadata_versions",
+                        "priceSnapshotRows": 0,
                         "lastLoadedAt": None,
                         "ageHours": None,
                         "stale": True,
@@ -164,6 +169,13 @@ class PricingHealthService:
                     "currentRows": current_rows,
                     "historyRows": history_rows,
                     "closedHistoryRows": closed_history_rows,
+                    # Same caveat as the fallback path: these count metadata
+                    # versions, not price refreshes. price_snapshot_rows
+                    # arrives once the RPC is migrated to return it; until
+                    # then the field is present and zero rather than absent,
+                    # so callers can rely on the shape.
+                    "historyRowsMeasure": "metadata_versions",
+                    "priceSnapshotRows": _safe_int(row.get("price_snapshot_rows")),
                     "lastLoadedAt": last_loaded_at.isoformat()
                     if last_loaded_at
                     else None,
@@ -222,6 +234,15 @@ class PricingHealthService:
                 "is_current": "eq.false",
             },
         )
+        # Price refreshes stopped writing SCD2 versions on 2026-09-09, so the
+        # two counts above no longer measure price activity -- they measure
+        # METADATA history, which barely moves. Read on its own,
+        # closedHistoryRows now looks like a pipeline that has stalled. The
+        # price signal is this one: snapshots written for the source.
+        price_snapshot_rows = self._count(
+            table="pricecharting_price_history",
+            filters={"source_file": f"eq.{source_file}"},
+        )
         latest = self._latest_catalog_row(source_file)
         last_loaded_at = _latest_timestamp(latest)
         age_hours = _age_hours(last_loaded_at, generated_at)
@@ -236,8 +257,13 @@ class PricingHealthService:
             "source": source_file,
             "status": source_status,
             "currentRows": current_rows,
+            # Kept, and kept named the same, because removing a field is a
+            # breaking change for anything reading it -- but neither of these
+            # is a price-freshness number any more. See priceSnapshotRows.
             "historyRows": history_rows,
             "closedHistoryRows": closed_history_rows,
+            "historyRowsMeasure": "metadata_versions",
+            "priceSnapshotRows": price_snapshot_rows,
             "lastLoadedAt": last_loaded_at.isoformat() if last_loaded_at else None,
             "ageHours": age_hours,
             "stale": stale,
