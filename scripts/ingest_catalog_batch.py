@@ -138,8 +138,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     temp_path = Path(tempfile.mkstemp(prefix="catalog-ingest-", suffix=".csv")[1])
     started = time.perf_counter()
+    # Where a 13.7-minute ingest actually goes. #213 cut SCD2 versions by
+    # 97.8% and moved the wall clock by 3% per row, which told us the SCD2
+    # write was never the bottleneck -- but not what is. The client already
+    # accumulated phase_seconds and nothing ever printed them, so the split
+    # was being inferred rather than measured. These three timers cover what
+    # the client cannot see: storage, parsing, and registry stamping.
+    timings: dict[str, float] = {"storage_download": 0.0, "parse": 0.0,
+                                 "registry_stamp": 0.0}
     try:
+        download_started_at = time.perf_counter()
         size = store.download_object(batch["storage_key"], temp_path)
+        timings["storage_download"] = time.perf_counter() - download_started_at
         print(f"  downloaded {size:,} bytes from storage", flush=True)
 
         # Row-at-a-time off disk, chunked into the writer. Never materialised:
@@ -147,10 +157,21 @@ def main(argv: list[str] | None = None) -> int:
         stamp = datetime.now(timezone.utc).isoformat()
 
         def rows():
-            for raw in iter_rows_from_file(temp_path, encoding="utf-8"):
-                row = to_catalog_row(raw, SOURCE_FILE_TAG, stamp)
-                if row is not None:
-                    yield row
+            # Timed inside the generator because parsing is interleaved with
+            # writing -- the chunk loop pulls rows as it needs them, so there
+            # is no wall-clock window that contains only parsing.
+            while True:
+                parse_started_at = time.perf_counter()
+                try:
+                    for raw in iter_rows_from_file(temp_path, encoding="utf-8"):
+                        row = to_catalog_row(raw, SOURCE_FILE_TAG, stamp)
+                        timings["parse"] += time.perf_counter() - parse_started_at
+                        if row is not None:
+                            yield row
+                        parse_started_at = time.perf_counter()
+                finally:
+                    timings["parse"] += time.perf_counter() - parse_started_at
+                return
 
         parsed = 0
         wrote = True
@@ -182,11 +203,25 @@ def main(argv: list[str] | None = None) -> int:
             "rows_abandoned": timeouts["statementTimeoutRowsAbandoned"],
         }
         file_rows = int(batch.get("row_count") or 0)
+        phases = {**catalog_client.phase_seconds, **timings}
+        accounted = sum(phases.values())
         summary.update(rowsParsed=parsed, fileRowCount=file_rows,
                        fileComplete=(file_rows == 0 or parsed >= file_rows),
                        writeRetries=retries, ingestMs=ingest_ms,
                        rowsWritten=stats["written"], rowsSkipped=stats["skippedUnchanged"],
-                       rowsFailed=stats["failed"], **timeouts)
+                       rowsFailed=stats["failed"],
+                       phaseSeconds={name: round(value, 2)
+                                     for name, value in sorted(
+                                         phases.items(), key=lambda kv: -kv[1])},
+                       # Anything the timers did not claim: retry backoff
+                       # sleeps, chunking, JSON encoding, interpreter time.
+                       # Printed rather than hidden, so a large residual is
+                       # visible as a gap instead of read as "nothing else".
+                       phaseUnaccountedSeconds=round(
+                           max(ingest_ms / 1000 - accounted, 0.0), 2),
+                       priceHistory=dict(catalog_client.price_history_stats),
+                       catalogLookups=dict(catalog_client.catalog_lookup_stats),
+                       **timeouts)
 
         if not wrote:
             # The object stays in storage, so the retry costs no vendor slot.
@@ -208,11 +243,22 @@ def main(argv: list[str] | None = None) -> int:
 
         # Only now. A set marked refreshed from data that never landed looks
         # exactly like a real refresh until someone reads the prices.
+        stamp_started_at = time.perf_counter()
         store.stamp_registry_refreshed(registry_ids)
+        timings["registry_stamp"] = time.perf_counter() - stamp_started_at
         assert_transition(INGESTING, INGESTED)
         store.update(batch_id, {**common, "status": INGESTED,
                                 "claimed_at": None, "claimed_by": None})
         summary.update(status=INGESTED, setsStamped=len(registry_ids))
+        total = max(ingest_ms / 1000, 0.001)
+        print("  where the time went:", flush=True)
+        for name, value in sorted(phases.items(), key=lambda kv: -kv[1]):
+            if value >= 0.005:
+                print(f"    {name:24} {value:8.1f}s  {value / total * 100:5.1f}%",
+                      flush=True)
+        unaccounted = max(total - accounted, 0.0)
+        print(f"    {'(unaccounted)':24} {unaccounted:8.1f}s  "
+              f"{unaccounted / total * 100:5.1f}%", flush=True)
         print(f"ingested: {stats['written']:,} written, "
               f"{stats['skippedUnchanged']:,} unchanged, {stats['failed']:,} failed; "
               f"stamped {len(registry_ids)} sets", flush=True)

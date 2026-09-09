@@ -87,11 +87,23 @@ class _Store:
 
 
 class _Stats:
-    def __init__(self, written=20, skipped=5, failed=0, abandoned=0):
+    """Stands in for SupabaseCatalogClient, and must carry every accumulator
+    the real one does -- a fake that is missing an attribute the caller reads
+    fails at runtime and nowhere else."""
+
+    def __init__(self, written=20, skipped=5, failed=0, abandoned=0,
+                 phase_seconds=None):
         self.catalog_write_stats = {
             "written": written, "skippedUnchanged": skipped, "failed": failed}
         self.timeout_retry_stats = {
             "timeouts": 1, "retries": 1, "rowsRecovered": 3, "rowsAbandoned": abandoned}
+        self.phase_seconds = phase_seconds if phase_seconds is not None else {
+            "unchanged_detection": 1.5, "catalog_upsert": 9.0,
+            "scd2_comparison": 0.75, "price_snapshot_insert": 0.5,
+            "scd2_close": 0.1, "scd2_insert": 0.25}
+        self.price_history_stats = {
+            "attempted": 12, "inserted": 11, "duplicateSkipped": 1, "failed": 0}
+        self.catalog_lookup_stats = {"fetched": 20, "reused": 20}
 
 
 def _run(store, *, wrote=True, stats=None, argv=("--commit",)):
@@ -364,3 +376,85 @@ class FailureReportsHowFarItGotTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ItReportsWhereTheTimeWentTest(unittest.TestCase):
+    """#213 cut SCD2 versions by 97.8% and moved the clock by 3% per row.
+
+    That ruled the SCD2 write out as the bottleneck without saying what the
+    bottleneck is. SupabaseCatalogClient had been accumulating phase_seconds
+    the whole time and nothing printed it, so the answer was being inferred
+    from row counts. These tests exist so the numbers stay reported.
+    """
+
+    def _summary(self, **kwargs):
+        """The summary reaches operators on stdout, so read it there.
+
+        Deliberately not read off the batch row: catalog_download_batches has
+        fixed columns and writing unknown keys to it would fail in production
+        while passing against a dict-backed fake.
+        """
+        import contextlib
+        import io
+        import json
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            _run(_Store(), **kwargs)
+        printed = buffer.getvalue()
+        start = printed.index("{", printed.rindex("\n{"))
+        return json.loads(printed[start:printed.rindex("}") + 1])
+
+    def test_every_phase_the_client_measured_is_reported(self) -> None:
+        phases = self._summary()["phaseSeconds"]
+        for phase in ("unchanged_detection", "catalog_upsert", "scd2_comparison",
+                      "price_snapshot_insert", "scd2_close", "scd2_insert"):
+            with self.subTest(phase=phase):
+                self.assertIn(phase, phases)
+
+    def test_the_phases_the_client_cannot_see_are_reported_too(self) -> None:
+        """Storage, parsing and stamping happen outside the write client."""
+        phases = self._summary()["phaseSeconds"]
+        for phase in ("storage_download", "parse", "registry_stamp"):
+            with self.subTest(phase=phase):
+                self.assertIn(phase, phases)
+
+    def test_the_biggest_phase_is_listed_first(self) -> None:
+        """The report is read to find a bottleneck, so order by cost."""
+        phases = self._summary()["phaseSeconds"]
+        self.assertEqual(list(phases), sorted(phases, key=phases.get, reverse=True))
+        self.assertEqual(next(iter(phases)), "catalog_upsert")
+
+    def test_unclaimed_time_is_shown_rather_than_hidden(self) -> None:
+        """Timers never sum to the total -- backoff sleeps, encoding, chunking.
+
+        Reporting only the phases invites reading them as the whole picture,
+        which is how you conclude the wrong thing dominates.
+        """
+        summary = self._summary()
+        self.assertIn("phaseUnaccountedSeconds", summary)
+        self.assertGreaterEqual(summary["phaseUnaccountedSeconds"], 0)
+
+    def test_the_snapshot_write_is_counted_separately_from_the_version_write(self) -> None:
+        """They shared a timer until 2026-09-09. One stayed, one went away."""
+        phases = self._summary()["phaseSeconds"]
+        self.assertNotEqual(phases["price_snapshot_insert"], phases["scd2_insert"])
+
+    def test_catalog_lookup_reuse_is_reported(self) -> None:
+        """A saving that is not counted is a saving nobody can confirm."""
+        lookups = self._summary()["catalogLookups"]
+        self.assertEqual(lookups["fetched"], 20)
+        self.assertEqual(lookups["reused"], 20)
+
+    def test_snapshot_counts_ride_along(self) -> None:
+        price_history = self._summary()["priceHistory"]
+        self.assertEqual(price_history["inserted"], 11)
+        self.assertEqual(price_history["duplicateSkipped"], 1)
+
+    def test_a_failed_run_still_reports_its_phases(self) -> None:
+        """A run that failed part-way is exactly when the split is wanted."""
+        summary = self._summary(wrote=False)
+        self.assertFalse(summary["success"])
+        self.assertIn("phaseSeconds", summary)
+        self.assertIn("catalog_upsert", summary["phaseSeconds"])
+
