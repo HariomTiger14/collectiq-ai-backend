@@ -842,6 +842,13 @@ class SupabaseCatalogClient:
             "unchanged_detection": 0.0,
             "catalog_upsert": 0.0,
             "scd2_comparison": 0.0,
+            # Split apart 2026-09-09. These three ran under one timer called
+            # "scd2_insert", which was fine while they were one decision.
+            # They are not: the snapshot insert is the write that stays, the
+            # close+insert pair is the write that mostly went away in #213,
+            # and a single number cannot show that.
+            "price_snapshot_insert": 0.0,
+            "scd2_close": 0.0,
             "scd2_insert": 0.0,
         }
         self.price_history_stats: dict[str, int] = {
@@ -1083,19 +1090,29 @@ class SupabaseCatalogClient:
                     # unrecoverable.
                     if price_observations:
                         self._insert_price_observation_rows(client, price_observations)
+                        self.phase_seconds["price_snapshot_insert"] += (
+                            time.perf_counter() - insert_started_at
+                        )
+                    close_started_at = time.perf_counter()
                     if changed_ids:
                         self._close_current_history_rows(
                             client,
                             pricecharting_ids=changed_ids,
                             valid_to=source_timestamp(batch[0].get("source_downloaded_at")),
                         )
+                        self.phase_seconds["scd2_close"] += (
+                            time.perf_counter() - close_started_at
+                        )
+                    version_started_at = time.perf_counter()
                     if rows_to_insert:
                         inserted += self._insert_history_rows(
                             client,
                             rows_to_insert,
                             batch_offset=index,
                         )
-                    self.phase_seconds["scd2_insert"] += time.perf_counter() - insert_started_at
+                        self.phase_seconds["scd2_insert"] += (
+                            time.perf_counter() - version_started_at
+                        )
                 except (SystemExit, Exception) as exc:
                     # Same reasoning as upsert_rows(): don't let one
                     # sub-batch's failure abort every later sub-batch.

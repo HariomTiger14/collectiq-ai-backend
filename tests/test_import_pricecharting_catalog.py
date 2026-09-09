@@ -511,6 +511,82 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
             ["1", "3"],
         )
 
+    def test_the_snapshot_and_version_writes_are_timed_apart(self) -> None:
+        """They shared one timer called scd2_insert until 2026-09-09.
+
+        That was fine while a price change wrote both. After #213 one of them
+        happens ~35,000 times a batch and the other ~800, so a single number
+        averages away the thing you are trying to see.
+        """
+        row = _catalog_row("1", "Pikachu")
+        transport = _FakeSupabaseTransport(current_rows=[])
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+            client.sync_scd2_history_rows([row], batch_size=100)
+        self.assertGreater(client.phase_seconds["price_snapshot_insert"], 0.0,
+                           "the snapshot write was not timed")
+        self.assertGreater(client.phase_seconds["scd2_insert"], 0.0,
+                           "the version write was not timed")
+
+    def test_a_price_only_change_charges_only_the_snapshot_timer(self) -> None:
+        """The common case after #213: no version written, so no version time."""
+        row = _catalog_row("1", "Pikachu")
+        frozen = {
+            "pricecharting_id": "1",
+            "change_hash": "x",
+            **{column: row.get(column)
+               for column in CATALOG_METADATA_SIGNATURE_COLUMNS},
+        }
+        stale_catalog = dict(frozen); stale_catalog["loose_price_cents"] = 1
+        transport = _FakeSupabaseTransport(current_rows=[frozen],
+                                           catalog_rows=[stale_catalog])
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+            client.sync_scd2_history_rows([row], batch_size=100)
+        self.assertGreater(client.phase_seconds["price_snapshot_insert"], 0.0)
+        self.assertEqual(client.phase_seconds["scd2_insert"], 0.0)
+        self.assertEqual(client.phase_seconds["scd2_close"], 0.0)
+
+    def test_closing_the_superseded_version_is_timed_on_its_own(self) -> None:
+        """A metadata change costs a close AND an insert -- two round trips.
+
+        Timed apart because they are different writes: the close is an UPDATE
+        against a partial unique index on a 24 GB table, the insert is an
+        append. Folding either into a neighbouring timer hides one of them.
+        """
+        row = _catalog_row("1", "Pikachu")
+        renamed = dict(row); renamed["product_name"] = "Was Called This"
+        stored = {
+            "pricecharting_id": "1",
+            "change_hash": "x",
+            **{column: renamed.get(column)
+               for column in CATALOG_METADATA_SIGNATURE_COLUMNS},
+        }
+        transport = _FakeSupabaseTransport(current_rows=[stored],
+                                           catalog_rows=[stored])
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+            client.sync_scd2_history_rows([row], batch_size=100)
+        self.assertEqual(transport.closed_ids, ["1"], "nothing was closed")
+        self.assertGreater(client.phase_seconds["scd2_close"], 0.0,
+                           "the close was not timed")
+        self.assertGreater(client.phase_seconds["scd2_insert"], 0.0)
+
     def test_phase_seconds_starts_at_zero(self) -> None:
         client = SupabaseCatalogClient(
             supabase_url="https://example.supabase.co",
@@ -524,6 +600,8 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
                 "unchanged_detection": 0.0,
                 "catalog_upsert": 0.0,
                 "scd2_comparison": 0.0,
+                "price_snapshot_insert": 0.0,
+                "scd2_close": 0.0,
                 "scd2_insert": 0.0,
             },
         )
