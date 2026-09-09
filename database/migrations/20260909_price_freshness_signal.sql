@@ -1,6 +1,10 @@
 -- Price-freshness signal for the ops board.
 --
--- NOT YET APPLIED. Review before running.
+-- APPLIED 2026-09-09, before the code change that depends on it.
+--   index built CONCURRENTLY in 64s, 115 MB, valid=true ready=true
+--   admin_pipeline_health() replaced; RPC returns in 1.18s
+--   inactive-source probe: 0.1 ms, index scan, no Seq Scan
+--   active-source probe:   1.9 ms, no Seq Scan
 --
 -- Why this is needed
 -- ------------------
