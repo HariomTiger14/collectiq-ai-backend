@@ -28,6 +28,7 @@ from scripts.backfill_price_history_from_scd2 import (
     load_plan,
     parse_args,
     record_checkpoint,
+    select_chunks,
 )
 
 SOURCE_TABLE = "pricecharting_catalog_history"
@@ -177,6 +178,90 @@ class ResumeAfterInterruptionTest(unittest.TestCase):
         """The first production run is deliberately three chunks."""
         self.assertEqual(parse_args(["--limit-chunks", "3"]).limit_chunks, 3)
         self.assertIsNone(parse_args([]).limit_chunks)
+
+
+class BoundingARunTest(unittest.TestCase):
+    """Two bounds with different meanings, because conflating them cost a run.
+
+    The first bounded production run was authorised as three chunks. It was
+    invoked as `--limit-chunks 3 --commit`, which committed chunks 1-3; the
+    same command run again committed 4-6, because --limit-chunks counts
+    UNPROCESSED chunks and the checkpoint had moved. That is correct for
+    resuming and wrong for bounding, so an absolute ceiling now exists and
+    these tests keep the two apart.
+    """
+
+    PLAN = [{"seq": seq, "lo": None, "hi": None, "versions": 0}
+            for seq in range(1, 11)]
+
+    def _chosen(self, argv, done=frozenset()):
+        return [c["seq"] for c in select_chunks(self.PLAN, set(done), parse_args(argv))]
+
+    def test_limit_chunks_takes_the_next_n_unprocessed(self) -> None:
+        self.assertEqual(self._chosen(["--limit-chunks", "3"]), [1, 2, 3])
+
+    def test_limit_chunks_advances_on_a_rerun_which_is_the_overrun(self) -> None:
+        """Pinned as intended behaviour, not fixed -- resume depends on it."""
+        self.assertEqual(self._chosen(["--limit-chunks", "3"], done={1, 2, 3}),
+                         [4, 5, 6])
+
+    def test_stop_after_chunk_is_absolute_across_reruns(self) -> None:
+        """The same ceiling, invoked twice, must not advance."""
+        first = self._chosen(["--stop-after-chunk", "3"])
+        self.assertEqual(first, [1, 2, 3])
+        self.assertEqual(self._chosen(["--stop-after-chunk", "3"], done=set(first)), [])
+
+    def test_a_ceiling_below_the_checkpoint_selects_nothing(self) -> None:
+        self.assertEqual(self._chosen(["--stop-after-chunk", "2"], done={1, 2, 3}), [])
+
+    def test_the_tighter_of_the_two_bounds_wins(self) -> None:
+        """Whichever flag is more restrictive decides, in either direction."""
+        self.assertEqual(
+            self._chosen(["--limit-chunks", "5", "--stop-after-chunk", "2"]), [1, 2])
+        self.assertEqual(
+            self._chosen(["--limit-chunks", "2", "--stop-after-chunk", "5"]), [1, 2])
+
+    def test_the_ceiling_still_bounds_a_rerun_that_the_limit_would_not(self) -> None:
+        """The actual defect: --limit-chunks alone advances, the ceiling does not.
+
+        Both filters take a prefix of an ascending list, so swapping their
+        order changes nothing -- a mutation proved that. What makes the ceiling
+        safe is that it is expressed in seq, not in count.
+        """
+        self.assertEqual(self._chosen(["--limit-chunks", "3"], done={1, 2, 3}),
+                         [4, 5, 6])
+        self.assertEqual(self._chosen(["--stop-after-chunk", "3"], done={1, 2, 3}),
+                         [])
+
+    def test_the_two_flags_together_bound_the_authorised_run(self) -> None:
+        """What the three-chunk run should have been invoked as."""
+        argv = ["--limit-chunks", "3", "--stop-after-chunk", "3"]
+        self.assertEqual(self._chosen(argv), [1, 2, 3])
+        self.assertEqual(self._chosen(argv, done={1, 2, 3}), [])
+
+    def test_neither_flag_means_the_whole_plan(self) -> None:
+        self.assertEqual(self._chosen([]), list(range(1, 11)))
+        self.assertIsNone(parse_args([]).stop_after_chunk)
+
+    def test_start_at_still_skips_from_the_front(self) -> None:
+        self.assertEqual(self._chosen(["--start-at", "8"]), [8, 9, 10])
+
+    def test_the_help_text_says_which_bound_is_which(self) -> None:
+        """A reader must not have to run it to learn the difference."""
+        parser_help = _build_help()
+        self.assertIn("next N UNPROCESSED", parser_help)
+        self.assertIn("absolute ceiling", parser_help)
+
+
+def _build_help() -> str:
+    import contextlib
+    import io
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        with contextlib.suppress(SystemExit):
+            parse_args(["--help"])
+    return buffer.getvalue()
 
 
 if __name__ == "__main__":

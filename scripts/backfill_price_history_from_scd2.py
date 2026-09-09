@@ -110,14 +110,43 @@ def record_checkpoint(path: pathlib.Path, seq: int) -> None:
         os.fsync(handle.fileno())
 
 
+def select_chunks(plan: list[dict], done: set[int],
+                  args: argparse.Namespace) -> list[dict]:
+    """Which chunks this invocation may touch.
+
+    --stop-after-chunk bounds by seq, so it means the same thing however many
+    times the command is repeated. --limit-chunks bounds by COUNT relative to
+    the checkpoint -- "the next N unprocessed" -- which is what makes resuming
+    work, and is also how a bounded run silently grew from 3 chunks to 6 the
+    first time this was used against production.
+
+    Both filters take a prefix of an ascending list, so their order does not
+    affect the result; the ceiling is applied first only because it reads
+    better. Do not infer that the order is load-bearing.
+    """
+    todo = [c for c in plan if c["seq"] >= args.start_at and c["seq"] not in done]
+    if args.stop_after_chunk is not None:
+        todo = [c for c in todo if c["seq"] <= args.stop_after_chunk]
+    if args.limit_chunks:
+        todo = todo[: args.limit_chunks]
+    return todo
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--commit", action="store_true",
                         help="actually insert; without it nothing is written")
     parser.add_argument("--plan", type=pathlib.Path, default=PLAN_PATH)
     parser.add_argument("--checkpoint", type=pathlib.Path, default=CHECKPOINT_PATH)
-    parser.add_argument("--limit-chunks", type=int, default=None,
-                        help="stop after this many chunks (for a bounded first run)")
+    parser.add_argument(
+        "--limit-chunks", type=int, default=None,
+        help="process the next N UNPROCESSED chunks. Relative to the checkpoint, "
+             "so re-running the same command continues past what it already did. "
+             "For an absolute bound a re-run cannot exceed, use --stop-after-chunk.")
+    parser.add_argument(
+        "--stop-after-chunk", type=int, default=None,
+        help="absolute ceiling: never touch a chunk with seq greater than N, "
+             "however many times the command is re-run.")
     parser.add_argument("--start-at", type=int, default=1, help="first chunk seq")
     return parser.parse_args(argv)
 
@@ -130,9 +159,7 @@ def main(argv: list[str] | None = None) -> int:
 
     plan = load_plan(args.plan)
     done = load_checkpoint(args.checkpoint)
-    todo = [c for c in plan if c["seq"] >= args.start_at and c["seq"] not in done]
-    if args.limit_chunks:
-        todo = todo[: args.limit_chunks]
+    todo = select_chunks(plan, done, args)
 
     mode = "COMMIT" if args.commit else "DRY-RUN (nothing will be written)"
     print(f"{mode}: {len(todo)} of {len(plan)} chunks to process "
