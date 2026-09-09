@@ -161,6 +161,14 @@ class AdminCatalogService:
         if not update:
             raise AdminCatalogError("At least one catalog field is required.")
         row = self._repository.update_catalog_item(item_id, update)
+        # Bullet 2, console half. pricecharting_current_price carries category
+        # and platform_group so the Discover browse indexes can live on it. The
+        # ingest path rewrites them whenever a CSV rename arrives, but an admin
+        # edit never goes through ingest -- so without this, an item recategorised
+        # here browses under its old category until its price happens to move,
+        # which for a stable item may be never.
+        if any(column in update for column in BROWSE_KEY_COLUMNS):
+            self._repository.sync_current_price_browse_keys(item_id, row)
         return {"success": True, "itemId": item_id, "item": row}
 
     def list_items(
@@ -595,6 +603,30 @@ class SupabaseAdminCatalogRepository:
         if isinstance(payload, list) and payload and isinstance(payload[0], dict):
             return payload[0]
         raise AdminCatalogError("Catalog item was not found.")
+
+    def sync_current_price_browse_keys(
+        self, catalog_id: str, row: dict[str, Any]
+    ) -> None:
+        """Push category/platform_group onto the current-price row.
+
+        Cents are deliberately untouched: this is a metadata edit, and the
+        console has no business restating a price it did not change.
+
+        A miss is not an error. An id with no current-price row simply has
+        nothing to keep in sync -- raising here would fail an admin edit that
+        actually succeeded.
+        """
+        update = {column: row.get(column) for column in BROWSE_KEY_COLUMNS
+                  if column in row}
+        if not update:
+            return
+        self._request(
+            "PATCH",
+            "/rest/v1/pricecharting_current_price",
+            params={"pricecharting_id": f"eq.{catalog_id}"},
+            json_payload=update,
+            extra_headers={"Prefer": "return=minimal"},
+        )
 
     def list_catalog_rows(
         self,
@@ -1298,6 +1330,13 @@ class SupabaseAdminCatalogRepository:
 # PRICECHARTING_CATEGORY_GROUPS / PRICECHARTING_PLATFORM_GROUPS now live in
 # catalog_search_service.py (imported above) -- shared with the public/
 # mobile Discover search, which needs the exact same taxonomy.
+
+
+# The two columns pricecharting_current_price carries so the Discover browse
+# indexes can live there. Kept as one list so the ingest writer
+# (scripts/import_pricecharting_catalog.py) and this console path cannot drift
+# on which keys have to be mirrored.
+BROWSE_KEY_COLUMNS = ("category", "platform_group")
 
 
 def _price_drives_the_query(

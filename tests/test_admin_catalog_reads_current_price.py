@@ -151,3 +151,97 @@ class ThePriceOrderedPageKeepsItsOrderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnAdminEditReachesTheBrowseKeysTest(unittest.TestCase):
+    """Bullet 2, console half -- and the half that was missed first time.
+
+    The ingest writer rewrites category/platform_group on current_price
+    whenever a CSV rename arrives. An admin edit never goes through ingest, so
+    without this an item recategorised in the console browses under its old
+    category until its price happens to move -- which for a stable item may be
+    never. The failure is invisible: the console shows the new category and
+    Discover shows the old one.
+    """
+
+    class _Repo(SupabaseAdminCatalogRepository):
+        _table_name = "pricecharting_catalog"
+
+        def __init__(self, updated_row):
+            self.calls: list[tuple[str, str, dict]] = []
+            self._updated_row = updated_row
+
+        @property
+        def is_configured(self) -> bool:
+            return True
+
+        def _request(self, method, path, params=None, json_payload=None, **kwargs):
+            self.calls.append((method, path, json_payload or {}))
+            return [self._updated_row]
+
+    def _service(self, updated_row):
+        from app.services.admin_catalog_service import AdminCatalogService
+
+        service = AdminCatalogService.__new__(AdminCatalogService)
+        service._repository = self._Repo(updated_row)
+        return service, service._repository
+
+    def _patches_to_current_price(self, repo):
+        return [(method, payload) for method, path, payload in repo.calls
+                if path.endswith("/pricecharting_current_price")]
+
+    def test_a_category_edit_reaches_current_price(self) -> None:
+        service, repo = self._service(
+            {"pricecharting_id": "1", "category": "Baseball Cards",
+             "platform_group": None})
+        service.update_item("1", {"category": "Baseball Cards"})
+        patches = self._patches_to_current_price(repo)
+        self.assertEqual(len(patches), 1, f"browse keys never synced: {repo.calls}")
+        self.assertEqual(patches[0][0], "PATCH")
+        self.assertEqual(patches[0][1]["category"], "Baseball Cards")
+
+    def test_platform_group_is_not_an_editable_admin_field(self) -> None:
+        """Recorded rather than fixed.
+
+        _catalog_update_payload accepts title/category/console/upc/productUrl/
+        note/active -- platform_group is not among them, so the console cannot
+        set it directly. Editing `console` does not recompute it either, on the
+        catalog or here; that gap predates this change and is not made worse by
+        it. If platform_group ever becomes editable, it is already in
+        BROWSE_KEY_COLUMNS and will sync without further work.
+        """
+        from app.services.admin_catalog_service import _catalog_update_payload
+
+        self.assertEqual(_catalog_update_payload({"platform_group": "nintendo"}), {})
+        self.assertEqual(_catalog_update_payload({"console": "Nintendo 64"}),
+                         {"console_name": "Nintendo 64"})
+
+    def test_an_edit_that_touches_no_browse_key_syncs_nothing(self) -> None:
+        """An admin note is not a browse key; a write per edit is waste."""
+        # The row carries category because the real PATCH uses select=* and
+        # gets the whole row back. An earlier fixture omitted it, which let a
+        # "sync on every edit" mutation pass -- the sync found nothing to write
+        # for the wrong reason.
+        service, repo = self._service(
+            {"pricecharting_id": "1", "admin_note": "hi", "category": "Coins",
+             "platform_group": None})
+        service.update_item("1", {"note": "hi"})
+        self.assertEqual(self._patches_to_current_price(repo), [],
+                         "an admin-note edit wrote to current_price")
+
+    def test_the_sync_never_restates_a_price(self) -> None:
+        """A metadata edit has no business rewriting cents it did not change."""
+        service, repo = self._service(
+            {"pricecharting_id": "1", "category": "Coins",
+             "loose_price_cents": 999, "currency": "USD"})
+        service.update_item("1", {"category": "Coins"})
+        payload = self._patches_to_current_price(repo)[0][1]
+        self.assertEqual(set(payload), {"category"})
+        self.assertNotIn("loose_price_cents", payload)
+
+    def test_the_mirrored_columns_match_the_ingest_writer(self) -> None:
+        """Two places mirror these keys; drift means one of them goes stale."""
+        from app.services.admin_catalog_service import BROWSE_KEY_COLUMNS as admin_keys
+        from scripts.import_pricecharting_catalog import BROWSE_KEY_COLUMNS as ingest_keys
+
+        self.assertEqual(tuple(admin_keys), tuple(ingest_keys))
