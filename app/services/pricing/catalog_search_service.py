@@ -180,6 +180,21 @@ def resolve_category_group_filters(
     return (keywords if keywords else None), None
 
 
+# The catalog row's cents are no longer authoritative -- pricecharting_current_price
+# is. Kept as one list so the SQL overlay
+# (database/migrations/20260909_search_reads_current_price.sql) and this read
+# path cannot drift apart on which fields move.
+CURRENT_PRICE_CENTS_COLUMNS = (
+    "loose_price_cents",
+    "cib_price_cents",
+    "new_price_cents",
+    "graded_price_cents",
+    "box_only_price_cents",
+    "manual_only_price_cents",
+)
+CURRENT_PRICE_COLUMNS = (*CURRENT_PRICE_CENTS_COLUMNS, "currency")
+
+
 @dataclass(frozen=True)
 class CatalogSearchService:
     supabase_url: str | None = None
@@ -1056,7 +1071,41 @@ class CatalogSearchService:
         if not isinstance(payload, list) or not payload:
             return None
         row = payload[0]
-        return row if isinstance(row, dict) else None
+        if not isinstance(row, dict):
+            return None
+        return self._overlay_current_price(row, catalog_id)
+
+    def _overlay_current_price(
+        self, row: dict[str, Any], catalog_id: str
+    ) -> dict[str, Any]:
+        """Replace the catalog row's cents with the current-price row's.
+
+        A second point lookup rather than an embed: PostgREST can only embed
+        across a foreign key, and pricecharting_current_price deliberately has
+        none -- a 12.5M-row FK check on every write prevents no failure the
+        catalog can actually produce. Two indexed PK lookups is the cost.
+
+        Overlaid even when the lookup finds nothing, which is the same choice
+        the SQL overlay makes: once the writers stop maintaining catalog cents
+        those values freeze, and serving a silently stale price is worse than
+        serving none. A missing row yields null prices, never an error.
+        """
+        payload = self._request(
+            "GET",
+            "/rest/v1/pricecharting_current_price",
+            params={
+                "select": ",".join(CURRENT_PRICE_COLUMNS),
+                "pricecharting_id": f"eq.{catalog_id}",
+                "limit": "1",
+            },
+        )
+        current = payload[0] if isinstance(payload, list) and payload else {}
+        if not isinstance(current, dict):
+            current = {}
+        for column in CURRENT_PRICE_CENTS_COLUMNS:
+            row[column] = current.get(column)
+        row["currency"] = current.get("currency") or "USD"
+        return row
 
     def _fetch_history_rows(self, catalog_id: str, limit: int) -> list[dict[str, Any]]:
         """Price points for the catalog detail chart.

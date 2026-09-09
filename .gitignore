@@ -16,3 +16,4 @@ database/.DS_Store
 
 # one-time backfill progress marker
 .backfill_price_history.checkpoint
+.backfill_current_price.checkpoint
