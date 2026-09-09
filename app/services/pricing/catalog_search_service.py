@@ -1059,25 +1059,75 @@ class CatalogSearchService:
         return row if isinstance(row, dict) else None
 
     def _fetch_history_rows(self, catalog_id: str, limit: int) -> list[dict[str, Any]]:
+        """Price points for the catalog detail chart.
+
+        Read from pricecharting_price_history, the append-only snapshot table
+        the ingest pipeline has been writing all along, rather than from
+        pricecharting_catalog_history.
+
+        Both hold the same prices. The difference is what else they hold: the
+        SCD2 table stores a full 26-column row copy per version -- product
+        name, normalized identity, raw_payload -- at 1,427 bytes against 188
+        for a snapshot, 7.6x, across 24 GB versus 398 MB. This function only
+        ever selected the twelve price columns from it.
+
+        HISTORY WINDOW: no longer a trade-off. The pipeline only ever wrote
+        snapshots from 2026-08-28, so switching would once have dropped every
+        earlier point -- for 89 of 150 sampled items the SCD2 table held price
+        points the snapshot table did not. A union was considered to bridge
+        that gap and rejected in favour of backfilling instead.
+
+        The backfill ran 2026-09-09 (104 chunks, 14,431,909 rows tagged
+        source_file='backfill-from-scd2'): every distinct price point in the
+        SCD2 table now exists as a snapshot, taking this table back to
+        2026-07-26 across 12,133,228 items. There is no window to caveat and
+        no union to maintain. See scripts/backfill_price_history_from_scd2.py.
+
+        The returned shape is unchanged, so _history_row_to_point, the API
+        contract and both clients are untouched. `valid_from` and
+        `source_downloaded_at` both map from observed_at, which IS the
+        provider's download timestamp -- the same value the SCD2 row carried
+        in both fields. `valid_to` has no meaning for a point observation and
+        is null; `is_current` marks the newest point, which is what it meant
+        here.
+        """
         params = {
             "select": (
-                "valid_from,valid_to,is_current,source_file,source_downloaded_at,"
+                "observed_at,source_file,currency,"
                 "loose_price_cents,cib_price_cents,new_price_cents,"
-                "graded_price_cents,box_only_price_cents,manual_only_price_cents,"
-                "currency"
+                "graded_price_cents,box_only_price_cents,manual_only_price_cents"
             ),
             "pricecharting_id": f"eq.{catalog_id}",
-            "order": "valid_from.desc",
+            "order": "observed_at.desc",
             "limit": str(limit),
         }
         payload = self._request(
             "GET",
-            "/rest/v1/pricecharting_catalog_history",
+            "/rest/v1/pricecharting_price_history",
             params=params,
         )
         if not isinstance(payload, list):
             return []
-        return [row for row in payload if isinstance(row, dict)]
+        rows = [row for row in payload if isinstance(row, dict)]
+        return [
+            {
+                # Newest first, matching the previous ordering -- the mobile
+                # client's same-price merge depends on it.
+                "valid_from": row.get("observed_at"),
+                "valid_to": None,
+                "is_current": index == 0,
+                "source_file": row.get("source_file"),
+                "source_downloaded_at": row.get("observed_at"),
+                "currency": row.get("currency"),
+                "loose_price_cents": row.get("loose_price_cents"),
+                "cib_price_cents": row.get("cib_price_cents"),
+                "new_price_cents": row.get("new_price_cents"),
+                "graded_price_cents": row.get("graded_price_cents"),
+                "box_only_price_cents": row.get("box_only_price_cents"),
+                "manual_only_price_cents": row.get("manual_only_price_cents"),
+            }
+            for index, row in enumerate(rows)
+        ]
 
     def _enrich_with_funko_image(self, result: CatalogSearchResult) -> CatalogSearchResult:
         # Funko Pop rows come from PriceCharting (real pricing, no image

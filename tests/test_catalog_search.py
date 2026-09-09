@@ -911,21 +911,22 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertEqual(response.count, 0)
         self.assertEqual(response.results, [])
 
-    def test_detail_returns_catalog_item_with_scd2_history(self) -> None:
+    def test_detail_returns_catalog_item_with_snapshot_history(self) -> None:
+        # History moved from pricecharting_catalog_history to the append-only
+        # pricecharting_price_history on 2026-09-09, once a backfill gave the
+        # snapshot table every price point the SCD2 table held. A point has no
+        # validity window, so validTo is null and isCurrent marks the newest.
         requests: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             requests.append(request)
-            if "pricecharting_catalog_history" in str(request.url):
+            if "pricecharting_price_history" in str(request.url):
                 return httpx.Response(
                     200,
                     json=[
                         {
-                            "valid_from": "2026-07-26T00:00:00Z",
-                            "valid_to": None,
-                            "is_current": True,
+                            "observed_at": "2026-07-26T00:00:00Z",
                             "source_file": "pokemon.csv",
-                            "source_downloaded_at": "2026-07-26T00:00:00Z",
                             "loose_price_cents": 16100,
                             "cib_price_cents": 20000,
                             "new_price_cents": None,
@@ -933,11 +934,8 @@ class CatalogSearchServiceTest(unittest.TestCase):
                             "currency": "USD",
                         },
                         {
-                            "valid_from": "2026-07-25T00:00:00Z",
-                            "valid_to": "2026-07-26T00:00:00Z",
-                            "is_current": False,
+                            "observed_at": "2026-07-25T00:00:00Z",
                             "source_file": "pokemon.csv",
-                            "source_downloaded_at": "2026-07-25T00:00:00Z",
                             "loose_price_cents": 15000,
                             "cib_price_cents": 19000,
                             "graded_price_cents": 76000,
@@ -982,12 +980,17 @@ class CatalogSearchServiceTest(unittest.TestCase):
         self.assertEqual(len(response.history), 2)
         self.assertTrue(response.history[0].isCurrent)
         self.assertEqual(response.history[0].pricing.highEstimate, 800)
-        self.assertEqual(response.history[1].validTo, "2026-07-26T00:00:00Z")
+        self.assertEqual(response.history[0].validFrom, "2026-07-26T00:00:00Z")
+        self.assertEqual(response.history[1].validFrom, "2026-07-25T00:00:00Z")
+        self.assertFalse(response.history[1].isCurrent)
+        # A snapshot is an observation, not a window: nothing closes it.
+        self.assertIsNone(response.history[0].validTo)
+        self.assertIsNone(response.history[1].validTo)
         self.assertIn("pricecharting_id=eq.999", str(requests[0].url))
         history_requests = [
             request
             for request in requests
-            if "pricecharting_catalog_history" in str(request.url)
+            if "pricecharting_price_history" in str(request.url)
         ]
         self.assertEqual(len(history_requests), 1)
         self.assertIn("limit=10", str(history_requests[0].url))
@@ -1000,7 +1003,7 @@ class CatalogSearchServiceTest(unittest.TestCase):
         # converts at display time against real dated rates; `currency` still
         # selects which marketplace's listings to match.
         def handler(request: httpx.Request) -> httpx.Response:
-            if "pricecharting_catalog_history" in str(request.url):
+            if "pricecharting_price_history" in str(request.url):
                 return httpx.Response(
                     200,
                     json=[
@@ -1058,7 +1061,7 @@ class CatalogSearchServiceTest(unittest.TestCase):
         # one) must behave exactly as before -- no conversion, no
         # originalCurrency stamped.
         def handler(request: httpx.Request) -> httpx.Response:
-            if "pricecharting_catalog_history" in str(request.url):
+            if "pricecharting_price_history" in str(request.url):
                 return httpx.Response(200, json=[])
             return httpx.Response(
                 200,
@@ -1096,7 +1099,7 @@ class CatalogSearchServiceTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if "catalog_marketplace_source_flags" in url:
                 return httpx.Response(200, json=[{"source": "ebay", "enabled": True}])
@@ -1165,7 +1168,7 @@ class CatalogSearchServiceTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if "catalog_marketplace_source_flags" in url:
                 return httpx.Response(200, json=[{"source": "ebay", "enabled": True}])
@@ -1225,7 +1228,7 @@ class CatalogSearchServiceTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if "catalog_marketplace_source_flags" in url:
                 return httpx.Response(200, json=[{"source": "ebay", "enabled": True}])
@@ -1281,7 +1284,7 @@ class CatalogSearchServiceTest(unittest.TestCase):
     def test_detail_skips_marketplace_sources_when_all_disabled_via_flag(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if "catalog_marketplace_source_flags" in url:
                 return httpx.Response(
@@ -1324,7 +1327,7 @@ class CatalogSearchServiceTest(unittest.TestCase):
         # all-or-nothing flag.
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if "catalog_marketplace_source_flags" in url:
                 return httpx.Response(200, json=[{"source": "ebay", "enabled": False}])
@@ -1381,7 +1384,7 @@ class CatalogSearchServiceTest(unittest.TestCase):
     ) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if "catalog_marketplace_source_flags" in url:
                 return httpx.Response(200, json=[])
@@ -1503,7 +1506,7 @@ class CatalogSearchServiceTest(unittest.TestCase):
                         }
                     ],
                 )
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -1544,7 +1547,7 @@ class CatalogSearchServiceTest(unittest.TestCase):
             url = str(request.url)
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])  # no match found
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -1580,7 +1583,7 @@ class CatalogSearchServiceTest(unittest.TestCase):
             url = str(request.url)
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -2054,7 +2057,7 @@ class CoinImageEnrichmentTest(unittest.TestCase):
             url = str(request.url)
             if "coin_catalog_images" in url:
                 return httpx.Response(200, json=coin_rows)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 if "pricecharting_id" in request.url.params:
@@ -2158,7 +2161,7 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
             url = str(request.url)
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if "tcgdex_pokemon_catalog" in url:
                 params = request.url.params
@@ -2739,7 +2742,7 @@ class PokemonImageEnrichmentTest(unittest.TestCase):
                 tcgplayer_requests.append(request)
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -2783,7 +2786,7 @@ class CatalogImageFlagsGatingTest(unittest.TestCase):
                 return flags_response
             if "funko_pop_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if "tcgplayer_pokemon_catalog" in url:
                 group_name = request.url.params.get("group_name", "").removeprefix("eq.")
@@ -2924,7 +2927,7 @@ class LegoImageEnrichmentTest(unittest.TestCase):
             if "rebrickable_lego_catalog" in url:
                 base_number = request.url.params.get("base_number", "").removeprefix("eq.")
                 return httpx.Response(200, json=lego_rows.get(base_number, []))
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(200, json=[search_row])
@@ -3009,7 +3012,7 @@ class LegoImageEnrichmentTest(unittest.TestCase):
                 return httpx.Response(200, json=[])
             if "tcgplayer_pokemon_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -3078,7 +3081,7 @@ class MagicImageEnrichmentTest(unittest.TestCase):
                     name = params.get("normalized_name", "").removeprefix("eq.")
                     return httpx.Response(200, json=name_rows.get((set_name, name), []))
                 return httpx.Response(200, json=[])
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(200, json=[search_row])
@@ -3297,7 +3300,7 @@ class MagicImageEnrichmentTest(unittest.TestCase):
                 return httpx.Response(200, json=[])
             if "rebrickable_lego_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -3367,7 +3370,7 @@ class YugiohImageEnrichmentTest(unittest.TestCase):
             if "yugioh_catalog" in url:
                 code = request.url.params.get("set_code", "").removeprefix("eq.")
                 return httpx.Response(200, json=code_rows.get(code, []))
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(200, json=[search_row])
@@ -3442,7 +3445,7 @@ class YugiohImageEnrichmentTest(unittest.TestCase):
                 return httpx.Response(200, json=[])
             if "scryfall_magic_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -3513,7 +3516,7 @@ class LorcanaImageEnrichmentTest(unittest.TestCase):
                 set_name = params.get("normalized_set_name", "").removeprefix("eq.")
                 number = params.get("card_number", "").removeprefix("eq.")
                 return httpx.Response(200, json=catalog_rows.get((set_name, number), []))
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(200, json=[search_row])
@@ -3605,7 +3608,7 @@ class LorcanaImageEnrichmentTest(unittest.TestCase):
                 return httpx.Response(200, json=[])
             if "yugioh_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -3671,7 +3674,7 @@ class OnePieceImageEnrichmentTest(unittest.TestCase):
             if "one_piece_catalog" in url:
                 code = request.url.params.get("card_set_id", "").removeprefix("eq.")
                 return httpx.Response(200, json=code_rows.get(code, []))
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(200, json=[search_row])
@@ -3872,7 +3875,7 @@ class OnePieceImageEnrichmentTest(unittest.TestCase):
                 return httpx.Response(200, json=[])
             if "lorcana_catalog" in url:
                 return httpx.Response(200, json=[])
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -3999,7 +4002,7 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -4115,7 +4118,7 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -4158,7 +4161,7 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -4198,7 +4201,7 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -4292,7 +4295,7 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -4375,7 +4378,7 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -4656,7 +4659,7 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -4705,7 +4708,7 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -4761,7 +4764,7 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -4817,7 +4820,7 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -4852,7 +4855,7 @@ class CatalogSearchVideoGameEnrichmentTest(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 return httpx.Response(
@@ -4903,7 +4906,7 @@ class CoinImageAttributionTest(unittest.TestCase):
             url = str(request.url)
             if "coin_catalog_images" in url:
                 return httpx.Response(200, json=coin_rows)
-            if "pricecharting_catalog_history" in url:
+            if "pricecharting_price_history" in url:
                 return httpx.Response(200, json=[])
             if request.method == "GET" and "/rest/v1/pricecharting_catalog" in url:
                 if "pricecharting_id" in request.url.params:
