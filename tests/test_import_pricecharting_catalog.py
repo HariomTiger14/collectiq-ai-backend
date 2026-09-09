@@ -9,6 +9,7 @@ from scripts.import_pricecharting_catalog import (
     MAX_TIMEOUT_ATTEMPTS,
     PartialCatalogWriteError,
     SupabaseCatalogClient,
+    CATALOG_METADATA_SIGNATURE_COLUMNS,
     catalog_history_change_hash,
     compute_platform_group,
     dedupe_catalog_rows,
@@ -310,7 +311,9 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
         self.assertIn("service_role", str(context.exception))
         self.assertIn("anon", str(context.exception))
 
-    def test_supabase_client_syncs_scd2_history_only_for_changes(self) -> None:
+    def test_supabase_client_syncs_scd2_history_only_for_metadata_changes(self) -> None:
+        """Item 1 unchanged, item 2 renamed, item 3 new. Only 2 and 3
+        get a version -- and only 2 needs its predecessor closed."""
         unchanged_row = {
             "pricecharting_id": "1",
             "product_name": "Unchanged",
@@ -323,10 +326,24 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
         existing_hash = catalog_history_change_hash(
             unchanged_row
         )
+        # The stored versions carry METADATA now, not just a hash: that is
+        # what decides whether a version is written. Item 1's metadata
+        # matches the incoming row, item 2's does not.
         transport = _FakeSupabaseTransport(
             current_rows=[
-                {"pricecharting_id": "1", "change_hash": existing_hash},
-                {"pricecharting_id": "2", "change_hash": "old-hash"},
+                {
+                    "pricecharting_id": "1",
+                    "change_hash": existing_hash,
+                    **{column: unchanged_row.get(column)
+                       for column in CATALOG_METADATA_SIGNATURE_COLUMNS},
+                },
+                {
+                    "pricecharting_id": "2",
+                    "change_hash": "old-hash",
+                    "product_name": "Was Called Something Else",
+                    "console_name": "Pokemon Cards",
+                    "normalized_identity": "was called something else pokemon cards",
+                },
             ]
         )
         with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
@@ -647,11 +664,17 @@ class _FakeSupabaseTransport:
         self,
         *,
         current_rows: list[dict[str, str]],
+        catalog_rows: list[dict[str, str]] | None = None,
         fail_on_post_call_index: int | None = None,
         fail_on_price_history_post: bool = False,
         fail_repeat: int = 1,
     ) -> None:
         self.current_rows = current_rows
+        # The two baselines are now DIFFERENT tables and are allowed to
+        # disagree -- that divergence is the whole point of the change, so
+        # the fake has to be able to express it. Defaults to the SCD2 rows
+        # so existing callers keep the old "they always agree" behaviour.
+        self.catalog_rows = current_rows if catalog_rows is None else catalog_rows
         self.closed_ids: list[str] = []
         self.inserted_rows: list[dict[str, object]] = []
         self.upserted_rows: list[dict[str, object]] = []
@@ -665,6 +688,8 @@ class _FakeSupabaseTransport:
         self._post_call_count = 0
 
     def get(self, url: str, **kwargs):
+        if url.endswith("/pricecharting_catalog"):
+            return _FakeSupabaseResponse(self.catalog_rows)
         return _FakeSupabaseResponse(self.current_rows)
 
     def patch(self, url: str, **kwargs):
@@ -803,12 +828,26 @@ class ApiCategoryCanonicalizationTest(unittest.TestCase):
 
 
 class PriceHistoryDualWriteTest(unittest.TestCase):
-    """Step-2 shadow-write behavior matrix: which events produce a legacy
-    SCD2 version, a compact price observation, both, or neither."""
+    """Which events produce an SCD2 version, a price snapshot, both, or neither.
 
-    def _run_sync(self, rows, current_rows, *, fail_price_history=False):
+    Rewritten 2026-09-09. A price move no longer writes a 1,427-byte SCD2
+    version -- it writes a 188-byte snapshot and nothing else. SCD2 became
+    catalog/metadata history; pricecharting_price_history is the price
+    timeline the chart reads (#212).
+
+    The two baselines now come from DIFFERENT tables and are allowed to
+    disagree: metadata is compared against the stored SCD2 version, prices
+    against the current pricecharting_catalog row. That is not an
+    implementation detail -- with prices frozen in SCD2, comparing against it
+    would report "changed" every run forever and write one redundant snapshot
+    per item per day. Several tests below exist only to pin that.
+    """
+
+    def _run_sync(self, rows, current_rows, *, catalog_rows=None,
+                  fail_price_history=False):
         transport = _FakeSupabaseTransport(
             current_rows=current_rows,
+            catalog_rows=catalog_rows,
             fail_on_price_history_post=fail_price_history,
         )
         with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
@@ -827,10 +866,17 @@ class PriceHistoryDualWriteTest(unittest.TestCase):
 
     @staticmethod
     def _current_from(row, **overrides):
+        """A stored SCD2 current version, shaped like the real lookup.
+
+        It carries the metadata columns because those now decide whether a
+        version is written; prices are carried too, but only so a test can
+        deliberately freeze them and prove the gate no longer reads them.
+        """
         current = {
             "pricecharting_id": row["pricecharting_id"],
             "change_hash": catalog_history_change_hash(row),
             "currency": row.get("currency") or "USD",
+            **{col: row.get(col) for col in CATALOG_METADATA_SIGNATURE_COLUMNS},
             **{col: row.get(col) for col in (
                 "loose_price_cents", "cib_price_cents", "new_price_cents",
                 "graded_price_cents", "box_only_price_cents", "manual_only_price_cents",
@@ -843,13 +889,15 @@ class PriceHistoryDualWriteTest(unittest.TestCase):
             current["change_hash"] = catalog_history_change_hash(recomputed)
         return current
 
-    def test_A_price_only_change_writes_both(self) -> None:
+    def test_A_price_only_change_writes_a_snapshot_and_no_version(self) -> None:
+        """The change this PR exists for: 188 bytes instead of 1,427 + 1,427."""
         row = _catalog_row("1", "Pikachu")
         current = self._current_from(row, loose_price_cents=555)
         transport, client, error = self._run_sync([row], [current])
         self.assertIsNone(error)
-        self.assertEqual(len(transport.inserted_rows), 1)        # legacy +1
-        self.assertEqual(len(transport.price_history_rows), 1)   # price_history +1
+        self.assertEqual(len(transport.inserted_rows), 0)        # NO SCD2 version
+        self.assertEqual(len(transport.closed_ids), 0)           # nothing closed
+        self.assertEqual(len(transport.price_history_rows), 1)   # snapshot only
         self.assertEqual(transport.price_history_rows[0]["loose_price_cents"], 1000)
         self.assertEqual(client.price_history_stats["inserted"], 1)
 
@@ -868,10 +916,10 @@ class PriceHistoryDualWriteTest(unittest.TestCase):
             "box_only_price_cents": row["box_only_price_cents"],
             "manual_only_price_cents": row["manual_only_price_cents"],
         }
-        transport, client, error = self._run_sync([row], [current])
+        transport, client, error = self._run_sync([row], [current], catalog_rows=[current])
         self.assertIsNone(error)
-        self.assertEqual(len(transport.inserted_rows), 1)        # legacy +1
-        self.assertEqual(len(transport.price_history_rows), 0)   # price_history +0
+        self.assertEqual(len(transport.inserted_rows), 1)        # SCD2 version
+        self.assertEqual(len(transport.price_history_rows), 0)   # no snapshot
         self.assertEqual(client.price_history_stats["attempted"], 0)
 
     def test_C_price_and_metadata_change_writes_both(self) -> None:
@@ -880,8 +928,8 @@ class PriceHistoryDualWriteTest(unittest.TestCase):
         current = self._current_from(old, loose_price_cents=555)
         transport, _, error = self._run_sync([row], [current])
         self.assertIsNone(error)
-        self.assertEqual(len(transport.inserted_rows), 1)
-        self.assertEqual(len(transport.price_history_rows), 1)
+        self.assertEqual(len(transport.inserted_rows), 1)        # metadata moved
+        self.assertEqual(len(transport.price_history_rows), 1)   # and so did price
 
     def test_D_unchanged_input_writes_nothing(self) -> None:
         row = _catalog_row("1", "Pikachu")
@@ -905,10 +953,102 @@ class PriceHistoryDualWriteTest(unittest.TestCase):
                 "loose_price_cents", "cib_price_cents", "new_price_cents",
                 "graded_price_cents", "box_only_price_cents", "manual_only_price_cents")},
         }
-        transport, _, error = self._run_sync([row], [current])
+        transport, _, error = self._run_sync([row], [current], catalog_rows=[current])
         self.assertIsNone(error)
-        self.assertEqual(len(transport.inserted_rows), 1)        # legacy +1 (the one-time wave)
-        self.assertEqual(len(transport.price_history_rows), 0)   # price_history +0
+        self.assertEqual(len(transport.inserted_rows), 1)        # the one-time wave
+        self.assertEqual(len(transport.price_history_rows), 0)   # prices never moved
+
+    def test_G_a_frozen_scd2_price_does_not_drive_the_snapshot_gate(self) -> None:
+        """The defect this design avoids, stated as a test.
+
+        Once price-only changes stop writing versions, the SCD2 row's prices
+        stop advancing. If the snapshot gate still read them, an item whose
+        price moved once would compare as "changed" against that stale value
+        on every subsequent run and mint a redundant snapshot per day --
+        roughly 12M rows a day into the table the backfill just filled.
+
+        Here SCD2 is frozen at 555 while the catalog already holds today's
+        1000. Nothing has actually changed since the last run, so nothing
+        should be written.
+        """
+        row = _catalog_row("1", "Pikachu")
+        frozen_scd2 = self._current_from(row, loose_price_cents=555)
+        catalog_now = self._current_from(row)          # already at 1000
+        transport, _, error = self._run_sync(
+            [row], [frozen_scd2], catalog_rows=[catalog_now])
+        self.assertIsNone(error)
+        self.assertEqual(len(transport.price_history_rows), 0,
+                         "snapshot written from a stale SCD2 price")
+        self.assertEqual(len(transport.inserted_rows), 0)
+
+    def test_H_a_stable_price_on_consecutive_runs_writes_one_snapshot(self) -> None:
+        """Run 1 records the move; run 2 sees the catalog caught up and stops.
+
+        This is the same property as G from the caller's side, and it is the
+        one that keeps the table's growth proportional to real price changes
+        rather than to items x days.
+        """
+        row = _catalog_row("1", "Pikachu")
+        yesterday = self._current_from(row, loose_price_cents=555)
+
+        first, _, _ = self._run_sync([row], [yesterday], catalog_rows=[yesterday])
+        self.assertEqual(len(first.price_history_rows), 1)
+
+        # upsert_rows has since advanced the catalog to the new price.
+        today = self._current_from(row)
+        second, _, _ = self._run_sync([row], [yesterday], catalog_rows=[today])
+        self.assertEqual(len(second.price_history_rows), 0,
+                         "a second snapshot for a price that did not move")
+
+    def test_I_a_price_that_returns_to_the_frozen_value_is_still_recorded(self) -> None:
+        """Why the change_hash short-circuit had to go.
+
+        SCD2 froze at 555. The price moved away and has now come back to 555,
+        so the full-signature change_hash matches the stored version exactly.
+        The old code returned early on that equality and would have recorded
+        nothing -- but against yesterday's catalog value of 900 this is a real
+        price move, and the chart needs the point.
+        """
+        row = _catalog_row("1", "Pikachu")
+        row["loose_price_cents"] = 555
+        frozen_scd2 = self._current_from(row)                       # hash matches
+        catalog_yesterday = self._current_from(row, loose_price_cents=900)
+        transport, _, error = self._run_sync(
+            [row], [frozen_scd2], catalog_rows=[catalog_yesterday])
+        self.assertIsNone(error)
+        self.assertEqual(len(transport.price_history_rows), 1)
+        self.assertEqual(transport.price_history_rows[0]["loose_price_cents"], 555)
+        self.assertEqual(len(transport.inserted_rows), 0, "metadata did not move")
+
+    def test_J_a_brand_new_item_writes_both(self) -> None:
+        row = _catalog_row("1", "Pikachu")
+        transport, _, error = self._run_sync([row], [], catalog_rows=[])
+        self.assertIsNone(error)
+        self.assertEqual(len(transport.inserted_rows), 1)
+        self.assertEqual(len(transport.price_history_rows), 1)
+        self.assertEqual(len(transport.closed_ids), 0, "nothing to close")
+
+    def test_K_the_metadata_gate_ignores_every_price_column(self) -> None:
+        """Field by field, so a column added to the wrong tuple is caught."""
+        row = _catalog_row("1", "Pikachu")
+        for column in ("loose_price_cents", "cib_price_cents", "new_price_cents",
+                       "graded_price_cents", "box_only_price_cents",
+                       "manual_only_price_cents", "currency"):
+            with self.subTest(column=column):
+                self.assertNotIn(column, CATALOG_METADATA_SIGNATURE_COLUMNS)
+
+    def test_L_the_metadata_gate_covers_every_non_price_signature_column(self) -> None:
+        from scripts.import_pricecharting_catalog import (
+            CATALOG_HISTORY_SIGNATURE_COLUMNS,
+            PRICE_OBSERVATION_COLUMNS,
+        )
+
+        expected = {column for column in CATALOG_HISTORY_SIGNATURE_COLUMNS
+                    if column not in PRICE_OBSERVATION_COLUMNS and column != "currency"}
+        self.assertEqual(set(CATALOG_METADATA_SIGNATURE_COLUMNS), expected)
+        self.assertIn("product_name", expected)
+        self.assertIn("category", expected)
+        self.assertIn("normalized_identity", expected)
 
     def test_F_retry_is_idempotent_at_the_database(self) -> None:
         # The DB enforces (pricecharting_id, observed_at) uniqueness with

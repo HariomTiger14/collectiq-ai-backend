@@ -205,10 +205,19 @@ def backfill_catalog_history_for_item(
     match_source: str,
     match_confidence: float,
 ) -> int:
-    """Backfills real historical price points from pricecharting_catalog_history
+    """Backfills real historical price points from pricecharting_price_history
     for a newly-matched item, for dates before its earliest existing real
-    snapshot (if any). Not fabricated data: every point is a real SCD2 price
-    version PriceCharting recorded for the SAME matched product -- this just
+    snapshot (if any).
+
+    The source is reached through catalog.detail(), which moved off
+    pricecharting_catalog_history in #212 -- so this path followed it without
+    changing, and the SCD2 table it used to name is no longer involved. That
+    matters now that price-only changes stop writing SCD2 versions: had this
+    still read the SCD2 table directly, a matched item's backfilled chart
+    would have quietly lost every price move.
+
+    Not fabricated data: every point is a real price observation
+    PriceCharting recorded for the SAME matched product -- this just
     makes it visible on the item's own chart instead of only starting from
     whenever it was actually scanned. Runs once, right when a match is first
     found (matched items never re-enter the unlinked queue), so no dedup
