@@ -754,6 +754,7 @@ class _FakeSupabaseTransport:
         # so existing callers keep the old "they always agree" behaviour.
         self.catalog_rows = current_rows if catalog_rows is None else catalog_rows
         self.closed_ids: list[str] = []
+        self.get_urls: list[str] = []
         self.inserted_rows: list[dict[str, object]] = []
         self.upserted_rows: list[dict[str, object]] = []
         self.price_history_rows: list[dict[str, object]] = []
@@ -766,6 +767,7 @@ class _FakeSupabaseTransport:
         self._post_call_count = 0
 
     def get(self, url: str, **kwargs):
+        self.get_urls.append(url)
         if url.endswith("/pricecharting_catalog"):
             return _FakeSupabaseResponse(self.catalog_rows)
         return _FakeSupabaseResponse(self.current_rows)
@@ -1184,3 +1186,117 @@ class PriceHistoryDualWriteTest(unittest.TestCase):
         self.assertEqual(len(transport.inserted_rows), 0)  # no legacy insert
         self.assertEqual(len(transport.closed_ids), 0)     # no legacy close
         self.assertEqual(client.price_history_stats["failed"], 1)
+
+
+class TheCatalogIsLookedUpOncePerBatchTest(unittest.TestCase):
+    """Two passes, one lookup.
+
+    sync_scd2_history_rows and upsert_rows each fetched the same current
+    catalog rows for the same batch. Measured on a real 350-set ingest
+    (2026-09-09) the duplicate cost ~81s of 595s -- 14% -- for an answer
+    already in hand. The second call arrived with the price baseline in #213
+    and sat 140 lines away from the first, which is how it went unnoticed.
+    """
+
+    def _run_both_passes(self, rows, current_rows, catalog_rows=None):
+        transport = _FakeSupabaseTransport(current_rows=current_rows,
+                                           catalog_rows=catalog_rows)
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+            client.sync_scd2_history_rows(rows, batch_size=100)
+            client.upsert_rows(rows, batch_size=100)
+        catalog_gets = [u for u in transport.get_urls
+                        if u.endswith("/pricecharting_catalog")]
+        return transport, client, catalog_gets
+
+    def test_the_catalog_is_fetched_once_not_twice(self) -> None:
+        row = _catalog_row("1", "Pikachu")
+        _, _, catalog_gets = self._run_both_passes([row], [])
+        self.assertEqual(len(catalog_gets), 1,
+                         f"catalog fetched {len(catalog_gets)} times for one batch")
+
+    def test_the_second_pass_is_recorded_as_reused(self) -> None:
+        row = _catalog_row("1", "Pikachu")
+        _, client, _ = self._run_both_passes([row], [])
+        self.assertEqual(client.catalog_lookup_stats["fetched"], 1)
+        self.assertEqual(client.catalog_lookup_stats["reused"], 1)
+
+    def test_both_decisions_see_the_same_baseline(self) -> None:
+        """An unchanged row must be skipped by the upsert using the hash the
+        SCD2 pass already fetched -- not a second, possibly different one."""
+        row = _catalog_row("1", "Pikachu")
+        stored = {
+            "pricecharting_id": "1",
+            "content_hash": row["content_hash"],
+            "currency": "USD",
+            **{c: row.get(c) for c in ("loose_price_cents", "cib_price_cents",
+                                       "new_price_cents", "graded_price_cents",
+                                       "box_only_price_cents", "manual_only_price_cents")},
+        }
+        transport, client, catalog_gets = self._run_both_passes([row], [], [stored])
+        self.assertEqual(len(catalog_gets), 1)
+        self.assertEqual(transport.upserted_rows, [],
+                         "an unchanged row was upserted; the reused hash did not match")
+        self.assertEqual(client.catalog_write_stats["skippedUnchanged"], 1)
+
+    def test_a_changed_row_is_still_upserted_from_the_reused_hash(self) -> None:
+        row = _catalog_row("1", "Pikachu")
+        stale = {"pricecharting_id": "1", "content_hash": "something-else"}
+        transport, _, catalog_gets = self._run_both_passes([row], [], [stale])
+        self.assertEqual(len(catalog_gets), 1)
+        self.assertEqual(len(transport.upserted_rows), 1)
+
+    def test_an_item_absent_from_the_catalog_is_remembered_as_absent(self) -> None:
+        """"Looked up and not found" and "never looked up" are different.
+
+        Collapsing them sends every new item back down the fetch path, which
+        is the whole cost this removes -- new items are common in a batch.
+        """
+        row = _catalog_row("1", "Pikachu")
+        transport, client, catalog_gets = self._run_both_passes([row], [], [])
+        self.assertEqual(len(catalog_gets), 1)
+        self.assertEqual(len(transport.upserted_rows), 1, "a new row was not written")
+        self.assertEqual(client.catalog_lookup_stats["reused"], 1)
+
+    def test_upsert_alone_still_fetches(self) -> None:
+        """Other callers run upsert_rows without the SCD2 pass; the cache
+        cannot answer for them and must not pretend to."""
+        row = _catalog_row("1", "Pikachu")
+        transport = _FakeSupabaseTransport(current_rows=[])
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+            client.upsert_rows([row], batch_size=100)
+        self.assertEqual(
+            len([u for u in transport.get_urls if u.endswith("/pricecharting_catalog")]), 1)
+        self.assertEqual(client.catalog_lookup_stats["reused"], 0)
+
+    def test_a_batch_the_cache_only_partly_covers_is_refetched(self) -> None:
+        """All-or-nothing: mixing cached and fetched answers inside one batch
+        is how a stale hash turns a changed row into a skipped one."""
+        first = _catalog_row("1", "Pikachu")
+        second = _catalog_row("2", "Squirtle")
+        transport = _FakeSupabaseTransport(current_rows=[])
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+            client.sync_scd2_history_rows([first], batch_size=100)   # covers id 1 only
+            client.upsert_rows([first, second], batch_size=100)      # needs 1 and 2
+        catalog_gets = [u for u in transport.get_urls
+                        if u.endswith("/pricecharting_catalog")]
+        self.assertEqual(len(catalog_gets), 2, "the uncovered batch was not refetched")
+        self.assertEqual(client.catalog_lookup_stats["reused"], 0)
+

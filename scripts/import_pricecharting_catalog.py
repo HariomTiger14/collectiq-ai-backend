@@ -851,6 +851,21 @@ class SupabaseCatalogClient:
             "scd2_close": 0.0,
             "scd2_insert": 0.0,
         }
+        # sync_scd2_history_rows and upsert_rows each fetched the SAME current
+        # catalog rows for the SAME batch -- two round trips over the wire for
+        # one answer. Measured 2026-09-09 on a 350-set batch: the duplicate
+        # cost ~81s of a 595s ingest, 14%, for nothing. The second lookup was
+        # added in #213 for the price baseline and the two calls live 140
+        # lines apart in different methods, which is why it was not obvious.
+        #
+        # Only the content_hash is kept, not the row: 169k ids at ~150 bytes
+        # is ~25 MB, where caching whole rows would be hundreds. The covered
+        # set is separate from the hashes because "looked up and absent" and
+        # "never looked up" mean different things -- the first is a new item,
+        # the second means the cache cannot answer and a fetch must happen.
+        self.catalog_lookup_stats: dict[str, int] = {"fetched": 0, "reused": 0}
+        self._catalog_hash_cache: dict[str, Any] = {}
+        self._catalog_lookup_covered: set[str] = set()
         self.price_history_stats: dict[str, int] = {
             "attempted": 0,
             "inserted": 0,
@@ -903,7 +918,7 @@ class SupabaseCatalogClient:
                 batch = rows[index : index + batch_size]
                 try:
                     detection_started_at = time.perf_counter()
-                    current_by_id = self._fetch_current_catalog_hashes(client, batch)
+                    current_by_id = self._current_catalog_hashes(client, batch)
                     self.phase_seconds["unchanged_detection"] += (
                         time.perf_counter() - detection_started_at
                     )
@@ -957,6 +972,54 @@ class SupabaseCatalogClient:
             )
         return total
 
+    def _remember_catalog_hashes(
+        self,
+        rows: list[dict[str, Any]],
+        fetched: dict[str, dict[str, Any]],
+    ) -> None:
+        """Record what a catalog lookup found, so the next pass need not ask.
+
+        Every id in `rows` joins the covered set, including ids the lookup did
+        not return -- absence is itself the answer ("no catalog row yet"), and
+        losing that distinction would send new items down the fetch path.
+        """
+        for row in rows:
+            product_id = str(row.get("pricecharting_id") or "").strip()
+            if not product_id:
+                continue
+            self._catalog_lookup_covered.add(product_id)
+            found = fetched.get(product_id)
+            if found is not None:
+                self._catalog_hash_cache[product_id] = found.get("content_hash")
+
+    def _current_catalog_hashes(
+        self,
+        client: httpx.Client,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """The batch's current content_hashes, from the cache when it can
+        answer for EVERY id and from Supabase otherwise.
+
+        All-or-nothing on purpose. A partial hit would mean a fetch anyway,
+        and mixing cached and fetched answers within a batch is how a stale
+        hash quietly turns a changed row into a skipped one. Nothing writes
+        pricecharting_catalog between the two passes, so a cached hash is the
+        same value the second fetch would have returned.
+        """
+        ids = [
+            str(row.get("pricecharting_id") or "").strip()
+            for row in rows
+            if str(row.get("pricecharting_id") or "").strip()
+        ]
+        if not ids or not self._catalog_lookup_covered.issuperset(ids):
+            return self._fetch_current_catalog_hashes(client, rows)
+        self.catalog_lookup_stats["reused"] += len(ids)
+        return {
+            product_id: {"content_hash": self._catalog_hash_cache[product_id]}
+            for product_id in ids
+            if product_id in self._catalog_hash_cache
+        }
+
     def _fetch_current_catalog_hashes(
         self,
         client: httpx.Client,
@@ -974,6 +1037,7 @@ class SupabaseCatalogClient:
         # silent cap, and a batch size that overflows one lookup overflows
         # both.
         _assert_lookup_fits(ids, what="catalog hash")
+        self.catalog_lookup_stats["fetched"] += len(ids)
         response = client.get(
             f"{self.supabase_url}/rest/v1/pricecharting_catalog",
             params={
@@ -1044,6 +1108,7 @@ class SupabaseCatalogClient:
                     # write a redundant snapshot per item per run, forever.
                     # pricecharting_catalog still advances every run.
                     catalog_by_id = self._fetch_current_catalog_hashes(client, batch)
+                    self._remember_catalog_hashes(batch, catalog_by_id)
                     self.phase_seconds["scd2_comparison"] += (
                         time.perf_counter() - comparison_started_at
                     )

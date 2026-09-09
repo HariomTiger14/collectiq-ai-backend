@@ -220,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
                        phaseUnaccountedSeconds=round(
                            max(ingest_ms / 1000 - accounted, 0.0), 2),
                        priceHistory=dict(catalog_client.price_history_stats),
+                       catalogLookups=dict(catalog_client.catalog_lookup_stats),
                        **timeouts)
 
         if not wrote:

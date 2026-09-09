@@ -103,6 +103,7 @@ class _Stats:
             "scd2_close": 0.1, "scd2_insert": 0.25}
         self.price_history_stats = {
             "attempted": 12, "inserted": 11, "duplicateSkipped": 1, "failed": 0}
+        self.catalog_lookup_stats = {"fetched": 20, "reused": 20}
 
 
 def _run(store, *, wrote=True, stats=None, argv=("--commit",)):
@@ -438,6 +439,12 @@ class ItReportsWhereTheTimeWentTest(unittest.TestCase):
         """They shared a timer until 2026-09-09. One stayed, one went away."""
         phases = self._summary()["phaseSeconds"]
         self.assertNotEqual(phases["price_snapshot_insert"], phases["scd2_insert"])
+
+    def test_catalog_lookup_reuse_is_reported(self) -> None:
+        """A saving that is not counted is a saving nobody can confirm."""
+        lookups = self._summary()["catalogLookups"]
+        self.assertEqual(lookups["fetched"], 20)
+        self.assertEqual(lookups["reused"], 20)
 
     def test_snapshot_counts_ride_along(self) -> None:
         price_history = self._summary()["priceHistory"]
