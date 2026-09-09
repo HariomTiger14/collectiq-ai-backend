@@ -1853,15 +1853,19 @@ class CatalogWriteStatsTest(unittest.TestCase):
             client.upsert_rows(rows, batch_size=10)
         return client, posted
 
+    # The catalog write gate reads METADATA, not content_hash: content_hash
+    # covers the six price columns, so gating on it rewrote the 25 GB search
+    # document every time a price moved. Prices now go to
+    # pricecharting_current_price and never reach this table.
     def test_unchanged_rows_are_counted_as_skipped_not_written(self) -> None:
         client, posted = self._run(
             rows=[
-                {"pricecharting_id": "1", "content_hash": "aaa"},
-                {"pricecharting_id": "2", "content_hash": "bbb"},
+                {"pricecharting_id": "1", "product_name": "Alpha"},
+                {"pricecharting_id": "2", "product_name": "Beta"},
             ],
             existing=[
-                {"pricecharting_id": "1", "content_hash": "aaa"},
-                {"pricecharting_id": "2", "content_hash": "bbb"},
+                {"pricecharting_id": "1", "product_name": "Alpha"},
+                {"pricecharting_id": "2", "product_name": "Beta"},
             ],
         )
         self.assertEqual(client.catalog_write_stats["written"], 0)
@@ -1872,12 +1876,12 @@ class CatalogWriteStatsTest(unittest.TestCase):
     def test_changed_rows_are_counted_as_written(self) -> None:
         client, posted = self._run(
             rows=[
-                {"pricecharting_id": "1", "content_hash": "NEW"},
-                {"pricecharting_id": "2", "content_hash": "bbb"},
+                {"pricecharting_id": "1", "product_name": "Renamed"},
+                {"pricecharting_id": "2", "product_name": "Beta"},
             ],
             existing=[
-                {"pricecharting_id": "1", "content_hash": "old"},
-                {"pricecharting_id": "2", "content_hash": "bbb"},
+                {"pricecharting_id": "1", "product_name": "Alpha"},
+                {"pricecharting_id": "2", "product_name": "Beta"},
             ],
         )
         self.assertEqual(client.catalog_write_stats["written"], 1)
@@ -1886,7 +1890,7 @@ class CatalogWriteStatsTest(unittest.TestCase):
 
     def test_rows_absent_from_the_table_count_as_written(self) -> None:
         client, _ = self._run(
-            rows=[{"pricecharting_id": "9", "content_hash": "a"}],
+            rows=[{"pricecharting_id": "9", "product_name": "Brand New"}],
             existing=[],
         )
         self.assertEqual(client.catalog_write_stats["written"], 1)

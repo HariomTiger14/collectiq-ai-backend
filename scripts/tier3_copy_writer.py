@@ -51,6 +51,36 @@ class CopyCatalogWriter:
     """Writes catalog rows via COPY + a single server-side merge."""
 
     def __init__(self, database_url: str, *, statement_timeout_ms: int = 120_000) -> None:
+
+        # Refuses to run: this merge is two PRs behind the REST writer.
+        #
+        # It still gates the catalog upsert on content_hash and writes an SCD2
+        # version whenever change_hash differs -- both of which include the six
+        # price columns. #213 stopped price-only changes writing SCD2 versions,
+        # and PR 4 moved current prices to pricecharting_current_price and made
+        # the catalog gate metadata-only. Running this now would undo both:
+        # every price move would rewrite the 25 GB search document and mint an
+        # SCD2 version, and pricecharting_current_price would never be written
+        # at all, so Discover and catalog detail would show prices frozen at
+        # whatever this run left behind.
+        #
+        # Its only caller is refresh_sportscardspro_rotation.py, a suspended
+        # cron slated for retirement, and the staged ingester hardcodes
+        # WRITE_REST -- so nothing in production reaches this today. The guard
+        # exists so that stays true by construction rather than by memory.
+        #
+        # To lift it: port the three semantics from the REST writer -- catalog
+        # written only on metadata change or new item, snapshots on price
+        # change, current_price upserted with category and platform_group --
+        # and prove them against the same behaviour matrix in
+        # tests/test_import_pricecharting_catalog.py.
+        raise NotImplementedError(
+            "CopyCatalogWriter is behind the REST writer since #213 and PR 4: "
+            "it gates the catalog on a price-inclusive content_hash, writes "
+            "SCD2 versions for price-only changes, and never writes "
+            "pricecharting_current_price. Align it with "
+            "scripts/import_pricecharting_catalog.py before enabling COPY."
+        )
         if not database_url:
             raise SystemExit("DATABASE_URL is required for the COPY writer.")
         self.database_url = database_url

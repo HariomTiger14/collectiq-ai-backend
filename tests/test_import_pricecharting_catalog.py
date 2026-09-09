@@ -418,12 +418,16 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
         assert changed_row is not None
         assert new_row is not None
         transport = _FakeSupabaseTransport(
+            # The catalog gate reads METADATA now, not content_hash: gating on
+            # a price-inclusive hash rewrote the search document on every price
+            # move. Item 1's metadata matches the incoming row, item 2's does not.
             current_rows=[
                 {
                     "pricecharting_id": "1",
-                    "content_hash": unchanged_row["content_hash"],
+                    **{c: unchanged_row.get(c) for c in CATALOG_METADATA_SIGNATURE_COLUMNS},
                 },
-                {"pricecharting_id": "2", "content_hash": "old-hash"},
+                {"pricecharting_id": "2", "product_name": "Was Called Something Else",
+                 "console_name": "Pokemon Cards"},
             ]
         )
         with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
@@ -600,6 +604,7 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
                 "unchanged_detection": 0.0,
                 "catalog_upsert": 0.0,
                 "scd2_comparison": 0.0,
+                "current_price_upsert": 0.0,
                 "price_snapshot_insert": 0.0,
                 "scd2_close": 0.0,
                 "scd2_insert": 0.0,
@@ -623,7 +628,8 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
         assert unchanged_row is not None
         transport = _FakeSupabaseTransport(
             current_rows=[
-                {"pricecharting_id": "1", "content_hash": unchanged_row["content_hash"]},
+                {"pricecharting_id": "1",
+                 **{c: unchanged_row.get(c) for c in CATALOG_METADATA_SIGNATURE_COLUMNS}},
             ]
         )
         with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
@@ -743,6 +749,7 @@ class _FakeSupabaseTransport:
         *,
         current_rows: list[dict[str, str]],
         catalog_rows: list[dict[str, str]] | None = None,
+        current_price_rows: list[dict[str, str]] | None = None,
         fail_on_post_call_index: int | None = None,
         fail_on_price_history_post: bool = False,
         fail_repeat: int = 1,
@@ -753,6 +760,14 @@ class _FakeSupabaseTransport:
         # the fake has to be able to express it. Defaults to the SCD2 rows
         # so existing callers keep the old "they always agree" behaviour.
         self.catalog_rows = current_rows if catalog_rows is None else catalog_rows
+        # Three baselines now, one per table that gets written. They are
+        # allowed to disagree -- that is the point: the SCD2 row gates the
+        # version, the catalog row gates the search document, the current
+        # price row gates the price. Defaults to the SCD2 rows so callers
+        # written before PR 4 keep their "they all agree" behaviour.
+        self.current_price_rows = (
+            current_rows if current_price_rows is None else current_price_rows)
+        self.current_price_upserts: list[dict[str, object]] = []
         self.closed_ids: list[str] = []
         self.get_urls: list[str] = []
         self.inserted_rows: list[dict[str, object]] = []
@@ -768,6 +783,8 @@ class _FakeSupabaseTransport:
 
     def get(self, url: str, **kwargs):
         self.get_urls.append(url)
+        if url.endswith("/pricecharting_current_price"):
+            return _FakeSupabaseResponse(self.current_price_rows)
         if url.endswith("/pricecharting_catalog"):
             return _FakeSupabaseResponse(self.catalog_rows)
         return _FakeSupabaseResponse(self.current_rows)
@@ -780,6 +797,9 @@ class _FakeSupabaseTransport:
 
     def post(self, url: str, **kwargs):
         rows = kwargs.get("json", [])
+        if url.endswith("/pricecharting_current_price"):
+            self.current_price_upserts.extend(rows)
+            return _FakeSupabaseResponse()
         if url.endswith("/pricecharting_price_history"):
             if self._fail_on_price_history_post:
                 return _FailingSupabaseResponse()
@@ -924,10 +944,11 @@ class PriceHistoryDualWriteTest(unittest.TestCase):
     """
 
     def _run_sync(self, rows, current_rows, *, catalog_rows=None,
-                  fail_price_history=False):
+                  current_price_rows=None, fail_price_history=False):
         transport = _FakeSupabaseTransport(
             current_rows=current_rows,
             catalog_rows=catalog_rows,
+            current_price_rows=current_price_rows,
             fail_on_price_history_post=fail_price_history,
         )
         with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
@@ -1053,9 +1074,10 @@ class PriceHistoryDualWriteTest(unittest.TestCase):
         """
         row = _catalog_row("1", "Pikachu")
         frozen_scd2 = self._current_from(row, loose_price_cents=555)
-        catalog_now = self._current_from(row)          # already at 1000
+        price_now = self._current_from(row)            # already at 1000
         transport, _, error = self._run_sync(
-            [row], [frozen_scd2], catalog_rows=[catalog_now])
+            [row], [frozen_scd2], catalog_rows=[frozen_scd2],
+            current_price_rows=[price_now])
         self.assertIsNone(error)
         self.assertEqual(len(transport.price_history_rows), 0,
                          "snapshot written from a stale SCD2 price")
@@ -1071,12 +1093,14 @@ class PriceHistoryDualWriteTest(unittest.TestCase):
         row = _catalog_row("1", "Pikachu")
         yesterday = self._current_from(row, loose_price_cents=555)
 
-        first, _, _ = self._run_sync([row], [yesterday], catalog_rows=[yesterday])
+        first, _, _ = self._run_sync([row], [yesterday], catalog_rows=[yesterday],
+                                     current_price_rows=[yesterday])
         self.assertEqual(len(first.price_history_rows), 1)
 
-        # upsert_rows has since advanced the catalog to the new price.
+        # The current-price upsert has since advanced that row to the new price.
         today = self._current_from(row)
-        second, _, _ = self._run_sync([row], [yesterday], catalog_rows=[today])
+        second, _, _ = self._run_sync([row], [yesterday], catalog_rows=[yesterday],
+                                      current_price_rows=[today])
         self.assertEqual(len(second.price_history_rows), 0,
                          "a second snapshot for a price that did not move")
 
@@ -1092,9 +1116,10 @@ class PriceHistoryDualWriteTest(unittest.TestCase):
         row = _catalog_row("1", "Pikachu")
         row["loose_price_cents"] = 555
         frozen_scd2 = self._current_from(row)                       # hash matches
-        catalog_yesterday = self._current_from(row, loose_price_cents=900)
+        price_yesterday = self._current_from(row, loose_price_cents=900)
         transport, _, error = self._run_sync(
-            [row], [frozen_scd2], catalog_rows=[catalog_yesterday])
+            [row], [frozen_scd2], catalog_rows=[frozen_scd2],
+            current_price_rows=[price_yesterday])
         self.assertIsNone(error)
         self.assertEqual(len(transport.price_history_rows), 1)
         self.assertEqual(transport.price_history_rows[0]["loose_price_cents"], 555)
@@ -1129,6 +1154,90 @@ class PriceHistoryDualWriteTest(unittest.TestCase):
         self.assertIn("product_name", expected)
         self.assertIn("category", expected)
         self.assertIn("normalized_identity", expected)
+
+    def test_M_a_price_move_writes_current_price_and_not_the_catalog(self) -> None:
+        """The whole point of PR 4.
+
+        catalog_upsert was 49.7% of a 350-set ingest -- rewriting 15 indexes
+        and ~7 GB of GIN for a price change that moved no searchable text.
+        """
+        row = _catalog_row("1", "Pikachu")
+        stored = self._current_from(row)                       # metadata matches
+        yesterday = self._current_from(row, loose_price_cents=555)
+        transport, client, error = self._run_sync(
+            [row], [stored], catalog_rows=[stored], current_price_rows=[yesterday])
+        self.assertIsNone(error)
+        self.assertEqual(len(transport.current_price_upserts), 1)
+        self.assertEqual(transport.current_price_upserts[0]["loose_price_cents"], 1000)
+        self.assertEqual(len(transport.price_history_rows), 1)   # snapshot still written
+        self.assertEqual(len(transport.inserted_rows), 0)        # no SCD2 version
+        self.assertEqual(client.current_price_stats["priceChanged"], 1)
+
+    def test_N_the_current_price_row_carries_the_browse_keys(self) -> None:
+        """Without them the browse indexes on that table cannot be used."""
+        row = _catalog_row("1", "Pikachu")
+        yesterday = self._current_from(row, loose_price_cents=555)
+        transport, _, _ = self._run_sync(
+            [row], [], catalog_rows=[], current_price_rows=[yesterday])
+        written = transport.current_price_upserts[0]
+        self.assertEqual(written["category"], row["category"])
+        self.assertIn("platform_group", written)
+        self.assertEqual(written["currency"], "USD")
+        self.assertIsNotNone(written["observed_at"])
+
+    def test_O_a_rename_with_no_price_move_still_patches_the_browse_keys(self) -> None:
+        """Bullet 2, and the easiest thing in this change to miss.
+
+        A category change that leaves the price alone must still reach
+        current_price. Otherwise Discover browses the old category until the
+        next price tick -- which for a stable item may be never.
+        """
+        row = _catalog_row("1", "Pikachu")
+        stale_keys = self._current_from(row)
+        stale_keys["category"] = "Was A Different Category"
+        transport, client, _ = self._run_sync(
+            [row], [self._current_from(row)], catalog_rows=[self._current_from(row)],
+            current_price_rows=[stale_keys])
+        self.assertEqual(len(transport.current_price_upserts), 1,
+                         "the stale browse key was never corrected")
+        self.assertEqual(transport.current_price_upserts[0]["category"], row["category"])
+        self.assertEqual(client.current_price_stats["browseKeysOnly"], 1)
+        self.assertEqual(len(transport.price_history_rows), 0,
+                         "no price moved, so no snapshot belongs in the chart")
+
+    def test_P_nothing_changed_writes_nothing_anywhere(self) -> None:
+        row = _catalog_row("1", "Pikachu")
+        same = self._current_from(row)
+        transport, _, _ = self._run_sync(
+            [row], [same], catalog_rows=[same], current_price_rows=[same])
+        self.assertEqual(transport.current_price_upserts, [])
+        self.assertEqual(transport.price_history_rows, [])
+        self.assertEqual(transport.inserted_rows, [])
+
+    def test_Q_a_new_item_writes_everywhere(self) -> None:
+        row = _catalog_row("1", "Pikachu")
+        transport, _, _ = self._run_sync([row], [], catalog_rows=[], current_price_rows=[])
+        self.assertEqual(len(transport.current_price_upserts), 1)
+        self.assertEqual(len(transport.price_history_rows), 1)
+        self.assertEqual(len(transport.inserted_rows), 1)
+
+    def test_R_the_price_baseline_is_current_price_not_the_catalog(self) -> None:
+        """The stale-baseline trap, one table along from #213.
+
+        The catalog's cents freeze once this PR ships. A gate still reading
+        them would report "changed" on every run forever and upsert every row
+        every day -- 12M writes daily into the table built to avoid them.
+        Here the catalog is frozen at 555 and current_price already says 1000.
+        """
+        row = _catalog_row("1", "Pikachu")
+        frozen_catalog = self._current_from(row, loose_price_cents=555)
+        price_now = self._current_from(row)
+        transport, _, _ = self._run_sync(
+            [row], [self._current_from(row)], catalog_rows=[frozen_catalog],
+            current_price_rows=[price_now])
+        self.assertEqual(transport.current_price_upserts, [],
+                         "upserted from a frozen catalog price")
+        self.assertEqual(transport.price_history_rows, [])
 
     def test_F_retry_is_idempotent_at_the_database(self) -> None:
         # The DB enforces (pricecharting_id, observed_at) uniqueness with
@@ -1230,14 +1339,8 @@ class TheCatalogIsLookedUpOncePerBatchTest(unittest.TestCase):
         """An unchanged row must be skipped by the upsert using the hash the
         SCD2 pass already fetched -- not a second, possibly different one."""
         row = _catalog_row("1", "Pikachu")
-        stored = {
-            "pricecharting_id": "1",
-            "content_hash": row["content_hash"],
-            "currency": "USD",
-            **{c: row.get(c) for c in ("loose_price_cents", "cib_price_cents",
-                                       "new_price_cents", "graded_price_cents",
-                                       "box_only_price_cents", "manual_only_price_cents")},
-        }
+        stored = {"pricecharting_id": "1",
+                  **{c: row.get(c) for c in CATALOG_METADATA_SIGNATURE_COLUMNS}}
         transport, client, catalog_gets = self._run_both_passes([row], [], [stored])
         self.assertEqual(len(catalog_gets), 1)
         self.assertEqual(transport.upserted_rows, [],
@@ -1246,7 +1349,8 @@ class TheCatalogIsLookedUpOncePerBatchTest(unittest.TestCase):
 
     def test_a_changed_row_is_still_upserted_from_the_reused_hash(self) -> None:
         row = _catalog_row("1", "Pikachu")
-        stale = {"pricecharting_id": "1", "content_hash": "something-else"}
+        stale = {"pricecharting_id": "1", "product_name": "A Different Name",
+                 "console_name": "Pokemon Cards"}
         transport, _, catalog_gets = self._run_both_passes([row], [], [stale])
         self.assertEqual(len(catalog_gets), 1)
         self.assertEqual(len(transport.upserted_rows), 1)
@@ -1300,3 +1404,35 @@ class TheCatalogIsLookedUpOncePerBatchTest(unittest.TestCase):
         self.assertEqual(len(catalog_gets), 2, "the uncovered batch was not refetched")
         self.assertEqual(client.catalog_lookup_stats["reused"], 0)
 
+
+
+class TheCopyWriterCannotSilentlyUndoPR4Test(unittest.TestCase):
+    """scripts/tier3_copy_writer.py is two PRs behind and must not run.
+
+    Its merge still gates the catalog on a price-inclusive content_hash and
+    writes an SCD2 version whenever change_hash differs. Running it would undo
+    #213 and PR 4 at once: every price move would rewrite the 25 GB search
+    document and mint a version, and pricecharting_current_price would never be
+    written -- leaving Discover and catalog detail on prices frozen at whatever
+    that run left behind.
+
+    Nothing reaches it today (its only caller is a suspended cron, and the
+    staged ingester hardcodes WRITE_REST). This keeps that true by
+    construction rather than by memory.
+    """
+
+    def test_constructing_it_refuses(self) -> None:
+        from scripts.tier3_copy_writer import CopyCatalogWriter
+
+        with self.assertRaises(NotImplementedError) as caught:
+            CopyCatalogWriter("postgresql://example/db")
+        message = str(caught.exception)
+        self.assertIn("current_price", message)
+        self.assertIn("content_hash", message)
+
+    def test_the_message_says_what_to_do_about_it(self) -> None:
+        from scripts.tier3_copy_writer import CopyCatalogWriter
+
+        with self.assertRaises(NotImplementedError) as caught:
+            CopyCatalogWriter("postgresql://example/db")
+        self.assertIn("import_pricecharting_catalog", str(caught.exception))
