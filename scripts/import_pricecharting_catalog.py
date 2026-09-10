@@ -551,6 +551,53 @@ CATALOG_METADATA_SIGNATURE_COLUMNS = tuple(
 )
 
 
+def catalog_metadata_hash(row: dict[str, Any]) -> str:
+    """Hash of the non-price signature columns only.
+
+    Used as the gate for writing pricecharting_catalog. content_hash cannot
+    serve: it covers prices, so once the catalog stops carrying daily cents it
+    would differ on every price move and rewrite the 25 GB search document --
+    the exact write this PR removes.
+
+    Cached per id rather than the columns themselves: a full CSV refresh runs
+    millions of rows through one process, and holding ~9 text columns for each
+    measured in the hundreds of MB where a hash is ~150 bytes.
+    """
+    payload = {column: row.get(column) for column in CATALOG_METADATA_SIGNATURE_COLUMNS}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+BROWSE_KEY_COLUMNS = ("category", "platform_group")
+
+
+def browse_keys_differ(catalog_row: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Whether the Discover browse keys on the current-price row are stale.
+
+    pricecharting_current_price carries category and platform_group so the
+    browse indexes can live there. A metadata-only rename that leaves prices
+    untouched still has to reach that copy, or browse serves the old key until
+    the next price move -- which for a stable item may be never.
+    """
+    return any(
+        (catalog_row.get(column) or None) != (current.get(column) or None)
+        for column in BROWSE_KEY_COLUMNS
+    )
+
+
+def to_current_price_row(catalog_row: dict[str, Any]) -> dict[str, Any]:
+    """The pricecharting_current_price shape for one parsed CSV/API row."""
+    return {
+        "pricecharting_id": catalog_row.get("pricecharting_id"),
+        **{column: catalog_row.get(column) for column in PRICE_OBSERVATION_COLUMNS},
+        "currency": catalog_row.get("currency") or "USD",
+        "observed_at": source_timestamp(catalog_row.get("source_downloaded_at")),
+        "source_file": catalog_row.get("source_file"),
+        "category": catalog_row.get("category"),
+        "platform_group": catalog_row.get("platform_group"),
+    }
+
+
 def metadata_differs(catalog_row: dict[str, Any], current: dict[str, Any]) -> bool:
     """Whether anything OTHER than price differs from the stored SCD2 version.
 
@@ -847,6 +894,7 @@ class SupabaseCatalogClient:
             # They are not: the snapshot insert is the write that stays, the
             # close+insert pair is the write that mostly went away in #213,
             # and a single number cannot show that.
+            "current_price_upsert": 0.0,
             "price_snapshot_insert": 0.0,
             "scd2_close": 0.0,
             "scd2_insert": 0.0,
@@ -864,6 +912,8 @@ class SupabaseCatalogClient:
         # "never looked up" mean different things -- the first is a new item,
         # the second means the cache cannot answer and a fetch must happen.
         self.catalog_lookup_stats: dict[str, int] = {"fetched": 0, "reused": 0}
+        self.current_price_stats: dict[str, int] = {
+            "upserted": 0, "priceChanged": 0, "browseKeysOnly": 0}
         self._catalog_hash_cache: dict[str, Any] = {}
         self._catalog_lookup_covered: set[str] = set()
         self.price_history_stats: dict[str, int] = {
@@ -926,7 +976,15 @@ class SupabaseCatalogClient:
                     for row in batch:
                         product_id = str(row.get("pricecharting_id") or "").strip()
                         current = current_by_id.get(product_id)
-                        if current and current.get("content_hash") == row.get("content_hash"):
+                        # Metadata, not content_hash. content_hash covers the
+                        # six price columns, so gating on it rewrote the search
+                        # document -- 15 indexes, ~7 GB of GIN -- every time a
+                        # price moved, although no searchable text had changed.
+                        # Measured at 49.7% of a 350-set ingest. Prices now go
+                        # to pricecharting_current_price and never touch this
+                        # table.
+                        incoming = catalog_metadata_hash(row)
+                        if current is not None and current.get("metadata_hash") == incoming:
                             skipped += 1
                             continue
                         changed_rows.append(row)
@@ -972,6 +1030,83 @@ class SupabaseCatalogClient:
             )
         return total
 
+    def _fetch_current_prices(
+        self,
+        client: httpx.Client,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """The batch's current prices and browse keys.
+
+        The price baseline is pricecharting_current_price itself, not the
+        catalog. Once the catalog stops being written for price changes its
+        cents freeze, and comparing against a frozen value reports "changed"
+        on every run forever -- the same stale-baseline trap #213 hit when the
+        SCD2 row stopped advancing, one table along.
+
+        category and platform_group come back too so a metadata-only rename can
+        be detected and pushed into the browse keys without a price move.
+        """
+        ids = [
+            str(row.get("pricecharting_id") or "").strip()
+            for row in rows
+            if str(row.get("pricecharting_id") or "").strip()
+        ]
+        if not ids:
+            return {}
+        _assert_lookup_fits(ids, what="current price")
+        response = client.get(
+            f"{self.supabase_url}/rest/v1/pricecharting_current_price",
+            params={
+                "select": (
+                    "pricecharting_id,currency,category,platform_group,"
+                    + ",".join(PRICE_OBSERVATION_COLUMNS)
+                ),
+                "pricecharting_id": f"in.({','.join(ids)})",
+            },
+            headers=self._headers(),
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise SystemExit(
+                "Supabase current price lookup failed "
+                f"with HTTP {response.status_code}: {response.text}"
+            ) from exc
+        rows_payload = response.json()
+        if not isinstance(rows_payload, list):
+            raise SystemExit("Supabase current price lookup returned invalid data.")
+        _assert_lookup_complete(ids, rows_payload, what="current price")
+        return {
+            str(row.get("pricecharting_id")): row
+            for row in rows_payload
+            if isinstance(row, dict) and row.get("pricecharting_id")
+        }
+
+    def _upsert_current_price_rows(
+        self,
+        client: httpx.Client,
+        rows: list[dict[str, Any]],
+    ) -> int:
+        """Upsert into pricecharting_current_price. One row per id, always."""
+        if not rows:
+            return 0
+        response = client.post(
+            f"{self.supabase_url}/rest/v1/pricecharting_current_price",
+            params={"on_conflict": "pricecharting_id"},
+            json=rows,
+            headers={**self._headers(),
+                     "Prefer": "resolution=merge-duplicates,return=minimal"},
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise SystemExit(
+                "Supabase current price upsert failed "
+                f"with HTTP {response.status_code}: {response.text}"
+            ) from exc
+        self.current_price_stats["upserted"] += len(rows)
+        return len(rows)
+
     def _remember_catalog_hashes(
         self,
         rows: list[dict[str, Any]],
@@ -990,7 +1125,7 @@ class SupabaseCatalogClient:
             self._catalog_lookup_covered.add(product_id)
             found = fetched.get(product_id)
             if found is not None:
-                self._catalog_hash_cache[product_id] = found.get("content_hash")
+                self._catalog_hash_cache[product_id] = catalog_metadata_hash(found)
 
     def _current_catalog_hashes(
         self,
@@ -1012,10 +1147,18 @@ class SupabaseCatalogClient:
             if str(row.get("pricecharting_id") or "").strip()
         ]
         if not ids or not self._catalog_lookup_covered.issuperset(ids):
-            return self._fetch_current_catalog_hashes(client, rows)
+            # Normalised to the same shape the cached branch returns. They used
+            # to differ -- the fetch path handed back raw rows while the cache
+            # handed back a hash -- so the gate silently compared against None
+            # and rewrote every row it was meant to skip.
+            fetched = self._fetch_current_catalog_hashes(client, rows)
+            return {
+                product_id: {"metadata_hash": catalog_metadata_hash(found)}
+                for product_id, found in fetched.items()
+            }
         self.catalog_lookup_stats["reused"] += len(ids)
         return {
-            product_id: {"content_hash": self._catalog_hash_cache[product_id]}
+            product_id: {"metadata_hash": self._catalog_hash_cache[product_id]}
             for product_id in ids
             if product_id in self._catalog_hash_cache
         }
@@ -1041,16 +1184,14 @@ class SupabaseCatalogClient:
         response = client.get(
             f"{self.supabase_url}/rest/v1/pricecharting_catalog",
             params={
-                # Prices come along because pricecharting_catalog is now the
-                # ROLLING BASELINE for the snapshot gate. sync_scd2_history_rows
-                # runs BEFORE upsert_rows, so these are the previous run's
-                # prices -- exactly the comparison the frozen SCD2 row can no
-                # longer provide. Fetched in the existing lookup so the gate
-                # costs no extra round trip.
+                # METADATA, not prices. The catalog stopped being the price
+                # baseline in this PR -- pricecharting_current_price is, and it
+                # has its own lookup. What the catalog is still authoritative
+                # for is its own metadata, which is what decides whether the
+                # 25 GB search document gets rewritten at all.
                 "select": (
-                    "pricecharting_id,content_hash,currency,"
-                    "loose_price_cents,cib_price_cents,new_price_cents,"
-                    "graded_price_cents,box_only_price_cents,manual_only_price_cents"
+                    "pricecharting_id,"
+                    + ",".join(CATALOG_METADATA_SIGNATURE_COLUMNS)
                 ),
                 "pricecharting_id": f"in.({','.join(ids)})",
             },
@@ -1100,14 +1241,16 @@ class SupabaseCatalogClient:
                 try:
                     comparison_started_at = time.perf_counter()
                     current_by_id = self._fetch_current_history_rows(client, batch)
-                    # The price baseline no longer comes from the SCD2 row.
-                    # Once price-only changes stop writing versions, that row
-                    # freezes at whatever the prices were when metadata last
-                    # moved -- so a price that changed once would compare as
-                    # "changed" against that stale value every single day and
-                    # write a redundant snapshot per item per run, forever.
-                    # pricecharting_catalog still advances every run.
+                    # Each gate reads the table it is about to write. The SCD2
+                    # row decides whether a version is written, the catalog row
+                    # whether the search document is rewritten, the current
+                    # price row whether a snapshot and a price upsert happen.
+                    # Inferring one from another is how a partial failure turns
+                    # into a permanently missed write: if the catalog write
+                    # fails after the SCD2 version lands, a gate reading SCD2
+                    # would conclude the catalog is up to date forever.
                     catalog_by_id = self._fetch_current_catalog_hashes(client, batch)
+                    price_by_id = self._fetch_current_prices(client, batch)
                     self._remember_catalog_hashes(batch, catalog_by_id)
                     self.phase_seconds["scd2_comparison"] += (
                         time.perf_counter() - comparison_started_at
@@ -1115,12 +1258,13 @@ class SupabaseCatalogClient:
                     rows_to_insert = []
                     changed_ids = []
                     price_observations = []
+                    current_price_rows: list[dict[str, Any]] = []
                     for row in batch:
                         product_id = str(row.get("pricecharting_id") or "").strip()
                         if not product_id:
                             continue
                         current = current_by_id.get(product_id)
-                        catalog_current = catalog_by_id.get(product_id)
+                        price_current = price_by_id.get(product_id)
                         # Two independent decisions, deliberately not chained.
                         # An earlier version of this short-circuited on
                         # change_hash equality before classifying, which is
@@ -1132,11 +1276,21 @@ class SupabaseCatalogClient:
                             if current:
                                 changed_ids.append(product_id)
                             rows_to_insert.append(history_row)
-                        # A price move is a snapshot, never a version. The
-                        # baseline is the catalog row (previous run), not the
-                        # SCD2 row -- see _fetch_current_catalog_hashes.
-                        if catalog_current is None or prices_differ(row, catalog_current):
+                        # A price move is a snapshot plus a current-price
+                        # upsert, never a catalog write and never a version.
+                        price_moved = (price_current is None
+                                       or prices_differ(row, price_current))
+                        if price_moved:
                             price_observations.append(to_price_observation_row(row))
+                            self.current_price_stats["priceChanged"] += 1
+                            current_price_rows.append(to_current_price_row(row))
+                        elif price_current is not None and browse_keys_differ(row, price_current):
+                            # Bullet 2: a rename that leaves the price alone
+                            # still has to reach the browse keys, or Discover
+                            # browses the old category until the next price
+                            # move -- which for a stable item may be never.
+                            self.current_price_stats["browseKeysOnly"] += 1
+                            current_price_rows.append(to_current_price_row(row))
 
                     insert_started_at = time.perf_counter()
                     # Price observations are written BEFORE the legacy
@@ -1153,6 +1307,12 @@ class SupabaseCatalogClient:
                     # order of failure converges; neither can produce a
                     # legacy version whose price observation is silently
                     # unrecoverable.
+                    if current_price_rows:
+                        current_price_started_at = time.perf_counter()
+                        self._upsert_current_price_rows(client, current_price_rows)
+                        self.phase_seconds["current_price_upsert"] += (
+                            time.perf_counter() - current_price_started_at
+                        )
                     if price_observations:
                         self._insert_price_observation_rows(client, price_observations)
                         self.phase_seconds["price_snapshot_insert"] += (

@@ -236,3 +236,7 @@ begin
 end;
 $function$
 
+-- NOTE: already applied to production on 2026-09-10, so this did NOT run
+-- there. Kept for fresh environments; in production the reload is a
+-- deploy-time step, not a migration line.
+NOTIFY pgrst, 'reload schema';

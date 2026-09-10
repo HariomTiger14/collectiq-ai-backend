@@ -125,3 +125,16 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS
 CREATE INDEX CONCURRENTLY IF NOT EXISTS
     pricecharting_current_price_loose_price_idx
     ON public.pricecharting_current_price (loose_price_cents);
+
+-- Step 4 (transactional): tell PostgREST the table exists.
+--
+-- PostgREST caches the schema and will 404 or 503 on a table it has not
+-- reloaded. Applied late on 2026-09-10 after catalog detail briefly failed for
+-- exactly this reason -- the table was live and the API could not see it. Run
+-- this after ANY new table, column or RPC, not just this one.
+
+-- NOTE: this file was already applied to production on 2026-09-09/10, so
+-- this statement did NOT run there. It is here so a fresh environment
+-- rebuilt from migrations gets the reload. In production, run it by hand
+-- once, at the moment something new is actually exposed to PostgREST.
+NOTIFY pgrst, 'reload schema';

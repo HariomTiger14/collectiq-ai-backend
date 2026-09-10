@@ -104,6 +104,7 @@ class _Stats:
         self.price_history_stats = {
             "attempted": 12, "inserted": 11, "duplicateSkipped": 1, "failed": 0}
         self.catalog_lookup_stats = {"fetched": 20, "reused": 20}
+        self.current_price_stats = {"upserted": 7, "priceChanged": 6, "browseKeysOnly": 1}
 
 
 def _run(store, *, wrote=True, stats=None, argv=("--commit",)):
@@ -445,6 +446,13 @@ class ItReportsWhereTheTimeWentTest(unittest.TestCase):
         lookups = self._summary()["catalogLookups"]
         self.assertEqual(lookups["fetched"], 20)
         self.assertEqual(lookups["reused"], 20)
+
+    def test_current_price_writes_are_reported(self) -> None:
+        """The counter that shows PR 4 actually moved the writes."""
+        current = self._summary()["currentPrice"]
+        self.assertEqual(current["upserted"], 7)
+        self.assertEqual(current["priceChanged"], 6)
+        self.assertEqual(current["browseKeysOnly"], 1)
 
     def test_snapshot_counts_ride_along(self) -> None:
         price_history = self._summary()["priceHistory"]

@@ -6,6 +6,10 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.services.pricing.catalog_search_service import (
+    CURRENT_PRICE_CENTS_COLUMNS,
+    CURRENT_PRICE_COLUMNS,
+)
 from app.services.pricing.admin_review_queue_service import _total_from_content_range
 from app.services.pricing.catalog_search_service import (
     PRICECHARTING_CATEGORY_GROUPS,
@@ -157,6 +161,14 @@ class AdminCatalogService:
         if not update:
             raise AdminCatalogError("At least one catalog field is required.")
         row = self._repository.update_catalog_item(item_id, update)
+        # Bullet 2, console half. pricecharting_current_price carries category
+        # and platform_group so the Discover browse indexes can live on it. The
+        # ingest path rewrites them whenever a CSV rename arrives, but an admin
+        # edit never goes through ingest -- so without this, an item recategorised
+        # here browses under its old category until its price happens to move,
+        # which for a stable item may be never.
+        if any(column in update for column in BROWSE_KEY_COLUMNS):
+            self._repository.sync_current_price_browse_keys(item_id, row)
         return {"success": True, "itemId": item_id, "item": row}
 
     def list_items(
@@ -592,6 +604,30 @@ class SupabaseAdminCatalogRepository:
             return payload[0]
         raise AdminCatalogError("Catalog item was not found.")
 
+    def sync_current_price_browse_keys(
+        self, catalog_id: str, row: dict[str, Any]
+    ) -> None:
+        """Push category/platform_group onto the current-price row.
+
+        Cents are deliberately untouched: this is a metadata edit, and the
+        console has no business restating a price it did not change.
+
+        A miss is not an error. An id with no current-price row simply has
+        nothing to keep in sync -- raising here would fail an admin edit that
+        actually succeeded.
+        """
+        update = {column: row.get(column) for column in BROWSE_KEY_COLUMNS
+                  if column in row}
+        if not update:
+            return
+        self._request(
+            "PATCH",
+            "/rest/v1/pricecharting_current_price",
+            params={"pricecharting_id": f"eq.{catalog_id}"},
+            json_payload=update,
+            extra_headers={"Prefer": "return=minimal"},
+        )
+
     def list_catalog_rows(
         self,
         *,
@@ -630,6 +666,14 @@ class SupabaseAdminCatalogRepository:
             "price_desc": f"{price_column}.desc.nullslast",
         }.get(sort or "", default_order)
         table_name = "kicksdb_catalog" if source == "kicksdb" else "pricecharting_catalog"
+        # PriceCharting cents live on pricecharting_current_price now. Sorting
+        # or filtering by the catalog's own copy would rank by whatever those
+        # columns froze at when the writers stopped maintaining them -- the
+        # console would look right and be wrong, which is worse than an error.
+        if source != "kicksdb" and _price_drives_the_query(
+            sort=sort, min_price=min_price, max_price=max_price
+        ):
+            table_name = "pricecharting_current_price"
         params = {"select": "*", "order": order, "limit": str(limit), "offset": str(offset)}
         params.update(_catalog_filter_params(
             source, category=category, category_group=category_group, min_price=min_price, max_price=max_price,
@@ -637,7 +681,66 @@ class SupabaseAdminCatalogRepository:
         payload = self._request("GET", f"/rest/v1/{table_name}", params=params)
         if not isinstance(payload, list):
             raise AdminCatalogError("Supabase catalog response shape was invalid.")
-        return [row for row in payload if isinstance(row, dict)]
+        rows = [row for row in payload if isinstance(row, dict)]
+        if source == "kicksdb":
+            return rows
+        if table_name == "pricecharting_current_price":
+            rows = self._hydrate_catalog_rows(rows)
+        return self._overlay_current_prices(rows)
+
+    def _hydrate_catalog_rows(
+        self, price_rows: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Turn a page of current-price rows into full catalog rows.
+
+        Ordering is taken from `price_rows` and re-imposed afterwards: a
+        PostgREST `in.()` lookup returns whatever order it likes, and the page
+        was ordered by price on purpose.
+        """
+        ids = [str(row.get("pricecharting_id") or "").strip() for row in price_rows]
+        ids = [item for item in ids if item]
+        if not ids:
+            return []
+        payload = self._request(
+            "GET",
+            "/rest/v1/pricecharting_catalog",
+            params={"select": "*", "pricecharting_id": f"in.({','.join(ids)})",
+                    "limit": str(len(ids))},
+        )
+        by_id = {str(row.get("pricecharting_id")): row
+                 for row in (payload if isinstance(payload, list) else [])
+                 if isinstance(row, dict)}
+        return [by_id[item] for item in ids if item in by_id]
+
+    def _overlay_current_prices(
+        self, rows: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Replace each row's cents with the current-price row's.
+
+        Applied even when the lookup misses, matching the SQL overlay and
+        catalog detail: once the catalog's cents freeze, showing them is
+        showing a stale number with no indication that it is stale.
+        """
+        ids = [str(row.get("pricecharting_id") or "").strip() for row in rows]
+        ids = [item for item in ids if item]
+        if not ids:
+            return rows
+        payload = self._request(
+            "GET",
+            "/rest/v1/pricecharting_current_price",
+            params={"select": ",".join(("pricecharting_id", *CURRENT_PRICE_COLUMNS)),
+                    "pricecharting_id": f"in.({','.join(ids)})",
+                    "limit": str(len(ids))},
+        )
+        by_id = {str(row.get("pricecharting_id")): row
+                 for row in (payload if isinstance(payload, list) else [])
+                 if isinstance(row, dict)}
+        for row in rows:
+            current = by_id.get(str(row.get("pricecharting_id") or "").strip()) or {}
+            for column in CURRENT_PRICE_CENTS_COLUMNS:
+                row[column] = current.get(column)
+            row["currency"] = current.get("currency") or "USD"
+        return rows
 
     def search_catalog_rows(
         self,
@@ -1227,6 +1330,27 @@ class SupabaseAdminCatalogRepository:
 # PRICECHARTING_CATEGORY_GROUPS / PRICECHARTING_PLATFORM_GROUPS now live in
 # catalog_search_service.py (imported above) -- shared with the public/
 # mobile Discover search, which needs the exact same taxonomy.
+
+
+# The two columns pricecharting_current_price carries so the Discover browse
+# indexes can live there. Kept as one list so the ingest writer
+# (scripts/import_pricecharting_catalog.py) and this console path cannot drift
+# on which keys have to be mirrored.
+BROWSE_KEY_COLUMNS = ("category", "platform_group")
+
+
+def _price_drives_the_query(
+    *, sort: str | None, min_price: float | None, max_price: float | None
+) -> bool:
+    """Whether this listing is ordered or filtered by price.
+
+    Only then does the page have to be driven from pricecharting_current_price;
+    every other listing still leads with the catalog, which is what carries the
+    identity columns the console shows.
+    """
+    return (sort or "") in ("price_asc", "price_desc") or (
+        min_price is not None or max_price is not None
+    )
 
 
 def _catalog_filter_params(
