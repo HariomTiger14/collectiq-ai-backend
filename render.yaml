@@ -34,7 +34,15 @@ services:
     branch: main
     schedule: "30 14 * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m scripts.refresh_pricecharting_catalog --batch-size 1000 --timeout-seconds 600 --sleep-between-sources-seconds 600
+    # --batch-size 900 (down from 1000 on 2026-09-12): upsert_rows and
+    # sync_scd2_history_rows refuse a batch at or above PostgREST's
+    # 1,000-row lookup cap, because a full-cap reply cannot be told apart
+    # from a truncated one. 1000 tripped that guard on every batch from
+    # 2026-09-08, import_batch swallowed the ValueError, and the run still
+    # reported success -- five CSV catalogs went unwritten for five days
+    # while the ledger showed five green runs. Must stay strictly below
+    # POSTGREST_MAX_LOOKUP_ROWS; a test pins this line.
+    startCommand: python -m scripts.refresh_pricecharting_catalog --batch-size 900 --timeout-seconds 600 --sleep-between-sources-seconds 600
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8

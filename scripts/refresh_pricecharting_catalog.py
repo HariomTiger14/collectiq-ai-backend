@@ -75,6 +75,13 @@ def main(argv: list[str] | None = None) -> int:
                 csv_limiter=csv_limiter,
             )
             summaries.append(summary)
+            # A source can finish without raising and still have failed: every
+            # batch write rejected, or rows parsed and none written. Both used
+            # to return a zero indistinguishable from "nothing changed".
+            if summary.get("failed"):
+                reason = summary.get("failureReason") or "unknown"
+                print(f"Source {source} wrote nothing: {reason}", flush=True)
+                failures.append({"source": source, "error": reason})
         except Exception as error:  # noqa: BLE001 - reported, not swallowed
             print(
                 f"Source {source} failed: {type(error).__name__}: {error}",
@@ -96,6 +103,10 @@ def main(argv: list[str] | None = None) -> int:
                 "validRows": sum(summary["validRows"] for summary in summaries),
                 "importedRows": sum(summary["importedRows"] for summary in summaries),
                 "historyRows": sum(summary["historyRows"] for summary in summaries),
+                # Reported, never gated on. After #216 this is the number that
+                # shows a night did something: importedRows and historyRows are
+                # both legitimately zero when only prices moved.
+                "currentPrice": dict(getattr(client, "current_price_stats", {}) or {}),
                 "archivedFiles": [
                     summary["archivePath"]
                     for summary in summaries
@@ -233,6 +244,7 @@ def import_source_file(
     valid_rows = 0
     imported_rows = 0
     history_rows = 0
+    batch_failed = False
     batch: list[dict[str, Any]] = []
     seen_in_batch: set[str] = set()
 
@@ -258,6 +270,7 @@ def import_source_file(
                 )
                 imported_rows += result["importedRows"]
                 history_rows += result["historyRows"]
+                batch_failed = batch_failed or result["batchFailed"]
                 batch = []
                 seen_in_batch = set()
 
@@ -271,7 +284,22 @@ def import_source_file(
         )
         imported_rows += result["importedRows"]
         history_rows += result["historyRows"]
+        batch_failed = batch_failed or result["batchFailed"]
 
+    # Deliberately NOT failing on "parsed rows, wrote none".
+    #
+    # That was in an earlier draft of this fix and it was wrong. importedRows
+    # counts CATALOG writes and historyRows counts SCD2 version inserts, and
+    # since #213/#216 a perfectly healthy night writes neither: prices go to
+    # pricecharting_current_price, the catalog is touched only for metadata
+    # changes and new items, and SCD2 only for metadata. So the quiet second
+    # night after a catch-up would look identical to the five silent failures
+    # and exit 1 while Discover was updating correctly.
+    #
+    # The five silent nights are covered by the ValueError no longer being
+    # swallowed: a batch-size over the cap can no longer return a quiet zero.
+    # What remains is batchFailed, which means a write was attempted and did
+    # not land -- the only thing here that is unambiguously wrong.
     print(f"Processed {source_name} with {input_rows} rows.", flush=True)
     return {
         "source": source_name,
@@ -279,6 +307,8 @@ def import_source_file(
         "validRows": valid_rows,
         "importedRows": imported_rows,
         "historyRows": history_rows,
+        "failed": bool(dry_run is False and batch_failed),
+        "failureReason": "batch_write_failed" if batch_failed else None,
     }
 
 
@@ -291,7 +321,7 @@ def import_batch(
     imported_rows: int,
 ) -> dict[str, int]:
     if dry_run:
-        return {"importedRows": 0, "historyRows": 0}
+        return {"importedRows": 0, "historyRows": 0, "batchFailed": False}
     if client is None:
         raise SystemExit("Supabase client is required for non-dry-run refresh.")
     # A single slow/failing write (e.g. a Postgres statement timeout on the
@@ -302,11 +332,29 @@ def import_batch(
     try:
         history_total = client.sync_scd2_history_rows(batch, batch_size=batch_size)
         total = client.upsert_rows(batch, batch_size=batch_size)
+    except ValueError:
+        # Fail closed, loudly. A ValueError from the writer is a programming
+        # error -- a batch size at or above the PostgREST lookup cap, or a
+        # non-positive one -- and no number of retries fixes it. Catching it
+        # is how this job reported five consecutive green runs while writing
+        # nothing from 2026-09-08 to 2026-09-11: --batch-size 1000 tripped the
+        # cap guard on every batch, the ValueError was caught here, and the
+        # zero it returned was indistinguishable from "nothing had changed".
+        raise
     except (SystemExit, Exception) as exc:
+        # Still tolerated, and deliberately including SystemExit: the writer
+        # raises SystemExit for an HTTP 500 / 57014 statement timeout, which is
+        # transient database pressure, not a bug. Aborting the run on one slow
+        # write is the failure mode fixed on 2026-08-29, where a single 503 on
+        # the first CSV cost every later category its daily refresh.
+        #
+        # What changed is what the caller learns: the zero now arrives with
+        # batchFailed set, so a source that wrote nothing is reported as
+        # failed instead of passing for "nothing had changed".
         print(f"  Batch write failed, will retry next cycle: {exc}", flush=True)
-        return {"importedRows": 0, "historyRows": 0}
+        return {"importedRows": 0, "historyRows": 0, "batchFailed": True}
     print(f"Imported {imported_rows + total} rows for current source...", flush=True)
-    return {"importedRows": total, "historyRows": history_total}
+    return {"importedRows": total, "historyRows": history_total, "batchFailed": False}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -318,7 +366,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=",".join(DEFAULT_SOURCE_ORDER),
         help="Comma-separated source keys to refresh.",
     )
-    parser.add_argument("--batch-size", type=int, default=1000)
+    parser.add_argument("--batch-size", type=int, default=900)
     parser.add_argument("--timeout-seconds", type=float, default=600)
     parser.add_argument(
         "--sleep-between-sources-seconds",
