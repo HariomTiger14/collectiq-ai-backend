@@ -103,6 +103,10 @@ def main(argv: list[str] | None = None) -> int:
                 "validRows": sum(summary["validRows"] for summary in summaries),
                 "importedRows": sum(summary["importedRows"] for summary in summaries),
                 "historyRows": sum(summary["historyRows"] for summary in summaries),
+                # Reported, never gated on. After #216 this is the number that
+                # shows a night did something: importedRows and historyRows are
+                # both legitimately zero when only prices moved.
+                "currentPrice": dict(getattr(client, "current_price_stats", {}) or {}),
                 "archivedFiles": [
                     summary["archivePath"]
                     for summary in summaries
@@ -282,11 +286,20 @@ def import_source_file(
         history_rows += result["historyRows"]
         batch_failed = batch_failed or result["batchFailed"]
 
-    # A source that parsed rows and wrote none did not succeed, whatever the
-    # individual batches reported. Before this, "wrote nothing" and "nothing
-    # had changed" were the same zero, and the job reported success for five
-    # days while five CSV catalogs went stale.
-    wrote_nothing = valid_rows > 0 and imported_rows == 0 and history_rows == 0
+    # Deliberately NOT failing on "parsed rows, wrote none".
+    #
+    # That was in an earlier draft of this fix and it was wrong. importedRows
+    # counts CATALOG writes and historyRows counts SCD2 version inserts, and
+    # since #213/#216 a perfectly healthy night writes neither: prices go to
+    # pricecharting_current_price, the catalog is touched only for metadata
+    # changes and new items, and SCD2 only for metadata. So the quiet second
+    # night after a catch-up would look identical to the five silent failures
+    # and exit 1 while Discover was updating correctly.
+    #
+    # The five silent nights are covered by the ValueError no longer being
+    # swallowed: a batch-size over the cap can no longer return a quiet zero.
+    # What remains is batchFailed, which means a write was attempted and did
+    # not land -- the only thing here that is unambiguously wrong.
     print(f"Processed {source_name} with {input_rows} rows.", flush=True)
     return {
         "source": source_name,
@@ -294,11 +307,8 @@ def import_source_file(
         "validRows": valid_rows,
         "importedRows": imported_rows,
         "historyRows": history_rows,
-        "failed": bool(dry_run is False and (batch_failed or wrote_nothing)),
-        "failureReason": (
-            "batch_write_failed" if batch_failed
-            else "parsed_rows_but_wrote_none" if wrote_nothing else None
-        ),
+        "failed": bool(dry_run is False and batch_failed),
+        "failureReason": "batch_write_failed" if batch_failed else None,
     }
 
 

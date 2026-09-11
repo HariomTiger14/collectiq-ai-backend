@@ -144,9 +144,12 @@ class ATransientFailureIsToleratedButReportedTest(unittest.TestCase):
         self.assertFalse(result["batchFailed"])
 
 
-class ASourceThatWroteNothingIsAFailureTest(unittest.TestCase):
-    """The second hole: even with every batch 'succeeding', a source that
-    parsed rows and wrote none has not refreshed anything."""
+class WhatCountsAsAFailedSourceTest(unittest.TestCase):
+    """A write that was attempted and did not land -- and only that.
+
+    Not "wrote no catalog rows": after #213/#216 that is what a healthy
+    price-only night looks like.
+    """
 
     def _summary(self, client, text=None, batch_size=900):
         import tempfile
@@ -172,9 +175,19 @@ class ASourceThatWroteNothingIsAFailureTest(unittest.TestCase):
         self.assertTrue(summary["failed"])
         self.assertEqual(summary["failureReason"], "batch_write_failed")
 
-    def test_rows_parsed_and_none_written_marks_the_source_failed(self) -> None:
-        """The exact shape of the five green runs: validRows in the hundreds
-        of thousands, importedRows 0, success true."""
+    def test_a_quiet_night_writing_no_catalog_or_scd2_rows_is_NOT_a_failure(self) -> None:
+        """The correction that matters, and an earlier draft of this fix got
+        it backwards.
+
+        importedRows counts CATALOG writes; historyRows counts SCD2 version
+        inserts. Since #213/#216 a healthy night writes neither -- prices go to
+        pricecharting_current_price, the catalog is touched only for metadata
+        and new items. Treating that as failure would have exited 1 on the
+        quiet night after a catch-up, while Discover updated correctly.
+
+        The five silent nights are covered elsewhere: the cap ValueError is no
+        longer swallowed, so it cannot return a quiet zero.
+        """
 
         class _WritesNothing(_Client):
             def sync_scd2_history_rows(self, rows, *, batch_size):
@@ -186,8 +199,10 @@ class ASourceThatWroteNothingIsAFailureTest(unittest.TestCase):
         summary = self._summary(_WritesNothing())
         self.assertGreater(summary["validRows"], 0)
         self.assertEqual(summary["importedRows"], 0)
-        self.assertTrue(summary["failed"])
-        self.assertEqual(summary["failureReason"], "parsed_rows_but_wrote_none")
+        self.assertEqual(summary["historyRows"], 0)
+        self.assertFalse(summary["failed"],
+                         "a price-only night was reported as a failed source")
+        self.assertIsNone(summary["failureReason"])
 
     def test_a_normal_source_is_not_flagged(self) -> None:
         summary = self._summary(_Client())
@@ -242,12 +257,19 @@ class TheRunItselfFailsTest(unittest.TestCase):
               "importedRows": 100, "historyRows": 100, "archivePath": None,
               "failed": False, "failureReason": None}
 
-    def test_a_source_that_wrote_nothing_makes_the_run_fail(self) -> None:
+    def test_a_failed_batch_makes_the_run_fail(self) -> None:
         code, payload = self._run({**self._CLEAN, "importedRows": 0, "historyRows": 0,
                                    "failed": True,
-                                   "failureReason": "parsed_rows_but_wrote_none"})
-        self.assertFalse(payload["success"], "run reported success having written nothing")
-        self.assertEqual(code, 1, "exit code was zero on a run that wrote nothing")
+                                   "failureReason": "batch_write_failed"})
+        self.assertFalse(payload["success"], "run reported success after a failed write")
+        self.assertEqual(code, 1, "exit code was zero on a run whose writes failed")
+
+    def test_a_price_only_night_still_succeeds(self) -> None:
+        """millions parsed, zero catalog writes, zero SCD2 versions -- healthy."""
+        code, payload = self._run({**self._CLEAN, "importedRows": 0, "historyRows": 0,
+                                   "failed": False, "failureReason": None})
+        self.assertTrue(payload["success"])
+        self.assertEqual(code, 0)
 
     def test_the_reason_reaches_the_ledger(self) -> None:
         """`success: false` with no reason sends the next person to the logs."""
