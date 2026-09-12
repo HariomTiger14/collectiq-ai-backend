@@ -240,7 +240,10 @@ def main(argv: list[str] | None = None) -> int:
                   "-- the rest of the file was NOT attempted. Batch left "
                   "retryable from storage, registry NOT stamped.", flush=True)
             print(dump_and_report(summary, indent=2), flush=True)
-            return 0
+            # Non-zero: the write failed. The object stays in storage so the
+            # retry is free, but a run that ingested nothing is not a success,
+            # and two of these sat green in the ledger on 2026-09-08.
+            return 1
 
         # Only now. A set marked refreshed from data that never landed looks
         # exactly like a real refresh until someone reads the prices.

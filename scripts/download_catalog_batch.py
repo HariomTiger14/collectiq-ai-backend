@@ -261,7 +261,12 @@ def main(argv: list[str] | None = None) -> int:
                            mismatch=mismatch_detail(exc))
             print(f"REFUSING BATCH: {exc}", flush=True)
             print(dump_and_report(summary, indent=2), flush=True)
-            return 0
+            # Non-zero: a refusal is not backpressure. The file is a
+            # wrong-catalog response and the same sets will be claimed again
+            # next run, so it repeats until someone looks -- which is what
+            # happened on 2026-09-09, twice in two minutes, both recorded
+            # green. A vendor 503 stays a quiet 0 below; this does not.
+            return 1
 
         key = storage_key(args.source, batch_id)
         store.upload(key, temp_path)
