@@ -80,13 +80,17 @@ class ItIsOffUnlessAskedForTest(unittest.TestCase):
         self.assertTrue(parse_args(["--use-storage"]).use_storage)
 
 
-class TheCronIsStillOnTheOldPathTest(unittest.TestCase):
-    """Staging ships as code first and is switched on separately.
+class TheCronRunsTheStagedPathTest(unittest.TestCase):
+    """Inverted 2026-09-12 when the flag was switched on.
 
-    The switch is a deliberate operational step, taken only once a 14:30
-    ledger looks quiet -- not something that rides along with the branch that
-    wrote the feature. This fails the moment the start command starts staging,
-    so turning it on has to be a decision rather than a diff nobody noticed.
+    This test previously asserted the cron did NOT pass --use-storage, so that
+    enabling staging had to be a deliberate act rather than a diff nobody
+    noticed. It now asserts the opposite, for the same reason in the other
+    direction: turning it back off should be a decision too, not a quiet
+    revert.
+
+    It is kept rather than deleted because the yaml line is the one that
+    matters. The argparse default has never been what production runs.
     """
 
     def _start_command(self) -> str:
@@ -98,11 +102,11 @@ class TheCronIsStillOnTheOldPathTest(unittest.TestCase):
         self.assertIsNotNone(match, "refresh_pricecharting_catalog startCommand not found")
         return match.group(0)
 
-    def test_the_cron_does_not_pass_use_storage(self) -> None:
-        self.assertNotIn(
+    def test_the_cron_passes_use_storage(self) -> None:
+        self.assertIn(
             "--use-storage", self._start_command(),
-            "the cron was switched to storage; that is an operational decision, "
-            "not part of the branch that built it")
+            "staging was switched off; that is an operational decision and "
+            "should not happen by a silent revert of this line")
 
     def test_the_cron_still_passes_the_safe_batch_size(self) -> None:
         """Unrelated to staging, and the reason five nights wrote nothing."""
@@ -437,14 +441,20 @@ class RefreshSourceControlFlowTest(unittest.TestCase):
         """Without reaping this file is invisible and today re-downloads it."""
         from datetime import datetime, timedelta, timezone
 
-        stale = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()
+        # Two different clocks, deliberately. claimed_at decides whether the
+        # LEASE is stale; created_at decides whether the FILE is today's. An
+        # earlier version of this test used one timestamp for both, so whether
+        # it passed depended on where the wall clock sat relative to UTC
+        # midnight -- it went green by luck and red four hours later.
+        stale_lease = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()
+        staged_days_ago = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
         from unittest.mock import patch
 
         import scripts.refresh_pricecharting_catalog as module
 
         batch = {"batch_id": "b0", "source": "pokemon.csv", "status": INGESTING,
-                 "storage_key": "k", "attempts": 1, "claimed_at": stale,
-                 "created_at": stale}
+                 "storage_key": "k", "attempts": 1, "claimed_at": stale_lease,
+                 "created_at": staged_days_ago}
         store = _Store([batch])
         # The fake store returns rows by status, so reaping must flip it for
         # the later resume lookup to see it -- mirroring the real table.

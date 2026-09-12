@@ -42,7 +42,17 @@ services:
     # reported success -- five CSV catalogs went unwritten for five days
     # while the ledger showed five green runs. Must stay strictly below
     # POSTGREST_MAX_LOOKUP_ROWS; a test pins this line.
-    startCommand: python -m scripts.refresh_pricecharting_catalog --batch-size 900 --timeout-seconds 600 --sleep-between-sources-seconds 600
+    # --use-storage (2026-09-12): each CSV is staged in Supabase Storage
+    # before import, and a file a previous run left uningested is drained
+    # before today's download rather than instead of it. The vendor CSV
+    # endpoint allows one request per ten minutes ACCOUNT-WIDE, shared with
+    # the tier-3 rotation and the sets backfill, so a crash mid-import used
+    # to cost a slot another job needed. See #218.
+    #
+    # THIS LINE IS NOT WHAT RENDER RUNS. The dashboard start command is
+    # separate and must be changed by hand -- that gap is why --batch-size
+    # 1000 sat here writing nothing for five days (#217).
+    startCommand: python -m scripts.refresh_pricecharting_catalog --batch-size 900 --timeout-seconds 600 --sleep-between-sources-seconds 600 --use-storage
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
