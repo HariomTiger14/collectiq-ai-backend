@@ -604,6 +604,9 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
                 "unchanged_detection": 0.0,
                 "catalog_upsert": 0.0,
                 "scd2_comparison": 0.0,
+                "scd2_history_lookup": 0.0,
+                "catalog_metadata_lookup": 0.0,
+                "current_price_lookup": 0.0,
                 "current_price_upsert": 0.0,
                 "price_snapshot_insert": 0.0,
                 "scd2_close": 0.0,
@@ -1436,3 +1439,95 @@ class TheCopyWriterCannotSilentlyUndoPR4Test(unittest.TestCase):
         with self.assertRaises(NotImplementedError) as caught:
             CopyCatalogWriter("postgresql://example/db")
         self.assertIn("import_pricecharting_catalog", str(caught.exception))
+
+
+class TheThreeLookupsAreTimedApartTest(unittest.TestCase):
+    """"scd2_comparison" was three lookups under one name.
+
+    It reported ~65% of a 350-set ingest and was read -- by me, in writing --
+    as the SCD2 history GET. It is actually a GET against the 24 GB SCD2 table,
+    one against the 25 GB catalog, and one against the 2 GB current_price
+    table. Choosing which to optimise from that single number would have been
+    guessing, and the guess had already been made.
+    """
+
+    def _client_with_timings(self):
+        row = _catalog_row("1", "Pikachu")
+        transport = _FakeSupabaseTransport(current_rows=[], catalog_rows=[],
+                                           current_price_rows=[])
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+            client.sync_scd2_history_rows([row], batch_size=100)
+        return client
+
+    def test_each_lookup_has_its_own_timer(self) -> None:
+        client = self._client_with_timings()
+        for phase in ("scd2_history_lookup", "catalog_metadata_lookup",
+                      "current_price_lookup"):
+            with self.subTest(phase=phase):
+                self.assertGreater(client.phase_seconds[phase], 0.0,
+                                   f"{phase} was never timed")
+
+    def test_the_combined_timer_is_kept_for_comparability(self) -> None:
+        """Every measurement taken before the split reports scd2_comparison;
+        dropping it would make this run incomparable with all of them."""
+        client = self._client_with_timings()
+        self.assertGreater(client.phase_seconds["scd2_comparison"], 0.0)
+
+    def test_the_parts_do_not_exceed_the_whole(self) -> None:
+        client = self._client_with_timings()
+        parts = sum(client.phase_seconds[p] for p in
+                    ("scd2_history_lookup", "catalog_metadata_lookup",
+                     "current_price_lookup"))
+        self.assertLessEqual(parts, client.phase_seconds["scd2_comparison"] + 1e-6)
+
+
+class TheScd2LookupFetchesNothingItDoesNotReadTest(unittest.TestCase):
+    """change_hash was selected and never read.
+
+    PR 4 replaced the hash comparison with metadata_differs(); the column
+    stayed in the SELECT, fetched from a 24 GB table for every row of every
+    batch, feeding nothing.
+    """
+
+    def test_change_hash_is_not_selected(self) -> None:
+        import pathlib
+
+        source = pathlib.Path("scripts/import_pricecharting_catalog.py").read_text()
+        body = source[source.index("def _fetch_current_history_rows"):]
+        body = body[: body.index("def ", 10)]
+        self.assertNotIn("change_hash", body.split('"select"')[1].split(")")[0])
+
+    def test_the_gate_still_has_what_it_reads(self) -> None:
+        """Narrowing must not remove a column metadata_differs compares."""
+        import pathlib
+
+        source = pathlib.Path("scripts/import_pricecharting_catalog.py").read_text()
+        body = source[source.index("def _fetch_current_history_rows"):]
+        body = body[: body.index("def ", 10)]
+        self.assertIn("CATALOG_METADATA_SIGNATURE_COLUMNS", body)
+
+    def test_a_metadata_change_is_still_detected(self) -> None:
+        """The behavioural proof that the narrowing is safe."""
+        row = _catalog_row("1", "Pikachu")
+        renamed = dict(row); renamed["product_name"] = "Was Called This"
+        stored = {"pricecharting_id": "1",
+                  **{c: renamed.get(c) for c in CATALOG_METADATA_SIGNATURE_COLUMNS}}
+        transport = _FakeSupabaseTransport(current_rows=[stored],
+                                           catalog_rows=[stored],
+                                           current_price_rows=[stored])
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+            client.sync_scd2_history_rows([row], batch_size=100)
+        self.assertEqual(len(transport.inserted_rows), 1,
+                         "a renamed item stopped producing an SCD2 version")
