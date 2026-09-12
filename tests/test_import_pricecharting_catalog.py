@@ -1,5 +1,7 @@
 import unittest
 import base64
+import threading
+import time
 import json
 from unittest.mock import patch
 
@@ -1479,12 +1481,21 @@ class TheThreeLookupsAreTimedApartTest(unittest.TestCase):
         client = self._client_with_timings()
         self.assertGreater(client.phase_seconds["scd2_comparison"], 0.0)
 
-    def test_the_parts_do_not_exceed_the_whole(self) -> None:
+    def test_the_parts_may_exceed_the_whole_now_that_they_overlap(self) -> None:
+        """Inverted when the lookups went concurrent.
+
+        While they ran in sequence, the three timers summed to the block's wall
+        clock. They now run together, so each measures its own duration and
+        those durations overlap -- the sum EXCEEDING the wall clock is the
+        arithmetic signature of concurrency, not a bookkeeping error. Asserting
+        the old invariant would quietly fail the moment the overlap worked.
+        """
         client = self._client_with_timings()
         parts = sum(client.phase_seconds[p] for p in
                     ("scd2_history_lookup", "catalog_metadata_lookup",
                      "current_price_lookup"))
-        self.assertLessEqual(parts, client.phase_seconds["scd2_comparison"] + 1e-6)
+        self.assertGreater(parts, 0.0)
+        self.assertGreater(client.phase_seconds["scd2_comparison"], 0.0)
 
 
 class TheScd2LookupFetchesNothingItDoesNotReadTest(unittest.TestCase):
@@ -1531,3 +1542,202 @@ class TheScd2LookupFetchesNothingItDoesNotReadTest(unittest.TestCase):
             client.sync_scd2_history_rows([row], batch_size=100)
         self.assertEqual(len(transport.inserted_rows), 1,
                          "a renamed item stopped producing an SCD2 version")
+
+
+class TheThreeLookupsRunTogetherTest(unittest.TestCase):
+    """Measured on a 93,685-row Pokemon run: 73.1 + 50.4 + 34.6 = 158.0s of
+    lookups against 34s of writes, across 315 sequential round trips.
+
+    The 2 GB current_price table cost 329ms per batch against the 25 GB
+    catalog's 480ms -- 1.46x apart for a 12x size difference -- so the cost is
+    per-round-trip, not per-table. Overlapping the three is the lever.
+
+    Concurrency is asserted with a barrier rather than wall-clock timing: a
+    timing assertion on three instant fakes is a coin flip, and a flaky test
+    for a performance property is worse than none because it gets deleted.
+    """
+
+    def _service(self, handler):
+        transport = httpx.MockTransport(handler)
+        real = httpx.Client
+        patcher = patch(
+            "scripts.import_pricecharting_catalog.httpx.Client",
+            side_effect=lambda *a, **kw: real(*a, transport=transport, **kw))
+        return patcher, _service_client()
+
+    def test_all_three_lookups_are_in_flight_at_once(self) -> None:
+        """A barrier of 3 with a short timeout: if the lookups are serialised,
+        the first one waits for two partners that will never arrive."""
+        barrier = threading.Barrier(3, timeout=5)
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if any(path.endswith(t) for t in (
+                    "/pricecharting_catalog_history", "/pricecharting_catalog",
+                    "/pricecharting_current_price")) and request.method == "GET":
+                seen.append(path)
+                barrier.wait()
+            return httpx.Response(200, json=[])
+
+        real = httpx.Client
+        transport = httpx.MockTransport(handler)
+        with patch("scripts.import_pricecharting_catalog.httpx.Client",
+                   side_effect=lambda *a, **kw: real(*a, transport=transport, **kw)):
+            client = _service_client()
+            client.sync_scd2_history_rows([_catalog_row("1", "Pikachu")],
+                                          batch_size=100)
+        self.assertEqual(len(seen), 3, f"three lookups expected, saw {seen}")
+
+    def test_all_three_are_still_actually_called(self) -> None:
+        """Concurrency must not quietly drop one."""
+        paths: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                paths.append(request.url.path)
+            return httpx.Response(200, json=[])
+
+        real = httpx.Client
+        transport = httpx.MockTransport(handler)
+        with patch("scripts.import_pricecharting_catalog.httpx.Client",
+                   side_effect=lambda *a, **kw: real(*a, transport=transport, **kw)):
+            _service_client().sync_scd2_history_rows(
+                [_catalog_row("1", "Pikachu")], batch_size=100)
+        for table in ("pricecharting_catalog_history", "pricecharting_catalog",
+                      "pricecharting_current_price"):
+            with self.subTest(table=table):
+                self.assertTrue(any(p.endswith(table) for p in paths),
+                                f"{table} was never queried; paths={paths}")
+
+    def test_one_failing_lookup_fails_the_whole_batch(self) -> None:
+        """Never write holding two answers out of three: a gate reading a
+        table it never asked about would see "unchanged" and skip a real
+        write."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/pricecharting_current_price"):
+                return httpx.Response(500, json={"message": "boom"})
+            return httpx.Response(200, json=[])
+
+        real = httpx.Client
+        transport = httpx.MockTransport(handler)
+        with patch("scripts.import_pricecharting_catalog.httpx.Client",
+                   side_effect=lambda *a, **kw: real(*a, transport=transport, **kw)):
+            client = _service_client()
+            with self.assertRaises(PartialCatalogWriteError):
+                client.sync_scd2_history_rows([_catalog_row("1", "Pikachu")],
+                                              batch_size=100)
+
+    def test_a_failure_does_not_leave_a_partial_write(self) -> None:
+        posted: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                posted.append(request.url.path)
+            if request.url.path.endswith("/pricecharting_catalog_history") \
+                    and request.method == "GET":
+                return httpx.Response(500, json={"message": "boom"})
+            return httpx.Response(200, json=[])
+
+        real = httpx.Client
+        transport = httpx.MockTransport(handler)
+        with patch("scripts.import_pricecharting_catalog.httpx.Client",
+                   side_effect=lambda *a, **kw: real(*a, transport=transport, **kw)):
+            client = _service_client()
+            with self.assertRaises(PartialCatalogWriteError):
+                client.sync_scd2_history_rows([_catalog_row("1", "Pikachu")],
+                                              batch_size=100)
+        self.assertEqual(posted, [], f"wrote despite a failed lookup: {posted}")
+
+
+def _service_client() -> SupabaseCatalogClient:
+    return SupabaseCatalogClient(
+        supabase_url="https://example.supabase.co",
+        service_role_key=_fake_supabase_jwt("service_role"),
+        timeout_seconds=5,
+    )
+
+
+class TheParallelLookupsAreSafeAndLegibleTest(unittest.TestCase):
+    """Two properties mutation testing showed were unasserted."""
+
+    def test_each_lookup_gets_its_own_client(self) -> None:
+        """httpx.Client is not thread-safe. Sharing one across the three
+        workers is the kind of bug that works in every test and corrupts a
+        connection pool under real latency, so it is asserted structurally
+        rather than hoped for."""
+        seen: list[int] = []
+        client = _service_client()
+        original = client._fetch_current_history_rows
+
+        def record(own_client, batch):
+            seen.append(id(own_client))
+            return original(own_client, batch)
+
+        import concurrent.futures
+
+        a, b, c = object(), object(), object()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            with patch.object(client, "_fetch_current_history_rows",
+                              lambda cl, b_: seen.append(id(cl)) or {}), \
+                 patch.object(client, "_fetch_current_catalog_hashes",
+                              lambda cl, b_: seen.append(id(cl)) or {}), \
+                 patch.object(client, "_fetch_current_prices",
+                              lambda cl, b_: seen.append(id(cl)) or {}):
+                client._fetch_batch_lookups(pool, (a, b, c), [])
+        self.assertEqual(len(set(seen)), 3,
+                         "the three lookups shared a client; httpx.Client is "
+                         "not thread-safe")
+
+    def test_the_original_failure_is_what_surfaces(self) -> None:
+        """Re-raising the lookup's own exception, not letting a None result
+        crash downstream.
+
+        Both end the batch, so the outcome is the same -- but one reports
+        'HTTP 500 on the current price lookup' and the other reports
+        'NoneType has no attribute get', which sends the next person reading
+        the log to entirely the wrong place.
+        """
+        import concurrent.futures
+
+        client = _service_client()
+
+        def boom(cl, b_):
+            raise SystemExit("Supabase current price lookup failed with HTTP 500")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            with patch.object(client, "_fetch_current_history_rows",
+                              lambda cl, b_: {}), \
+                 patch.object(client, "_fetch_current_catalog_hashes",
+                              lambda cl, b_: {}), \
+                 patch.object(client, "_fetch_current_prices", boom):
+                with self.assertRaises(SystemExit) as caught:
+                    client._fetch_batch_lookups(pool, (1, 2, 3), [])
+        self.assertIn("current price lookup failed", str(caught.exception))
+
+    def test_every_lookup_is_waited_on_even_when_one_fails(self) -> None:
+        """Otherwise a worker outlives the batch and writes into phase_seconds
+        for a batch that already failed."""
+        import concurrent.futures
+
+        finished: list[str] = []
+        client = _service_client()
+
+        def slow_ok(name):
+            def run(cl, b_):
+                time.sleep(0.05)
+                finished.append(name)
+                return {}
+            return run
+
+        def boom(cl, b_):
+            raise SystemExit("first to fail")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            with patch.object(client, "_fetch_current_history_rows", boom), \
+                 patch.object(client, "_fetch_current_catalog_hashes", slow_ok("catalog")), \
+                 patch.object(client, "_fetch_current_prices", slow_ok("price")):
+                with self.assertRaises(SystemExit):
+                    client._fetch_batch_lookups(pool, (1, 2, 3), [])
+        self.assertEqual(sorted(finished), ["catalog", "price"],
+                         "a slower lookup was abandoned mid-flight")
