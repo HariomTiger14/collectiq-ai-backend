@@ -128,6 +128,25 @@ def main(argv: list[str] | None = None) -> int:
                 # shows a night did something: importedRows and historyRows are
                 # both legitimately zero when only prices moved.
                 "currentPrice": dict(getattr(client, "current_price_stats", {}) or {}),
+                # The client has accumulated these all along and this script
+                # never read them, so two full runs -- Saturday's manual
+                # five-file and Sunday's scheduled night -- produced the
+                # measurement in memory and discarded it at exit. #214 wired
+                # this reporting into the staged ingester only; #221 split the
+                # three lookup timers on the client without giving this path a
+                # way to emit them.
+                #
+                # Rounded because the consumer is a human reading a ledger row,
+                # and sorted largest-first for the same reason. Zeroes are kept
+                # rather than dropped: a phase that cost nothing is a fact
+                # worth seeing, and an absent key reads as "not measured".
+                "phaseSeconds": {
+                    name: round(value, 2)
+                    for name, value in sorted(
+                        (getattr(client, "phase_seconds", {}) or {}).items(),
+                        key=lambda item: -item[1],
+                    )
+                },
                 "archivedFiles": [
                     summary["archivePath"]
                     for summary in summaries
