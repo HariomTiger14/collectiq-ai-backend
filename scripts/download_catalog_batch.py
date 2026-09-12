@@ -74,7 +74,7 @@ from scripts.csv_source_policy import (
     validate_csv_families,
 )
 from scripts.backfill_pricecharting_sets import REQUEST_HEADERS
-from scripts.catalog_batch_store import BatchStore
+from scripts.catalog_batch_store import BatchStore, dedupe_by_console_uid
 from scripts.import_pricecharting_catalog import iter_rows_from_file
 
 DEFAULT_SOURCE = "sportscardspro"
@@ -154,7 +154,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"resuming pending batch {batch['batch_id']} "
               f"({batch['requested_count']} sets)", flush=True)
     else:
-        rows = store.claim_due_sets(source=args.source, limit=args.batch_size)
+        # Deduped HERE, not inside the store. It is batch-construction policy,
+        # not part of the rotation's queue predicate -- and a test double for
+        # the store would otherwise return raw rows and hide the whole thing,
+        # which is exactly what happened on the first attempt.
+        rows = dedupe_by_console_uid(
+            store.claim_due_sets(source=args.source, limit=args.batch_size))
         if not rows:
             summary["skippedReason"] = "no_due_sets"
             print("no sets due for refresh.", flush=True)
@@ -176,7 +181,27 @@ def main(argv: list[str] | None = None) -> int:
 
     batch_id = batch["batch_id"]
     uids = batch["console_uids"]
-    set_names = [r["set_name"] for r in rows] if rows else []
+    # Widened to every registry name sharing a requested console_uid. The
+    # vendor answers a uid with ITS canonical family name, which need not be
+    # the name of the row we claimed -- G9157 is registered as both
+    # '2015 Panini Donrus' and '2015 Panini Donruss'. Without this, a batch
+    # claiming one can be answered with the other, refused as a wrong-catalog
+    # response, and the same 350 sets reclaimed next run: a permanent jam.
+    #
+    # Not a weakening of the guard. A family matching a sibling of a REQUESTED
+    # uid is a requested set under a different label; a genuinely wrong catalog
+    # still matches no name of any requested uid.
+    # Derived from the BATCH's console_uids, not from the claimed rows, so it
+    # is populated on both paths. A resumed PENDING batch has no rows -- and
+    # with an empty expected list validate_csv_families returns early and
+    # performs NO family check at all, so the wrong-catalog guard was simply
+    # absent on every retry. That is worse than the jam this widening fixes:
+    # a jam refuses a good batch loudly, an absent guard accepts a bad one
+    # quietly.
+    claimed_names = {r["set_name"] for r in rows if r.get("set_name")} if rows else set()
+    set_names = sorted(
+        claimed_names | set(store.sibling_set_names(source=args.source, uids=uids))
+    )
     summary.update(batchId=batch_id, setsRequested=len(uids))
 
     assert_transition(PENDING, DOWNLOADING)

@@ -52,6 +52,14 @@ WRONG_CATALOG = "id,console-name,product-name,loose-price\n" + "".join(
 class _Store:
     """Stands in for BatchStore, recording every write."""
 
+    # Mirrors BatchStore. A fake missing a method its caller reads fails at
+    # runtime and nowhere else -- the same gap that let 39 mock handlers go
+    # green in #212.
+    sibling_names: list[str] = []
+
+    def sibling_set_names(self, *, source, uids):
+        return list(self.sibling_names)
+
     def __init__(self, *, due=None, batches=None):
         self._due = due if due is not None else [
             {"registry_id": f"r{i}", "console_uid": f"G{i}", "set_name": "1962 Bazooka"}
@@ -343,3 +351,108 @@ class ARefusedBatchExitsNonZeroTest(unittest.TestCase):
 
         source = pathlib.Path("scripts/download_catalog_batch.py").read_text()
         self.assertIn("return 1 if error_class == CLASS_BLOCKED else 0", source)
+
+
+class DuplicateConsoleUidDoesNotJamTheRotationTest(unittest.TestCase):
+    """Asserted through main(), not against the helpers.
+
+    dedupe_by_console_uid and the sibling lookup are both unit-tested in
+    tests/test_duplicate_console_uid.py, and both passed while mutations that
+    removed them from the DOWNLOADER entirely went unnoticed. The call site is
+    where the jam actually happens.
+    """
+
+    DUPE = [
+        {"registry_id": "r1", "console_uid": "G9157", "set_name": "2015 Panini Donrus"},
+        {"registry_id": "r2", "console_uid": "G9157", "set_name": "2015 Panini Donruss"},
+        {"registry_id": "r3", "console_uid": "G1", "set_name": "1962 Bazooka"},
+    ]
+
+    def test_the_uid_is_requested_only_once(self) -> None:
+        """Sent twice, one family comes back, validation passes, and BOTH rows
+        are stamped refreshed -- the duplicate having never been refreshed."""
+        store = _Store(due=list(self.DUPE))
+        _run(store)
+        uids = store.inserted[0]["console_uids"]
+        self.assertEqual(sorted(uids), ["G1", "G9157"],
+                         f"the duplicate uid was requested twice: {uids}")
+
+    def test_only_the_kept_row_is_claimed(self) -> None:
+        store = _Store(due=list(self.DUPE))
+        _run(store)
+        self.assertEqual(sorted(store.inserted[0]["registry_ids"]), ["r1", "r3"])
+
+    def test_the_vendors_own_label_does_not_refuse_the_batch(self) -> None:
+        """The jam: claim 'Donrus', get answered 'Donruss'. Without the sibling
+        widening this refuses all 350 sets and reclaims them next run."""
+        store = _Store(due=[self.DUPE[0]])
+        store.sibling_names = ["2015 Panini Donrus", "2015 Panini Donruss"]
+        csv = ("id,console-name,product-name,loose-price\n"
+               "1,Football Cards 2015 Panini Donruss,Card,1.00\n")
+        code = _run(store, body=csv)
+        statuses = [p.get("status") for _, p in store.updates]
+        self.assertNotIn("validation_failed", statuses,
+                         "the vendor's own spelling was refused as a wrong catalog")
+        self.assertEqual(code, 0)
+
+    def test_a_wrong_catalog_is_still_refused_with_siblings_present(self) -> None:
+        """Widening must not admit a family belonging to no requested uid."""
+        store = _Store(due=[self.DUPE[0]])
+        store.sibling_names = ["2015 Panini Donrus", "2015 Panini Donruss"]
+        csv = ("id,console-name,product-name,loose-price\n"
+               "1,Baseball Cards 1962 Topps,Card,1.00\n")
+        code = _run(store, body=csv)
+        statuses = [p.get("status") for _, p in store.updates]
+        self.assertIn("validation_failed", statuses,
+                      "a wrong catalog passed once siblings were allowed")
+        self.assertEqual(code, 1, "a refusal must exit non-zero")
+
+
+class AResumedBatchIsValidatedToo(unittest.TestCase):
+    """The resume path had no family check at all.
+
+    Expected names were built from the CLAIMED rows, and a resumed PENDING
+    batch has none -- so set_names was empty, and validate_csv_families returns
+    early when it has nothing to compare against. Every retry therefore ran
+    with the wrong-catalog guard switched off.
+
+    That is worse than the G9157 jam it sits beside: a jam refuses a good batch
+    loudly, an absent guard accepts a bad one quietly. Both are fixed by
+    deriving the names from the batch's own console_uids, which exist on both
+    paths.
+    """
+
+    PENDING_BATCH = {"batch_id": "old-1", "status": PENDING,
+                     "console_uids": ["G9157"], "registry_ids": ["r1"],
+                     "requested_count": 1, "attempts": 0}
+
+    def test_a_resumed_batch_accepts_the_vendors_own_label(self) -> None:
+        """Claim 'Donrus', crash, resume, get answered 'Donruss'."""
+        store = _Store(batches={"all": [dict(self.PENDING_BATCH)]})
+        store.sibling_names = ["2015 Panini Donrus", "2015 Panini Donruss"]
+        csv = ("id,console-name,product-name,loose-price\n"
+               "1,Football Cards 2015 Panini Donruss,Card,1.00\n")
+        code = _run(store, body=csv)
+        statuses = [p.get("status") for _, p in store.updates]
+        self.assertNotIn("validation_failed", statuses)
+        self.assertEqual(code, 0)
+
+    def test_a_resumed_batch_still_refuses_a_wrong_catalog(self) -> None:
+        """The guard that was absent entirely before this."""
+        store = _Store(batches={"all": [dict(self.PENDING_BATCH)]})
+        store.sibling_names = ["2015 Panini Donrus", "2015 Panini Donruss"]
+        csv = ("id,console-name,product-name,loose-price\n"
+               "1,Baseball Cards 1962 Topps,Card,1.00\n")
+        code = _run(store, body=csv)
+        statuses = [p.get("status") for _, p in store.updates]
+        self.assertIn("validation_failed", statuses,
+                      "a resumed batch accepted a wrong catalog")
+        self.assertEqual(code, 1)
+
+    def test_the_resumed_batch_looks_up_siblings_for_its_own_uids(self) -> None:
+        asked: list[list[str]] = []
+        store = _Store(batches={"all": [dict(self.PENDING_BATCH)]})
+        store.sibling_set_names = lambda *, source, uids: asked.append(list(uids)) or []
+        _run(store)
+        self.assertEqual(asked, [["G9157"]],
+                         "resume did not widen from the batch's console_uids")
