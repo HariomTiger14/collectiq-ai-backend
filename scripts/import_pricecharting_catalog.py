@@ -889,6 +889,9 @@ class SupabaseCatalogClient:
             "unchanged_detection": 0.0,
             "catalog_upsert": 0.0,
             "scd2_comparison": 0.0,
+            "scd2_history_lookup": 0.0,
+            "catalog_metadata_lookup": 0.0,
+            "current_price_lookup": 0.0,
             # Split apart 2026-09-09. These three ran under one timer called
             # "scd2_insert", which was fine while they were one decision.
             # They are not: the snapshot insert is the write that stays, the
@@ -1239,8 +1242,17 @@ class SupabaseCatalogClient:
             for index in range(0, len(rows), batch_size):
                 batch = rows[index : index + batch_size]
                 try:
+                    # Timed apart. "scd2_comparison" wrapped all three of
+                    # these, so the 65% it reported was read as the SCD2 GET
+                    # when it is in fact three lookups against a 24 GB table, a
+                    # 25 GB table and a 2 GB one. Optimising on that number
+                    # would have been guessing which of the three to attack.
                     comparison_started_at = time.perf_counter()
                     current_by_id = self._fetch_current_history_rows(client, batch)
+                    self.phase_seconds["scd2_history_lookup"] += (
+                        time.perf_counter() - comparison_started_at
+                    )
+                    catalog_lookup_started_at = time.perf_counter()
                     # Each gate reads the table it is about to write. The SCD2
                     # row decides whether a version is written, the catalog row
                     # whether the search document is rewritten, the current
@@ -1250,8 +1262,17 @@ class SupabaseCatalogClient:
                     # fails after the SCD2 version lands, a gate reading SCD2
                     # would conclude the catalog is up to date forever.
                     catalog_by_id = self._fetch_current_catalog_hashes(client, batch)
-                    price_by_id = self._fetch_current_prices(client, batch)
                     self._remember_catalog_hashes(batch, catalog_by_id)
+                    self.phase_seconds["catalog_metadata_lookup"] += (
+                        time.perf_counter() - catalog_lookup_started_at
+                    )
+                    price_lookup_started_at = time.perf_counter()
+                    price_by_id = self._fetch_current_prices(client, batch)
+                    self.phase_seconds["current_price_lookup"] += (
+                        time.perf_counter() - price_lookup_started_at
+                    )
+                    # Kept as the sum so a run can still be compared against
+                    # every measurement taken before this split.
                     self.phase_seconds["scd2_comparison"] += (
                         time.perf_counter() - comparison_started_at
                     )
@@ -1384,8 +1405,13 @@ class SupabaseCatalogClient:
                 # Compared field by field against CATALOG_METADATA_SIGNATURE_
                 # COLUMNS instead, which needs no migration and no rewrite of
                 # the 18M hashes already stored.
+                # change_hash is NOT selected. PR 4 replaced the hash
+                # comparison with metadata_differs(), and the column stayed in
+                # this SELECT reading nothing -- 64 bytes per row across the
+                # batch, fetched from a 24 GB table, for a value no code
+                # touches. The gate needs the metadata columns and nothing else.
                 "select": (
-                    "pricecharting_id,change_hash,"
+                    "pricecharting_id,"
                     + ",".join(CATALOG_METADATA_SIGNATURE_COLUMNS)
                 ),
                 "is_current": "eq.true",
