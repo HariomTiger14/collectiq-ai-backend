@@ -159,11 +159,14 @@ def refresh_source(
     print(f"Refreshing PriceCharting source: {source}", flush=True)
     source_name = f"{source}.csv"
 
-    # With staging on, a file left behind by a previous run is ingested first
-    # and no download happens at all. That is the point of staging: the vendor
-    # CSV endpoint allows one request per ten minutes ACCOUNT-WIDE, shared with
-    # the tier-3 rotation and the sets backfill, so re-downloading a file we
-    # already have is not merely wasteful -- it takes a slot from another job.
+    # With staging on, a file left behind by a previous run is ingested BEFORE
+    # today's download rather than instead of it -- draining yesterday is not
+    # refreshing today. The saving is that the leftover costs no vendor slot:
+    # the CSV endpoint allows one request per ten minutes ACCOUNT-WIDE, shared
+    # with the tier-3 rotation and the sets backfill, so re-downloading a file
+    # we already have takes a slot from another job rather than merely wasting
+    # time. The one case that does skip the download is a leftover staged
+    # today, which has already done today's work.
     drained: list[dict[str, Any]] = []
     if store is not None and not dry_run:
         # A process killed mid-import leaves the row INGESTING, which is not
@@ -180,7 +183,7 @@ def refresh_source(
         # whose previous night failed -- the failure hiding inside the fix.
         for batch in resumable_batches(store, source_name=source_name):
             print(f"  resuming {source_name} from storage "
-                  f"({batch['storage_key']}), no download needed", flush=True)
+                  f"({batch['storage_key']}), costing no vendor slot", flush=True)
             drained.append(_ingest_staged_batch(
                 store=store, batch=batch, source_name=source_name,
                 source_downloaded_at=source_downloaded_at,
