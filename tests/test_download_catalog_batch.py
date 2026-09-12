@@ -406,3 +406,53 @@ class DuplicateConsoleUidDoesNotJamTheRotationTest(unittest.TestCase):
         self.assertIn("validation_failed", statuses,
                       "a wrong catalog passed once siblings were allowed")
         self.assertEqual(code, 1, "a refusal must exit non-zero")
+
+
+class AResumedBatchIsValidatedToo(unittest.TestCase):
+    """The resume path had no family check at all.
+
+    Expected names were built from the CLAIMED rows, and a resumed PENDING
+    batch has none -- so set_names was empty, and validate_csv_families returns
+    early when it has nothing to compare against. Every retry therefore ran
+    with the wrong-catalog guard switched off.
+
+    That is worse than the G9157 jam it sits beside: a jam refuses a good batch
+    loudly, an absent guard accepts a bad one quietly. Both are fixed by
+    deriving the names from the batch's own console_uids, which exist on both
+    paths.
+    """
+
+    PENDING_BATCH = {"batch_id": "old-1", "status": PENDING,
+                     "console_uids": ["G9157"], "registry_ids": ["r1"],
+                     "requested_count": 1, "attempts": 0}
+
+    def test_a_resumed_batch_accepts_the_vendors_own_label(self) -> None:
+        """Claim 'Donrus', crash, resume, get answered 'Donruss'."""
+        store = _Store(batches={"all": [dict(self.PENDING_BATCH)]})
+        store.sibling_names = ["2015 Panini Donrus", "2015 Panini Donruss"]
+        csv = ("id,console-name,product-name,loose-price\n"
+               "1,Football Cards 2015 Panini Donruss,Card,1.00\n")
+        code = _run(store, body=csv)
+        statuses = [p.get("status") for _, p in store.updates]
+        self.assertNotIn("validation_failed", statuses)
+        self.assertEqual(code, 0)
+
+    def test_a_resumed_batch_still_refuses_a_wrong_catalog(self) -> None:
+        """The guard that was absent entirely before this."""
+        store = _Store(batches={"all": [dict(self.PENDING_BATCH)]})
+        store.sibling_names = ["2015 Panini Donrus", "2015 Panini Donruss"]
+        csv = ("id,console-name,product-name,loose-price\n"
+               "1,Baseball Cards 1962 Topps,Card,1.00\n")
+        code = _run(store, body=csv)
+        statuses = [p.get("status") for _, p in store.updates]
+        self.assertIn("validation_failed", statuses,
+                      "a resumed batch accepted a wrong catalog")
+        self.assertEqual(code, 1)
+
+    def test_the_resumed_batch_looks_up_siblings_for_its_own_uids(self) -> None:
+        asked: list[list[str]] = []
+        store = _Store(batches={"all": [dict(self.PENDING_BATCH)]})
+        store.sibling_set_names = lambda *, source, uids: asked.append(list(uids)) or []
+        _run(store)
+        self.assertEqual(asked, [["G9157"]],
+                         "resume did not widen from the batch's console_uids")

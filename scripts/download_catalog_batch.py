@@ -191,10 +191,17 @@ def main(argv: list[str] | None = None) -> int:
     # Not a weakening of the guard. A family matching a sibling of a REQUESTED
     # uid is a requested set under a different label; a genuinely wrong catalog
     # still matches no name of any requested uid.
-    set_names = [r["set_name"] for r in rows] if rows else []
-    if rows:
-        set_names = sorted(set(set_names) | set(
-            store.sibling_set_names(source=args.source, uids=uids)))
+    # Derived from the BATCH's console_uids, not from the claimed rows, so it
+    # is populated on both paths. A resumed PENDING batch has no rows -- and
+    # with an empty expected list validate_csv_families returns early and
+    # performs NO family check at all, so the wrong-catalog guard was simply
+    # absent on every retry. That is worse than the jam this widening fixes:
+    # a jam refuses a good batch loudly, an absent guard accepts a bad one
+    # quietly.
+    claimed_names = {r["set_name"] for r in rows if r.get("set_name")} if rows else set()
+    set_names = sorted(
+        claimed_names | set(store.sibling_set_names(source=args.source, uids=uids))
+    )
     summary.update(batchId=batch_id, setsRequested=len(uids))
 
     assert_transition(PENDING, DOWNLOADING)
