@@ -8,6 +8,7 @@ import os
 import re
 from functools import lru_cache
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -1238,7 +1239,20 @@ class SupabaseCatalogClient:
             )
         inserted = 0
         failed_ids: list[str] = []
-        with httpx.Client(timeout=self.timeout_seconds) as client:
+        # One client per lookup, not one shared: httpx.Client is not
+        # thread-safe. Created once for the whole call rather than per batch --
+        # a 93,685-row run is 105 batches, so per-batch construction would be
+        # 315 connection pools built and discarded to save three.
+        #
+        # Each client is only ever touched by its own worker, and batches are
+        # processed one at a time, so no client is used concurrently.
+        with httpx.Client(timeout=self.timeout_seconds) as client, \
+                httpx.Client(timeout=self.timeout_seconds) as history_client, \
+                httpx.Client(timeout=self.timeout_seconds) as catalog_client, \
+                httpx.Client(timeout=self.timeout_seconds) as price_client, \
+                ThreadPoolExecutor(max_workers=3,
+                                   thread_name_prefix="catalog-lookup") as pool:
+            lookup_clients = (history_client, catalog_client, price_client)
             for index in range(0, len(rows), batch_size):
                 batch = rows[index : index + batch_size]
                 try:
@@ -1247,12 +1261,6 @@ class SupabaseCatalogClient:
                     # when it is in fact three lookups against a 24 GB table, a
                     # 25 GB table and a 2 GB one. Optimising on that number
                     # would have been guessing which of the three to attack.
-                    comparison_started_at = time.perf_counter()
-                    current_by_id = self._fetch_current_history_rows(client, batch)
-                    self.phase_seconds["scd2_history_lookup"] += (
-                        time.perf_counter() - comparison_started_at
-                    )
-                    catalog_lookup_started_at = time.perf_counter()
                     # Each gate reads the table it is about to write. The SCD2
                     # row decides whether a version is written, the catalog row
                     # whether the search document is rewritten, the current
@@ -1261,18 +1269,24 @@ class SupabaseCatalogClient:
                     # into a permanently missed write: if the catalog write
                     # fails after the SCD2 version lands, a gate reading SCD2
                     # would conclude the catalog is up to date forever.
-                    catalog_by_id = self._fetch_current_catalog_hashes(client, batch)
+                    #
+                    # Run concurrently because they are independent reads of
+                    # three different tables. Measured on a 93,685-row Pokemon
+                    # run: 73.1s + 50.4s + 34.6s = 158.0s of the 192s total,
+                    # against 34s of writes. The 2 GB current_price table cost
+                    # 329ms per batch against the 25 GB catalog's 480ms -- only
+                    # 1.46x apart for a 12x size difference -- so the cost is
+                    # per-round-trip, not per-table, and the lever is fewer
+                    # waits rather than faster queries.
+                    comparison_started_at = time.perf_counter()
+                    current_by_id, catalog_by_id, price_by_id = (
+                        self._fetch_batch_lookups(pool, lookup_clients, batch)
+                    )
                     self._remember_catalog_hashes(batch, catalog_by_id)
-                    self.phase_seconds["catalog_metadata_lookup"] += (
-                        time.perf_counter() - catalog_lookup_started_at
-                    )
-                    price_lookup_started_at = time.perf_counter()
-                    price_by_id = self._fetch_current_prices(client, batch)
-                    self.phase_seconds["current_price_lookup"] += (
-                        time.perf_counter() - price_lookup_started_at
-                    )
-                    # Kept as the sum so a run can still be compared against
-                    # every measurement taken before this split.
+                    # Wall clock of the whole parallel block. The three
+                    # per-lookup timers now OVERLAP, so their sum exceeds this
+                    # -- which is the signal that they really are concurrent.
+                    # If this ever equals the sum again, the overlap is gone.
                     self.phase_seconds["scd2_comparison"] += (
                         time.perf_counter() - comparison_started_at
                     )
@@ -1380,6 +1394,56 @@ class SupabaseCatalogClient:
                 failed_ids=failed_ids,
             )
         return inserted
+
+    def _fetch_batch_lookups(
+        self,
+        pool: "ThreadPoolExecutor",
+        clients: tuple[httpx.Client, httpx.Client, httpx.Client],
+        batch: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """The three gate lookups, in flight together.
+
+        Returns (scd2_current, catalog_metadata, current_prices).
+
+        All three are waited on even when one fails, and the first exception is
+        re-raised, so a batch never proceeds holding two answers out of three:
+        writing on a partial view is how a gate silently reads "unchanged" for
+        a table it never actually asked about.
+
+        Each lookup times itself. Those timers now overlap by design, so their
+        sum exceeds the wall clock recorded for the block -- that gap IS the
+        evidence of concurrency, and its absence would mean this stopped
+        overlapping.
+        """
+        fetchers = (
+            ("scd2_history_lookup", self._fetch_current_history_rows),
+            ("catalog_metadata_lookup", self._fetch_current_catalog_hashes),
+            ("current_price_lookup", self._fetch_current_prices),
+        )
+
+        def run(phase: str, fetch, own_client: httpx.Client):
+            started = time.perf_counter()
+            try:
+                return fetch(own_client, batch)
+            finally:
+                self.phase_seconds[phase] += time.perf_counter() - started
+
+        futures = [
+            pool.submit(run, phase, fetch, own_client)
+            for (phase, fetch), own_client in zip(fetchers, clients)
+        ]
+        results: list[Any] = []
+        error: BaseException | None = None
+        for future in futures:
+            try:
+                results.append(future.result())
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                results.append(None)
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
+        return results[0], results[1], results[2]
 
     def _fetch_current_history_rows(
         self,
