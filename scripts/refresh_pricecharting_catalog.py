@@ -19,6 +19,16 @@ from scripts._shared_rate_limiter import (
     SharedRateLimiter,
 )
 from scripts.backfill_pricecharting_sets import REQUEST_HEADERS
+from scripts.catalog_batch_store import BatchStore
+from scripts.csv_refresh_storage import (
+    mark_ingest_failed,
+    mark_ingested,
+    mark_ingesting,
+    reap_stale_ingesting,
+    resumable_batches,
+    staged_today,
+    stage_csv,
+)
 from scripts.import_pricecharting_catalog import PRICECHARTING_CSV_ENV_VARS
 from scripts.import_pricecharting_catalog import SupabaseCatalogClient
 from scripts.import_pricecharting_catalog import timeout_retry_summary
@@ -50,6 +60,15 @@ def main(argv: list[str] | None = None) -> int:
         fallback_interval_seconds=args.sleep_between_sources_seconds,
     )
 
+    store = None
+    if args.use_storage and not args.dry_run:
+        store = BatchStore(
+            supabase_url=args.supabase_url or os.getenv("SUPABASE_URL", ""),
+            service_role_key=args.service_role_key
+            or os.getenv("SUPABASE_SERVICE_ROLE_KEY", ""),
+            timeout_seconds=args.timeout_seconds,
+        )
+
     summaries: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
     for source in selected_sources:
@@ -73,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=args.dry_run,
                 client=client,
                 csv_limiter=csv_limiter,
+                store=store,
             )
             summaries.append(summary)
             # A source can finish without raising and still have failed: every
@@ -96,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
                 # never recorded as a success in the ops ledger.
                 "success": not failures,
                 "dryRun": args.dry_run,
+                "useStorage": bool(store is not None),
                 "sources": summaries,
                 **timeout_retry_summary(client),
                 "failedSources": failures,
@@ -133,9 +154,48 @@ def refresh_source(
     dry_run: bool,
     client: SupabaseCatalogClient | None,
     csv_limiter: SharedRateLimiter | None = None,
+    store: "BatchStore | None" = None,
 ) -> dict[str, Any]:
     print(f"Refreshing PriceCharting source: {source}", flush=True)
     source_name = f"{source}.csv"
+
+    # With staging on, a file left behind by a previous run is ingested BEFORE
+    # today's download rather than instead of it -- draining yesterday is not
+    # refreshing today. The saving is that the leftover costs no vendor slot:
+    # the CSV endpoint allows one request per ten minutes ACCOUNT-WIDE, shared
+    # with the tier-3 rotation and the sets backfill, so re-downloading a file
+    # we already have takes a slot from another job rather than merely wasting
+    # time. The one case that does skip the download is a leftover staged
+    # today, which has already done today's work.
+    drained: list[dict[str, Any]] = []
+    if store is not None and not dry_run:
+        # A process killed mid-import leaves the row INGESTING, which is not
+        # resumable on its own. Without this the next run downloads again --
+        # spending the vendor slot this whole path exists to save.
+        reaped = reap_stale_ingesting(store, source_name=source_name)
+        if reaped:
+            print(f"  reaped {reaped} stale ingest lease(s) for {source_name}",
+                  flush=True)
+
+        # Drain every leftover, and do NOT return: finishing yesterday's file
+        # is not the same as refreshing today. An earlier version returned
+        # here, which would have quietly skipped a day's prices for any source
+        # whose previous night failed -- the failure hiding inside the fix.
+        for batch in resumable_batches(store, source_name=source_name):
+            print(f"  resuming {source_name} from storage "
+                  f"({batch['storage_key']}), costing no vendor slot", flush=True)
+            drained.append(_ingest_staged_batch(
+                store=store, batch=batch, source_name=source_name,
+                source_downloaded_at=source_downloaded_at,
+                batch_size=batch_size, dry_run=dry_run, client=client))
+            # Unless the leftover IS today's download, in which case it has
+            # already done today's work and a second fetch would spend a slot
+            # to import the same file twice.
+            if staged_today(batch):
+                print(f"  {source_name} was already staged today; "
+                      "not downloading again", flush=True)
+                return _merge_summaries(drained)
+
     temp_path = download_source_to_temp_file(
         source=source,
         source_name=source_name,
@@ -143,6 +203,17 @@ def refresh_source(
         csv_limiter=csv_limiter,
     )
     try:
+        if store is not None and not dry_run:
+            batch = stage_csv(store, source_name=source_name, path=temp_path)
+            print(f"  staged {source_name} to storage: {batch['storage_key']}",
+                  flush=True)
+            summary = _ingest_staged_batch(
+                store=store, batch=batch, source_name=source_name,
+                source_downloaded_at=source_downloaded_at,
+                batch_size=batch_size, dry_run=dry_run, client=client,
+                path=temp_path)
+            summary["archivePath"] = None
+            return _merge_summaries(drained + [summary])
         archive_path = archive_source_file(
             source_name=source_name,
             path=temp_path,
@@ -159,9 +230,93 @@ def refresh_source(
             client=client,
         )
         summary["archivePath"] = str(archive_path) if archive_path else None
-        return summary
+        return _merge_summaries(drained + [summary])
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+def _merge_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fold one source's imports into a single summary.
+
+    A source can import more than once in a run now -- a leftover file plus
+    today's download -- and the caller still expects one row per source.
+    Counts add; `failed` is true if any leg failed, because a run that
+    finished yesterday and failed today has not refreshed today.
+    """
+    if len(summaries) == 1:
+        return summaries[0]
+    merged = dict(summaries[-1])
+    for key in ("inputRows", "validRows", "importedRows", "historyRows"):
+        merged[key] = sum(int(s.get(key) or 0) for s in summaries)
+    merged["failed"] = any(bool(s.get("failed")) for s in summaries)
+    merged["failureReason"] = next(
+        (s.get("failureReason") for s in summaries if s.get("failureReason")), None)
+    merged["importsInRun"] = len(summaries)
+    return merged
+
+
+def _ingest_staged_batch(
+    *,
+    store: "BatchStore",
+    batch: dict[str, Any],
+    source_name: str,
+    source_downloaded_at: str,
+    batch_size: int,
+    dry_run: bool,
+    client: SupabaseCatalogClient | None,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    """Import one staged CSV, from disk if we still hold it or from Storage.
+
+    `path` is passed on the download leg because the file is already on disk --
+    fetching back what we just uploaded would double the bytes for nothing. A
+    resume has no local copy, so it streams the object down.
+
+    A failure leaves the batch INGEST_FAILED with the object intact, which is
+    what makes the retry free. The exception is re-raised rather than swallowed:
+    #217 exists because this job used to turn a failed write into a zero and
+    call the run a success.
+    """
+    import tempfile
+
+    mark_ingesting(store, batch, claimed_by=f"refresh:{source_name}")
+    local = path
+    downloaded: Path | None = None
+    if local is None:
+        handle = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+        handle.close()
+        downloaded = Path(handle.name)
+        store.download_object(batch["storage_key"], downloaded)
+        local = downloaded
+    try:
+        summary = import_source_file(
+            source_name=source_name,
+            path=local,
+            source_downloaded_at=source_downloaded_at,
+            batch_size=batch_size,
+            dry_run=dry_run,
+            client=client,
+        )
+    except BaseException as exc:
+        mark_ingest_failed(store, batch, error=f"{type(exc).__name__}: {exc}",
+                           error_class="write")
+        raise
+    finally:
+        if downloaded is not None:
+            downloaded.unlink(missing_ok=True)
+
+    if summary.get("failed"):
+        mark_ingest_failed(store, batch,
+                           error=str(summary.get("failureReason") or "unknown"),
+                           error_class="write")
+    else:
+        mark_ingested(store, batch, stats={
+            "rows_written": summary["importedRows"],
+            "row_count": summary["validRows"],
+            "write_path": "rest",
+        })
+    summary["storageKey"] = batch["storage_key"]
+    return summary
 
 
 def download_source_to_temp_file(
@@ -367,6 +522,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Comma-separated source keys to refresh.",
     )
     parser.add_argument("--batch-size", type=int, default=900)
+    parser.add_argument(
+        "--use-storage",
+        action="store_true",
+        help="Stage each CSV in Supabase Storage before importing it, and "
+             "resume any file a previous run left uningested instead of "
+             "downloading again. Off by default so the cron behaves exactly "
+             "as it does today until the flag is added to its start command.")
     parser.add_argument("--timeout-seconds", type=float, default=600)
     parser.add_argument(
         "--sleep-between-sources-seconds",
