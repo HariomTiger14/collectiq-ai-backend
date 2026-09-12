@@ -466,3 +466,31 @@ class ItReportsWhereTheTimeWentTest(unittest.TestCase):
         self.assertIn("phaseSeconds", summary)
         self.assertIn("catalog_upsert", summary["phaseSeconds"])
 
+
+
+class AFailedIngestExitsNonZeroTest(unittest.TestCase):
+    """Two failed ingests sat in the ledger as green on 2026-09-08.
+
+    The recorder fix makes summary.success=false enough on its own, but the
+    exit code is Render's signal and should agree: a run that ingested nothing
+    is not a success there either. A vendor 503 on the DOWNLOAD side stays a
+    quiet zero -- that is backpressure, not failure -- but a write that did not
+    land is neither quiet nor expected.
+    """
+
+    def test_a_failed_write_exits_one(self) -> None:
+        code, _ = _run(_Store(), wrote=False)
+        self.assertEqual(code, 1)
+
+    def test_a_clean_ingest_still_exits_zero(self) -> None:
+        code, _ = _run(_Store())
+        self.assertEqual(code, 0)
+
+    def test_nothing_to_ingest_is_not_a_failure(self) -> None:
+        """An empty queue is the normal state between batches."""
+        code, _ = _run(_Store(batch=None))
+        self.assertEqual(code, 0)
+
+    def test_a_dry_run_is_not_a_failure(self) -> None:
+        code, _ = _run(_Store(), argv=())
+        self.assertEqual(code, 0)

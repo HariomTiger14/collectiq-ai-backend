@@ -76,8 +76,38 @@ def run_with_recorder(job_name: str, main: Callable[[], int]) -> int:
         else:
             recorder.finish_failed(error)
         raise
-    recorder.finish_succeeded(exit_code)
+    # A run that reported failure is recorded as failed, whatever it returned.
+    #
+    # This used to mark EVERY non-exception return 'succeeded'. The exit code
+    # reached the row only as summary.exitCode, and the summary's own
+    # success:false was never consulted -- so four runs sat in the ledger as
+    # green while their payload said otherwise: two sports downloads refused
+    # over a duplicate console_uid (2026-09-09) and two failed ingests
+    # (2026-09-08). #217 added `return 1` to the CSV refresh believing that
+    # flipped the row; it did not.
+    #
+    # The exit code and the ledger status answer different questions on
+    # purpose. The code is Render's alerting signal, where a 503 from the
+    # vendor is deliberately quiet backpressure rather than an incident. The
+    # status is whether the work happened, and a batch that never downloaded
+    # did not happen regardless of how calmly it declined.
+    if _failed(_summary, exit_code):
+        recorder.finish_reported_failure(exit_code, summary=_summary)
+    else:
+        recorder.finish_succeeded(exit_code)
     return exit_code
+
+
+def _failed(summary: dict[str, Any] | None, exit_code: int | None) -> bool:
+    """Whether this run should be recorded as failed.
+
+    success:false in the summary is authoritative when present -- the script
+    said so itself. A non-zero exit is the fallback for scripts that report no
+    summary at all.
+    """
+    if isinstance(summary, dict) and summary.get("success") is False:
+        return True
+    return exit_code not in (None, 0)
 
 
 def sqlstate_of(body: str) -> str | None:
@@ -252,6 +282,22 @@ class _Recorder:
 
     def finish_succeeded(self, exit_code: int | None) -> None:
         self._finish("succeeded", summary=_summary, error=None, exit_code=exit_code)
+
+    def finish_reported_failure(self, exit_code: int | None,
+                                *, summary: dict[str, Any] | None) -> None:
+        """Failed by its own report, not by an exception.
+
+        No ops_error_events row: there is no traceback to fingerprint, and the
+        script has already described the failure in its summary. Writing one
+        would put an entry with no stack into the error feed for every quiet
+        vendor 503.
+        """
+        reason = "run reported success=false"
+        if isinstance(summary, dict) and summary.get("skippedReason"):
+            reason = f"{reason} ({summary['skippedReason']})"
+        if exit_code not in (None, 0):
+            reason = f"{reason}; exit code {exit_code}"
+        self._finish("failed", summary=summary, error=reason, exit_code=exit_code)
 
     def finish_failed(self, error: BaseException) -> None:
         stack = scrub_secrets("".join(traceback.format_exception(error)))[-_STACK_CAP:]

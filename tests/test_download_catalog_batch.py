@@ -314,3 +314,32 @@ class RateLimiterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ARefusedBatchExitsNonZeroTest(unittest.TestCase):
+    """Two refusals on 2026-09-09 were recorded green, two minutes apart.
+
+    A refusal is not backpressure. The file is a wrong-catalog response, the
+    same sets are claimed again next run, and it repeats until someone looks --
+    so it must be loud at the Render level too, not only in the summary.
+
+    A vendor 503 stays a quiet zero: that is expected pacing, and alerting on
+    it would train the alert away.
+    """
+
+    def test_the_refusal_path_returns_one(self) -> None:
+        import pathlib
+        import re
+
+        source = pathlib.Path("scripts/download_catalog_batch.py").read_text()
+        block = source[source.index("except CsvFamilyMismatch"):]
+        block = block[: block.index("key = storage_key")]
+        self.assertRegex(block, r"return 1\b",
+                         "a refused batch still exits 0; it was recorded green twice")
+
+    def test_a_transient_fetch_failure_stays_quiet(self) -> None:
+        """Only a blocked host exits non-zero on the fetch path."""
+        import pathlib
+
+        source = pathlib.Path("scripts/download_catalog_batch.py").read_text()
+        self.assertIn("return 1 if error_class == CLASS_BLOCKED else 0", source)
