@@ -17,6 +17,30 @@ import httpx
 from scripts.catalog_batches import BUCKET, INGEST_FAILED, INGESTING, VALIDATED
 
 
+def dedupe_by_console_uid(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One registry row per console_uid, keeping the first (oldest refresh).
+
+    Two rows sharing a uid are one vendor set registered twice. Sending the uid
+    twice wastes a slot in the batch and, worse, stamps BOTH rows refreshed
+    from a single family -- so the duplicate rotates to the back of the queue
+    having never actually been refreshed, which is silent staleness rather than
+    a visible jam.
+
+    The dropped row is not lost: it has the older tier3_refreshed_at next time
+    and leads the rotation, so the pair alternates and both stay current.
+    """
+    seen: set[str] = set()
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        uid = str(row.get("console_uid") or "").strip()
+        if uid and uid in seen:
+            continue
+        if uid:
+            seen.add(uid)
+        kept.append(row)
+    return kept
+
+
 class BatchStore:
     """PostgREST access to catalog_download_batches and the registry."""
 
@@ -55,6 +79,36 @@ class BatchStore:
             )
             response.raise_for_status()
             return [row for row in response.json() if isinstance(row, dict)]
+
+    def sibling_set_names(self, *, source: str, uids: list[str]) -> list[str]:
+        """Every registry name sharing one of these console_uids.
+
+        The vendor answers a uid with ITS canonical family name, which need not
+        be the name of the row we happened to claim. G9157 is registered twice
+        -- '2015 Panini Donrus' and '2015 Panini Donruss', the first being the
+        vendor's own typo'd slug -- so a batch claiming one can be answered
+        with the other and refused as a wrong-catalog response.
+
+        Widening the expected names to the uid's siblings does not weaken the
+        guard: a family matching a sibling of a REQUESTED uid is a requested
+        set under the vendor's preferred label. A genuinely wrong catalog
+        still matches no name of any requested uid.
+        """
+        if not uids:
+            return []
+        with self._client() as client:
+            response = client.get(
+                f"{self.base}/rest/v1/pricecharting_set_registry",
+                params={
+                    "select": "set_name",
+                    "source_site": f"eq.{source}",
+                    "console_uid": f"in.({','.join(sorted(set(uids)))})",
+                },
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+            return [str(row.get("set_name")) for row in response.json()
+                    if isinstance(row, dict) and row.get("set_name")]
 
     def batches(self, *, source: str, statuses: list[str]) -> list[dict[str, Any]]:
         with self._client() as client:
