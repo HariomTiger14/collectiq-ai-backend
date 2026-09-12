@@ -43,12 +43,17 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from datetime import datetime, timezone
+
 from scripts.catalog_batches import (
     BUCKET,
     INGEST_FAILED,
     INGESTED,
     INGESTING,
     VALIDATED,
+    assert_transition,
+    is_lease_stale,
+    recovery_status,
     storage_key,
 )
 from scripts.catalog_batch_store import BatchStore
@@ -108,11 +113,67 @@ def resumable_batches(store: BatchStore, *, source_name: str) -> list[dict[str, 
 
 
 def mark_ingesting(store: BatchStore, batch: dict[str, Any], *, claimed_by: str) -> None:
+    """Claim a staged file for import.
+
+    claimed_at is written, not just claimed_by, and that is load-bearing: a
+    process killed mid-import leaves the row INGESTING, and without a claim
+    timestamp nothing can tell an import running now from one abandoned by a
+    deploy last night. The reaper needs a clock, not a name.
+    """
     store.update(batch["batch_id"], {
         "status": INGESTING,
+        "claimed_at": datetime.now(timezone.utc).isoformat(),
         "claimed_by": claimed_by,
         "attempts": int(batch.get("attempts") or 0) + 1,
     })
+
+
+def reap_stale_ingesting(store: BatchStore, *, source_name: str) -> int:
+    """Return abandoned imports to VALIDATED so the next run can resume them.
+
+    Without this, a crash or deploy mid-import parks the file in INGESTING
+    forever: it is not in RESUMABLE_STATUSES, so the next run downloads again
+    -- spending the vendor slot this whole change exists to save. Exactly the
+    shape of the orphaned 'running' ledger rows sitting since 2026-09-03.
+
+    Back to VALIDATED rather than PENDING because the object is still in
+    storage; recovery_status() already encodes that choice for the sports
+    pipeline and is reused rather than restated.
+    """
+    reaped = 0
+    for batch in store.batches(source=csv_batch_source(source_name),
+                               statuses=[INGESTING]):
+        claimed_at = batch.get("claimed_at")
+        moment = (datetime.fromisoformat(claimed_at.replace("Z", "+00:00"))
+                  if claimed_at else None)
+        if not is_lease_stale(INGESTING, moment):
+            continue
+        target = recovery_status(INGESTING)
+        assert_transition(INGESTING, target)
+        store.update(batch["batch_id"], {
+            "status": target,
+            "claimed_at": None,
+            "claimed_by": None,
+            "last_error": "ingest lease expired",
+            "last_error_class": "transient",
+        })
+        reaped += 1
+    return reaped
+
+
+def staged_today(batch: dict[str, Any], *, now: datetime | None = None) -> bool:
+    """Whether this staged object is already today's download.
+
+    Decides whether draining a leftover also satisfies today's refresh. A file
+    staged yesterday does not: ingesting it finishes yesterday's work, and
+    today still needs its own download.
+    """
+    created = batch.get("created_at")
+    if not created:
+        return False
+    moment = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+    today = (now or datetime.now(timezone.utc)).date()
+    return moment.astimezone(timezone.utc).date() == today
 
 
 def mark_ingested(store: BatchStore, batch: dict[str, Any], *, stats: dict[str, Any]) -> None:

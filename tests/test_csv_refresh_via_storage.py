@@ -23,7 +23,9 @@ from scripts.csv_refresh_storage import (
     mark_ingest_failed,
     mark_ingested,
     mark_ingesting,
+    reap_stale_ingesting,
     resumable_batches,
+    staged_today,
     stage_csv,
 )
 from scripts.refresh_pricecharting_catalog import parse_args
@@ -231,3 +233,242 @@ class TheStatusTellsTheTruthTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ACrashMidImportIsRecoverableTest(unittest.TestCase):
+    """A process killed mid-import leaves the row INGESTING.
+
+    That status is not resumable on its own, so without reaping, the next run
+    downloads again -- spending the vendor slot this whole path exists to save.
+    Exactly the shape of the orphaned 'running' ledger rows that have been
+    sitting since 2026-09-03.
+    """
+
+    def _ingesting(self, claimed_at):
+        return {"batch_id": "abc", "source": "pokemon.csv", "status": INGESTING,
+                "storage_key": "k", "attempts": 1, "claimed_at": claimed_at}
+
+    def test_the_claim_records_a_time_not_just_a_name(self) -> None:
+        """A reaper needs a clock. claimed_by alone cannot tell an import
+        running now from one abandoned last night."""
+        store = _Store()
+        mark_ingesting(store, {"batch_id": "abc", "attempts": 0},
+                       claimed_by="refresh:pokemon.csv")
+        _, patch = store.updates[0]
+        self.assertIsNotNone(patch.get("claimed_at"))
+        self.assertEqual(patch["claimed_by"], "refresh:pokemon.csv")
+
+    def test_a_stale_lease_goes_back_to_validated(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        stale = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()
+        store = _Store([self._ingesting(stale)])
+        self.assertEqual(reap_stale_ingesting(store, source_name="pokemon.csv"), 1)
+        _, patch = store.updates[0]
+        self.assertEqual(patch["status"], VALIDATED)
+        self.assertIsNone(patch["claimed_at"])
+        self.assertNotIn("storage_key", patch, "the object must survive reaping")
+
+    def test_a_fresh_lease_is_left_alone(self) -> None:
+        """Another process may genuinely be importing it right now."""
+        from datetime import datetime, timezone
+
+        store = _Store([self._ingesting(datetime.now(timezone.utc).isoformat())])
+        self.assertEqual(reap_stale_ingesting(store, source_name="pokemon.csv"), 0)
+        self.assertEqual(store.updates, [])
+
+    def test_a_reaped_batch_is_then_resumable(self) -> None:
+        """Reaping is only useful if it feeds the resume path."""
+        store = _Store([{**self._ingesting(None), "status": VALIDATED}])
+        self.assertEqual(len(resumable_batches(store, source_name="pokemon.csv")), 1)
+
+
+class DrainingALeftoverDoesNotSkipTodayTest(unittest.TestCase):
+    """Finishing yesterday's file is not the same as refreshing today.
+
+    An earlier version returned straight after resuming, which would have
+    quietly skipped a day's prices for any source whose previous night failed
+    -- the failure hiding inside the fix for the failure.
+    """
+
+    def _batch(self, created_at):
+        return {"batch_id": "abc", "source": "pokemon.csv", "status": VALIDATED,
+                "storage_key": "k", "attempts": 0, "created_at": created_at}
+
+    def test_a_file_staged_yesterday_does_not_count_as_today(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        self.assertFalse(staged_today(self._batch(yesterday)))
+
+    def test_a_file_staged_today_does(self) -> None:
+        from datetime import datetime, timezone
+
+        self.assertTrue(
+            staged_today(self._batch(datetime.now(timezone.utc).isoformat())))
+
+    def test_a_row_with_no_timestamp_is_treated_as_not_today(self) -> None:
+        """Fail towards downloading: a redundant fetch costs one slot, a
+        skipped day costs a day of prices."""
+        self.assertFalse(staged_today(self._batch(None)))
+
+    def test_the_check_is_by_utc_date_not_elapsed_hours(self) -> None:
+        """'Already refreshed today' is a calendar question -- the job runs
+        once a day at a fixed hour, so 23 hours ago is still yesterday."""
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime(2026, 9, 12, 14, 30, tzinfo=timezone.utc)
+        self.assertTrue(staged_today(self._batch(
+            (now - timedelta(hours=13)).isoformat()), now=now))
+        self.assertFalse(staged_today(self._batch(
+            (now - timedelta(hours=15)).isoformat()), now=now))
+
+
+class MergingTwoImportsInOneRunTest(unittest.TestCase):
+    """A source can now import twice in a run -- a leftover plus today."""
+
+    def _merge(self, *summaries):
+        from scripts.refresh_pricecharting_catalog import _merge_summaries
+
+        return _merge_summaries(list(summaries))
+
+    _OK = {"source": "pokemon.csv", "inputRows": 10, "validRows": 10,
+           "importedRows": 3, "historyRows": 3, "failed": False,
+           "failureReason": None}
+
+    def test_a_single_import_is_returned_unchanged(self) -> None:
+        self.assertEqual(self._merge(self._OK), self._OK)
+
+    def test_counts_add_up(self) -> None:
+        merged = self._merge(self._OK, self._OK)
+        self.assertEqual(merged["validRows"], 20)
+        self.assertEqual(merged["importedRows"], 6)
+        self.assertEqual(merged["importsInRun"], 2)
+
+    def test_yesterday_succeeding_does_not_mask_today_failing(self) -> None:
+        merged = self._merge(self._OK, {**self._OK, "failed": True,
+                                        "failureReason": "batch_write_failed"})
+        self.assertTrue(merged["failed"])
+        self.assertEqual(merged["failureReason"], "batch_write_failed")
+
+    def test_today_succeeding_does_not_mask_yesterday_failing(self) -> None:
+        merged = self._merge({**self._OK, "failed": True,
+                              "failureReason": "batch_write_failed"}, self._OK)
+        self.assertTrue(merged["failed"])
+
+
+class RefreshSourceControlFlowTest(unittest.TestCase):
+    """The loop itself, not just the helpers it calls.
+
+    staged_today() and _merge_summaries() were both covered in isolation while
+    the branch that uses them was not -- so a mutation making the resume return
+    early, skipping the day's download entirely, passed every test. That is the
+    bug this class exists to catch.
+    """
+
+    def _run(self, existing, *, created_at=None):
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import patch
+
+        import scripts.refresh_pricecharting_catalog as module
+
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        batches = []
+        for status in existing:
+            batches.append({
+                "batch_id": f"b{len(batches)}", "source": "pokemon.csv",
+                "status": status, "storage_key": "k", "attempts": 0,
+                "created_at": created_at or yesterday,
+            })
+        store = _Store(batches)
+        downloads: list[str] = []
+        imports: list[str] = []
+
+        def fake_download(**kwargs):
+            downloads.append(kwargs["source"])
+            path = _csv()
+            self.addCleanup(path.unlink, missing_ok=True)
+            return path
+
+        def fake_import(**kwargs):
+            imports.append(str(kwargs["path"]))
+            return {"source": "pokemon.csv", "inputRows": 1, "validRows": 1,
+                    "importedRows": 1, "historyRows": 1, "failed": False,
+                    "failureReason": None}
+
+        with patch.object(module, "download_source_to_temp_file", fake_download), \
+             patch.object(module, "import_source_file", fake_import), \
+             patch.object(module, "archive_source_file", lambda **kw: None):
+            summary = module.refresh_source(
+                source="pokemon", source_downloaded_at="2026-09-12T00:00:00Z",
+                archive_dir="/tmp", batch_size=900, timeout_seconds=5,
+                dry_run=False, client=object(), store=store)
+        return summary, downloads, imports, store
+
+    def test_a_leftover_from_yesterday_is_drained_AND_today_is_downloaded(self) -> None:
+        summary, downloads, imports, _ = self._run([VALIDATED])
+        self.assertEqual(len(imports), 2, "expected the leftover plus today's file")
+        self.assertEqual(downloads, ["pokemon"],
+                         "today's download was skipped; the day's prices are lost")
+        self.assertEqual(summary["importsInRun"], 2)
+
+    def test_a_file_already_staged_today_does_not_trigger_a_second_download(self) -> None:
+        """It has already done today's work; fetching again spends a vendor
+        slot to import the same file twice."""
+        from datetime import datetime, timezone
+
+        _, downloads, imports, _ = self._run(
+            [VALIDATED], created_at=datetime.now(timezone.utc).isoformat())
+        self.assertEqual(imports, imports[:1], "imported more than the staged file")
+        self.assertEqual(downloads, [], "downloaded despite already having today's file")
+
+    def test_no_leftover_downloads_exactly_once(self) -> None:
+        summary, downloads, imports, _ = self._run([])
+        self.assertEqual(downloads, ["pokemon"])
+        self.assertEqual(len(imports), 1)
+        self.assertNotIn("importsInRun", summary)
+
+    def test_the_downloaded_file_is_staged_before_it_is_imported(self) -> None:
+        _, _, _, store = self._run([])
+        self.assertEqual(len(store.uploads), 1)
+        self.assertEqual(len(store.inserted), 1)
+
+    def test_a_stale_ingesting_row_is_reaped_and_then_resumed(self) -> None:
+        """Without reaping this file is invisible and today re-downloads it."""
+        from datetime import datetime, timedelta, timezone
+
+        stale = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()
+        from unittest.mock import patch
+
+        import scripts.refresh_pricecharting_catalog as module
+
+        batch = {"batch_id": "b0", "source": "pokemon.csv", "status": INGESTING,
+                 "storage_key": "k", "attempts": 1, "claimed_at": stale,
+                 "created_at": stale}
+        store = _Store([batch])
+        # The fake store returns rows by status, so reaping must flip it for
+        # the later resume lookup to see it -- mirroring the real table.
+        original_update = store.update
+
+        def update(batch_id, patch_body):
+            original_update(batch_id, patch_body)
+            if "status" in patch_body:
+                batch["status"] = patch_body["status"]
+
+        store.update = update
+        imports: list[str] = []
+        with patch.object(module, "download_source_to_temp_file",
+                          lambda **kw: _csv()), \
+             patch.object(module, "import_source_file",
+                          lambda **kw: (imports.append("x"), {
+                              "source": "pokemon.csv", "inputRows": 1,
+                              "validRows": 1, "importedRows": 1, "historyRows": 1,
+                              "failed": False, "failureReason": None})[1]), \
+             patch.object(module, "archive_source_file", lambda **kw: None):
+            module.refresh_source(
+                source="pokemon", source_downloaded_at="2026-09-12T00:00:00Z",
+                archive_dir="/tmp", batch_size=900, timeout_seconds=5,
+                dry_run=False, client=object(), store=store)
+        self.assertEqual(store.updates[0][1]["status"], VALIDATED,
+                         "the stale lease was not reaped")
+        self.assertEqual(len(imports), 2, "reaped file was not resumed")
