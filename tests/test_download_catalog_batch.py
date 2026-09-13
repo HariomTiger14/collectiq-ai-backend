@@ -84,10 +84,21 @@ class _Store:
     def insert(self, row):
         batch = {**row, "batch_id": "batch-1", "attempts": 0}
         self.inserted.append(batch)
+        # Visible to batches() afterwards, as a real insert would be.
+        self._batches.setdefault("all", []).append(batch)
         return batch
 
     def update(self, batch_id, patch):
         self.updates.append((batch_id, patch))
+        # APPLIES the patch, like BatchStore does. Recording without applying
+        # made the fake amnesiac: a second run re-read the batch exactly as the
+        # first one found it, so any test that runs the script twice on one row
+        # -- which is the only way to see a counter accumulate -- passed while
+        # testing nothing.
+        for row in self._batches.get("all", []):
+            if row.get("batch_id") == batch_id:
+                row.update(patch)
+                break
 
     def upload(self, key, path):
         self.uploads.append((key, path))
@@ -376,10 +387,105 @@ class ResumeTest(unittest.TestCase):
              "download_attempts": 1},
         ]})
         _run(store)
-        first = [p for _, p in store.updates if p.get("status") == DOWNLOADING][0]
-        self.assertEqual(first["download_attempts"], 2)
-        self.assertNotIn("attempts", first,
-                         "the download bumped the ingest alias")
+        # Asserted on the EFFECT, not on which payload carries it: since the
+        # slot-refusal fix the bump lands after acquire() rather than in the
+        # PENDING->DOWNLOADING claim.
+        bumps = [p["download_attempts"] for _, p in store.updates
+                 if "download_attempts" in p]
+        self.assertEqual(bumps, [2])
+        for _, payload in store.updates:
+            self.assertNotIn("attempts", payload,
+                             "the download bumped the ingest alias")
+
+
+class SlotRefusalDoesNotSpendAnAttemptTest(unittest.TestCase):
+    """A refused CSV slot is not a failed download.
+
+    refresh_completed_pricecharting_categories holds the shared
+    pricecharting:csv slot from 04:45 to ~08:29 UTC (23 calls at 610s) and
+    outranks sports -- it declares essential_categories, the downloader
+    declares tier3, which is bulk. So every sports tick in that window is
+    refused before it ever reaches the vendor.
+
+    While the attempt was charged at claim time, five refusals took the row to
+    the --max-attempts ceiling and the NEXT run stopped the whole rotation with
+    download_attempts_exhausted and exit 1, until a human reset the row. A hard
+    stop produced entirely by backpressure working correctly, and it would have
+    fired on the first morning the categories job was resumed.
+    """
+
+    def _pending_row(self, attempts=0):
+        return {"batch_id": "old-1", "status": PENDING, "console_uids": ["G1"],
+                "registry_ids": ["r1"], "requested_count": 1,
+                "download_attempts": attempts}
+
+    def _run_refused(self, store):
+        """One run where the limiter grants nothing."""
+        with patch("scripts.download_catalog_batch.SharedRateLimiter") as limiter:
+            limiter.return_value.acquire.return_value = False
+            with patch("scripts.download_catalog_batch.BatchStore", return_value=store), \
+                 patch.dict("os.environ", {"SUPABASE_URL": "https://x.test",
+                                           "SUPABASE_SERVICE_ROLE_KEY": "k",
+                                           "PRICECHARTING_API_TOKEN": "t"}):
+                return main(["--commit"])
+
+    def test_one_refusal_spends_nothing(self) -> None:
+        store = _Store(batches={"all": [self._pending_row(0)]})
+        self.assertEqual(self._run_refused(store), 0)
+        row = store._batches["all"][0]
+        self.assertEqual(row["download_attempts"], 0)
+        self.assertEqual(row["status"], PENDING)
+
+    def test_ten_refusals_leave_the_counter_untouched(self) -> None:
+        """Ten is more than --max-attempts 5, and more than the ~22 ticks the
+        real window would produce only in that it is enough to prove the
+        counter does not creep."""
+        store = _Store(batches={"all": [self._pending_row(0)]})
+        for _ in range(10):
+            self.assertEqual(self._run_refused(store), 0)
+        self.assertEqual(store._batches["all"][0]["download_attempts"], 0)
+
+    def test_the_rotation_still_runs_after_a_morning_of_refusals(self) -> None:
+        """The whole point. After the categories job releases the slot, the
+        next tick must download -- not stop with download_attempts_exhausted."""
+        store = _Store(batches={"all": [self._pending_row(0)]})
+        for _ in range(10):
+            self._run_refused(store)
+        self.assertEqual(_run(store), 0, "the rotation halted after refusals")
+        self.assertEqual(len(store.uploads), 1, "no download after the slot freed up")
+
+    def test_a_refusal_does_not_touch_the_ingest_alias_either(self) -> None:
+        store = _Store(batches={"all": [self._pending_row(0)]})
+        self._run_refused(store)
+        for _, payload in store.updates:
+            self.assertNotIn("attempts", payload)
+            self.assertNotIn("ingest_attempts", payload)
+
+    def test_the_lease_is_still_taken_and_released_around_the_wait(self) -> None:
+        """Not bumping the counter must not mean not claiming the batch: the
+        limiter can wait up to 30 minutes, and an unleased row is one another
+        run can claim underneath us."""
+        store = _Store(batches={"all": [self._pending_row(0)]})
+        self._run_refused(store)
+        statuses = [p.get("status") for _, p in store.updates if "status" in p]
+        self.assertEqual(statuses, [DOWNLOADING, PENDING])
+        released = [p for _, p in store.updates if p.get("status") == PENDING][0]
+        self.assertIsNone(released["claimed_at"])
+        self.assertIsNone(released["claimed_by"])
+        self.assertEqual(released["last_error_class"], "transient")
+
+    def test_a_real_download_still_spends_an_attempt(self) -> None:
+        """The ceiling is not removed, only moved past the limiter. A run that
+        reaches the vendor is charged exactly as before."""
+        store = _Store(batches={"all": [self._pending_row(1)]})
+        _run(store)
+        self.assertEqual(store._batches["all"][0]["download_attempts"], 2)
+
+    def test_a_spent_row_still_halts_the_rotation(self) -> None:
+        """download_attempts_exhausted stays exit 1 for real failures."""
+        store = _Store(batches={"all": [self._pending_row(5)]})
+        self.assertEqual(_run(store), 1)
+        self.assertEqual(store.uploads, [])
 
 
 class ReaperTest(unittest.TestCase):
