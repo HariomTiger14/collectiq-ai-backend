@@ -36,7 +36,7 @@ import json
 import os
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -84,11 +84,52 @@ DEFAULT_SOURCE = "sportscardspro"
 # moves with their load. 350 gives margin and still refreshes all 36,962 sets
 # in ~17.7h at 106 requests/day (74% of the 144-slot budget).
 DEFAULT_BATCH_SIZE = 350
+# How long a uid set that failed validation stays un-reclaimable.
+#
+# claim_due_sets orders by tier3_refreshed_at NULLS FIRST, and a batch that
+# fails validation never stamps its sets -- so the very next run claims the
+# identical 350 uids, downloads the identical CSV, and fails identically. On a
+# 10-minute cron that is one account-wide vendor slot burned every ten minutes
+# for as long as nobody is looking. It ran nine times on 2026-09-13 (20:50 to
+# 22:10 UTC) against the same fingerprint before it was caught, which is ten of
+# the day's 141 slots spent re-downloading a file already known to be refused.
+#
+# The guard itself is right and stays fail-closed. What was missing is that a
+# refusal left no trace the NEXT run could see.
+DEFAULT_VALIDATION_COOLDOWN_HOURS = 6.0
+
 # Two batches in flight is already a signal the ingester is behind. Left at 2 so
 # an interactive Shell run is unchanged; the sports cron passes 1 explicitly,
 # because at a 10-minute cadence "two in flight" means two concurrent disk
 # writers rather than a queue.
 DEFAULT_MAX_QUEUE_DEPTH = 2
+
+
+def recently_refused_uid_sets(
+    batches: list[dict[str, Any]], *, cooldown_hours: float,
+    now: datetime | None = None,
+) -> list[frozenset[str]]:
+    """The uid sets of validation_failed batches still inside the cooldown.
+
+    Returned as sets rather than a flat uid list on purpose: the block is on
+    re-requesting the SAME COMBINATION, not on the individual sets. 349 of those
+    350 sets are innocent, and excluding them would punish them for a neighbour's
+    rename.
+    """
+    moment = now or datetime.now(timezone.utc)
+    cutoff = moment - timedelta(hours=cooldown_hours)
+    refused = []
+    for batch in batches:
+        created = batch.get("created_at")
+        if not created:
+            continue
+        when = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+        if when < cutoff:
+            continue
+        uids = [str(uid) for uid in (batch.get("console_uids") or [])]
+        if uids:
+            refused.append(frozenset(uids))
+    return refused
 
 
 def reap_stale_leases(store: BatchStore, *, source: str, commit: bool) -> int:
@@ -206,6 +247,39 @@ def main(argv: list[str] | None = None) -> int:
             print("no sets due for refresh.", flush=True)
             print(dump_and_report(summary, indent=2), flush=True)
             return 0
+
+        # Refuse to re-request a combination validation already refused.
+        #
+        # This check sits BEFORE insert() and before the CSV slot is asked for,
+        # so a jam costs nothing: no batch row, no vendor call. claim_due_sets
+        # is a plain ordered SELECT, so peeking at it here mutates nothing.
+        #
+        # Matched on equality of the whole uid set, not on overlap. The ordering
+        # (tier3_refreshed_at NULLS FIRST, registry_id) is deterministic, so the
+        # identical set is precisely what recurs; any real movement in the
+        # rotation produces a different set and is allowed straight through. No
+        # threshold to tune, and no chance of blocking a batch that merely
+        # shares a few sets with a failed one.
+        candidate = frozenset(str(row["console_uid"]) for row in rows)
+        refused = recently_refused_uid_sets(
+            store.batches(source=args.source, statuses=[VALIDATION_FAILED]),
+            cooldown_hours=args.validation_cooldown_hours,
+        )
+        if candidate in refused:
+            # success=false and exit 1, like download_attempts_exhausted: the
+            # rotation is STOPPED, not idle. A green run carrying only a
+            # skippedReason is the #217 failure shape.
+            summary.update(success=False, setsRequested=len(rows),
+                           skippedReason="validation_failed_cooldown",
+                           cooldownHours=args.validation_cooldown_hours)
+            print(f"STOPPING: these {len(rows)} sets are the same combination a "
+                  f"batch failed validation on within the last "
+                  f"{args.validation_cooldown_hours}h. Re-downloading would spend "
+                  f"an account-wide CSV slot on a file already known to be "
+                  f"refused. Fix the set name the vendor renamed, or wait out the "
+                  f"cooldown.", flush=True)
+            print(dump_and_report(summary, indent=2), flush=True)
+            return 1
         payload = new_batch_row(
             source=args.source,
             console_uids=[r["console_uid"] for r in rows],
@@ -393,6 +467,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "behaving as before; the 10-minute sports cron "
                              "passes 1, which is what makes it single-writer.")
     parser.add_argument("--csv-sleep-seconds", type=float, default=600.0)
+    parser.add_argument(
+        "--validation-cooldown-hours", type=float,
+        default=DEFAULT_VALIDATION_COOLDOWN_HOURS,
+        help="Do not re-request a uid combination a batch failed validation on "
+             "within this many hours. 0 disables the block.")
     parser.add_argument(
         "--max-attempts", type=int, default=5,
         help="Abandon a PENDING batch after this many download attempts. NEW "

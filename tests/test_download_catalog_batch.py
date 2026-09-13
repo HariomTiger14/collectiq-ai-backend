@@ -49,6 +49,18 @@ from scripts.download_catalog_batch import (
 CSV = "id,console-name,product-name,loose-price\n" + "".join(
     f"{i},Baseball Cards 1962 Bazooka,Card {i},$1.00\n" for i in range(1, 21)
 )
+# The 2026-09-13 incident in miniature: the right NUMBER of families (so the
+# count check passes -- this is not the 123k video-game dump), with exactly one
+# family the requested sets do not account for. The vendor renamed G9533 from
+# "2015 Topps Platinum Autograph Rookies" to the name below, and one unmatched
+# family refuses the whole file.
+WRONG_FAMILY_CSV = "id,console-name,product-name,loose-price\n" + "".join(
+    f"{i},Baseball Cards 1962 Bazooka,Card {i},$1.00\n" for i in range(1, 11)
+) + "".join(
+    f"{i},Football Cards 2015 Topps Platinum Autographed Rookie Refractor,"
+    f"Card {i},$1.00\n" for i in range(11, 14)
+)
+
 WRONG_CATALOG = "id,console-name,product-name,loose-price\n" + "".join(
     f"{i},Console {i % 200},Game {i},$1.00\n" for i in range(1, 400)
 )
@@ -82,7 +94,12 @@ class _Store:
         return [b for b in self._batches.get("all", []) if b["status"] in statuses]
 
     def insert(self, row):
-        batch = {**row, "batch_id": "batch-1", "attempts": 0}
+        # created_at is stamped by a column default in Postgres, so a real
+        # inserted row always has one. Without it here the cooldown check --
+        # which reads created_at -- silently saw no recent failures and every
+        # test of it passed while blocking nothing.
+        batch = {**row, "batch_id": "batch-1", "attempts": 0,
+                 "created_at": datetime.now(timezone.utc).isoformat()}
         self.inserted.append(batch)
         # Visible to batches() afterwards, as a real insert would be.
         self._batches.setdefault("all", []).append(batch)
@@ -108,8 +125,16 @@ class _Store:
         return [p.get("status") for _, p in self.updates if "status" in p]
 
 
-def _run(store, *, body=CSV, status=200, argv=("--commit",)):
+def _run(store, *, body=CSV, status=200, argv=("--commit",), calls=None):
+    """`calls` collects every vendor request made.
+
+    uploads is NOT a proxy for "spent a vendor slot": a batch that fails
+    validation has already paid for its CSV and then never uploads. Counting
+    fetches is the only way to see the slot burn.
+    """
     def handler(request: httpx.Request) -> httpx.Response:
+        if calls is not None:
+            calls.append(str(request.url))
         if status != 200:
             return httpx.Response(status, text="upstream error")
         return httpx.Response(200, content=body.encode())
@@ -486,6 +511,92 @@ class SlotRefusalDoesNotSpendAnAttemptTest(unittest.TestCase):
         store = _Store(batches={"all": [self._pending_row(5)]})
         self.assertEqual(_run(store), 1)
         self.assertEqual(store.uploads, [])
+
+
+class ValidationFailureCooldownTest(unittest.TestCase):
+    """A refused combination must not be re-requested every ten minutes.
+
+    2026-09-13, 20:50 to 22:10 UTC: nine consecutive batches, the same 350
+    console_uids, the same 203,560 rows, the same single unexpected family
+    (`football cards 2015 topps platinum autographed rookie refractor`, uid
+    G9533, which the vendor renamed from the registry's "2015 Topps Platinum
+    Autograph Rookies"). Each burned one of the day's 141 account-wide CSV
+    slots to re-download a file already known to be refused.
+
+    The guard did its job: one unmatched family fails the whole file, closed.
+    What was missing is that a refusal left no trace the NEXT run could see --
+    validation_failed never stamps its sets, and claim_due_sets orders
+    NULLS FIRST, so the identical set is exactly what comes back.
+    """
+
+    UIDS = ["G1", "G2", "G3"]
+
+    def _due(self):
+        return [{"registry_id": f"r{i}", "console_uid": uid,
+                 "set_name": "1962 Bazooka"} for i, uid in enumerate(self.UIDS)]
+
+    def _failed_batch(self, *, uids, age_hours):
+        when = datetime.now(timezone.utc) - timedelta(hours=age_hours)
+        return {"batch_id": "failed-1", "status": VALIDATION_FAILED,
+                "console_uids": list(uids), "requested_count": len(uids),
+                "created_at": when.isoformat()}
+
+    def test_the_same_combination_is_refused_without_spending_a_slot(self) -> None:
+        store = _Store(due=self._due(), batches={"all": [
+            self._failed_batch(uids=self.UIDS, age_hours=0.1)]})
+        self.assertEqual(_run(store), 1, "a stopped rotation must not exit 0")
+        self.assertEqual(store.uploads, [], "downloaded a known-refused file")
+        self.assertEqual(store.inserted, [], "created a batch row for it anyway")
+
+    def test_a_different_combination_still_downloads(self) -> None:
+        """The block is on the combination, not on the sets. 349 of 350 are
+        innocent and must not be punished for a neighbour's rename."""
+        store = _Store(due=self._due(), batches={"all": [
+            self._failed_batch(uids=["G1", "G2", "G9"], age_hours=0.1)]})
+        self.assertEqual(_run(store), 0)
+        self.assertEqual(len(store.uploads), 1)
+
+    def test_an_overlapping_combination_is_not_blocked(self) -> None:
+        """Equality, not overlap: the rotation moving on by one set is a real
+        new batch, and no threshold has to be guessed."""
+        store = _Store(due=self._due(), batches={"all": [
+            self._failed_batch(uids=["G1", "G2"], age_hours=0.1)]})
+        self.assertEqual(_run(store), 0)
+        self.assertEqual(len(store.uploads), 1)
+
+    def test_the_block_expires(self) -> None:
+        store = _Store(due=self._due(), batches={"all": [
+            self._failed_batch(uids=self.UIDS, age_hours=99)]})
+        self.assertEqual(_run(store), 0)
+        self.assertEqual(len(store.uploads), 1)
+
+    def test_zero_hours_disables_the_block(self) -> None:
+        store = _Store(due=self._due(), batches={"all": [
+            self._failed_batch(uids=self.UIDS, age_hours=0.0)]})
+        _run(store, argv=("--commit", "--validation-cooldown-hours", "0"))
+        self.assertEqual(len(store.uploads), 1)
+
+    def test_nine_reclaims_cost_one_download_not_nine(self) -> None:
+        """The shape of the incident, end to end."""
+        store = _Store(due=self._due(), batches={"all": []})
+        calls: list[str] = []
+        _run(store, body=WRONG_FAMILY_CSV, calls=calls)
+        self.assertEqual(len(calls), 1, "the first attempt should fetch")
+        failed = [p for _, p in store.updates
+                  if p.get("status") == VALIDATION_FAILED]
+        self.assertEqual(len(failed), 1, "the batch did not fail validation")
+        for _ in range(8):
+            self.assertEqual(_run(store, body=WRONG_FAMILY_CSV, calls=calls), 1)
+        self.assertEqual(len(calls), 1,
+                         f"spent {len(calls)} vendor CSV slots on a combination "
+                         f"already known to be refused")
+
+    def test_a_successful_batch_does_not_arm_the_block(self) -> None:
+        store = _Store(due=self._due(), batches={"all": [
+            {"batch_id": "ok-1", "status": INGESTED, "console_uids": self.UIDS,
+             "created_at": datetime.now(timezone.utc).isoformat()}]})
+        self.assertEqual(_run(store), 0)
+        self.assertEqual(len(store.uploads), 1)
 
 
 class ReaperTest(unittest.TestCase):
