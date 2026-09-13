@@ -12,6 +12,7 @@ spending a second vendor slot out of 144/day, and completed-categories failed
 9-16 batches per run -- so this is a real cost, not a hypothetical one.
 """
 
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -315,8 +316,8 @@ class FailedBatchesAreRetriedFromStorageTest(unittest.TestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             if request.method == "GET":
                 return httpx.Response(200, json=[
-                    {**BATCH, "batch_id": "spent", "attempts": 5},
-                    {**BATCH, "batch_id": "fresh", "attempts": 1},
+                    {**BATCH, "batch_id": "spent", "ingest_attempts": 5},
+                    {**BATCH, "batch_id": "fresh", "ingest_attempts": 1},
                 ])
             patched.append(str(request.url))
             return httpx.Response(200, json=[{**BATCH, "batch_id": "fresh"}])
@@ -336,8 +337,70 @@ class FailedBatchesAreRetriedFromStorageTest(unittest.TestCase):
                       "claimed the batch that had already used its attempts")
         self.assertNotIn("spent", patched[0])
 
+    def test_a_high_download_count_does_not_spend_the_ingest_budget(self) -> None:
+        """The bug this split exists for.
+
+        Both counters used to be one column, so a batch arrived at the ingester
+        having already spent part of its retry budget on being downloaded.
+        Two clean sports cycles on 2026-09-12 each ended at attempts=2 with no
+        failure of any kind -- a Storage object that is perfectly retryable was
+        four ingest claims from being abandoned, not five.
+        """
+        from scripts.catalog_batch_store import BatchStore
+
+        patched = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(200, json=[
+                    {**BATCH, "batch_id": "many-downloads",
+                     "download_attempts": 99, "ingest_attempts": 0},
+                ])
+            patched.append(str(request.url))
+            return httpx.Response(200, json=[{**BATCH, "batch_id": "many-downloads"}])
+
+        transport = httpx.MockTransport(handler)
+        real = httpx.Client
+        store = BatchStore(supabase_url="https://x.test", service_role_key="k",
+                           timeout_seconds=5)
+        with patch("scripts.catalog_batch_store.httpx.Client",
+                   side_effect=lambda *a, **kw: real(*a, transport=transport,
+                                                     **{k: v for k, v in kw.items()})):
+            claimed = store.claim_ingestable_batch(
+                source="sportscardspro", claimed_by="test", max_attempts=5)
+        self.assertIsNotNone(claimed, "download retries consumed the ingest budget")
+        self.assertEqual(len(patched), 1)
+
+    def test_the_claim_writes_both_the_counter_and_its_alias(self) -> None:
+        """`attempts` stays readable for one release, mirroring ingest_attempts
+        -- never their sum, which would restore the shared ceiling."""
+        from scripts.catalog_batch_store import BatchStore
+
+        bodies = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                # download_attempts is non-zero on purpose: the alias must
+                # mirror ingest_attempts, never their sum, or the shared
+                # ceiling is back for everything still reading `attempts`.
+                return httpx.Response(200, json=[
+                    {**BATCH, "ingest_attempts": 2, "download_attempts": 7}])
+            bodies.append(json.loads(request.content))
+            return httpx.Response(200, json=[{**BATCH}])
+
+        transport = httpx.MockTransport(handler)
+        real = httpx.Client
+        store = BatchStore(supabase_url="https://x.test", service_role_key="k",
+                           timeout_seconds=5)
+        with patch("scripts.catalog_batch_store.httpx.Client",
+                   side_effect=lambda *a, **kw: real(*a, transport=transport,
+                                                     **{k: v for k, v in kw.items()})):
+            store.claim_ingestable_batch(source="s", claimed_by="t", max_attempts=5)
+        self.assertEqual(bodies[0]["ingest_attempts"], 3)
+        self.assertEqual(bodies[0]["attempts"], 3, "alias diverged from ingest_attempts")
+
     def test_a_batch_under_the_attempt_limit_is_claimed(self) -> None:
-        store = _Store(batch={**BATCH, "attempts": 4})
+        store = _Store(batch={**BATCH, "ingest_attempts": 4})
         _run(store)
         self.assertEqual(store.statuses()[-1], INGESTED)
 

@@ -120,11 +120,16 @@ def mark_ingesting(store: BatchStore, batch: dict[str, Any], *, claimed_by: str)
     timestamp nothing can tell an import running now from one abandoned by a
     deploy last night. The reaper needs a clock, not a name.
     """
+    attempts = int(batch.get("ingest_attempts") or batch.get("attempts") or 0) + 1
     store.update(batch["batch_id"], {
         "status": INGESTING,
         "claimed_at": datetime.now(timezone.utc).isoformat(),
         "claimed_by": claimed_by,
-        "attempts": int(batch.get("attempts") or 0) + 1,
+        # Ingest only. This helper serves the five-CSV pipeline, which never
+        # goes through download_catalog_batch, so `attempts` does not fall for
+        # these rows -- it is written alongside as the alias.
+        "ingest_attempts": attempts,
+        "attempts": attempts,
     })
 
 

@@ -150,9 +150,39 @@ def main(argv: list[str] | None = None) -> int:
     resumable = store.batches(source=args.source, statuses=[PENDING])
     if resumable:
         batch = resumable[0]
+        spent = int(batch.get("download_attempts") or 0)
+        if spent >= args.max_attempts:
+            # STOP -- do not fall through to claim_due_sets.
+            #
+            # This row still holds its 350 console_uids. Skipping it and
+            # claiming fresh sets would book those uids a second time: two
+            # vendor CSVs for the same sets and two stamps later. The
+            # rotation halting until a human resets download_attempts is the
+            # lesser failure, and it is visible in the table rather than in a
+            # log nobody reads.
+            #
+            # success=false and exit 1, not a quiet skip. no_csv_slot and
+            # no_ingestable_batch mean "nothing to do, next cycle proceeds";
+            # this means "the rotation is stopped". A green cron carrying only
+            # a skippedReason is the #217 failure shape, and #224 exists
+            # because the ledger did not record that distinction either.
+            summary.update(success=False, batchId=batch["batch_id"],
+                           status=PENDING,
+                           skippedReason="download_attempts_exhausted",
+                           downloadAttempts=spent,
+                           maxAttempts=args.max_attempts)
+            print(f"STOPPING: pending batch {batch['batch_id']} has used "
+                  f"{spent} of {args.max_attempts} download attempts. Its "
+                  f"{batch.get('requested_count')} sets stay booked to it, so "
+                  "no new batch is claimed. Reset download_attempts or the row "
+                  "to let those sets re-enter the rotation.", flush=True)
+            print(dump_and_report(summary, indent=2), flush=True)
+            return 1
+        batch = resumable[0]
         rows = None
         print(f"resuming pending batch {batch['batch_id']} "
-              f"({batch['requested_count']} sets)", flush=True)
+              f"({batch['requested_count']} sets, "
+              f"download attempt {spent + 1}/{args.max_attempts})", flush=True)
     else:
         # Deduped HERE, not inside the store. It is batch-construction policy,
         # not part of the rotation's queue predicate -- and a test double for
@@ -206,7 +236,11 @@ def main(argv: list[str] | None = None) -> int:
 
     assert_transition(PENDING, DOWNLOADING)
     store.update(batch_id, {
-        "status": DOWNLOADING, "attempts": int(batch.get("attempts") or 0) + 1,
+        # download_attempts only. `attempts` is an INGEST alias now: bumping it
+        # here is what let a download spend the ingester's retry budget, so a
+        # perfectly retryable Storage object could be abandoned early.
+        "status": DOWNLOADING,
+        "download_attempts": int(batch.get("download_attempts") or 0) + 1,
         "claimed_at": datetime.now(timezone.utc).isoformat(),
         "claimed_by": os.getenv("RENDER_SERVICE_NAME", "local"),
         "fetch_started_at": datetime.now(timezone.utc).isoformat(),
@@ -316,6 +350,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-queue-depth", type=int, default=DEFAULT_MAX_QUEUE_DEPTH,
                         help="Skip the run when this many batches already await ingest.")
     parser.add_argument("--csv-sleep-seconds", type=float, default=600.0)
+    parser.add_argument(
+        "--max-attempts", type=int, default=5,
+        help="Abandon a PENDING batch after this many download attempts. NEW "
+             "in this release -- the downloader previously counted attempts "
+             "and never checked them, so a batch that could not be fetched "
+             "was retried forever, one vendor slot per cycle.")
     parser.add_argument("--timeout-seconds", type=float, default=900)
     parser.add_argument("--api-token", default="")
     parser.add_argument("--supabase-url", default="")

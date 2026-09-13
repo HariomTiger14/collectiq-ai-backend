@@ -190,7 +190,14 @@ class BatchStore:
         """
         candidates = self.batches(source=source, statuses=[VALIDATED, INGEST_FAILED])
         for candidate in candidates:
-            attempts = int(candidate.get("attempts") or 0)
+            # ingest_attempts, never `attempts`. The shared column is bumped
+            # by the DOWNLOADER too, so gating on it spent part of the ingest
+            # budget before the ingester ever saw the batch -- two clean sports
+            # cycles on 2026-09-12 both ended at attempts=2 having failed
+            # nothing. Moving the gate is mandatory rather than cosmetic:
+            # leaving it on `attempts` while download stops bumping that column
+            # would silently GRANT extra ingest claims.
+            attempts = int(candidate.get("ingest_attempts") or 0)
             if attempts >= max_attempts:
                 # Left in place rather than hidden: a batch that keeps failing
                 # is a thing to look at, not to quietly drop.
@@ -208,6 +215,11 @@ class BatchStore:
                         "claimed_at": datetime.now(timezone.utc).isoformat(),
                         "claimed_by": claimed_by,
                         "ingest_started_at": datetime.now(timezone.utc).isoformat(),
+                        "ingest_attempts": attempts + 1,
+                        # Alias, kept for one release so the five-CSV helper,
+                        # existing tests and any dashboard select keep working.
+                        # Mirrors ingest_attempts -- never the sum, which would
+                        # put the shared ceiling back on everything reading it.
                         "attempts": attempts + 1,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                     },

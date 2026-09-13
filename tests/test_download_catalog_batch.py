@@ -259,14 +259,23 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(store.inserted, [], "created a new batch instead of resuming")
         self.assertTrue(all(bid == "old-1" for bid, _ in store.updates))
 
-    def test_the_attempt_counter_advances_on_resume(self) -> None:
+    def test_the_download_counter_advances_on_resume(self) -> None:
+        """download_attempts, not `attempts`.
+
+        `attempts` is an ingest alias since the counters were split: bumping
+        it here is what let a download spend the ingester's retry budget, so a
+        Storage object that could still be retried was abandoned early.
+        """
         store = _Store(batches={"all": [
             {"batch_id": "old-1", "status": PENDING, "console_uids": ["G1"],
-             "registry_ids": ["r1"], "requested_count": 1, "attempts": 1},
+             "registry_ids": ["r1"], "requested_count": 1,
+             "download_attempts": 1},
         ]})
         _run(store)
         first = [p for _, p in store.updates if p.get("status") == DOWNLOADING][0]
-        self.assertEqual(first["attempts"], 2)
+        self.assertEqual(first["download_attempts"], 2)
+        self.assertNotIn("attempts", first,
+                         "the download bumped the ingest alias")
 
 
 class ReaperTest(unittest.TestCase):
@@ -456,3 +465,78 @@ class AResumedBatchIsValidatedToo(unittest.TestCase):
         _run(store)
         self.assertEqual(asked, [["G9157"]],
                          "resume did not widen from the batch's console_uids")
+
+
+class ASpentPendingBatchStopsTheRotationTest(unittest.TestCase):
+    """A new abandon path, not a relocated one.
+
+    The downloader previously counted attempts and never checked them, so a
+    batch that could not be fetched was retried forever -- one vendor slot per
+    cycle, account-wide, shared with the tier-3 rotation and the sets backfill.
+
+    The dangerous part is what happens after the skip. That PENDING row still
+    holds its 350 console_uids, and the resume-before-claim ordering exists so
+    those uids are not booked twice. Skipping it and falling through to
+    claim_due_sets would download the same sets again under a second batch.
+    So the run stops instead.
+    """
+
+    def _spent(self, attempts=5):
+        return {"batch_id": "stuck", "status": PENDING, "console_uids": ["G1"],
+                "registry_ids": ["r1"], "requested_count": 350,
+                "download_attempts": attempts}
+
+    def test_it_does_not_claim_new_sets(self) -> None:
+        """The double-booking this guard exists for."""
+        store = _Store(batches={"all": [self._spent()]})
+        _run(store)
+        self.assertEqual(store.inserted, [],
+                         "claimed a fresh batch while 350 uids were still booked")
+
+    def test_it_reports_failure_not_a_skip(self) -> None:
+        """no_csv_slot means 'next cycle proceeds'. This means 'stopped'.
+
+        Both halves are asserted: the exit code is Render's signal, and
+        success=false is what the ledger reads since #224. A mutation flipping
+        only the summary passed while the exit code was checked alone.
+        """
+        import contextlib
+        import io
+        import json
+
+        store = _Store(batches={"all": [self._spent()]})
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = _run(store)
+        self.assertEqual(code, 1)
+        printed = buffer.getvalue()
+        starts = [i for i, line in enumerate(printed.splitlines()) if line.startswith("{")]
+        body = "\n".join(printed.splitlines()[starts[-1]:])
+        summary = json.loads(body[: body.rindex("}") + 1])
+        self.assertIs(summary["success"], False,
+                      "a stopped rotation reported success to the ledger")
+        self.assertEqual(summary["skippedReason"], "download_attempts_exhausted")
+
+    def test_it_does_not_download(self) -> None:
+        store = _Store(batches={"all": [self._spent()]})
+        _run(store)
+        self.assertEqual([p for _, p in store.updates
+                          if p.get("status") == DOWNLOADING], [])
+
+    def test_one_attempt_below_the_limit_still_runs(self) -> None:
+        store = _Store(batches={"all": [self._spent(attempts=4)]})
+        code = _run(store)
+        self.assertEqual(code, 0)
+        self.assertTrue([p for _, p in store.updates
+                         if p.get("status") == DOWNLOADING])
+
+    def test_a_batch_with_no_download_attempts_runs(self) -> None:
+        """Rows predating the split backfill download_attempts to 0."""
+        batch = self._spent()
+        del batch["download_attempts"]
+        store = _Store(batches={"all": [batch]})
+        self.assertEqual(_run(store), 0)
+
+    def test_the_limit_is_configurable(self) -> None:
+        store = _Store(batches={"all": [self._spent(attempts=6)]})
+        self.assertEqual(_run(store, argv=("--commit", "--max-attempts", "9")), 0)
