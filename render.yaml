@@ -457,7 +457,7 @@ services:
     buildCommand: pip install -r requirements.txt
     # URL hardcoded (not $PUBLIC_API_URL) — the env var wasn't reliably present
     # on the cron, so curl got an empty host and failed with "(3) bad/illegal URL".
-    startCommand: 'curl -fsS -X POST "https://api-sit.packlox.com/admin/pricing/reprice-all?limit=5000" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"'
+    startCommand: 'curl -fsS -X POST "https://api-sit.packlox.com/admin/pricing/reprice-all?limit=5000&dryRun=false" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"'
     envVars:
       - key: ADMIN_JOB_TOKEN
         sync: false
@@ -476,7 +476,7 @@ services:
     branch: main
     schedule: "0 */6 * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: 'curl -fsS -X POST "https://api-sit.packlox.com/admin/push/price-alerts/run?limit=200" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"'
+    startCommand: 'curl -fsS -X POST "https://api-sit.packlox.com/admin/push/price-alerts/run?limit=200&dryRun=false" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"'
     envVars:
       - key: ADMIN_JOB_TOKEN
         sync: false
@@ -488,12 +488,14 @@ services:
   # requires at least one independent corroborating scan beyond the original
   # before anything is promoted. dryRun=false — a no-op cron would defeat the
   # point; the corroboration threshold is the safety gate, not dry-run mode.
-  # Uses ADMIN_IMPORT_TOKEN (not ADMIN_JOB_TOKEN) — this endpoint reuses the
-  # same auth dependency as /admin/pricecharting/import.
+  # Uses ADMIN_JOB_TOKEN. It used to send ADMIN_IMPORT_TOKEN, which the route
+  # has not accepted since it moved to the job-token dependency; the import
+  # token now also lacks catalog:write. ⚠️ ADMIN_JOB_TOKEN must be set on this
+  # cron in the Render dashboard before it is unsuspended.
   #
   # NOTE: standalone-script alternative would call
   #   promote_scan_derived_rows() directly and needs SUPABASE_* on the cron
-  #   itself instead of ADMIN_IMPORT_TOKEN.
+  #   itself instead of an admin token.
   - type: cron
     name: packlox-catalog-promote-scan-derived-sit
     runtime: python
@@ -502,9 +504,9 @@ services:
     branch: main
     schedule: "0 17 * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: 'curl -fsS -X POST "https://api-sit.packlox.com/admin/catalog/promote-scan-derived?dryRun=false&minHitCount=1" -H "X-Admin-Token: $ADMIN_IMPORT_TOKEN"'
+    startCommand: 'curl -fsS -X POST "https://api-sit.packlox.com/admin/catalog/promote-scan-derived?dryRun=false&minHitCount=1" -H "X-Admin-Token: $ADMIN_JOB_TOKEN"'
     envVars:
-      - key: ADMIN_IMPORT_TOKEN
+      - key: ADMIN_JOB_TOKEN
         sync: false
 
   # App-facing: carries out account deletions whose 30-day grace period has

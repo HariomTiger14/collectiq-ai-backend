@@ -92,6 +92,11 @@ def invite_admin_team_member(
 ) -> dict[str, Any]:
     email = request.email.strip().lower()
     try:
+        # The same gate as PATCH /{user_id}/role. Inviting is the other door
+        # into the same escalation: without this a support admin cannot
+        # promote an existing account to admin, but can simply invite a new
+        # one as admin instead.
+        _require_role_grant_authority(admin, role=request.role, is_admin=request.isAdmin)
         payload = AdminUserService().invite_team_member(
             email=email, role=request.role, is_admin=request.isAdmin,
         )
@@ -248,6 +253,7 @@ def update_admin_user_role(
                     "retryable": False,
                 },
             )
+        _require_role_grant_authority(admin, role=request.role, is_admin=request.isAdmin)
         payload = AdminUserService().update_admin_role(
             user_id=user_id,
             role=request.role,
@@ -589,6 +595,33 @@ def _record_audit(
         )
     except Exception:
         return
+
+
+# Roles that may hand out privileged access, on both doors into it: PATCH
+# /{user_id}/role and POST /team. users:write on its own is not enough:
+# support holds it for day-to-day account actions, and without this a support
+# admin could promote anyone -- or invite a fresh admin account of their own
+# -- to full admin, which is privilege escalation, not user support.
+ROLE_GRANTING_ROLES = {"admin", "owner", "super_admin"}
+
+# Granting either of these hands over powers the grantor may not hold.
+PRIVILEGED_ROLES = {"admin", "pricing_reviewer"}
+
+
+def _require_role_grant_authority(admin: dict[str, Any], *, role: str, is_admin: bool) -> None:
+    if role not in PRIVILEGED_ROLES and not is_admin:
+        return
+    actor_role = str(admin.get("role") or "").strip().lower()
+    if actor_role in ROLE_GRANTING_ROLES:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "code": "admin_permission_denied",
+            "message": "Only an admin, owner or super_admin can grant that role.",
+            "retryable": False,
+        },
+    )
 
 
 def _is_self_target(admin: dict[str, Any], user_id: str) -> bool:

@@ -106,6 +106,34 @@ class AdminAuthTest(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json()["error"]["code"], "unauthorized")
 
+    def test_roleless_admin_profile_resolves_to_viewer(self) -> None:
+        """is_admin=true with no role must be the weakest session, not the
+        strongest. The role fallback used to be "admin", so a profile row
+        carrying nothing but is_admin was handed every permission."""
+        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+            "app.routers.admin_auth.httpx.get",
+        ) as get_request:
+            auth_settings.supabase_url = "https://packlox.supabase.co"
+            auth_settings.supabase_anon_key = "anon-key"
+            auth_settings.supabase_service_role_key = "service-role"
+            auth_settings.admin_profile_table = "profiles"
+            get_request.side_effect = [
+                _MockResponse(200, {"id": "roleless", "email": "someone@packlox.com"}),
+                _MockResponse(200, [{"id": "roleless", "is_admin": True}]),
+            ]
+
+            response = self.client.get(
+                "/auth/admin/session",
+                headers={"Authorization": "Bearer supabase-session"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        admin = payload.get("admin", payload)
+        self.assertEqual(admin["role"], "viewer")
+        self.assertEqual(sorted(admin["permissions"]), ["admin:read", "audit:read"])
+        self.assertFalse(admin["canWrite"])
+
     def test_admin_session_reports_unconfigured_profile_auth(self) -> None:
         with patch("app.routers.admin_auth.settings") as auth_settings:
             auth_settings.supabase_url = "https://packlox.supabase.co"

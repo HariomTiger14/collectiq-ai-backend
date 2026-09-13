@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from app.services.ops.observability import recorded_admin_job
 
 from app.routers.admin_auth import (
-    require_admin_job_token,
+    require_admin_job_permission,
     require_admin_permission,
 )
 from app.services.alerts.price_alert_evaluation_service import (
@@ -21,9 +21,9 @@ router = APIRouter(prefix="/admin/push", tags=["Admin Push"])
 
 @router.post("/price-alerts/evaluate")
 async def evaluate_price_alerts(
-    dry_run: bool = Query(False, alias="dryRun"),
+    dry_run: bool = Query(True, alias="dryRun"),
     limit: int = Query(1000, ge=1, le=5000),
-    _admin: dict[str, Any] = Depends(require_admin_job_token),
+    _admin: dict[str, Any] = Depends(require_admin_job_permission("push:write")),
 ) -> dict:
     """Flip saved alerts whose condition is now met to `triggered`."""
     summary = PriceAlertEvaluationService().evaluate_and_flag(
@@ -36,10 +36,13 @@ async def evaluate_price_alerts(
 @router.post("/price-alerts/run")
 @recorded_admin_job("price-alerts-run")
 async def run_price_alert_push_job(
-    dry_run: bool = Query(False, alias="dryRun"),
+    # Defaults to a dry run: a mistyped or truncated call must not put real
+    # pushes on real devices. Every scheduler that means it passes
+    # dryRun=false explicitly (see render.yaml).
+    dry_run: bool = Query(True, alias="dryRun"),
     evaluate: bool = Query(True, alias="evaluate"),
     limit: int = Query(50, ge=1, le=500),
-    _admin: dict[str, Any] = Depends(require_admin_job_token),
+    _admin: dict[str, Any] = Depends(require_admin_job_permission("push:write")),
 ) -> dict:
     # Full pipeline for the scheduler: evaluate saved alerts (flip to
     # triggered), then dispatch pushes for triggered rows. Evaluation is

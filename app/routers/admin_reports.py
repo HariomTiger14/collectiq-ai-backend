@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
-from app.routers.admin_auth import require_admin_import_token
+from app.routers.admin_auth import require_admin_import_token, require_admin_permission
 from app.services.admin_audit_service import AdminAuditService
 from app.services.admin_reports_service import AdminReportsService
 from app.services.admin_scan_failure_service import AdminScanFailureService
@@ -43,7 +43,10 @@ def reports_export(
     since: str | None = Query(default=None, min_length=1),
     until: str | None = Query(default=None, min_length=1),
     limit: int = Query(200, ge=1, le=1000),
-    _admin: dict[str, Any] = Depends(require_admin_import_token),
+    # A CSV of every user, scan or audit row leaves the console entirely, so
+    # it is gated on reports:export rather than on merely being signed in.
+    # viewer does not hold it -- nor does the static import token.
+    _admin: dict[str, Any] = Depends(require_admin_permission("reports:export")),
 ) -> StreamingResponse:
     try:
         rows = _export_rows(

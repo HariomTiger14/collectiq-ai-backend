@@ -1025,3 +1025,125 @@ def _response(payload, headers: dict | None = None) -> httpx.Response:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AdminRoleGrantAuthorityTest(unittest.TestCase):
+    """Who may hand out privileged roles.
+
+    users:write alone is not authority to create an admin. support holds it so
+    it can run day-to-day account actions; before this it could also promote
+    any account -- including a second account of its own -- to full admin,
+    which is privilege escalation rather than user support.
+    """
+
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+        clear_in_memory_audit_events()
+
+    def tearDown(self) -> None:
+        clear_in_memory_audit_events()
+
+    def _patch_role(self, role: str, body: dict):
+        with console_admin(role), patch(
+            "app.routers.admin_users.AdminUserService"
+        ) as service:
+            service.return_value.update_admin_role.return_value = {"success": True}
+            response = self.client.patch(
+                "/admin/users/target-user/role",
+                headers={"Authorization": "Bearer supabase-session"},
+                json=body,
+            )
+        return response, service
+
+    def test_support_cannot_grant_the_admin_role(self) -> None:
+        response, service = self._patch_role(
+            "support", {"role": "admin", "isAdmin": True}
+        )
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertEqual(response.json()["error"]["code"], "admin_permission_denied")
+        service.return_value.update_admin_role.assert_not_called()
+
+    def test_support_cannot_grant_pricing_reviewer(self) -> None:
+        response, service = self._patch_role(
+            "support", {"role": "pricing_reviewer", "isAdmin": False}
+        )
+        self.assertEqual(response.status_code, 403, response.text)
+        service.return_value.update_admin_role.assert_not_called()
+
+    def test_support_cannot_smuggle_admin_through_the_is_admin_flag(self) -> None:
+        """A non-privileged role name plus isAdmin=true is still a grant of
+        console access, so it goes through the same gate."""
+        response, service = self._patch_role(
+            "support", {"role": "viewer", "isAdmin": True}
+        )
+        self.assertEqual(response.status_code, 403, response.text)
+        service.return_value.update_admin_role.assert_not_called()
+
+    def test_support_may_still_set_a_non_privileged_role(self) -> None:
+        response, service = self._patch_role(
+            "support", {"role": "viewer", "isAdmin": False}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        service.return_value.update_admin_role.assert_called_once_with(
+            user_id="target-user", role="viewer", is_admin=False
+        )
+
+    def _invite(self, role: str, body: dict):
+        with console_admin(role), patch(
+            "app.routers.admin_users.AdminUserService"
+        ) as service:
+            service.return_value.invite_team_member.return_value = {"success": True}
+            response = self.client.post(
+                "/admin/users/team",
+                headers={"Authorization": "Bearer supabase-session"},
+                json=body,
+            )
+        return response, service
+
+    def test_support_cannot_invite_a_new_admin(self) -> None:
+        """The other door into the same escalation: blocked from promoting an
+        existing account, support could otherwise just invite a fresh one."""
+        response, service = self._invite(
+            "support", {"email": "new@packlox.com", "role": "admin", "isAdmin": True}
+        )
+        self.assertEqual(response.status_code, 403, response.text)
+        self.assertEqual(response.json()["error"]["code"], "admin_permission_denied")
+        service.return_value.invite_team_member.assert_not_called()
+
+    def test_support_cannot_invite_with_the_is_admin_flag(self) -> None:
+        response, service = self._invite(
+            "support", {"email": "new@packlox.com", "role": "viewer", "isAdmin": True}
+        )
+        self.assertEqual(response.status_code, 403, response.text)
+        service.return_value.invite_team_member.assert_not_called()
+
+    def test_support_may_still_invite_a_plain_collector(self) -> None:
+        """The invite flow also onboards ordinary app accounts -- that must
+        keep working for support."""
+        response, service = self._invite(
+            "support", {"email": "collector@example.com", "role": "user", "isAdmin": False}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        service.return_value.invite_team_member.assert_called_once_with(
+            email="collector@example.com", role="user", is_admin=False
+        )
+
+    def test_owner_may_invite_an_admin(self) -> None:
+        response, service = self._invite(
+            "owner", {"email": "new@packlox.com", "role": "admin", "isAdmin": True}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        service.return_value.invite_team_member.assert_called_once_with(
+            email="new@packlox.com", role="admin", is_admin=True
+        )
+
+    def test_admin_owner_and_super_admin_may_grant_admin(self) -> None:
+        for role in ("admin", "owner", "super_admin"):
+            with self.subTest(role=role):
+                response, service = self._patch_role(
+                    role, {"role": "admin", "isAdmin": True}
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                service.return_value.update_admin_role.assert_called_once_with(
+                    user_id="target-user", role="admin", is_admin=True
+                )

@@ -77,9 +77,10 @@ def require_admin_job_token(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    # Unchanged: a scheduled job authenticates with this token and the routes
-    # it reaches check the token itself, not a permission. Narrowing it would
-    # change what every cron can do, which is a separate decision.
+    # Authenticates the caller as *either* the static job token or a Supabase
+    # console admin. It deliberately does not decide what that caller may do:
+    # a job route must wrap this in require_admin_job_permission, or any
+    # signed-in admin -- viewer included -- reaches it.
     return _require_admin_token(
         expected_token=settings.admin_job_token,
         static_permissions=FULL_ADMIN_PERMISSIONS,
@@ -97,11 +98,33 @@ def require_admin_session(
 
 
 def require_admin_permission(permission: str) -> Callable[..., dict[str, Any]]:
+    return _permission_dependency(permission, require_admin_import_token)
+
+
+def require_admin_job_permission(permission: str) -> Callable[..., dict[str, Any]]:
+    """Authorise a cron route: the job token, or an admin holding `permission`.
+
+    Job routes used to depend on require_admin_job_token alone. That check
+    falls through to the Supabase profile path, so the portal -- which sends
+    the signed-in user's JWT as X-Admin-Token -- reached live reprice, catalog
+    promotion, the price-alert sweep and the GDPR purge with *any* admin
+    session, viewer included. The static ADMIN_JOB_TOKEN keeps working
+    unchanged because it resolves to FULL_ADMIN_PERMISSIONS, so a scheduler
+    satisfies every permission this can ask for; a person now has to hold the
+    permission the route names.
+    """
+    return _permission_dependency(permission, require_admin_job_token)
+
+
+def _permission_dependency(
+    permission: str,
+    authenticate: Callable[..., dict[str, Any]],
+) -> Callable[..., dict[str, Any]]:
     def dependency(
         x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        admin = require_admin_import_token(
+        admin = authenticate(
             x_admin_token=x_admin_token,
             authorization=authorization,
         )
@@ -185,7 +208,11 @@ def _require_supabase_admin(token: str) -> dict[str, Any]:
     if not _profile_has_admin_role(profile):
         raise _unauthorized_admin_session()
 
-    role = str(profile.get("role") or profile.get("admin_role") or "admin").strip().lower()
+    # Defaults to viewer, never admin. A profile row carrying is_admin=true
+    # with no role at all used to land here and be handed
+    # FULL_ADMIN_PERMISSIONS purely because "admin" was the fallback string --
+    # the weakest possible record produced the strongest possible session.
+    role = str(profile.get("role") or profile.get("admin_role") or "viewer").strip().lower()
     permissions = sorted(_permissions_for_role(role))
     return {
         "id": user_id,

@@ -40,10 +40,11 @@ class AdminReportsAndActionsTest(unittest.TestCase):
         self.assertEqual(response.json()["summary"]["users"], 3)
 
     def test_reports_export_returns_csv(self) -> None:
-        with patch("app.routers.admin_auth.settings") as auth_settings, patch(
+        """Authenticates as a console admin: export now needs reports:export,
+        which the static import token deliberately does not hold."""
+        with console_admin("admin"), patch(
             "app.routers.admin_reports.AdminUserService",
         ) as service:
-            auth_settings.admin_import_token = "secret-token"
             service.return_value.list_users.return_value = {
                 "users": [{"id": "user-1", "email": "collector@example.com"}]
             }
