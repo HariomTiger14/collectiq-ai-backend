@@ -74,7 +74,7 @@ class _Store:
     # green in #212.
     sibling_names: list[str] = []
 
-    def sibling_set_names(self, *, source, uids):
+    def expected_family_names(self, *, source, uids):
         return list(self.sibling_names)
 
     def __init__(self, *, due=None, batches=None):
@@ -782,7 +782,7 @@ class AResumedBatchIsValidatedToo(unittest.TestCase):
     def test_the_resumed_batch_looks_up_siblings_for_its_own_uids(self) -> None:
         asked: list[list[str]] = []
         store = _Store(batches={"all": [dict(self.PENDING_BATCH)]})
-        store.sibling_set_names = lambda *, source, uids: asked.append(list(uids)) or []
+        store.expected_family_names = lambda *, source, uids: asked.append(list(uids)) or []
         _run(store)
         self.assertEqual(asked, [["G9157"]],
                          "resume did not widen from the batch's console_uids")
