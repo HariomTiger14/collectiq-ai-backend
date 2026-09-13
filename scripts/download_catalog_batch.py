@@ -245,13 +245,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     summary.update(batchId=batch_id, setsRequested=len(uids))
 
+    # The LEASE is taken now; the attempt COUNTER is not. They used to move
+    # together, which meant a run that never reached the vendor still spent an
+    # attempt -- see the slot-refusal branch below for why that halts the
+    # rotation. The lease still has to be taken before the wait, so nothing
+    # else claims this batch while we sit on the limiter.
     assert_transition(PENDING, DOWNLOADING)
     store.update(batch_id, {
-        # download_attempts only. `attempts` is an INGEST alias now: bumping it
-        # here is what let a download spend the ingester's retry budget, so a
-        # perfectly retryable Storage object could be abandoned early.
         "status": DOWNLOADING,
-        "download_attempts": int(batch.get("download_attempts") or 0) + 1,
         "claimed_at": datetime.now(timezone.utc).isoformat(),
         "claimed_by": os.getenv("RENDER_SERVICE_NAME", "local"),
         "fetch_started_at": datetime.now(timezone.utc).isoformat(),
@@ -264,13 +265,40 @@ def main(argv: list[str] | None = None) -> int:
         fallback_interval_seconds=args.csv_sleep_seconds,
     )
     if not limiter.acquire(max_wait_seconds=BULK_MAX_SLOT_WAIT_SECONDS):
+        # download_attempts is deliberately NOT touched here.
+        #
+        # A refused slot is not a failed download -- we never reached the
+        # vendor. Charging it an attempt makes the rotation halt on the one
+        # thing the limiter exists to do. refresh_completed_pricecharting_
+        # categories holds the shared pricecharting:csv slot from 04:45 to
+        # ~08:29 UTC and outranks us (essential_categories vs our tier3, which
+        # is bulk), so every sports tick in that window is refused. At one
+        # attempt per refusal the ceiling of 5 is reached inside the window,
+        # and the next run stops the whole rotation with
+        # download_attempts_exhausted until a human resets the row -- a hard
+        # stop caused entirely by working backpressure.
+        #
+        # The ceiling stays for real download failures: fetch_failed,
+        # validation_failed and a lease reaped mid-fetch all still spend one,
+        # because those did reach the vendor.
         store.update(batch_id, {"status": PENDING, "claimed_at": None, "claimed_by": None,
                                 "last_error": "no CSV slot available",
                                 "last_error_class": "transient"})
-        summary.update(status=PENDING, skippedReason="no_csv_slot")
-        print("no CSV slot available -- batch left pending.", flush=True)
+        summary.update(status=PENDING, skippedReason="no_csv_slot",
+                       downloadAttempts=int(batch.get("download_attempts") or 0))
+        print("no CSV slot available -- batch left pending "
+              "(no download attempt spent).", flush=True)
         print(dump_and_report(summary, indent=2), flush=True)
         return 0
+
+    # Slot granted: this run is now genuinely attempting a download, so the
+    # attempt is charged here rather than at claim time.
+    store.update(batch_id, {
+        # download_attempts only. `attempts` is an INGEST alias now: bumping it
+        # here is what let a download spend the ingester's retry budget, so a
+        # perfectly retryable Storage object could be abandoned early.
+        "download_attempts": int(batch.get("download_attempts") or 0) + 1,
+    })
 
     base_url = csv_base_url(args.source)
     temp_path = Path(tempfile.mkstemp(prefix="catalog-batch-", suffix=".csv")[1])
