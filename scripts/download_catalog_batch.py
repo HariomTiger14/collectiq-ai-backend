@@ -57,6 +57,7 @@ from scripts.catalog_batches import (
     DOWNLOADING,
     FETCH_FAILED,
     PENDING,
+    QUEUE_DEPTH_STATUSES,
     VALIDATED,
     VALIDATION_FAILED,
     assert_transition,
@@ -83,7 +84,10 @@ DEFAULT_SOURCE = "sportscardspro"
 # moves with their load. 350 gives margin and still refreshes all 36,962 sets
 # in ~17.7h at 106 requests/day (74% of the 144-slot budget).
 DEFAULT_BATCH_SIZE = 350
-# Two validated batches waiting is already a signal the ingester is behind.
+# Two batches in flight is already a signal the ingester is behind. Left at 2 so
+# an interactive Shell run is unchanged; the sports cron passes 1 explicitly,
+# because at a 10-minute cadence "two in flight" means two concurrent disk
+# writers rather than a queue.
 DEFAULT_MAX_QUEUE_DEPTH = 2
 
 
@@ -134,9 +138,16 @@ def main(argv: list[str] | None = None) -> int:
     summary["staleLeasesReaped"] = reap_stale_leases(
         store, source=args.source, commit=args.commit)
 
-    # Backpressure: a growing validated queue means the ingester is behind,
+    # Backpressure: more work already in the pipe means the ingester is behind,
     # and downloading more only fills the bucket and burns vendor slots.
-    queued = store.batches(source=args.source, statuses=[DOWNLOADED, VALIDATED])
+    #
+    # QUEUE_DEPTH_STATUSES includes INGESTING and DOWNLOADING, not just the
+    # files sitting on disk -- see the note there. The short version: on a
+    # 10-minute schedule an ingest outlives the tick that fed it, so counting
+    # only DOWNLOADED+VALIDATED lets tick N+1 write a second 37 MB file while
+    # tick N's is still being read.
+    queued = store.batches(source=args.source,
+                           statuses=sorted(QUEUE_DEPTH_STATUSES))
     summary["queueDepth"] = len(queued)
     if len(queued) >= args.max_queue_depth:
         summary["skippedReason"] = "queue_full"
@@ -348,7 +359,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source", default=DEFAULT_SOURCE)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--max-queue-depth", type=int, default=DEFAULT_MAX_QUEUE_DEPTH,
-                        help="Skip the run when this many batches already await ingest.")
+                        help="Skip the run when this many batches are already in "
+                             "flight (downloading, downloaded, validated or "
+                             "ingesting). Default 2 keeps a manual Shell run "
+                             "behaving as before; the 10-minute sports cron "
+                             "passes 1, which is what makes it single-writer.")
     parser.add_argument("--csv-sleep-seconds", type=float, default=600.0)
     parser.add_argument(
         "--max-attempts", type=int, default=5,

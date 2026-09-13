@@ -29,12 +29,17 @@ from scripts.catalog_batches import (
     DOWNLOADED,
     DOWNLOADING,
     FETCH_FAILED,
+    IN_FLIGHT_STATUSES,
+    INGESTED,
+    INGESTING,
     PENDING,
+    QUEUE_DEPTH_STATUSES,
     VALIDATED,
     VALIDATION_FAILED,
 )
 from scripts.download_catalog_batch import (
     DEFAULT_BATCH_SIZE,
+    DEFAULT_MAX_QUEUE_DEPTH,
     BatchStore,
     main,
     parse_args,
@@ -241,6 +246,105 @@ class BackpressureTest(unittest.TestCase):
         ]})
         _run(store)
         self.assertEqual(len(store.uploads), 1)
+
+
+class SingleWriterBackpressureTest(unittest.TestCase):
+    """--max-queue-depth 1, the setting the 10-minute sports cron runs with.
+
+    The depth count used to be {DOWNLOADED, VALIDATED} -- the files sitting on
+    disk. That answers "is the ingester behind?", which is the question the flag
+    was written for. It does not answer "is anything writing to disk right now?",
+    and on a 10-minute cadence those come apart: a 270k-row ingest takes ~7.5
+    minutes, so the next tick arrives while the previous batch is INGESTING and
+    invisible to the count. The downloader then writes a second 37 MB file while
+    the first is still being read.
+
+    Nothing downstream would report that. Both runs succeed, both ledger rows are
+    green, and the only symptom is Disk IOPS -- which is not observable from
+    inside Postgres.
+    """
+
+    def _run_at_depth_one(self, status):
+        store = _Store(batches={"all": [
+            {"batch_id": "a", "status": status, "requested_count": 350},
+        ]})
+        code = _run(store, argv=("--commit", "--max-queue-depth", "1"))
+        return store, code
+
+    def test_one_ingesting_batch_blocks_the_download(self) -> None:
+        """The case the old count missed entirely."""
+        store, code = self._run_at_depth_one(INGESTING)
+        self.assertEqual(code, 0)
+        self.assertEqual(store.uploads, [], "downloaded while an ingest was writing")
+        self.assertEqual(store.inserted, [], "claimed sets while an ingest was writing")
+
+    def test_one_downloading_batch_blocks_the_download(self) -> None:
+        """A live download is a disk writer too.
+
+        claimed_at is left unset so the reaper cannot mistake it for a dead
+        lease -- this asserts the queue count, not the reaper.
+        """
+        store, code = self._run_at_depth_one(DOWNLOADING)
+        self.assertEqual(code, 0)
+        self.assertEqual(store.uploads, [])
+        self.assertEqual(store.inserted, [])
+
+    def test_one_validated_batch_blocks_the_download(self) -> None:
+        store, code = self._run_at_depth_one(VALIDATED)
+        self.assertEqual(code, 0)
+        self.assertEqual(store.uploads, [])
+        self.assertEqual(store.inserted, [])
+
+    def test_one_downloaded_batch_blocks_the_download(self) -> None:
+        store, code = self._run_at_depth_one(DOWNLOADED)
+        self.assertEqual(code, 0)
+        self.assertEqual(store.uploads, [])
+        self.assertEqual(store.inserted, [])
+
+    def test_an_empty_queue_still_downloads_at_depth_one(self) -> None:
+        """Depth 1 must not mean 'never download'."""
+        store = _Store(batches={"all": []})
+        _run(store, argv=("--commit", "--max-queue-depth", "1"))
+        self.assertEqual(len(store.uploads), 1)
+
+    def test_an_ingested_batch_does_not_block(self) -> None:
+        """Terminal states are not work in flight; every past batch is INGESTED,
+        so counting them would wedge the rotation permanently after run one."""
+        store = _Store(batches={"all": [
+            {"batch_id": "a", "status": INGESTED, "requested_count": 350},
+        ]})
+        _run(store, argv=("--commit", "--max-queue-depth", "1"))
+        self.assertEqual(len(store.uploads), 1)
+
+    def test_the_default_is_still_two_so_a_shell_run_is_unchanged(self) -> None:
+        """The flag changes what is counted for everyone; the default must not
+        change who is blocked. A manual Shell run with one batch in flight
+        behaved one way before this change and must behave the same way after."""
+        self.assertEqual(DEFAULT_MAX_QUEUE_DEPTH, 2)
+        store = _Store(batches={"all": [
+            {"batch_id": "a", "status": INGESTING, "requested_count": 350},
+        ]})
+        _run(store)
+        self.assertEqual(len(store.uploads), 1)
+
+
+class QueueDepthStatusesTest(unittest.TestCase):
+    def test_the_counted_statuses_are_exactly_the_in_flight_ones(self) -> None:
+        """Expressed against IN_FLIGHT_STATUSES rather than a second literal
+        list, so a new state added to the pipeline cannot be silently left out
+        of the backpressure count.
+
+        PENDING is the one in-flight state deliberately excluded: it holds
+        claimed uids but has no file and writes nothing, and the resume path
+        below depends on a run reaching it rather than being turned away.
+        """
+        self.assertEqual(QUEUE_DEPTH_STATUSES, IN_FLIGHT_STATUSES - {PENDING})
+
+    def test_a_pending_batch_does_not_block_its_own_resume(self) -> None:
+        """The resume path exists to pick a PENDING batch back up. Counting it
+        toward the queue would make depth 1 refuse the very run meant to clear
+        it, and those 350 uids would stay booked forever."""
+        self.assertNotIn(PENDING, QUEUE_DEPTH_STATUSES)
 
 
 class ResumeTest(unittest.TestCase):
