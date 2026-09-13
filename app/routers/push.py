@@ -1,6 +1,7 @@
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 from app.services.ops.observability import recorded_admin_job
 
 from app.routers.admin_auth import (
@@ -17,6 +18,51 @@ from app.services.push.price_alert_push_service import (
 
 
 router = APIRouter(prefix="/admin/push", tags=["Admin Push"])
+
+TITLE_MAX = 120
+BODY_MAX = 500
+SEGMENT_PATTERN = "^(all|pro|inactive)$"
+
+
+class BroadcastRequest(BaseModel):
+    """JSON body for a broadcast.
+
+    The message used to travel only as query parameters, which put the full
+    title and body of every push an admin sent into request logs, proxy and
+    CDN access logs, and browser history. A URL is not a private channel.
+
+    Query parameters still work: the two callers that send them (the console
+    before this deploys, and anything scripted against the documented route)
+    must not break on the deploy that adds this. Body wins where both are
+    given.
+    """
+
+    segment: str | None = Field(default=None, pattern=SEGMENT_PATTERN)
+    title: str | None = Field(default=None, min_length=1, max_length=TITLE_MAX)
+    body: str | None = Field(default=None, min_length=1, max_length=BODY_MAX)
+
+
+class DirectSendRequest(BaseModel):
+    """JSON body for a direct send to one user. See BroadcastRequest."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=TITLE_MAX)
+    body: str | None = Field(default=None, min_length=1, max_length=BODY_MAX)
+    deviceId: str | None = Field(default=None, max_length=512)
+
+
+def _resolve_required(body_value: str | None, query_value: str | None, field: str) -> str:
+    """Body first, then the query parameter. 422 rather than an empty push."""
+    value = (body_value if body_value is not None else query_value)
+    if value is None or not str(value).strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "push_field_required",
+                "message": f"`{field}` is required, in the JSON body or as a query parameter.",
+                "retryable": False,
+            },
+        )
+    return str(value)
 
 
 @router.post("/price-alerts/evaluate")
@@ -169,17 +215,23 @@ async def get_push_audience_counts(
 
 @router.post("/broadcast")
 async def send_broadcast_push_notification(
-    segment: str = Query(..., pattern="^(all|pro|inactive)$"),
-    title: str = Query(..., min_length=1, max_length=120),
-    body: str = Query(..., min_length=1, max_length=500),
+    payload: BroadcastRequest | None = Body(default=None),
+    segment: str | None = Query(default=None, pattern=SEGMENT_PATTERN),
+    title: str | None = Query(default=None, min_length=1, max_length=TITLE_MAX),
+    body: str | None = Query(default=None, min_length=1, max_length=BODY_MAX),
     dry_run: bool = Query(True, alias="dryRun"),
     _admin: dict[str, Any] = Depends(require_admin_permission("push:write")),
 ) -> dict:
+    resolved_segment = _resolve_required(
+        payload.segment if payload else None, segment, "segment"
+    )
+    resolved_title = _resolve_required(payload.title if payload else None, title, "title")
+    resolved_body = _resolve_required(payload.body if payload else None, body, "body")
     try:
         summary = PriceAlertPushService().dispatch_broadcast(
-            segment=segment,
-            title=title,
-            body=body,
+            segment=resolved_segment,
+            title=resolved_title,
+            body=resolved_body,
             dry_run=dry_run,
         )
     except PushNotificationError as error:
@@ -197,18 +249,22 @@ async def send_broadcast_push_notification(
 @router.post("/users/{user_id}/send")
 async def send_push_to_user(
     user_id: str,
-    title: str = Query(..., min_length=1, max_length=120),
-    body: str = Query(..., min_length=1, max_length=500),
+    payload: DirectSendRequest | None = Body(default=None),
+    title: str | None = Query(default=None, min_length=1, max_length=TITLE_MAX),
+    body: str | None = Query(default=None, min_length=1, max_length=BODY_MAX),
     device_id: str | None = Query(None, alias="deviceId"),
     dry_run: bool = Query(True, alias="dryRun"),
     _admin: dict[str, Any] = Depends(require_admin_permission("push:write")),
 ) -> dict:
+    resolved_title = _resolve_required(payload.title if payload else None, title, "title")
+    resolved_body = _resolve_required(payload.body if payload else None, body, "body")
+    resolved_device_id = (payload.deviceId if payload else None) or device_id
     try:
         summary = PriceAlertPushService().dispatch_to_user(
             user_id=user_id,
-            title=title,
-            body=body,
-            device_id=device_id,
+            title=resolved_title,
+            body=resolved_body,
+            device_id=resolved_device_id,
             dry_run=dry_run,
         )
     except PushNotificationError as error:
