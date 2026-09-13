@@ -1327,7 +1327,6 @@ class SupabaseCatalogClient:
                             self.current_price_stats["browseKeysOnly"] += 1
                             current_price_rows.append(to_current_price_row(row))
 
-                    insert_started_at = time.perf_counter()
                     # Price observations are written BEFORE the legacy
                     # close/insert on purpose: PostgREST offers no
                     # cross-request transaction (the legacy close+insert
@@ -1349,9 +1348,16 @@ class SupabaseCatalogClient:
                             time.perf_counter() - current_price_started_at
                         )
                     if price_observations:
+                        # Its OWN clock. This timer used to start before the
+                        # current_price upsert above, so price_snapshot_insert
+                        # silently included current_price_upsert -- the two
+                        # phases summed past the wall clock and the report's
+                        # "(unaccounted)" line clamped to 0.0s, hiding whatever
+                        # real residual was left.
+                        snapshot_started_at = time.perf_counter()
                         self._insert_price_observation_rows(client, price_observations)
                         self.phase_seconds["price_snapshot_insert"] += (
-                            time.perf_counter() - insert_started_at
+                            time.perf_counter() - snapshot_started_at
                         )
                     close_started_at = time.perf_counter()
                     if changed_ids:

@@ -563,6 +563,41 @@ class ImportPriceChartingCatalogTest(unittest.TestCase):
         self.assertEqual(client.phase_seconds["scd2_insert"], 0.0)
         self.assertEqual(client.phase_seconds["scd2_close"], 0.0)
 
+    def test_the_snapshot_timer_excludes_the_current_price_upsert(self) -> None:
+        """They shared a start point, so snapshot time included upsert time.
+
+        The two timers then summed past the run's wall clock, and the phase
+        report's "(unaccounted)" line -- which clamps a negative residual to
+        zero -- read 0.0s on a run that had 32s unaccounted for. A timer that
+        reports someone else's work is worse than no timer: it sent the last
+        round of tuning at the wrong phase.
+        """
+        row = _catalog_row("1", "Pikachu")
+        transport = _FakeSupabaseTransport(current_rows=[])
+        with patch("scripts.import_pricecharting_catalog.httpx.Client") as client_class:
+            client_class.return_value.__enter__.return_value = transport
+            client = SupabaseCatalogClient(
+                supabase_url="https://example.supabase.co",
+                service_role_key=_fake_supabase_jwt("service_role"),
+                timeout_seconds=1,
+            )
+            upsert = client._upsert_current_price_rows
+
+            def slow_upsert(*args, **kwargs):
+                time.sleep(0.2)
+                return upsert(*args, **kwargs)
+
+            client._upsert_current_price_rows = slow_upsert
+            client.sync_scd2_history_rows([row], batch_size=100)
+
+        self.assertGreater(client.phase_seconds["current_price_upsert"], 0.2,
+                           "the upsert timer did not see the delay")
+        self.assertGreater(client.phase_seconds["price_snapshot_insert"], 0.0,
+                           "the snapshot write was not timed at all")
+        self.assertLess(client.phase_seconds["price_snapshot_insert"], 0.2,
+                        "the snapshot timer is still charging itself for the "
+                        "current_price upsert")
+
     def test_closing_the_superseded_version_is_timed_on_its_own(self) -> None:
         """A metadata change costs a close AND an insert -- two round trips.
 
