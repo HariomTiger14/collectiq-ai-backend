@@ -15,13 +15,33 @@ import yaml
 
 RENDER_YAML = pathlib.Path("render.yaml")
 
-DOWNLOAD_JOB = "collectiq-sportscardspro-download-sit"
-INGEST_JOB = "collectiq-sportscardspro-ingest-sit"
+DOWNLOAD_JOB = "collectiq-sportscardspro-download"
+INGEST_JOB = "collectiq-sportscardspro-ingest"
 OLD_ROTATION_JOB = "packlox-tier3-sportscardspro-rotation-sit"
 FIVE_CSV_JOB_COMMAND = "scripts.refresh_pricecharting_catalog"
 
 # The five-CSV window. Sports must not run in it.
 FIVE_CSV_HOURS = {14, 15}
+
+# Services that already exist in Render, pinned EXACTLY as the dashboard has
+# them. See RenderNameIsIdentityTest for why these must not be "tidied".
+EXISTING_SERVICE_NAMES = frozenset({
+    "collectiq-pricecharting-refresh-sit",
+    "packlox-discover-pricecharting-sets-sit",
+    "packlox-backfill-pricecharting-sets-sit",
+    "packlox-refresh-tracked-catalog-items-sit",
+    "packlox-refresh-small-sets-sit",
+    "packlox-refresh-kicksdb-catalog-sit",
+    "packlox-tier3-sportscardspro-rotation-sit",
+    "packlox-refresh-completed-pricecharting-categories-sit",
+    "packlox-fx-rates-refresh-sit",
+    "packlox-batch-reprice-sit",
+    "packlox-price-alerts-sit",
+    "packlox-catalog-promote-scan-derived-sit",
+    "packlox-purge-scheduled-deletions-sit",
+    "packlox-match-portfolio-catalog-sit",
+})
+
 
 
 def _services() -> dict[str, dict]:
@@ -190,6 +210,80 @@ class FiveCsvStartCommandUnchangedTest(unittest.TestCase):
 
     def test_it_still_passes_use_storage(self) -> None:
         self.assertIn("--use-storage", self._five_csv_command())
+
+
+
+class RenderNameIsIdentityTest(unittest.TestCase):
+    """`name:` is a Blueprint's IDENTITY, not a label.
+
+    Editing a name here does not rename the service in Render. It describes a
+    service Render has never seen, so the Blueprint CREATES it and leaves the
+    old one running -- two crons on the same schedule doing the same work. For
+    collectiq-pricecharting-refresh-sit that is two five-CSV jobs writing the
+    catalog nightly and two claims on a vendor budget of 144 CSVs a day.
+
+    So the -sit suffix, ugly as it is, is pinned on every service that already
+    exists. A real rename is a dashboard action first (Settings -> Name, which
+    keeps the service id and its history), and only then this file, to match.
+    Never this file first.
+
+    The two sports crons are the exception only because Render has never seen
+    them either way -- naming them without the suffix costs nothing.
+    """
+
+    def test_every_existing_service_keeps_its_exact_name(self) -> None:
+        names = set(_services())
+        missing = EXISTING_SERVICE_NAMES - names
+        self.assertEqual(
+            missing, set(),
+            f"renamed in render.yaml without a dashboard rename first: {missing}. "
+            f"The Blueprint will CREATE these as new services rather than rename "
+            f"the running ones.")
+
+    def test_the_two_new_sports_crons_carry_no_suffix(self) -> None:
+        for name in (DOWNLOAD_JOB, INGEST_JOB):
+            with self.subTest(service=name):
+                self.assertIn(name, _services())
+                self.assertFalse(name.endswith("-sit"))
+
+    def test_no_service_is_both_suffixed_and_unsuffixed(self) -> None:
+        """The shape a half-applied rename leaves behind: the old service still
+        running and its duplicate alongside it."""
+        names = set(_services())
+        for name in names:
+            with self.subTest(service=name):
+                twin = name[:-4] if name.endswith("-sit") else f"{name}-sit"
+                self.assertNotIn(twin, names,
+                                 f"{name} and {twin} both defined -- that is a "
+                                 f"duplicated service, not a rename")
+
+    def test_the_custom_domain_was_not_renamed_with_the_services(self) -> None:
+        """api-sit.packlox.com is DNS, not a service name. Six crons curl it and
+        app/core/config.py defaults PUBLIC_API_URL to it, so a bulk
+        find-and-replace over "-sit" would have silently pointed every one of
+        them at a host that does not exist."""
+        self.assertEqual(
+            RENDER_YAML.read_text().count("https://api-sit.packlox.com"), 6)
+
+    def test_the_environment_var_still_says_sit(self) -> None:
+        """A rename does not promote anything to production.
+
+        app/core/config.py reads ENVIRONMENT to decide
+        subscription_allow_untrusted_sources, which in production rejects
+        unverified subscription claims and fails closed when no store verifier
+        is configured. That is a subscription decision, not a naming one.
+        """
+        declared = 0
+        for name, service in _services().items():
+            env = {var["key"]: var.get("value") for var in service["envVars"]}
+            if "ENVIRONMENT" not in env:
+                # The curl-based crons call the deployed API over HTTP; the var
+                # lives on that service, not on them.
+                continue
+            declared += 1
+            with self.subTest(service=name):
+                self.assertEqual(env.get("ENVIRONMENT"), "sit")
+        self.assertGreater(declared, 0, "no service declares ENVIRONMENT any more")
 
 
 if __name__ == "__main__":
