@@ -42,7 +42,7 @@
 
 services:
   - type: cron
-    name: collectiq-pricecharting-refresh-sit
+    name: collectiq-pricecharting-refresh
     runtime: python
     plan: starter
     region: oregon
@@ -103,7 +103,7 @@ services:
   # Render has no in-place region change, a new service must be created in
   # Ohio and the old Oregon one retired, same as was done for backfill.
   - type: cron
-    name: packlox-discover-pricecharting-sets-sit
+    name: packlox-discover-pricecharting-sets
     runtime: python
     plan: starter
     region: ohio
@@ -205,7 +205,7 @@ services:
   # retries the failed rows next cycle, no data loss) -- this just reduces
   # how often it happens by keeping each write sub-batch smaller.
   - type: cron
-    name: packlox-backfill-pricecharting-sets-sit
+    name: packlox-backfill-pricecharting-sets
     runtime: python
     plan: starter
     # ohio, NOT oregon: sportscardspro.com 403-blocks Render's Oregon
@@ -243,7 +243,7 @@ services:
   # like backfill: refresh only matters for items someone actually tracks,
   # a much smaller and slower-moving population than full-set backfill.
   - type: cron
-    name: packlox-refresh-tracked-catalog-items-sit
+    name: packlox-refresh-tracked-catalog-items
     runtime: python
     plan: starter
     region: ohio
@@ -274,7 +274,7 @@ services:
   # backfill's */15 and tracked-item-refresh's :20) to spread load in time,
   # not because it needs to be that frequent.
   - type: cron
-    name: packlox-refresh-small-sets-sit
+    name: packlox-refresh-small-sets
     runtime: python
     plan: starter
     region: ohio
@@ -308,7 +308,7 @@ services:
   # nothing). Costs ~100 requests/run (~3,000/month) -- well inside the Pro
   # plan's 250,000/month budget.
   - type: cron
-    name: packlox-refresh-kicksdb-catalog-sit
+    name: packlox-refresh-kicksdb-catalog
     runtime: python
     plan: starter
     region: ohio
@@ -373,7 +373,7 @@ services:
   # Do not unsuspend both: they claim from the same registry rotation and would
   # double-book the same sets and spend two vendor CSV slots on one batch.
   - type: cron
-    name: packlox-tier3-sportscardspro-rotation-sit
+    name: packlox-tier3-sportscardspro-rotation
     runtime: python
     plan: starter
     region: ohio
@@ -396,7 +396,7 @@ services:
   # Daily refresh for the 5 pricecharting.com registry categories that are
   # already 100% backfilled (coins, comic-books, funko-pops, lego-sets,
   # lorcana-cards -- ~6,600 sets total) but permanently excluded from
-  # backfill-pricecharting-sets-sit's claim_rows() once successful. Unlike
+  # packlox-backfill-pricecharting-sets'  claim_rows() once successful. Unlike
   # sportscardspro.com's categories (huge and heavily throttled -- their
   # recurring refresh is the tier-3 rotation cron above), these are small and completely unthrottled, so rather than
   # complicate the shared claim/priority-tier logic sportscardspro depends
@@ -405,7 +405,7 @@ services:
   # requests/run (6,600 sets / 150 per batch) -- a couple minutes, not the
   # multi-day sportscardspro backfill problem.
   - type: cron
-    name: packlox-refresh-completed-pricecharting-categories-sit
+    name: packlox-refresh-completed-pricecharting-categories
     runtime: python
     plan: starter
     region: ohio
@@ -426,7 +426,7 @@ services:
         sync: false
 
   - type: cron
-    name: packlox-fx-rates-refresh-sit
+    name: packlox-fx-rates-refresh
     runtime: python
     plan: starter
     region: oregon
@@ -448,7 +448,7 @@ services:
   # then it needs the FULL pricing env (SUPABASE_*, PRICING_PROVIDER=auto,
   # PRICECHARTING_API_KEY, EBAY_*, KICKSDB_*) on the cron itself.
   - type: cron
-    name: packlox-batch-reprice-sit
+    name: packlox-batch-reprice
     runtime: python
     plan: starter
     region: oregon
@@ -469,7 +469,7 @@ services:
   #   python -m scripts.run_price_alert_pipeline --limit 1000 --push-limit 200
   # needs SUPABASE_* + FIREBASE_* on the cron itself.
   - type: cron
-    name: packlox-price-alerts-sit
+    name: packlox-price-alerts
     runtime: python
     plan: starter
     region: oregon
@@ -495,7 +495,7 @@ services:
   #   promote_scan_derived_rows() directly and needs SUPABASE_* on the cron
   #   itself instead of ADMIN_IMPORT_TOKEN.
   - type: cron
-    name: packlox-catalog-promote-scan-derived-sit
+    name: packlox-catalog-promote-scan-derived
     runtime: python
     plan: starter
     region: oregon
@@ -523,7 +523,7 @@ services:
   # deletes only, so it consumes none of the external provider quota the
   # catalog crons are pacing against.
   - type: cron
-    name: packlox-purge-scheduled-deletions-sit
+    name: packlox-purge-scheduled-deletions
     runtime: python
     plan: starter
     region: oregon
@@ -545,7 +545,7 @@ services:
   # the same job. Cheap (internal Supabase reads/writes only, no external
   # rate limits), so it runs hourly rather than daily.
   - type: cron
-    name: packlox-match-portfolio-catalog-sit
+    name: packlox-match-portfolio-catalog
     runtime: python
     plan: starter
     region: oregon
@@ -580,7 +580,7 @@ services:
   # ticks skip. Ingest runs more often than download deliberately, so a file is
   # picked up promptly rather than waiting a full download cycle.
   - type: cron
-    name: collectiq-sportscardspro-download-sit
+    name: collectiq-sportscardspro-download
     runtime: python
     plan: starter
     region: ohio
@@ -607,7 +607,7 @@ services:
         sync: false
 
   - type: cron
-    name: collectiq-sportscardspro-ingest-sit
+    name: collectiq-sportscardspro-ingest
     runtime: python
     plan: starter
     region: ohio

@@ -15,13 +15,54 @@ import yaml
 
 RENDER_YAML = pathlib.Path("render.yaml")
 
-DOWNLOAD_JOB = "collectiq-sportscardspro-download-sit"
-INGEST_JOB = "collectiq-sportscardspro-ingest-sit"
-OLD_ROTATION_JOB = "packlox-tier3-sportscardspro-rotation-sit"
+DOWNLOAD_JOB = "collectiq-sportscardspro-download"
+INGEST_JOB = "collectiq-sportscardspro-ingest"
+OLD_ROTATION_JOB = "packlox-tier3-sportscardspro-rotation"
 FIVE_CSV_JOB_COMMAND = "scripts.refresh_pricecharting_catalog"
 
 # The five-CSV window. Sports must not run in it.
 FIVE_CSV_HOURS = {14, 15}
+
+
+class NoSitSuffixTest(unittest.TestCase):
+    """These jobs are production. The -sit suffix was dropped 2026-09-13.
+
+    Asserted for every service, not just the two new ones, so a copy-pasted
+    block cannot reintroduce the suffix on the next cron added.
+    """
+
+    def test_no_service_name_carries_the_sit_suffix(self) -> None:
+        for name in _services():
+            with self.subTest(service=name):
+                self.assertFalse(name.endswith("-sit"), f"{name} still ends in -sit")
+
+    def test_the_custom_domain_was_not_renamed_with_the_services(self) -> None:
+        """api-sit.packlox.com is DNS, not a service name. Six crons curl it and
+        app/core/config.py defaults PUBLIC_API_URL to it, so a bulk
+        find-and-replace over "-sit" would have silently pointed every one of
+        them at a host that does not exist."""
+        text = RENDER_YAML.read_text()
+        self.assertEqual(text.count("https://api-sit.packlox.com"), 6)
+
+    def test_the_environment_var_still_says_sit(self) -> None:
+        """Renaming the services did NOT promote them to ENVIRONMENT=production.
+
+        That value is not cosmetic: app/core/config.py reads it to decide
+        subscription_allow_untrusted_sources, which in production rejects
+        unverified subscription claims and fails closed when no store verifier
+        is configured. Changing it is a subscription decision, not a rename.
+        """
+        declared = 0
+        for name, service in _services().items():
+            env = {var["key"]: var.get("value") for var in service["envVars"]}
+            if "ENVIRONMENT" not in env:
+                # The curl-based crons call the deployed API over HTTP; the var
+                # lives on that service, not on them.
+                continue
+            declared += 1
+            with self.subTest(service=name):
+                self.assertEqual(env.get("ENVIRONMENT"), "sit")
+        self.assertGreater(declared, 0, "no service declares ENVIRONMENT any more")
 
 
 def _services() -> dict[str, dict]:
