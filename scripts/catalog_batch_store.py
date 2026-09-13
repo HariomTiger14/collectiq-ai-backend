@@ -80,19 +80,34 @@ class BatchStore:
             response.raise_for_status()
             return [row for row in response.json() if isinstance(row, dict)]
 
-    def sibling_set_names(self, *, source: str, uids: list[str]) -> list[str]:
-        """Every registry name sharing one of these console_uids.
+    def expected_family_names(self, *, source: str, uids: list[str]) -> list[str]:
+        """Every name a CSV for these uids could legitimately come back under.
 
-        The vendor answers a uid with ITS canonical family name, which need not
-        be the name of the row we happened to claim. G9157 is registered twice
-        -- '2015 Panini Donrus' and '2015 Panini Donruss', the first being the
-        vendor's own typo'd slug -- so a batch claiming one can be answered
-        with the other and refused as a wrong-catalog response.
+        Two sources, unioned, because either can be the one the vendor uses.
 
-        Widening the expected names to the uid's siblings does not weaken the
-        guard: a family matching a sibling of a REQUESTED uid is a requested
-        set under the vendor's preferred label. A genuinely wrong catalog
-        still matches no name of any requested uid.
+        SIBLING set_names. The vendor answers a uid with ITS canonical family
+        name, which need not be the name of the row we happened to claim. G9157
+        is registered twice -- '2015 Panini Donrus' and '2015 Panini Donruss',
+        the first being the vendor's own typo'd slug -- so a batch claiming one
+        can be answered with the other and refused as a wrong-catalog response.
+
+        VENDOR labels. Siblings only help when a second registry row already
+        carries the vendor's spelling. When the vendor RENAMES a set and we hold
+        one row with the old name, there is no sibling to save us: on 2026-09-13
+        G9533 went from '2015 Topps Platinum Autograph Rookies' to
+        '...autographed rookie refractor' and jammed the rotation for 90 minutes.
+        vendor_label is that name, captured from /consoles-autocomplete by
+        scripts/fill_sports_vendor_labels.py and read from the table here.
+
+        Read from the TABLE, never fetched live. Eight autocomplete GETs of
+        ~80,000 rows on every ten-minute download tick would be a new latency
+        and Cloudflare surface on the one path that must not acquire new ways to
+        fail.
+
+        Neither widening weakens the guard. A family matching a sibling or the
+        vendor's own label for a REQUESTED uid is a requested set under a
+        different label; a genuinely wrong catalog still matches no name of any
+        requested uid, and the count check (families <= uids) is untouched.
         """
         if not uids:
             return []
@@ -100,15 +115,22 @@ class BatchStore:
             response = client.get(
                 f"{self.base}/rest/v1/pricecharting_set_registry",
                 params={
-                    "select": "set_name",
+                    "select": "set_name,vendor_label",
                     "source_site": f"eq.{source}",
                     "console_uid": f"in.({','.join(sorted(set(uids)))})",
                 },
                 headers=self._headers(),
             )
             response.raise_for_status()
-            return [str(row.get("set_name")) for row in response.json()
-                    if isinstance(row, dict) and row.get("set_name")]
+            names: list[str] = []
+            for row in response.json():
+                if not isinstance(row, dict):
+                    continue
+                for key in ("set_name", "vendor_label"):
+                    value = row.get(key)
+                    if value:
+                        names.append(str(value))
+            return names
 
     def batches(self, *, source: str, statuses: list[str]) -> list[dict[str, Any]]:
         with self._client() as client:

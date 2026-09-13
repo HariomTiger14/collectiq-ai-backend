@@ -146,7 +146,7 @@ class TheRealSiblingLookupTest(unittest.TestCase):
     """Against BatchStore itself, not the test double.
 
     Every test above uses a fake store, so a mutation emptying the real
-    sibling_set_names passed all of them: the downloader would have widened
+    expected_family_names passed all of them: the downloader would have widened
     its expected names with nothing, and the jam would be back with a full
     green suite.
     """
@@ -170,7 +170,7 @@ class TheRealSiblingLookupTest(unittest.TestCase):
             return httpx.Response(200, json=[{"set_name": "2015 Panini Donrus"},
                                              {"set_name": "2015 Panini Donruss"}])
 
-        names = self._store(handler).sibling_set_names(
+        names = self._store(handler).expected_family_names(
             source="sportscardspro", uids=["G9157"])
         self.assertEqual(sorted(names), ["2015 Panini Donrus", "2015 Panini Donruss"])
 
@@ -185,7 +185,7 @@ class TheRealSiblingLookupTest(unittest.TestCase):
             captured.append(request)
             return httpx.Response(200, json=[])
 
-        self._store(handler).sibling_set_names(
+        self._store(handler).expected_family_names(
             source="sportscardspro", uids=["G9157", "G1"])
         params = captured[0].url.params
         self.assertEqual(params["source_site"], "eq.sportscardspro")
@@ -200,7 +200,7 @@ class TheRealSiblingLookupTest(unittest.TestCase):
             captured.append(request)
             return httpx.Response(200, json=[])
 
-        self.assertEqual(self._store(handler).sibling_set_names(
+        self.assertEqual(self._store(handler).expected_family_names(
             source="sportscardspro", uids=[]), [])
         self.assertEqual(captured, [])
 
@@ -211,5 +211,5 @@ class TheRealSiblingLookupTest(unittest.TestCase):
             return httpx.Response(200, json=[{"set_name": None},
                                              {"set_name": "2015 Panini Donruss"}])
 
-        self.assertEqual(self._store(handler).sibling_set_names(
+        self.assertEqual(self._store(handler).expected_family_names(
             source="sportscardspro", uids=["G9157"]), ["2015 Panini Donruss"])

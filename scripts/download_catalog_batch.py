@@ -315,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
     # quietly.
     claimed_names = {r["set_name"] for r in rows if r.get("set_name")} if rows else set()
     set_names = sorted(
-        claimed_names | set(store.sibling_set_names(source=args.source, uids=uids))
+        claimed_names | set(store.expected_family_names(source=args.source, uids=uids))
     )
     summary.update(batchId=batch_id, setsRequested=len(uids))
 
