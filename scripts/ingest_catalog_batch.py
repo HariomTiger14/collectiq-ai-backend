@@ -62,6 +62,33 @@ DEFAULT_SOURCE = "sportscardspro"
 SOURCE_FILE_TAG = "sportscardspro-tier3-refresh"
 
 
+# Timers that run INSIDE another timer rather than beside it. Since #223 the
+# three gate lookups execute concurrently within scd2_comparison, so their sum
+# exceeds it -- that gap is the evidence of overlap, not an accounting error,
+# and treating them as siblings makes the percentages meaningless.
+def accounted_seconds(phases: dict[str, float]) -> float:
+    """Wall-clock seconds the phase timers explain.
+
+    Nested lookups are excluded. They overlap inside scd2_comparison, so
+    adding them double-counts and drives the total past the run's own wall
+    clock -- which is why phaseUnaccountedSeconds reported a clamped 0.0 on
+    every run since #223 instead of the real residual.
+
+    A separate function rather than an inline sum because it cannot be tested
+    through main(): a fake's fabricated seconds always exceed a
+    millisecond-long test run, so the residual clamps either way and a
+    mutation putting the nested timers back was invisible.
+    """
+    return sum(value for name, value in phases.items()
+               if name not in NESTED_PHASES)
+
+
+NESTED_PARENT = "scd2_comparison"
+NESTED_PHASES = frozenset({
+    "scd2_history_lookup", "catalog_metadata_lookup", "current_price_lookup",
+})
+
+
 def reap_stale_ingest_leases(store: BatchStore, *, source: str, commit: bool) -> int:
     """Return abandoned ingests to validated so a later run can retry.
 
@@ -204,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         file_rows = int(batch.get("row_count") or 0)
         phases = {**catalog_client.phase_seconds, **timings}
-        accounted = sum(phases.values())
+        accounted = accounted_seconds(phases)
         summary.update(rowsParsed=parsed, fileRowCount=file_rows,
                        fileComplete=(file_rows == 0 or parsed >= file_rows),
                        writeRetries=retries, ingestMs=ingest_ms,
@@ -257,7 +284,18 @@ def main(argv: list[str] | None = None) -> int:
         total = max(ingest_ms / 1000, 0.001)
         print("  where the time went:", flush=True)
         for name, value in sorted(phases.items(), key=lambda kv: -kv[1]):
-            if value >= 0.005:
+            if value < 0.005:
+                continue
+            if name in NESTED_PHASES:
+                # Printed WITHOUT a percentage, and indented under its parent.
+                # These run concurrently inside scd2_comparison since #223, so
+                # they are not slices of the run -- they are what the parallel
+                # block was waiting on. Showing them as a share of wall clock
+                # made the list sum to ~171% and invited someone to "optimise"
+                # three lookups that are already overlapped into one wait.
+                print(f"      -> {name:20} {value:8.1f}s  (inside "
+                      f"{NESTED_PARENT})", flush=True)
+            else:
                 print(f"    {name:24} {value:8.1f}s  {value / total * 100:5.1f}%",
                       flush=True)
         unaccounted = max(total - accounted, 0.0)

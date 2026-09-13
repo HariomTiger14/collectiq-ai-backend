@@ -98,10 +98,14 @@ class _Stats:
             "written": written, "skippedUnchanged": skipped, "failed": failed}
         self.timeout_retry_stats = {
             "timeouts": 1, "retries": 1, "rowsRecovered": 3, "rowsAbandoned": abandoned}
+        # Shaped like a real run since #223: the three lookups sum to MORE
+        # than scd2_comparison, because they overlap inside it.
         self.phase_seconds = phase_seconds if phase_seconds is not None else {
             "unchanged_detection": 1.5, "catalog_upsert": 9.0,
-            "scd2_comparison": 0.75, "price_snapshot_insert": 0.5,
-            "scd2_close": 0.1, "scd2_insert": 0.25}
+            "scd2_comparison": 0.75, "scd2_history_lookup": 0.6,
+            "catalog_metadata_lookup": 0.55, "current_price_lookup": 0.4,
+            "price_snapshot_insert": 0.5, "scd2_close": 0.1,
+            "scd2_insert": 0.25}
         self.price_history_stats = {
             "attempted": 12, "inserted": 11, "duplicateSkipped": 1, "failed": 0}
         self.catalog_lookup_stats = {"fetched": 20, "reused": 20}
@@ -557,3 +561,165 @@ class AFailedIngestExitsNonZeroTest(unittest.TestCase):
     def test_a_dry_run_is_not_a_failure(self) -> None:
         code, _ = _run(_Store(), argv=())
         self.assertEqual(code, 0)
+
+
+class NestedLookupTimersAreNotSiblingsTest(unittest.TestCase):
+    """Since #223 the three gate lookups run INSIDE scd2_comparison.
+
+    On a real sports batch that produced:
+
+        scd2_comparison          69.3s   32.9%
+        catalog_metadata_lookup  63.1s   30.0%
+        scd2_history_lookup      60.4s   28.7%
+        current_price_lookup     39.7s   18.9%
+
+    -- a list summing to ~171% of the run, with (unaccounted) showing 0.0s
+    because the total clamped at zero once the parts exceeded the whole. Read
+    at face value it says there are three large independent lookups to attack,
+    when they are one wait the overlap already collapsed.
+
+    The data was always right. The presentation was not, and presentation is
+    what the next optimisation gets chosen from.
+    """
+
+    def _summary(self):
+        import contextlib
+        import io
+        import json
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            _run(_Store())
+        printed = buffer.getvalue()
+        starts = [i for i, line in enumerate(printed.splitlines()) if line.startswith("{")]
+        body = "\n".join(printed.splitlines()[starts[-1]:])
+        return json.loads(body[: body.rindex("}") + 1]), printed
+
+    def test_the_nested_lookups_are_still_reported(self) -> None:
+        """Hidden would be worse than mislabelled -- they are the evidence the
+        overlap is working."""
+        summary, _ = self._summary()
+        for name in ("scd2_history_lookup", "catalog_metadata_lookup",
+                     "current_price_lookup"):
+            with self.subTest(phase=name):
+                self.assertIn(name, summary["phaseSeconds"])
+
+    def _breakdown_lines(self, printed: str) -> list[str]:
+        """Just the human 'where the time went' block.
+
+        The JSON summary repeats every phase name, and scanning the whole of
+        stdout matched those too -- the first version of this test failed on
+        `"scd2_history_lookup": 0.6,` from the payload, not on the breakdown
+        it was written to check.
+        """
+        lines = printed.splitlines()
+        start = next(i for i, l in enumerate(lines) if "where the time went" in l)
+        end = next((i for i, l in enumerate(lines[start:], start)
+                    if l.startswith("{")), len(lines))
+        return lines[start:end]
+
+    def test_they_are_printed_under_their_parent(self) -> None:
+        _, printed = self._summary()
+        nested = [l for l in self._breakdown_lines(printed)
+                  if "scd2_history_lookup" in l]
+        self.assertTrue(nested, "the nested lookup vanished from the breakdown")
+        self.assertNotIn("%", nested[0],
+                         "a nested timer was shown as a share of wall clock")
+        self.assertIn("inside", nested[0])
+
+    def test_the_parent_keeps_its_percentage(self) -> None:
+        _, printed = self._summary()
+        parent = [l for l in printed.splitlines() if "scd2_comparison" in l]
+        self.assertTrue(parent)
+        self.assertIn("%", parent[0])
+
+    def test_no_nested_timer_is_ever_shown_as_a_share_of_the_run(self) -> None:
+        """The whole defect in one assertion. On a real batch the list summed
+        to ~171% because these three were counted beside their own parent."""
+        _, printed = self._summary()
+        for name in ("scd2_history_lookup", "catalog_metadata_lookup",
+                     "current_price_lookup"):
+            for line in printed.splitlines():
+                if name in line:
+                    with self.subTest(phase=name):
+                        self.assertNotIn("%", line)
+
+    def test_the_nested_timers_are_excluded_from_the_accounted_total(self) -> None:
+        """Including them drove `accounted` past the run's own wall clock,
+        which is why phaseUnaccountedSeconds reported a clamped 0.0 on every
+        run since #223 instead of the real residual. Asserted on the sum
+        rather than on the residual itself, because a fake's fabricated
+        seconds always exceed a millisecond-long test run."""
+        from scripts.ingest_catalog_batch import NESTED_PHASES
+
+        summary, _ = self._summary()
+        phases = summary["phaseSeconds"]
+        nested = sum(v for k, v in phases.items() if k in NESTED_PHASES)
+        self.assertGreater(nested, phases["scd2_comparison"],
+                           "fixture does not reproduce the overlap it is testing")
+
+    def test_the_nested_set_matches_what_runs_in_parallel(self) -> None:
+        """If a fourth lookup joins the parallel block it must be listed here,
+        or the percentages silently go wrong again."""
+        from scripts.ingest_catalog_batch import NESTED_PHASES
+
+        self.assertEqual(NESTED_PHASES, {
+            "scd2_history_lookup", "catalog_metadata_lookup",
+            "current_price_lookup"})
+
+
+class AccountedSecondsTest(unittest.TestCase):
+    """The arithmetic on its own, because main() cannot exercise it.
+
+    A fake's fabricated phase seconds always exceed a millisecond-long test
+    run, so phaseUnaccountedSeconds clamps to 0 whether or not the nested
+    timers are included -- and a mutation putting them back passed every test
+    that went through main().
+    """
+
+    PHASES = {
+        "scd2_comparison": 69.26,
+        "scd2_history_lookup": 60.44,
+        "catalog_metadata_lookup": 63.12,
+        "current_price_lookup": 39.74,
+        "price_snapshot_insert": 64.16,
+        "catalog_upsert": 9.8,
+        "parse": 35.13,
+    }
+
+    def _accounted(self):
+        from scripts.ingest_catalog_batch import accounted_seconds
+
+        return accounted_seconds(self.PHASES)
+
+    def test_the_nested_lookups_are_not_added(self) -> None:
+        """Real numbers from the 2026-09-12 sports batch: including them gives
+        352s for a run whose wall clock was 210s."""
+        self.assertAlmostEqual(self._accounted(), 178.35, places=2)
+
+    def test_the_naive_sum_would_exceed_the_run(self) -> None:
+        """Shows why the exclusion exists rather than asserting it twice."""
+        self.assertGreater(sum(self.PHASES.values()), 210.0)
+        self.assertLess(self._accounted(), 210.0)
+
+    def test_the_parent_is_still_counted(self) -> None:
+        """scd2_comparison IS wall clock of the block, so it belongs."""
+        from scripts.ingest_catalog_batch import accounted_seconds
+
+        without = accounted_seconds(
+            {k: v for k, v in self.PHASES.items() if k != "scd2_comparison"})
+        self.assertAlmostEqual(self._accounted() - without, 69.26, places=2)
+
+    def test_an_unknown_phase_is_counted(self) -> None:
+        """A new sibling timer must count by default; only the explicitly
+        nested set is excluded."""
+        from scripts.ingest_catalog_batch import accounted_seconds
+
+        self.assertAlmostEqual(
+            accounted_seconds({**self.PHASES, "brand_new": 5.0}),
+            self._accounted() + 5.0, places=2)
+
+    def test_no_phases_is_zero(self) -> None:
+        from scripts.ingest_catalog_batch import accounted_seconds
+
+        self.assertEqual(accounted_seconds({}), 0.0)
