@@ -580,7 +580,7 @@ services:
   # ticks skip. Ingest runs more often than download deliberately, so a file is
   # picked up promptly rather than waiting a full download cycle.
   - type: cron
-    name: collectiq-sportscardspro-download-sit
+    name: collectiq-sportscardspro-download
     runtime: python
     plan: starter
     region: ohio
@@ -607,7 +607,7 @@ services:
         sync: false
 
   - type: cron
-    name: collectiq-sportscardspro-ingest-sit
+    name: collectiq-sportscardspro-ingest
     runtime: python
     plan: starter
     region: ohio
