@@ -3,7 +3,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 
 from app.routers.admin_auth import (
-    require_admin_job_token,
+    require_admin_job_permission,
     require_admin_permission,
 )
 from app.services.data_requests.data_request_service import (
@@ -133,7 +133,7 @@ async def list_admin_data_requests(
 async def purge_due_data_requests(
     limit: int = Query(50, ge=1, le=500),
     dry_run: bool = Query(True, alias="dryRun"),
-    _admin: dict[str, Any] = Depends(require_admin_job_token),
+    _admin: dict[str, Any] = Depends(require_admin_job_permission("users:write")),
 ) -> dict:
     """Cron entry point: carry out deletions whose grace period has elapsed.
 
@@ -154,10 +154,16 @@ async def purge_due_data_requests(
 async def process_admin_data_request(
     request_id: str,
     dry_run: bool = Query(True, alias="dryRun"),
-    _admin: dict[str, Any] = Depends(require_admin_permission("users:write")),
+    admin: dict[str, Any] = Depends(require_admin_permission("users:write")),
 ) -> dict:
     try:
-        return _service.process_request(request_id, dry_run=dry_run)
+        # Without this the audit row for a live export or erasure always read
+        # "admin_token", so the log could not say which person did it.
+        return _service.process_request(
+            request_id,
+            dry_run=dry_run,
+            actor=str(admin.get("email") or admin.get("id") or "admin_token"),
+        )
     except DataRequestNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
     except DataRequestError as error:

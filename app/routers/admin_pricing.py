@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 from app.routers.admin_auth import (
     require_admin_import_token,
-    require_admin_job_token,
+    require_admin_job_permission,
     require_admin_permission,
 )
 from app.services.admin_audit_service import AdminAuditService
@@ -69,9 +69,12 @@ def pricing_health_quick(
 @router.post("/reprice-all")
 @recorded_admin_job("batch-reprice")
 def reprice_all_portfolio_items(
-    dry_run: bool = Query(False, alias="dryRun"),
+    # Defaults to a dry run: this rewrites the stored value of every portfolio
+    # item, so a bare POST must preview rather than write. The batch-reprice
+    # cron passes dryRun=false explicitly (see render.yaml).
+    dry_run: bool = Query(True, alias="dryRun"),
     limit: int = Query(1000, ge=1, le=10000),
-    _admin: dict[str, Any] = Depends(require_admin_job_token),
+    _admin: dict[str, Any] = Depends(require_admin_job_permission("pricing:write")),
 ) -> dict[str, Any]:
     """Scheduled batch re-pricing: re-value every portfolio item and persist
     refreshed values. Unavailable results are a no-op (never zero out a value).

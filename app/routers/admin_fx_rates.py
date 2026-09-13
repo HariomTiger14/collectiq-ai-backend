@@ -3,7 +3,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from app.services.ops.observability import recorded_admin_job
 
-from app.routers.admin_auth import require_admin_job_token
+from app.routers.admin_auth import require_admin_job_permission
 from app.services.pricing.fx_rate_service import FxRateService, FxRateServiceError
 
 
@@ -13,7 +13,7 @@ router = APIRouter(prefix="/admin/pricing/fx-rates", tags=["Admin"])
 @router.post("/refresh")
 @recorded_admin_job("fx-rates-refresh")
 def refresh_fx_rates(
-    _admin: dict[str, Any] = Depends(require_admin_job_token),
+    _admin: dict[str, Any] = Depends(require_admin_job_permission("pricing:write")),
 ) -> dict[str, Any]:
     """Meant to run once a day via a Render cron -- fetches today's rates
     from Frankfurter and upserts them. currency_conversion.py's static
@@ -37,7 +37,7 @@ def refresh_fx_rates(
 def backfill_fx_rates(
     start_date: str = Query(..., alias="startDate"),
     end_date: str = Query(..., alias="endDate"),
-    _admin: dict[str, Any] = Depends(require_admin_job_token),
+    _admin: dict[str, Any] = Depends(require_admin_job_permission("pricing:write")),
 ) -> dict[str, Any]:
     """One-time (or re-runnable) historical backfill so existing portfolio
     value history can be converted using the rate that was actually in

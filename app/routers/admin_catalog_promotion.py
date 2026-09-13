@@ -3,7 +3,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from app.services.ops.observability import recorded_admin_job
 
-from app.routers.admin_auth import require_admin_job_token
+from app.routers.admin_auth import require_admin_job_permission
 from app.services.admin_import_job_service import AdminImportJobService
 from app.services.pricing.promote_scan_derived_catalog import (
     ScanDerivedPromotionError,
@@ -37,7 +37,7 @@ def promote_scan_derived_catalog_rows(
     # historical accident, which is what kept ADMIN_IMPORT_TOKEN load-bearing
     # for automation. ⚠️ The cron's Render env var must be switched from
     # ADMIN_IMPORT_TOKEN to ADMIN_JOB_TOKEN before it is unsuspended.
-    _admin: dict[str, Any] = Depends(require_admin_job_token),
+    _admin: dict[str, Any] = Depends(require_admin_job_permission("catalog:write")),
 ) -> dict[str, Any]:
     jobs = AdminImportJobService()
     job = jobs.create_job(source="scan_derived", dry_run=dry_run)

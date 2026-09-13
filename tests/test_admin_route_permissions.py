@@ -82,6 +82,14 @@ def as_job_token(token: str = "job-token"):
 
 
 AUTH = {"Authorization": "Bearer supabase-session"}
+
+
+def _call(client: TestClient, method: str, path: str):
+    """Issue the request. GET carries no body -- TestClient.get() rejects one."""
+    if method == "get":
+        return client.get(path, headers=AUTH)
+    return getattr(client, method)(path, headers=AUTH, json={})
+
 JOB_HEADERS = {"X-Admin-Token": "job-token"}
 
 # (method, path, required permission). Every route changed by this work.
@@ -115,6 +123,19 @@ PROTECTED_ROUTES: list[tuple[str, str, str]] = [
     ("post", "/admin/push/broadcast", "push:write"),
     ("post", "/admin/push/users/user-1/send", "push:write"),
     ("post", "/admin/push/devices/device-1/disable", "push:write"),
+    # reports:export -- a CSV of every user/scan/audit row leaves the console
+    ("get", "/admin/reports/export?dataset=users", "reports:export"),
+    # Job routes. The scheduler's own token still passes (it resolves to
+    # FULL_ADMIN_PERMISSIONS); a person needs the named permission. Before
+    # this, the portal's user JWT reached all of these with any admin role.
+    ("post", "/admin/pricing/reprice-all", "pricing:write"),
+    ("post", "/admin/pricing/fx-rates/refresh", "pricing:write"),
+    ("post", "/admin/pricing/fx-rates/backfill?startDate=2026-01-01&endDate=2026-01-02", "pricing:write"),
+    ("post", "/admin/portfolio/match-catalog", "pricing:write"),
+    ("post", "/admin/catalog/promote-scan-derived", "catalog:write"),
+    ("post", "/admin/push/price-alerts/evaluate", "push:write"),
+    ("post", "/admin/push/price-alerts/run", "push:write"),
+    ("post", "/admin/data-requests/purge-due", "users:write"),
     # admin:read -- console reads that used to demand a job token
     ("get", "/admin/push/history", "admin:read"),
     ("get", "/admin/push/audience", "admin:read"),
@@ -129,6 +150,18 @@ JOB_ROUTES: list[tuple[str, str]] = [
     ("post", "/admin/push/price-alerts/evaluate"),
     ("post", "/admin/push/price-alerts/run"),
     ("post", "/admin/data-requests/purge-due"),
+]
+
+# POSTs whose default must be a preview. Each rewrites live state -- portfolio
+# values, real device pushes -- so a call that forgets the flag has to no-op
+# rather than run. Every cron that means it passes dryRun=false (render.yaml).
+DRY_RUN_BY_DEFAULT: list[tuple[str, str]] = [
+    ("/admin/pricing/reprice-all", "dryRun"),
+    ("/admin/push/price-alerts/evaluate", "dryRun"),
+    ("/admin/push/price-alerts/run", "dryRun"),
+    ("/admin/catalog/promote-scan-derived", "dryRun"),
+    ("/admin/portfolio/match-catalog", "dryRun"),
+    ("/admin/data-requests/purge-due", "dryRun"),
 ]
 
 ALL_ROLES = ("viewer", "support", "pricing_reviewer", "admin", "owner", "super_admin")
@@ -173,9 +206,7 @@ class RouteDenialTest(unittest.TestCase):
                     continue
                 with self.subTest(route=f"{method.upper()} {path}", role=role):
                     with as_role(role):
-                        response = getattr(self.client, method)(
-                            path, headers=AUTH, json={}
-                        )
+                        response = _call(self.client, method, path)
                     self.assertEqual(
                         response.status_code,
                         403,
@@ -191,7 +222,7 @@ class RouteDenialTest(unittest.TestCase):
         for method, path, _permission in writes:
             with self.subTest(route=f"{method.upper()} {path}"):
                 with as_role("viewer"):
-                    response = getattr(self.client, method)(path, headers=AUTH, json={})
+                    response = _call(self.client, method, path)
                 self.assertEqual(response.status_code, 403, response.text)
 
     def test_support_cannot_change_pricing_or_catalog_over_http(self) -> None:
@@ -226,14 +257,14 @@ class RouteDenialTest(unittest.TestCase):
     def test_push_send_routes_require_push_write(self) -> None:
         """The whole point of adding push:write: no lesser role may send."""
         push_routes = [r for r in PROTECTED_ROUTES if r[2] == "push:write"]
-        self.assertEqual(len(push_routes), 5)
+        # 5 console send routes + the 2 price-alert job routes, which used to
+        # take a bare job-token dependency and so were open to any admin.
+        self.assertEqual(len(push_routes), 7)
         for method, path, _ in push_routes:
             for role in ("viewer", "support", "pricing_reviewer"):
                 with self.subTest(route=path, role=role):
                     with as_role(role):
-                        response = getattr(self.client, method)(
-                            path, headers=AUTH, json={}
-                        )
+                        response = _call(self.client, method, path)
                     self.assertEqual(response.status_code, 403, response.text)
 
 
@@ -370,7 +401,10 @@ class RouteAllowTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json()["success"])
-        service.process_request.assert_called_once_with("request-1", dry_run=False)
+        # The signed-in admin, not "admin_token", is what the audit records.
+        service.process_request.assert_called_once_with(
+            "request-1", dry_run=False, actor="admin@packlox.com"
+        )
 
     def test_support_may_reply_to_a_ticket(self) -> None:
         with as_role("support"), patch("app.routers.support._service") as service:
@@ -576,6 +610,91 @@ class ScheduledJobRouteTest(unittest.TestCase):
                         path, headers={"X-Admin-Token": "wrong-token"}, json={}
                     )
                 self.assertEqual(response.status_code, 401, response.text)
+
+
+class JobRouteAuthorisationTest(unittest.TestCase):
+    """A signed-in admin must hold the permission a job route names.
+
+    require_admin_job_token authenticates but does not authorise: it falls
+    through to the Supabase profile path, so before this every cron route was
+    reachable with any admin session -- and the portal sends the signed-in
+    user's JWT as X-Admin-Token, so viewer could fire a live reprice.
+    """
+
+    def setUp(self) -> None:
+        self.client = TestClient(app)
+
+    JOB_PERMISSIONS = [
+        ("post", "/admin/pricing/reprice-all", "pricing:write"),
+        ("post", "/admin/pricing/fx-rates/refresh", "pricing:write"),
+        ("post", "/admin/portfolio/match-catalog", "pricing:write"),
+        ("post", "/admin/catalog/promote-scan-derived", "catalog:write"),
+        ("post", "/admin/push/price-alerts/evaluate", "push:write"),
+        ("post", "/admin/push/price-alerts/run", "push:write"),
+        ("post", "/admin/data-requests/purge-due", "users:write"),
+    ]
+
+    def test_viewer_cannot_reach_any_job_route(self) -> None:
+        for method, path, _permission in self.JOB_PERMISSIONS:
+            with self.subTest(route=path):
+                with as_role("viewer"):
+                    response = getattr(self.client, method)(path, headers=AUTH, json={})
+                self.assertEqual(response.status_code, 403, response.text)
+                self.assertEqual(
+                    response.json()["error"]["code"], "admin_permission_denied"
+                )
+
+    def test_support_cannot_reprice_or_push(self) -> None:
+        """support holds users:write only -- not pricing or push."""
+        for path in (
+            "/admin/pricing/reprice-all",
+            "/admin/push/price-alerts/run",
+            "/admin/catalog/promote-scan-derived",
+        ):
+            with self.subTest(route=path):
+                with as_role("support"):
+                    response = self.client.post(path, headers=AUTH, json={})
+                self.assertEqual(response.status_code, 403, response.text)
+
+    def test_a_role_holding_the_permission_gets_through(self) -> None:
+        with as_role("pricing_reviewer"), patch(
+            "app.routers.admin_pricing.BatchRepricingService"
+        ) as service, patch("app.routers.admin_pricing.AdminAuditService"):
+            service.return_value.reprice_all.return_value = _SummaryStub(
+                {
+                    "scanned": 0,
+                    "repriced": 0,
+                    "unavailable": 0,
+                    "skipped": 0,
+                    "rateLimited": 0,
+                    "errors": [],
+                }
+            )
+            response = self.client.post("/admin/pricing/reprice-all", headers=AUTH)
+
+        self.assertEqual(response.status_code, 200, response.text)
+
+
+class DryRunDefaultTest(unittest.TestCase):
+    """A POST that omits dryRun must preview, not write.
+
+    Asserted off the OpenAPI schema rather than by calling each route, so it
+    covers the default itself instead of whatever a mocked service happened to
+    return.
+    """
+
+    def test_state_changing_job_routes_default_to_dry_run(self) -> None:
+        schema = app.openapi()
+        for path, param in DRY_RUN_BY_DEFAULT:
+            with self.subTest(route=path):
+                params = schema["paths"][path]["post"].get("parameters", [])
+                match = next((p for p in params if p["name"] == param), None)
+                self.assertIsNotNone(match, f"{path} has no {param} parameter")
+                self.assertIs(
+                    match["schema"].get("default"),
+                    True,
+                    f"{path} defaults to a live run",
+                )
 
 
 if __name__ == "__main__":

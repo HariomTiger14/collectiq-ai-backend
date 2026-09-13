@@ -3,7 +3,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from app.services.ops.observability import recorded_admin_job
 
-from app.routers.admin_auth import require_admin_job_token
+from app.routers.admin_auth import require_admin_job_permission
 from app.services.pricing.portfolio_catalog_matching_service import (
     PortfolioCatalogMatchingError,
     match_unlinked_portfolio_items,
@@ -19,7 +19,7 @@ def match_portfolio_items_to_catalog(
     dry_run: bool = Query(True, alias="dryRun"),
     limit: int = Query(200, ge=1, le=2000),
     timeout_seconds: int = Query(30, alias="timeoutSeconds", ge=5, le=120),
-    _admin: dict[str, Any] = Depends(require_admin_job_token),
+    _admin: dict[str, Any] = Depends(require_admin_job_permission("pricing:write")),
 ) -> dict[str, Any]:
     try:
         result = match_unlinked_portfolio_items(
