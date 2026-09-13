@@ -252,6 +252,22 @@ class ACrashMidImportIsRecoverableTest(unittest.TestCase):
         return {"batch_id": "abc", "source": "pokemon.csv", "status": INGESTING,
                 "storage_key": "k", "attempts": 1, "claimed_at": claimed_at}
 
+    def test_the_five_csv_claim_never_bumps_download_attempts(self) -> None:
+        """Same table, different pipeline.
+
+        These rows never go through download_catalog_batch, so writing
+        download_attempts here would invent downloads that never happened and
+        could trip the downloader's new ceiling for a batch it never fetched.
+        """
+        store = _Store()
+        mark_ingesting(store, {"batch_id": "abc", "ingest_attempts": 1},
+                       claimed_by="refresh:pokemon.csv")
+        _, patch_body = store.updates[0]
+        self.assertNotIn("download_attempts", patch_body)
+        self.assertEqual(patch_body["ingest_attempts"], 2)
+        self.assertEqual(patch_body["attempts"], 2,
+                         "the alias must not fall for five-CSV rows")
+
     def test_the_claim_records_a_time_not_just_a_name(self) -> None:
         """A reaper needs a clock. claimed_by alone cannot tell an import
         running now from one abandoned last night."""
