@@ -59,6 +59,26 @@ IN_FLIGHT_STATUSES = frozenset(ALL_STATUSES - TERMINAL_STATUSES)
 # States that hold a lease and can therefore go stale if a run dies.
 LEASED_STATUSES = frozenset({DOWNLOADING, INGESTING})
 
+# What counts as "work already in the pipe" for the downloader's backpressure.
+#
+# This deliberately includes INGESTING, which it did not until 2026-09-13. The
+# old set was {DOWNLOADED, VALIDATED} -- "files sitting on disk waiting" -- which
+# is the right answer to "is the ingester behind?" but the wrong answer to "is it
+# safe to write another file now?".
+#
+# On the 10-minute sports schedule those diverge. An ingest takes ~7.5 minutes
+# for a 270k-row batch, so tick N+1 arrives while tick N's file is INGESTING and
+# no longer counted: the downloader sees an empty queue and writes a second
+# 37 MB file while the first is still being read. Two disk writers at once is
+# exactly the contention the quiet-window rule exists to avoid, and nothing
+# downstream would report it -- both runs succeed.
+#
+# DOWNLOADING is included for the same reason one step earlier: a download still
+# in flight is a writer too. A stale one is not, which is why reap_stale_leases
+# runs BEFORE this count -- it returns dead leases to a retryable state so they
+# are not mistaken for live work.
+QUEUE_DEPTH_STATUSES = frozenset({DOWNLOADING, DOWNLOADED, VALIDATED, INGESTING})
+
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     PENDING: frozenset({DOWNLOADING, FETCH_FAILED}),
     DOWNLOADING: frozenset({DOWNLOADED, FETCH_FAILED, PENDING}),

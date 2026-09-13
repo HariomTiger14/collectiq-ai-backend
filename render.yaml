@@ -24,6 +24,21 @@
 # file was only a documentation mirror; the Blueprint instance created that
 # day made it the source of truth for the crons. The hand-made cron copies
 # were deleted after the Blueprint versions were verified.
+#
+# THIS FILE IS A MEMO, NOT THE RUNNING CONFIG. A service's start command in
+# the Render DASHBOARD is what actually executes, and it can drift from the
+# startCommand written here -- editing this file does not change a service
+# that already exists.
+#
+# That is not hypothetical (#217). From 2026-09-08 to 2026-09-11 this file
+# carried the agreed --batch-size for the five-CSV refresh while the dashboard
+# still ran the old value. Every run reported success, the ledger was green
+# five nights running, and catalog prices were frozen the whole time. Tests
+# pin the startCommand lines below, but a passing test proves the FILE is
+# right -- only a human reading the dashboard proves production is.
+#
+# So: after changing a startCommand here, open the service in Render and
+# confirm the two match.
 
 services:
   - type: cron
@@ -353,6 +368,10 @@ services:
   # --max-requests is therefore a CEILING, not a promise: a run that contends
   # with another job simply covers fewer sets rather than breaching the limit.
   # Raising it no longer risks the limit, only a longer run.
+  # SUSPENDED in the dashboard, deliberately, and left here unchanged. Its
+  # replacement is the staged pair below (download + ingest, 10 minutes apart).
+  # Do not unsuspend both: they claim from the same registry rotation and would
+  # double-book the same sets and spend two vendor CSV slots on one batch.
   - type: cron
     name: packlox-tier3-sportscardspro-rotation-sit
     runtime: python
@@ -537,3 +556,76 @@ services:
     envVars:
       - key: ADMIN_JOB_TOKEN
         sync: false
+
+  # --- staged sportscardspro pipeline ------------------------------------
+  #
+  # Replaces the single-process tier-3 rotation above with two crons that do
+  # one job each: one writes a CSV to storage, the other reads it and writes
+  # to the catalog. Split because they fail differently -- a download failure
+  # costs a vendor slot and must back off, an ingest failure costs none and
+  # should retry immediately -- and because a single process doing both holds
+  # a lease across the whole span, which is what left leases stale for 118
+  # hours.
+  #
+  # IMPORTANT -- the hole at 14:00-15:59 UTC (schedules read 0-13,16-23).
+  # The five-CSV refresh (packlox-pricecharting-catalog-refresh-sit) runs in
+  # that window and is by far the heaviest disk writer we have. Sports must
+  # not sit on it: Disk IOPS is a Supabase-side allowance that is NOT
+  # observable from inside Postgres, so contention there shows up as a slow
+  # night rather than as an error anyone is paged for. An earlier proposal of
+  # "35 */2 * * *" was rejected for including 14:35, which lands inside it.
+  #
+  # Cadence: download every 10 minutes is well inside the vendor's 1-CSV-per-
+  # 10-minutes account-wide budget only because --max-queue-depth 1 means most
+  # ticks skip. Ingest runs more often than download deliberately, so a file is
+  # picked up promptly rather than waiting a full download cycle.
+  - type: cron
+    name: collectiq-sportscardspro-download-sit
+    runtime: python
+    plan: starter
+    region: ohio
+    branch: main
+    # Every 10 minutes, except the five-CSV window at 14:00-15:59 UTC.
+    schedule: "*/10 0-13,16-23 * * *"
+    buildCommand: pip install -r requirements.txt
+    # --max-queue-depth 1 is what makes this single-writer. The argparse
+    # default is 2 (unchanged, so a manual Shell run behaves as before); at a
+    # 10-minute cadence 2 would mean two concurrent disk writers rather than a
+    # queue, because a ~7.5-minute ingest outlives the tick that fed it.
+    startCommand: python -m scripts.download_catalog_batch --source sportscardspro --commit --max-queue-depth 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ENVIRONMENT
+        value: sit
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # The only one of the pair that talks to the vendor.
+      - key: PRICECHARTING_API_TOKEN
+        sync: false
+
+  - type: cron
+    name: collectiq-sportscardspro-ingest-sit
+    runtime: python
+    plan: starter
+    region: ohio
+    branch: main
+    # Offset 3 minutes past each download tick so a file exists to pick up.
+    # Explicitly NOT "*/5": a 270k-row ingest measured 7m28s, so a 5-minute
+    # cron would start a second run on top of the first.
+    schedule: "3,13,23,33,43,53 0-13,16-23 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m scripts.ingest_catalog_batch --source sportscardspro --commit
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: ENVIRONMENT
+        value: sit
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # No PRICECHARTING_API_TOKEN: the ingester reads a file already in
+      # storage and never contacts the vendor. Withholding it is the guard.
